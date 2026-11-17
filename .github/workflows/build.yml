@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
           }
 
       - name: Upload Windows x64 artifact bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openvmm-fastdesk-windows-x64
           path: dist/openvmm-fastdesk-windows-x64/*
@@ -178,7 +178,7 @@ jobs:
 
       - name: Upload Windows x64 release zip
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-archive-windows-x64
           path: dist/openvmm-fastdesk-windows-x64.zip
@@ -190,7 +190,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install system build dependencies
         run: |
@@ -321,7 +321,7 @@ jobs:
           fi
 
       - name: Upload Linux x64 artifact bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openvmm-fastdesk-linux-x64
           path: dist/openvmm-fastdesk-linux-x64/*
@@ -329,7 +329,7 @@ jobs:
 
       - name: Upload Linux x64 release archive
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-archive-linux-x64
           path: dist/openvmm-fastdesk-linux-x64.tar.gz
@@ -345,7 +345,7 @@ jobs:
 
     steps:
       - name: Download release archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-archive-*
           merge-multiple: true
@@ -359,7 +359,7 @@ jobs:
           ls -lh
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             release-assets/openvmm-fastdesk-windows-x64.zip
