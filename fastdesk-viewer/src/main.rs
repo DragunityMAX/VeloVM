@@ -88,26 +88,36 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
         .with_context(|| format!("connecting to {}", args.connect))?;
     let mut writer_stream = reader_stream.try_clone()?;
 
-    let (init_w, init_h, init_stride, shm_path) = match read_server_msg(&mut reader_stream)? {
+    let (init_w, init_h, init_stride, init_offset, shm_path) = match read_server_msg(&mut reader_stream)? {
         ServerMsg::ServerHello {
             width,
             height,
             stride,
+            offset,
             shm_path,
             ..
-        } => (width, height, stride, shm_path),
+        } => (width, height, stride, offset, shm_path),
         other => anyhow::bail!("expected ServerHello, got {other:?}"),
     };
+
+    let mut comp = DesktopCompositor::new(
+        init_w,
+        init_h,
+        init_stride,
+        init_offset,
+        shm_path.as_deref(),
+        allow_shm,
+    )?;
+    let mut shm_enabled = comp.is_shm_active();
+    let mut fallback_pending = false;
 
     write_client_msg(
         &mut writer_stream,
         &ClientMsg::ClientHello {
             capabilities: CAP_ALL,
-            prefer_shm: allow_shm,
+            prefer_shm: shm_enabled,
         },
     )?;
-
-    let mut comp = DesktopCompositor::new(init_w, init_h, init_stride, shm_path.as_deref(), allow_shm)?;
 
     let (tx, rx) = mpsc::channel::<anyhow::Result<ServerMsg>>();
     thread::spawn(move || {
@@ -157,30 +167,50 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
                     width,
                     height,
                     stride,
+                    offset,
                     shm_path,
                 } => {
-                    comp.resize(width, height, stride, shm_path.as_deref(), allow_shm);
-                    window = Window::new(
-                        &args.title,
-                        comp.width as usize,
-                        comp.height as usize,
-                        WindowOptions {
-                            resize: true,
-                            scale_mode: ScaleMode::AspectRatioStretch,
-                            ..WindowOptions::default()
-                        },
-                    )?;
-                    if args.max_fps > 0 {
-                        window.set_target_fps(args.max_fps as usize);
+                    let dims_changed = width != comp.width || height != comp.height;
+                    comp.resize(width, height, stride, offset, shm_path.as_deref(), shm_enabled);
+                    if shm_enabled && !comp.is_shm_active() {
+                        shm_enabled = false;
+                        write_client_msg(
+                            &mut writer_stream,
+                            &ClientMsg::RequestFullFrame { allow_shm: false },
+                        )?;
+                        fallback_pending = true;
+                    }
+                    if dims_changed {
+                        window = Window::new(
+                            &args.title,
+                            comp.width as usize,
+                            comp.height as usize,
+                            WindowOptions {
+                                resize: true,
+                                scale_mode: ScaleMode::AspectRatioStretch,
+                                ..WindowOptions::default()
+                            },
+                        )?;
+                        if args.max_fps > 0 {
+                            window.set_target_fps(args.max_fps as usize);
+                        } else {
+                            window.set_target_fps(0);
+                        }
                     }
                     dirty = true;
                 }
                 ServerMsg::FrameBatch { rects, .. } => {
                     if comp.apply_rects(&rects)? {
-                        write_client_msg(
-                            &mut writer_stream,
-                            &ClientMsg::RequestFullFrame { allow_shm: false },
-                        )?;
+                        shm_enabled = false;
+                        if !fallback_pending {
+                            write_client_msg(
+                                &mut writer_stream,
+                                &ClientMsg::RequestFullFrame { allow_shm: false },
+                            )?;
+                            fallback_pending = true;
+                        }
+                    } else {
+                        fallback_pending = false;
                     }
                     frame_count += 1;
                     dirty = true;

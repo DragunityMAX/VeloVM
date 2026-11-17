@@ -166,6 +166,11 @@ impl View {
         self.len
     }
 
+    /// Returns the base file offset of this framebuffer view.
+    pub fn file_offset(&self) -> u64 {
+        self.offset
+    }
+
     /// Reads a line within the framebuffer.
     pub fn read_line(&mut self, line: u16, data: &mut [u8]) {
         if let Some(format) = &self.format {

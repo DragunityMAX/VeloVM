@@ -32,7 +32,7 @@ pub use wire::write_client_msg;
 pub use wire::write_server_msg;
 
 /// Protocol magic banner sent in [`ServerMsg::ServerHello`] and [`ClientMsg::ClientHello`].
-pub const MAGIC: [u8; 6] = *b"FDSK01";
+pub const MAGIC: [u8; 6] = *b"FDSK02";
 
 /// Default TCP port for the FastDesk server.
 pub const DEFAULT_TCP_PORT: u16 = 5901;
@@ -108,6 +108,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 stride: 1920 * 4,
+                offset: 4096,
                 vram_size: 32 * 1024 * 1024,
                 shm_path: Some("/tmp/vram.shm".into()),
             },
@@ -115,6 +116,7 @@ mod tests {
                 width: 3840,
                 height: 2160,
                 stride: 3840 * 4,
+                offset: 8192,
                 shm_path: None,
             },
             ServerMsg::FrameBatch {

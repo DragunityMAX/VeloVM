@@ -21,6 +21,7 @@ pub struct DesktopCompositor {
     pub width: u16,
     pub height: u16,
     pub stride: u32,
+    pub offset: u32,
     pub backing_fb: Vec<u32>,
     pub present_fb: Vec<u32>,
     shm_mmap: Option<Mmap>,
@@ -32,6 +33,7 @@ impl DesktopCompositor {
         width: u16,
         height: u16,
         stride: u32,
+        offset: u32,
         shm_path: Option<&str>,
         allow_shm: bool,
     ) -> anyhow::Result<Self> {
@@ -40,6 +42,7 @@ impl DesktopCompositor {
             width,
             height,
             stride,
+            offset,
             backing_fb: vec![0; len],
             present_fb: vec![0; len],
             shm_mmap: None,
@@ -59,18 +62,41 @@ impl DesktopCompositor {
 
     pub fn try_open_shm(&mut self, path: &str) {
         self.shm_mmap = None;
+        let required_end = if self.width > 0 && self.height > 0 {
+            let Some(end) = (self.height as usize - 1)
+                .checked_mul(self.stride as usize)
+                .and_then(|rows| (self.offset as usize).checked_add(rows))
+                .and_then(|o| o.checked_add(self.width as usize * 4))
+            else {
+                return;
+            };
+            end
+        } else {
+            self.offset as usize
+        };
         if let Ok(file) = File::open(path) {
             // SAFETY: file is opened read-only and maps shared guest VRAM maintained by OpenVMM.
             if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-                self.shm_mmap = Some(mmap);
+                if mmap.len() >= required_end {
+                    self.shm_mmap = Some(mmap);
+                }
             }
         }
     }
 
-    pub fn resize(&mut self, width: u16, height: u16, stride: u32, shm_path: Option<&str>, allow_shm: bool) {
+    pub fn resize(
+        &mut self,
+        width: u16,
+        height: u16,
+        stride: u32,
+        offset: u32,
+        shm_path: Option<&str>,
+        allow_shm: bool,
+    ) {
         self.width = width;
         self.height = height;
         self.stride = stride;
+        self.offset = offset;
         let len = width as usize * height as usize;
         self.backing_fb.resize(len, 0);
         self.backing_fb.fill(0);
@@ -80,6 +106,8 @@ impl DesktopCompositor {
         if allow_shm {
             if let Some(path) = shm_path {
                 self.try_open_shm(path);
+            } else {
+                self.shm_mmap = None;
             }
         } else {
             self.shm_mmap = None;
@@ -153,30 +181,51 @@ impl DesktopCompositor {
             }
             match r.encoding {
                 RectEncoding::ShmDirtyOnly => {
-                    let Some(mmap) = &self.shm_mmap else {
+                    let Some(mmap_len) = self.shm_mmap.as_ref().map(|m| m.len()) else {
                         need_pixel_fallback = true;
                         continue;
                     };
                     let shm_stride = self.stride as usize;
-                    for dy in 0..h {
-                        let src_off = (y + dy) * shm_stride + x * 4;
-                        let row_bytes = w * 4;
-                        if src_off + row_bytes > mmap.len() {
-                            break;
+                    let base_offset = self.offset as usize;
+                    let row_bytes = w * 4;
+                    let mut oob = false;
+                    {
+                        let mmap = self.shm_mmap.as_ref().unwrap();
+                        for dy in 0..h {
+                            let Some(src_off) = (y + dy)
+                                .checked_mul(shm_stride)
+                                .and_then(|o| o.checked_add(base_offset))
+                                .and_then(|o| o.checked_add(x * 4))
+                            else {
+                                oob = true;
+                                break;
+                            };
+                            let Some(src_end) = src_off.checked_add(row_bytes) else {
+                                oob = true;
+                                break;
+                            };
+                            if src_end > mmap_len {
+                                oob = true;
+                                break;
+                            }
+                            let src_row = &mmap[src_off..src_end];
+                            let dst_off = (y + dy) * fb_w + x;
+                            for dx in 0..w {
+                                let s = dx * 4;
+                                let px = u32::from_le_bytes([
+                                    src_row[s],
+                                    src_row[s + 1],
+                                    src_row[s + 2],
+                                    0,
+                                ]);
+                                self.backing_fb[dst_off + dx] = px;
+                                self.present_fb[dst_off + dx] = px;
+                            }
                         }
-                        let src_row = &mmap[src_off..src_off + row_bytes];
-                        let dst_off = (y + dy) * fb_w + x;
-                        for dx in 0..w {
-                            let s = dx * 4;
-                            let px = u32::from_le_bytes([
-                                src_row[s],
-                                src_row[s + 1],
-                                src_row[s + 2],
-                                0,
-                            ]);
-                            self.backing_fb[dst_off + dx] = px;
-                            self.present_fb[dst_off + dx] = px;
-                        }
+                    }
+                    if oob {
+                        self.shm_mmap = None;
+                        need_pixel_fallback = true;
                     }
                 }
                 RectEncoding::RawBgra | RectEncoding::Lz4Bgra => {
@@ -272,10 +321,11 @@ impl DesktopCompositor {
 mod tests {
     use super::*;
     use fastdesk_proto::encode_bgra_rect;
+    use std::io::Write;
 
     #[test]
     fn compositor_blits_rects_and_alpha_cursor_without_corrupting_backing() {
-        let mut comp = DesktopCompositor::new(32, 32, 32 * 4, None, false).unwrap();
+        let mut comp = DesktopCompositor::new(32, 32, 32 * 4, 0, None, false).unwrap();
         let mut raw = Vec::with_capacity(16 * 16 * 4);
         for _ in 0..16 * 16 {
             raw.extend_from_slice(&[0x10, 0x20, 0x30, 0xff]);
@@ -304,5 +354,103 @@ mod tests {
         comp.set_cursor_position(true, 0, 0);
         comp.composite_cursor();
         assert_eq!(comp.present_fb[10 * 32 + 10], 0x00302010);
+    }
+
+    #[test]
+    fn shm_compositor_reads_from_nonzero_surface_offset() {
+        let offset = 4096usize;
+        let width = 32u16;
+        let height = 32u16;
+        let stride = width as u32 * 4;
+        let surface_bytes = width as usize * height as usize * 4;
+
+        let mut vram = vec![0u8; offset + surface_bytes];
+        let mut surface = Vec::with_capacity(surface_bytes);
+        for _ in 0..(width as usize * height as usize) {
+            surface.extend_from_slice(&[0x12, 0x34, 0x56, 0xff]);
+        }
+        vram[offset..].copy_from_slice(&surface);
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&vram).unwrap();
+        tmp.flush().unwrap();
+        let shm_path = tmp.path().to_string_lossy().into_owned();
+
+        let mut shm_comp =
+            DesktopCompositor::new(width, height, stride, offset as u32, Some(&shm_path), true)
+                .unwrap();
+        assert!(shm_comp.is_shm_active());
+        let need_fallback = shm_comp
+            .apply_rects(&[EncodedRect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+                encoding: RectEncoding::ShmDirtyOnly,
+                data: Vec::new(),
+            }])
+            .unwrap();
+        assert!(!need_fallback);
+        assert_eq!(shm_comp.backing_fb[0], 0x00563412);
+        assert_eq!(shm_comp.backing_fb[17 * 32 + 19], 0x00563412);
+
+        let mut lz4_comp =
+            DesktopCompositor::new(width, height, stride, offset as u32, None, false).unwrap();
+        let (encoding, data) = encode_bgra_rect(&surface);
+        lz4_comp
+            .apply_rects(&[EncodedRect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+                encoding,
+                data,
+            }])
+            .unwrap();
+        assert_eq!(shm_comp.backing_checksum(), lz4_comp.backing_checksum());
+    }
+
+    #[test]
+    fn shm_fallback_triggered_when_shm_missing_or_too_small_for_offset() {
+        let missing = DesktopCompositor::new(
+            32,
+            32,
+            32 * 4,
+            0,
+            Some("/nonexistent/fastdesk-missing.shm"),
+            true,
+        )
+        .unwrap();
+        assert!(!missing.is_shm_active());
+        let mut missing = missing;
+        let need_fallback = missing
+            .apply_rects(&[EncodedRect {
+                x: 0,
+                y: 0,
+                w: 32,
+                h: 32,
+                encoding: RectEncoding::ShmDirtyOnly,
+                data: Vec::new(),
+            }])
+            .unwrap();
+        assert!(need_fallback);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(4096 + 64).unwrap();
+        let path = tmp.path().to_string_lossy().into_owned();
+        let mut too_small =
+            DesktopCompositor::new(32, 32, 32 * 4, 4096, Some(&path), true).unwrap();
+        assert!(!too_small.is_shm_active());
+        let need_fallback = too_small
+            .apply_rects(&[EncodedRect {
+                x: 0,
+                y: 0,
+                w: 32,
+                h: 32,
+                encoding: RectEncoding::ShmDirtyOnly,
+                data: Vec::new(),
+            }])
+            .unwrap();
+        assert!(need_fallback);
     }
 }

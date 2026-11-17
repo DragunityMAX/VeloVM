@@ -458,16 +458,26 @@ struct ClientContext {
     start_time: Instant,
 }
 
-fn current_display_dims(view: &Arc<Mutex<ViewWrapper>>) -> (u16, u16, u32, usize) {
+fn current_display_dims(view: &Arc<Mutex<ViewWrapper>>) -> (u16, u16, u32, u32, usize) {
     let mut guard = view.lock();
     let vram_size = guard.0.len();
+    let base_offset = guard.0.file_offset();
     if let Some(fmt) = guard.0.format() {
         let w = (fmt.width.max(1) as usize).min(u16::MAX as usize) as u16;
         let h = (fmt.height.max(1) as usize).min(u16::MAX as usize) as u16;
         let stride = fmt.bytes_per_line.max(w as usize * 4) as u32;
-        (w, h, stride, vram_size)
+        let offset = base_offset
+            .saturating_add(fmt.offset as u64)
+            .min(u32::MAX as u64) as u32;
+        (w, h, stride, offset, vram_size)
     } else {
-        (1024, 768, 1024 * 4, vram_size)
+        (
+            1024,
+            768,
+            1024 * 4,
+            base_offset.min(u32::MAX as u64) as u32,
+            vram_size,
+        )
     }
 }
 
@@ -494,7 +504,8 @@ fn dispatch_client_msg(
     msg: ClientMsg,
     input_send: &mesh::Sender<InputData>,
     force_full: &mut bool,
-    force_pixels: &mut bool,
+    use_shm: &mut bool,
+    shm_available: bool,
     wakeup_ready: &mut bool,
     pong_out: &mut Option<u64>,
 ) {
@@ -541,7 +552,7 @@ fn dispatch_client_msg(
         }
         ClientMsg::RequestFullFrame { allow_shm } => {
             *force_full = true;
-            *force_pixels = !allow_shm;
+            *use_shm = allow_shm && shm_available;
             *wakeup_ready = true;
         }
         ClientMsg::Ping { client_time_us } => {
@@ -551,7 +562,8 @@ fn dispatch_client_msg(
 }
 
 async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
-    let (mut width, mut height, mut stride, vram_size) = current_display_dims(&ctx.view);
+    let (mut width, mut height, mut stride, mut offset, vram_size) =
+        current_display_dims(&ctx.view);
 
     let mut out_buf = Vec::with_capacity(64 * 1024);
     encode_server_msg(
@@ -560,6 +572,7 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
             width,
             height,
             stride,
+            offset,
             vram_size: vram_size as u32,
             shm_path: ctx.shm_path.clone(),
         },
@@ -567,8 +580,9 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
     )?;
     ctx.socket.write_all(&out_buf).await?;
 
-    let use_shm = match read_client_frame(&mut ctx.socket).await? {
-        ClientMsg::ClientHello { prefer_shm, .. } => prefer_shm && ctx.shm_path.is_some(),
+    let shm_available = ctx.shm_path.is_some();
+    let mut use_shm = match read_client_frame(&mut ctx.socket).await? {
+        ClientMsg::ClientHello { prefer_shm, .. } => prefer_shm && shm_available,
         other => anyhow::bail!("expected ClientHello, got {other:?}"),
     };
 
@@ -597,7 +611,6 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
     let mut cur_fb: Vec<u8> = Vec::new();
     let mut frame_seq = 0u64;
     let mut force_full = true;
-    let mut force_pixels = false;
     let mut msg_type = [0u8; 1];
 
     loop {
@@ -636,7 +649,8 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
                     msg,
                     &ctx.input_send,
                     &mut force_full,
-                    &mut force_pixels,
+                    &mut use_shm,
+                    shm_available,
                     &mut wakeup_ready,
                     &mut pong_ts,
                 );
@@ -682,11 +696,12 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
         }
 
         // 2. Check resolution changes.
-        let (new_w, new_h, new_stride, _) = current_display_dims(&ctx.view);
-        if new_w != width || new_h != height || new_stride != stride {
+        let (new_w, new_h, new_stride, new_offset, _) = current_display_dims(&ctx.view);
+        if new_w != width || new_h != height || new_stride != stride || new_offset != offset {
             width = new_w;
             height = new_h;
             stride = new_stride;
+            offset = new_offset;
             tracker.resize(width, height);
             prev_fb.clear();
             cur_fb.clear();
@@ -696,6 +711,7 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
                     width,
                     height,
                     stride,
+                    offset,
                     shm_path: ctx.shm_path.clone(),
                 },
                 &mut out_buf,
@@ -740,11 +756,9 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
         // 4. Encode dirty rectangles (SHM zero-copy vs LZ4 dirty-column read).
         if !tracker.is_empty() {
             tracker.merge_into(&mut merged_rects);
-            let shm_mode = use_shm && !force_pixels;
-            force_pixels = false;
 
             let mut encoded_rects = Vec::with_capacity(merged_rects.len());
-            if shm_mode {
+            if use_shm {
                 for r in &merged_rects {
                     encoded_rects.push(EncodedRect {
                         x: r.x,
@@ -818,6 +832,7 @@ mod tests {
         input_recv: mesh::Receiver<InputData>,
         dirty_send: mesh::Sender<Vec<DirtyRect>>,
         cursor_send: mesh::Sender<CursorUpdate>,
+        format_send: mesh::Sender<FramebufferFormat>,
         stop_send: Option<mesh::OneshotSender<()>>,
         join: Option<JoinHandle<anyhow::Result<()>>>,
     }
@@ -837,6 +852,15 @@ mod tests {
     fn start_test_server(
         width: u16,
         height: u16,
+        shm_file: Option<&std::path::Path>,
+    ) -> TestServer {
+        start_test_server_with_offset(width, height, 0, shm_file)
+    }
+
+    fn start_test_server_with_offset(
+        width: u16,
+        height: u16,
+        initial_offset: usize,
         shm_file: Option<&std::path::Path>,
     ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -861,11 +885,12 @@ mod tests {
         };
         let writer_vram = vram.try_clone().unwrap();
         let (fb, access) = framebuffer::framebuffer(vram, FRAMEBUFFER_SIZE, 0).unwrap();
-        fb.format_send().send(FramebufferFormat {
+        let format_send = fb.format_send();
+        format_send.send(FramebufferFormat {
             width: width as usize,
             height: height as usize,
             bytes_per_line: width as usize * 4,
-            offset: 0,
+            offset: initial_offset,
         });
 
         let mapping = SparseMapping::new(FRAMEBUFFER_SIZE).unwrap();
@@ -909,6 +934,7 @@ mod tests {
             input_recv,
             dirty_send,
             cursor_send,
+            format_send,
             stop_send: Some(stop_send),
             join: Some(join),
         }
@@ -1143,6 +1169,176 @@ mod tests {
         let disk_bytes = std::fs::read(&shm_file).unwrap();
         let off = (4 * 64 + 4) * 4;
         assert_eq!(&disk_bytes[off..off + 4], &px);
+
+        drop(stream);
+        server.stop();
+    }
+
+    #[test]
+    fn shm_and_lz4_respect_nonzero_surface_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm_file = dir.path().join("vram-offset.shm");
+        let server = start_test_server_with_offset(64, 64, 4096, Some(&shm_file));
+
+        // Write sentinel garbage at byte 0 and the real pixel inside the offset primary surface.
+        let garbage = [0xaa, 0xbb, 0xcc, 0xdd];
+        let expected_px = [0x34, 0x56, 0x78, 0xff];
+        server.vram.write_at(0, &garbage).unwrap();
+        let surface_rel_off = (4 * 64 + 4) * 4;
+        server
+            .vram
+            .write_at(4096 + surface_rel_off, &expected_px)
+            .unwrap();
+
+        // LZ4 client observes offset in ServerHello and receives pixels from 4096+.
+        let (mut lz4_stream, lz4_hello) = connect_client(server.addr, false);
+        assert!(matches!(
+            lz4_hello,
+            ServerMsg::ServerHello {
+                width: 64,
+                height: 64,
+                stride: 256,
+                offset: 4096,
+                ..
+            }
+        ));
+        match read_server_msg(&mut lz4_stream).unwrap() {
+            ServerMsg::FrameBatch { rects, .. } => {
+                assert_eq!(rects.len(), 1);
+                let decoded =
+                    decode_bgra_rect(rects[0].encoding, &rects[0].data, 64 * 64 * 4).unwrap();
+                assert_eq!(&decoded[surface_rel_off..surface_rel_off + 4], &expected_px);
+            }
+            other => panic!("expected initial LZ4 FrameBatch, got {other:?}"),
+        }
+
+        // SHM client receives offset in ServerHello and reads from offset + surface_rel_off.
+        let (mut shm_stream, shm_hello) = connect_client(server.addr, true);
+        let shm_offset = match shm_hello {
+            ServerMsg::ServerHello {
+                offset,
+                shm_path: Some(_),
+                ..
+            } => {
+                assert_eq!(offset, 4096);
+                offset as usize
+            }
+            other => panic!("expected ServerHello with offset and shm_path, got {other:?}"),
+        };
+        match read_server_msg(&mut shm_stream).unwrap() {
+            ServerMsg::FrameBatch { rects, .. } => {
+                assert_eq!(rects.len(), 1);
+                assert_eq!(rects[0].encoding, RectEncoding::ShmDirtyOnly);
+            }
+            other => panic!("expected initial SHM FrameBatch, got {other:?}"),
+        }
+        let disk_bytes = std::fs::read(&shm_file).unwrap();
+        assert_eq!(&disk_bytes[0..4], &garbage);
+        assert_eq!(
+            &disk_bytes[shm_offset + surface_rel_off..shm_offset + surface_rel_off + 4],
+            &expected_px
+        );
+
+        // Dynamic surface offset change emits Resolution with new offset.
+        server.format_send.send(FramebufferFormat {
+            width: 64,
+            height: 64,
+            bytes_per_line: 64 * 4,
+            offset: 8192,
+        });
+        server.dirty_send.send(vec![DirtyRect {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 16,
+        }]);
+        match read_server_msg(&mut shm_stream).unwrap() {
+            ServerMsg::Resolution {
+                width: 64,
+                height: 64,
+                stride: 256,
+                offset: 8192,
+                ..
+            } => {}
+            other => panic!("expected Resolution with offset 8192, got {other:?}"),
+        }
+        match read_server_msg(&mut shm_stream).unwrap() {
+            ServerMsg::FrameBatch { .. } => {}
+            other => panic!("expected FrameBatch after Resolution, got {other:?}"),
+        }
+
+        drop(lz4_stream);
+        drop(shm_stream);
+        server.stop();
+    }
+
+    #[test]
+    fn shm_fallback_persists_across_subsequent_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm_file = dir.path().join("vram-fallback.shm");
+        let server = start_test_server(64, 64, Some(&shm_file));
+        let (mut stream, _) = connect_client(server.addr, true);
+
+        // Initial frame uses SHM.
+        match read_server_msg(&mut stream).unwrap() {
+            ServerMsg::FrameBatch { rects, .. } => {
+                assert_eq!(rects[0].encoding, RectEncoding::ShmDirtyOnly);
+            }
+            other => panic!("expected initial SHM FrameBatch, got {other:?}"),
+        }
+
+        // Client triggers fallback to pixel mode.
+        write_client_msg(&mut stream, &ClientMsg::RequestFullFrame { allow_shm: false }).unwrap();
+        match read_server_msg(&mut stream).unwrap() {
+            ServerMsg::FrameBatch { rects, .. } => {
+                assert!(!rects.is_empty());
+                assert!(
+                    rects
+                        .iter()
+                        .all(|r| r.encoding != RectEncoding::ShmDirtyOnly)
+                );
+            }
+            other => panic!("expected pixel fallback FrameBatch, got {other:?}"),
+        }
+
+        // Subsequent dirty updates must stay in pixel mode (not revert to ShmDirtyOnly).
+        let px1 = [0x12, 0x34, 0x56, 0xff];
+        server.vram.write_at((16 * 64 + 16) * 4, &px1).unwrap();
+        server.dirty_send.send(vec![DirtyRect {
+            left: 16,
+            top: 16,
+            right: 32,
+            bottom: 32,
+        }]);
+        match read_server_msg(&mut stream).unwrap() {
+            ServerMsg::FrameBatch { rects, .. } => {
+                assert_eq!(rects.len(), 1);
+                assert_ne!(rects[0].encoding, RectEncoding::ShmDirtyOnly);
+                let decoded =
+                    decode_bgra_rect(rects[0].encoding, &rects[0].data, 16 * 16 * 4).unwrap();
+                assert_eq!(&decoded[0..4], &px1);
+            }
+            other => panic!("expected first post-fallback pixel FrameBatch, got {other:?}"),
+        }
+
+        let px2 = [0x78, 0x9a, 0xbc, 0xff];
+        server.vram.write_at((32 * 64 + 32) * 4, &px2).unwrap();
+        server.dirty_send.send(vec![DirtyRect {
+            left: 32,
+            top: 32,
+            right: 48,
+            bottom: 48,
+        }]);
+        match read_server_msg(&mut stream).unwrap() {
+            ServerMsg::FrameBatch { rects, .. } => {
+                assert_eq!(rects.len(), 1);
+                assert_ne!(rects[0].encoding, RectEncoding::ShmDirtyOnly);
+                let decoded =
+                    decode_bgra_rect(rects[0].encoding, &rects[0].data, 16 * 16 * 4).unwrap();
+                assert_eq!(&decoded[0..4], &px2);
+            }
+            other => panic!("expected second post-fallback pixel FrameBatch, got {other:?}"),
+        }
 
         drop(stream);
         server.stop();

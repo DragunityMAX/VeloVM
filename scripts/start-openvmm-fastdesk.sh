@@ -8,7 +8,8 @@ ISO_PATH=""
 MEMORY="8G"
 CPUS="4"
 VRAM_MB="32"
-SHM_PATH="/dev/shm/openvmm-fastdesk-vram.shm"
+SHM_PATH=""
+SHM_CUSTOM=0
 LISTEN_ADDR="127.0.0.1:5901"
 
 usage() {
@@ -21,40 +22,58 @@ Options:
   --memory <SIZE>     Guest RAM size (default: $MEMORY)
   --cpus <N>          Virtual processor count (default: $CPUS)
   --vram-mb <MB>      SynthVid framebuffer VRAM in MiB (default: $VRAM_MB)
-  --shm <PATH>        Shared-memory VRAM file path (default: $SHM_PATH)
+  --shm <PATH>        Shared-memory VRAM file path (default: /dev/shm/openvmm-fastdesk-<uid>/vram.shm, mode 0600)
   --listen <ADDR>     FastDesk TCP listen address (default: $LISTEN_ADDR)
   -h, --help          Show this help
 EOF
 }
 
+require_arg() {
+    local opt="$1"
+    local val="${2:-}"
+    if [[ -z "$val" ]]; then
+        echo "Error: $opt requires a non-empty argument." >&2
+        usage >&2
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --disk)
-            DISK_PATH="${2:-}"
+            require_arg "$1" "${2:-}"
+            DISK_PATH="$2"
             shift 2
             ;;
         --iso)
-            ISO_PATH="${2:-}"
+            require_arg "$1" "${2:-}"
+            ISO_PATH="$2"
             shift 2
             ;;
         --memory)
-            MEMORY="${2:-}"
+            require_arg "$1" "${2:-}"
+            MEMORY="$2"
             shift 2
             ;;
         --cpus)
-            CPUS="${2:-}"
+            require_arg "$1" "${2:-}"
+            CPUS="$2"
             shift 2
             ;;
         --vram-mb)
-            VRAM_MB="${2:-}"
+            require_arg "$1" "${2:-}"
+            VRAM_MB="$2"
             shift 2
             ;;
         --shm)
-            SHM_PATH="${2:-}"
+            require_arg "$1" "${2:-}"
+            SHM_PATH="$2"
+            SHM_CUSTOM=1
             shift 2
             ;;
         --listen)
-            LISTEN_ADDR="${2:-}"
+            require_arg "$1" "${2:-}"
+            LISTEN_ADDR="$2"
             shift 2
             ;;
         -h|--help)
@@ -118,8 +137,47 @@ UEFI_FD="$(resolve_first \
     exit 1
 }
 
-mkdir -p "$(dirname "$SHM_PATH")"
-truncate -s "${VRAM_MB}M" "$SHM_PATH"
+if [[ "$SHM_CUSTOM" -eq 0 ]]; then
+    if [[ -d /dev/shm && -w /dev/shm ]]; then
+        SHM_BASE="/dev/shm"
+    else
+        SHM_BASE="${XDG_RUNTIME_DIR:-/tmp}"
+    fi
+    SHM_DIR="${SHM_BASE}/openvmm-fastdesk-$(id -u)"
+    SHM_PATH="${SHM_DIR}/vram.shm"
+    (umask 077 && mkdir -p "$SHM_DIR")
+    if [[ -L "$SHM_DIR" || ! -d "$SHM_DIR" || ! -O "$SHM_DIR" ]]; then
+        echo "Error: unsafe shared-memory directory: $SHM_DIR" >&2
+        exit 1
+    fi
+    chmod 0700 "$SHM_DIR"
+else
+    SHM_DIR="$(dirname "$SHM_PATH")"
+    if [[ ! -e "$SHM_DIR" ]]; then
+        (umask 077 && mkdir -p "$SHM_DIR")
+        chmod 0700 "$SHM_DIR"
+    fi
+    if [[ ! -d "$SHM_DIR" ]]; then
+        echo "Error: shared-memory parent is not a directory: $SHM_DIR" >&2
+        exit 1
+    fi
+fi
+
+if [[ -L "$SHM_PATH" ]]; then
+    echo "Error: refusing symlink shared-memory file: $SHM_PATH" >&2
+    exit 1
+fi
+if [[ -e "$SHM_PATH" && ( ! -f "$SHM_PATH" || ! -O "$SHM_PATH" ) ]]; then
+    echo "Error: unsafe existing shared-memory file: $SHM_PATH" >&2
+    exit 1
+fi
+
+(
+    umask 077
+    : >> "$SHM_PATH"
+    chmod 0600 "$SHM_PATH"
+    truncate -s "${VRAM_MB}M" "$SHM_PATH"
+)
 
 VMM_ARGS=(
     --uefi "firmware=$UEFI_FD"

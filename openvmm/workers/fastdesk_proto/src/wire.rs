@@ -101,6 +101,8 @@ pub enum ServerMsg {
         height: u16,
         /// Scanline stride in bytes.
         stride: u32,
+        /// Byte offset of the primary surface within VRAM.
+        offset: u32,
         /// Total framebuffer VRAM size in bytes.
         vram_size: u32,
         /// Optional backing shared-memory file path for local zero-copy mode.
@@ -114,6 +116,8 @@ pub enum ServerMsg {
         height: u16,
         /// New scanline stride in bytes.
         stride: u32,
+        /// Byte offset of the primary surface within VRAM.
+        offset: u32,
         /// Optional backing shared-memory file path.
         shm_path: Option<String>,
     },
@@ -303,6 +307,7 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) -> Result<(), Proto
             width,
             height,
             stride,
+            offset,
             vram_size,
             shm_path,
         } => {
@@ -312,6 +317,7 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) -> Result<(), Proto
             out.extend_from_slice(&width.to_le_bytes());
             out.extend_from_slice(&height.to_le_bytes());
             out.extend_from_slice(&stride.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&vram_size.to_le_bytes());
             write_opt_str(out, shm_path.as_deref());
             finish_frame(out, len_pos)
@@ -320,12 +326,14 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) -> Result<(), Proto
             width,
             height,
             stride,
+            offset,
             shm_path,
         } => {
             let len_pos = begin_frame(out, MSG_RESOLUTION);
             out.extend_from_slice(&width.to_le_bytes());
             out.extend_from_slice(&height.to_le_bytes());
             out.extend_from_slice(&stride.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
             write_opt_str(out, shm_path.as_deref());
             finish_frame(out, len_pos)
         }
@@ -401,6 +409,7 @@ pub fn decode_server_msg(msg_type: u8, payload: &[u8]) -> Result<ServerMsg, Prot
                 width: c.u16()?,
                 height: c.u16()?,
                 stride: c.u32()?,
+                offset: c.u32()?,
                 vram_size: c.u32()?,
                 shm_path: c.opt_str()?,
             })
@@ -409,6 +418,7 @@ pub fn decode_server_msg(msg_type: u8, payload: &[u8]) -> Result<ServerMsg, Prot
             width: c.u16()?,
             height: c.u16()?,
             stride: c.u32()?,
+            offset: c.u32()?,
             shm_path: c.opt_str()?,
         }),
         MSG_FRAME_BATCH => {

@@ -1306,13 +1306,22 @@ async fn vm_config_from_command_line(
 
     let framebuffer = if opt.gfx || opt.fastdesk.fastdesk || opt.vtl2_gfx || opt.vnc.vnc || opt.pcat {
         let vram = if let Some(shm_path) = &opt.fastdesk.fastdesk_shm {
-            let file = fs_err::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
+            let mut open_opts = fs_err::OpenOptions::new();
+            open_opts.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
+            }
+            let file = open_opts
                 .open(shm_path)
                 .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .context("setting FastDesk SHM file permissions")?;
+            }
             file.file()
                 .set_len(vram_size as u64)
                 .context("sizing FastDesk SHM file")?;

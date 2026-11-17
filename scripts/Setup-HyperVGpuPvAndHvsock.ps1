@@ -122,9 +122,14 @@ if (-not $SkipDriverCopy) {
     $vhdxPath = $osDrive.Path
     Write-Host "Mounting VHDX '$vhdxPath' to sync HostDriverStore..." -ForegroundColor Cyan
 
-    $mounted = Mount-VHD -Path $vhdxPath -Passthru
+    $mounted = Mount-VHD -Path $vhdxPath -PassThru
     try {
-        $partitions = Get-Disk -Number $mounted.Number | Get-Partition | Where-Object { $_.DriveLetter }
+        $disk = if ($null -ne $mounted.DiskNumber) {
+            Get-Disk -Number $mounted.DiskNumber
+        } else {
+            $mounted | Get-Disk
+        }
+        $partitions = $disk | Get-Partition | Where-Object { $_.DriveLetter }
         $windowsRoot = $null
         foreach ($part in $partitions) {
             $candidate = "$($part.DriveLetter):\Windows\System32"

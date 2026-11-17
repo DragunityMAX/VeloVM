@@ -193,6 +193,7 @@ dependencies = [
  "lz4_flex",
  "memmap2",
  "minifb",
+ "raw-window-handle",
  "socket2",
  "tempfile",
  "tracing",

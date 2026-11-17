@@ -89,6 +89,7 @@ fn run_single_self_test(
                 width,
                 height,
                 stride,
+                offset: 0,
                 vram_size: vram_size as u32,
                 shm_path: Some(shm_path_str),
             },
@@ -215,14 +216,15 @@ fn run_single_self_test(
     });
 
     let mut stream = TransportStream::connect(&format!("tcp://{addr}"))?;
-    let (w, h, s, shm_path) = match read_server_msg(&mut stream)? {
+    let (w, h, s, offset, shm_path) = match read_server_msg(&mut stream)? {
         ServerMsg::ServerHello {
             width,
             height,
             stride,
+            offset,
             shm_path,
             ..
-        } => (width, height, stride, shm_path),
+        } => (width, height, stride, offset, shm_path),
         other => anyhow::bail!("expected ServerHello, got {other:?}"),
     };
 
@@ -234,7 +236,7 @@ fn run_single_self_test(
         },
     )?;
 
-    let mut comp = DesktopCompositor::new(w, h, s, shm_path.as_deref(), prefer_shm)?;
+    let mut comp = DesktopCompositor::new(w, h, s, offset, shm_path.as_deref(), prefer_shm)?;
     let mut latencies_us = Vec::with_capacity(frames);
     let mut wire_bytes = 0u64;
     let mut raw_pixel_bytes = 0u64;
@@ -344,25 +346,26 @@ pub fn run_self_test(frames: usize, width: u16, height: u16) -> anyhow::Result<(
 
 pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyhow::Result<()> {
     let mut stream = TransportStream::connect(endpoint)?;
-    let (w, h, s, shm_path) = match read_server_msg(&mut stream)? {
+    let (w, h, s, offset, shm_path) = match read_server_msg(&mut stream)? {
         ServerMsg::ServerHello {
             width,
             height,
             stride,
+            offset,
             shm_path,
             ..
-        } => (width, height, stride, shm_path),
+        } => (width, height, stride, offset, shm_path),
         other => anyhow::bail!("expected ServerHello, got {other:?}"),
     };
+    let mut comp = DesktopCompositor::new(w, h, s, offset, shm_path.as_deref(), allow_shm)?;
     write_client_msg(
         &mut stream,
         &ClientMsg::ClientHello {
             capabilities: CAP_ALL,
-            prefer_shm: allow_shm,
+            prefer_shm: comp.is_shm_active(),
         },
     )?;
 
-    let mut comp = DesktopCompositor::new(w, h, s, shm_path.as_deref(), allow_shm)?;
     let mut rtts_us = Vec::new();
     let start = Instant::now();
     let mut got_frames = 0usize;
@@ -399,8 +402,9 @@ pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyho
                     width,
                     height,
                     stride,
+                    offset,
                     shm_path,
-                } => comp.resize(width, height, stride, shm_path.as_deref(), allow_shm),
+                } => comp.resize(width, height, stride, offset, shm_path.as_deref(), allow_shm),
                 ServerMsg::CursorShape {
                     width,
                     height,
