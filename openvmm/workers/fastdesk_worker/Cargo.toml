@@ -1,0 +1,40 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "fastdesk_worker"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fastdesk_proto.workspace = true
+fastdesk_worker_defs.workspace = true
+
+framebuffer.workspace = true
+input_core.workspace = true
+video_core.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+mesh_worker.workspace = true
+pal_async.workspace = true
+tracing_helpers.workspace = true
+
+anyhow.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+lz4_flex.workspace = true
+parking_lot.workspace = true
+socket2 = { workspace = true, features = ["all"] }
+tracing.workspace = true
+unicycle.workspace = true
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+vmsocket.workspace = true
+
+[dev-dependencies]
+sparse_mmap.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

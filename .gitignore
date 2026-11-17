@@ -1,0 +1,29 @@
+# Cargo build outputs across all workspaces
+**/target/
+
+# OpenVMM downloaded packages & flowey scratch directories
+/openvmm/.packages/
+/openvmm/flowey-out/
+/openvmm/flowey-persist/
+/openvmm/vmm_test_results/
+
+# Packaged distribution staging
+/dist/
+
+# VM disks, firmware images at repo root, and shared-memory files
+*.vhdx
+*.vhd
+*.img
+*.iso
+*.vmgs
+*.dbhd
+*.dbhd-shm
+*.dbhd-wal
+*.shm
+*.pdb
+
+# Editor / OS
+.DS_Store
+.vscode/
+**/*.rs.bk
+__pycache__/

@@ -1,0 +1,368 @@
+name: Build & Package OpenVMM FastDesk
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  PROTOC_VERSION: "27.1"
+  MU_MSVM_VERSION: "26.0.44"
+
+jobs:
+  build-windows-x64:
+    name: Build & Package Windows x64 (WHP)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            openvmm -> openvmm/target
+            openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
+            fastdesk-viewer -> fastdesk-viewer/target
+
+      - name: Download protoc and mu_msvm x64 UEFI firmware
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolsRoot = Join-Path $env:RUNNER_TEMP "fastdesk-tools"
+          $protocExtract = Join-Path $toolsRoot "protoc"
+          $msvmExtract = Join-Path $toolsRoot "mu_msvm"
+          New-Item -ItemType Directory -Force -Path $protocExtract, $msvmExtract | Out-Null
+
+          # 1. protoc (Google.Protobuf.Tools layout used by openvmm/.cargo/config.toml)
+          $protocZip = Join-Path $toolsRoot "protoc-win64.zip"
+          $protocUrl = "https://github.com/protocolbuffers/protobuf/releases/download/v${env:PROTOC_VERSION}/protoc-${env:PROTOC_VERSION}-win64.zip"
+          curl.exe --fail --retry 3 -sSLo $protocZip $protocUrl
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download $protocUrl" }
+          Expand-Archive -Force -Path $protocZip -DestinationPath $protocExtract
+
+          $protocTools = "openvmm\.packages\Google.Protobuf.Tools\tools"
+          New-Item -ItemType Directory -Force -Path $protocTools | Out-Null
+          Copy-Item -Force (Join-Path $protocExtract "bin\protoc.exe") (Join-Path $protocTools "protoc.exe")
+          $protocIncludeDst = Join-Path $protocTools "include"
+          if (Test-Path $protocIncludeDst) { Remove-Item -Recurse -Force $protocIncludeDst }
+          Copy-Item -Recurse -Force (Join-Path $protocExtract "include") $protocIncludeDst
+          (Resolve-Path $protocTools).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          # 2. mu_msvm x64 UEFI firmware (MSVM.fd)
+          $msvmUrl = "https://github.com/microsoft/mu_msvm/releases/download/v${env:MU_MSVM_VERSION}/firmware-RELEASE-X64-CLANGPDB.tar.gz"
+          curl.exe --fail --retry 3 -sSLo (Join-Path $msvmExtract "mu_msvm.tar.gz") $msvmUrl
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download $msvmUrl" }
+          Push-Location $msvmExtract
+          try {
+            tar.exe -xzf mu_msvm.tar.gz
+            if ($LASTEXITCODE -ne 0) { throw "Failed to unpack mu_msvm archive" }
+          } finally {
+            Pop-Location
+          }
+          $msvmSrc = Join-Path $msvmExtract "FV\MSVM.fd"
+          if (-not (Test-Path $msvmSrc)) { throw "MSVM.fd not found inside mu_msvm archive" }
+
+          $msvmMagicDir = "openvmm\.packages\hyperv.uefi.mscoreuefi.x64.RELEASE\MsvmX64\RELEASE_VS2022\FV"
+          New-Item -ItemType Directory -Force -Path $msvmMagicDir | Out-Null
+          Copy-Item -Force $msvmSrc (Join-Path $msvmMagicDir "MSVM.fd")
+
+      - name: Run fastdesk_proto tests
+        working-directory: openvmm/workers/fastdesk_proto
+        run: cargo test
+
+      - name: Run OpenVMM display and FastDesk worker tests
+        working-directory: openvmm
+        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
+
+      - name: Run fastdesk-viewer tests
+        working-directory: fastdesk-viewer
+        run: cargo test
+
+      - name: Build OpenVMM release binary
+        working-directory: openvmm
+        run: cargo build -p openvmm --release
+
+      - name: Build fastdesk-viewer release binary
+        working-directory: fastdesk-viewer
+        run: cargo build --release
+
+      - name: Smoke-test and benchmark Windows x64 binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $helpText = & .\openvmm\target\release\openvmm.exe --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "openvmm.exe --help exited with $LASTEXITCODE" }
+          foreach ($flag in @("--fastdesk", "--fastdesk-shm", "--fastdesk-vsock-port", "--vram-mb")) {
+            if ($helpText -notmatch [regex]::Escape($flag)) {
+              throw "Missing expected CLI flag '$flag' in openvmm.exe --help"
+            }
+          }
+
+          $benchOut = & .\fastdesk-viewer\target\release\fastdesk-viewer.exe `
+            --bench --self-test --frames 200 --resolution 1920x1080 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "fastdesk-viewer.exe --bench failed with $LASTEXITCODE`n$benchOut" }
+          Write-Host $benchOut
+          if ($benchOut -notmatch "CHECKSUM OK") {
+            throw "Expected CHECKSUM OK in fastdesk-viewer self-test output"
+          }
+
+          $benchFile = Join-Path $env:RUNNER_TEMP "bench-windows-x64.txt"
+          $benchOut.Trim() | Set-Content -Path $benchFile -Encoding utf8
+
+          @(
+            '## Windows x64 (`x86_64-pc-windows-msvc`) Self-Test Benchmark'
+            '```text'
+            $benchOut.Trim()
+            '```'
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Stage turnkey Windows x64 bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "dist\openvmm-fastdesk-windows-x64"
+          $fwDir = Join-Path $bundle "firmware"
+          if (Test-Path $bundle) { Remove-Item -Recurse -Force $bundle }
+          New-Item -ItemType Directory -Force -Path $bundle, $fwDir | Out-Null
+
+          Copy-Item -Force "openvmm\target\release\openvmm.exe" $bundle
+          Copy-Item -Force "fastdesk-viewer\target\release\fastdesk-viewer.exe" $bundle
+          Copy-Item -Force "openvmm\.packages\hyperv.uefi.mscoreuefi.x64.RELEASE\MsvmX64\RELEASE_VS2022\FV\MSVM.fd" (Join-Path $fwDir "MSVM.fd")
+          Copy-Item -Force "scripts\Start-OpenVmmFastDesktop.ps1" $bundle
+          Copy-Item -Force "scripts\Setup-HyperVGpuPvAndHvsock.ps1" $bundle
+          Copy-Item -Force "README.md" $bundle
+
+          $benchText = Get-Content -Raw (Join-Path $env:RUNNER_TEMP "bench-windows-x64.txt")
+          $utcNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+          @(
+            "OpenVMM FastDesk Bundle (Windows x64)"
+            "Commit: $($env:GITHUB_SHA)"
+            "Ref: $($env:GITHUB_REF_NAME)"
+            "Built (UTC): $utcNow"
+            "Target: x86_64-pc-windows-msvc"
+            "UEFI Firmware: microsoft/mu_msvm v$($env:MU_MSVM_VERSION) (firmware\MSVM.fd)"
+            ""
+            "Quickstart (PowerShell on Windows 11 with WHP enabled):"
+            "  .\Start-OpenVmmFastDesktop.ps1 -DiskPath C:\VMs\win11.vhdx -Memory 8G -Processors 4"
+            ""
+            "Self-Test Benchmark (1920x1080, 200 frames):"
+            $benchText.TrimEnd()
+          ) | Set-Content -Path (Join-Path $bundle "BUILD_INFO.txt") -Encoding utf8
+
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            Compress-Archive -Force -Path $bundle -DestinationPath "dist\openvmm-fastdesk-windows-x64.zip"
+          }
+
+      - name: Upload Windows x64 artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: openvmm-fastdesk-windows-x64
+          path: dist/openvmm-fastdesk-windows-x64/*
+          if-no-files-found: error
+
+      - name: Upload Windows x64 release zip
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archive-windows-x64
+          path: dist/openvmm-fastdesk-windows-x64.zip
+          if-no-files-found: error
+
+  build-linux-x64:
+    name: Build & Package Linux x64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config libssl-dev \
+            libx11-dev libxkbcommon-dev libwayland-dev
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            openvmm -> openvmm/target
+            openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
+            fastdesk-viewer -> fastdesk-viewer/target
+
+      - name: Download protoc and mu_msvm x64 UEFI firmware
+        run: |
+          set -euo pipefail
+          TOOLS_ROOT="$RUNNER_TEMP/fastdesk-tools"
+          PROTOC_DIR="$TOOLS_ROOT/protoc"
+          MSVM_DIR="$TOOLS_ROOT/mu_msvm"
+          mkdir -p "$PROTOC_DIR" "$MSVM_DIR"
+
+          # 1. protoc (Google.Protobuf.Tools layout used by openvmm/.cargo/config.toml)
+          curl --fail --retry 3 -sSLo "$TOOLS_ROOT/protoc-linux.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          unzip -q -o "$TOOLS_ROOT/protoc-linux.zip" -d "$PROTOC_DIR"
+          chmod +x "$PROTOC_DIR/bin/protoc"
+
+          PROTOC_TOOLS="$PWD/openvmm/.packages/Google.Protobuf.Tools/tools"
+          mkdir -p "$PROTOC_TOOLS"
+          ln -sf "$PROTOC_DIR/bin/protoc" "$PROTOC_TOOLS/protoc"
+          rm -rf "$PROTOC_TOOLS/include"
+          ln -s "$PROTOC_DIR/include" "$PROTOC_TOOLS/include"
+          echo "$PROTOC_TOOLS" >> "$GITHUB_PATH"
+
+          # 2. mu_msvm x64 UEFI firmware (MSVM.fd)
+          curl --fail --retry 3 -sSLo "$TOOLS_ROOT/mu_msvm.tar.gz" \
+            "https://github.com/microsoft/mu_msvm/releases/download/v${MU_MSVM_VERSION}/firmware-RELEASE-X64-CLANGPDB.tar.gz"
+          tar -xzf "$TOOLS_ROOT/mu_msvm.tar.gz" -C "$MSVM_DIR"
+          test -f "$MSVM_DIR/FV/MSVM.fd"
+
+          MSVM_MAGIC_DIR="openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV"
+          mkdir -p "$MSVM_MAGIC_DIR"
+          cp -f "$MSVM_DIR/FV/MSVM.fd" "$MSVM_MAGIC_DIR/MSVM.fd"
+
+      - name: Run fastdesk_proto tests
+        working-directory: openvmm/workers/fastdesk_proto
+        run: cargo test
+
+      - name: Run OpenVMM display and FastDesk worker tests
+        working-directory: openvmm
+        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
+
+      - name: Run fastdesk-viewer tests
+        working-directory: fastdesk-viewer
+        run: cargo test
+
+      - name: Build OpenVMM release binary
+        working-directory: openvmm
+        run: cargo build -p openvmm --release
+
+      - name: Build fastdesk-viewer release binary
+        working-directory: fastdesk-viewer
+        run: cargo build --release
+
+      - name: Smoke-test and benchmark Linux x64 binaries
+        run: |
+          set -euo pipefail
+          HELP_TEXT="$(./openvmm/target/release/openvmm --help)"
+          for flag in --fastdesk --fastdesk-shm --fastdesk-vsock-port --vram-mb; do
+            echo "$HELP_TEXT" | grep -q -- "$flag" || {
+              echo "Missing expected flag: $flag" >&2
+              exit 1
+            }
+          done
+
+          BENCH_FILE="$RUNNER_TEMP/bench-linux-x64.txt"
+          ./fastdesk-viewer/target/release/fastdesk-viewer \
+            --bench --self-test --frames 200 --resolution 1920x1080 | tee "$BENCH_FILE"
+          grep -q "CHECKSUM OK" "$BENCH_FILE"
+
+          {
+            echo "## Linux x64 (\`x86_64-unknown-linux-gnu\`) Self-Test Benchmark"
+            echo '```text'
+            cat "$BENCH_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage turnkey Linux x64 bundle
+        run: |
+          set -euo pipefail
+          BUNDLE="dist/openvmm-fastdesk-linux-x64"
+          rm -rf "$BUNDLE"
+          mkdir -p "$BUNDLE/firmware"
+
+          cp -f "openvmm/target/release/openvmm" "$BUNDLE/openvmm"
+          cp -f "fastdesk-viewer/target/release/fastdesk-viewer" "$BUNDLE/fastdesk-viewer"
+          strip --strip-debug "$BUNDLE/openvmm" "$BUNDLE/fastdesk-viewer"
+          chmod +x "$BUNDLE/openvmm" "$BUNDLE/fastdesk-viewer"
+
+          cp -f "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd" "$BUNDLE/firmware/MSVM.fd"
+          cp -f "scripts/start-openvmm-fastdesk.sh" "$BUNDLE/start-openvmm-fastdesk.sh"
+          chmod +x "$BUNDLE/start-openvmm-fastdesk.sh"
+          cp -f "README.md" "$BUNDLE/README.md"
+
+          {
+            echo "OpenVMM FastDesk Bundle (Linux x64)"
+            echo "Commit: $GITHUB_SHA"
+            echo "Ref: $GITHUB_REF_NAME"
+            echo "Built (UTC): $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Target: x86_64-unknown-linux-gnu"
+            echo "UEFI Firmware: microsoft/mu_msvm v${MU_MSVM_VERSION} (firmware/MSVM.fd)"
+            echo ""
+            echo "Quickstart:"
+            echo "  ./start-openvmm-fastdesk.sh --disk /path/to/win11.vhdx --memory 8G --cpus 4"
+            echo ""
+            echo "Self-Test Benchmark (1920x1080, 200 frames):"
+            cat "$RUNNER_TEMP/bench-linux-x64.txt"
+          } > "$BUNDLE/BUILD_INFO.txt"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tar -C dist -czf dist/openvmm-fastdesk-linux-x64.tar.gz openvmm-fastdesk-linux-x64
+          fi
+
+      - name: Upload Linux x64 artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: openvmm-fastdesk-linux-x64
+          path: dist/openvmm-fastdesk-linux-x64/*
+          if-no-files-found: error
+
+      - name: Upload Linux x64 release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archive-linux-x64
+          path: dist/openvmm-fastdesk-linux-x64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [build-windows-x64, build-linux-x64]
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-archive-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Generate SHA256 checksums
+        working-directory: release-assets
+        run: |
+          sha256sum openvmm-fastdesk-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -lh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/openvmm-fastdesk-windows-x64.zip
+            release-assets/openvmm-fastdesk-linux-x64.tar.gz
+            release-assets/SHA256SUMS.txt
+          generate_release_notes: true
