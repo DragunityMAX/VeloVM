@@ -35,6 +35,14 @@ impl DesktopCompositor {
         shm_path: Option<&str>,
         allow_shm: bool,
     ) -> anyhow::Result<Self> {
+        if width == 0 || height == 0 || (stride as usize) < (width as usize * 4) {
+            anyhow::bail!(
+                "invalid compositor dimensions: {}x{} stride {}",
+                width,
+                height,
+                stride
+            );
+        }
         let len = width as usize * height as usize;
         let mut comp = Self {
             width,
@@ -126,12 +134,24 @@ impl DesktopCompositor {
         _hotspot_y: u16,
         lz4_bgra: &[u8],
     ) -> anyhow::Result<()> {
-        let expected = width as usize * height as usize * 4;
-        let decoded = lz4_flex::decompress_size_prepended(lz4_bgra)
-            .map_err(|e| anyhow::anyhow!("cursor decompress error: {e}"))?;
-        if decoded.len() != expected {
-            anyhow::bail!("cursor size mismatch: expected {expected}, got {}", decoded.len());
+        if width == 0
+            || height == 0
+            || width > fastdesk_proto::MAX_CURSOR_DIM
+            || height > fastdesk_proto::MAX_CURSOR_DIM
+        {
+            anyhow::bail!("invalid cursor dimensions: {width}x{height}");
         }
+        let expected = width as usize * height as usize * 4;
+        if lz4_bgra.len() < 4 {
+            anyhow::bail!("truncated cursor payload: {} bytes", lz4_bgra.len());
+        }
+        let declared =
+            u32::from_le_bytes([lz4_bgra[0], lz4_bgra[1], lz4_bgra[2], lz4_bgra[3]]) as usize;
+        if declared != expected {
+            anyhow::bail!("cursor size mismatch: expected {expected}, got {declared}");
+        }
+        let decoded = decode_bgra_rect(RectEncoding::Lz4Bgra, lz4_bgra, expected)
+            .map_err(|e| anyhow::anyhow!("cursor decompress error: {e}"))?;
         self.cursor.width = width;
         self.cursor.height = height;
         self.cursor.bgra = decoded;
@@ -490,5 +510,34 @@ mod tests {
         assert_eq!(comp.present_fb[7 * 16 + 5], 0);
         assert_eq!(comp.present_fb[7 * 16 + 6], 0);
         assert_eq!(comp.present_fb[0], 0x00c0b0a0);
+    }
+
+    #[test]
+    fn cursor_shape_rejects_untrusted_size_prefix_before_allocating() {
+        let mut comp = DesktopCompositor::new(16, 16, 16 * 4, 0, None, false).unwrap();
+
+        // Set a valid cursor first to verify error paths leave existing cursor state intact.
+        let valid_raw = [0x11u8, 0x22, 0x33, 0xff].repeat(4);
+        let valid_lz4 = lz4_flex::compress_prepend_size(&valid_raw);
+        comp.set_cursor_shape(2, 2, 0, 0, &valid_lz4).unwrap();
+
+        // Five-byte payload claiming a 1 GiB uncompressed cursor.
+        let mut one_gib_bomb = (1024u32 * 1024 * 1024).to_le_bytes().to_vec();
+        one_gib_bomb.push(0);
+        assert!(comp.set_cursor_shape(2, 2, 0, 0, &one_gib_bomb).is_err());
+
+        // u32::MAX size prefix.
+        let mut max_bomb = u32::MAX.to_le_bytes().to_vec();
+        max_bomb.push(0);
+        assert!(comp.set_cursor_shape(2, 2, 0, 0, &max_bomb).is_err());
+
+        // Truncated (< 4 bytes) payload and invalid cursor dimensions.
+        assert!(comp.set_cursor_shape(2, 2, 0, 0, &[1, 2, 3]).is_err());
+        assert!(comp.set_cursor_shape(0, 2, 0, 0, &valid_lz4).is_err());
+        assert!(comp.set_cursor_shape(97, 2, 0, 0, &valid_lz4).is_err());
+
+        assert_eq!(comp.cursor.width, 2);
+        assert_eq!(comp.cursor.height, 2);
+        assert_eq!(comp.cursor.bgra, valid_raw);
     }
 }

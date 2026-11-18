@@ -2,13 +2,16 @@ use fastdesk_proto::BTN_LEFT;
 use fastdesk_proto::BTN_MIDDLE;
 use fastdesk_proto::BTN_RIGHT;
 use fastdesk_proto::ClientMsg;
+use minifb::InputCallback;
 use minifb::Key;
 use minifb::MouseButton;
 use minifb::MouseMode;
 use minifb::Window;
 use raw_window_handle::HasDisplayHandle;
 use raw_window_handle::RawDisplayHandle;
-use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImageBounds {
@@ -110,8 +113,36 @@ pub fn normalize_pointer_pos(
     Some((nx, ny))
 }
 
+struct KeyEventCollector(Arc<Mutex<VecDeque<(Key, bool)>>>);
+
+impl InputCallback for KeyEventCollector {
+    fn add_char(&mut self, _uni_char: u32) {}
+
+    fn set_key_state(&mut self, key: Key, state: bool) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((key, state));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PollSnapshot {
+    pub is_active: bool,
+    pub win_size: (usize, usize),
+    pub mouse_pos: Option<(f32, f32)>,
+    pub raw_buttons: u8,
+    pub raw_scroll_dy: Option<f32>,
+    pub scroll_backend: ScrollBackend,
+}
+
+#[derive(Debug)]
 pub struct InputTracker {
-    pressed_keys: HashSet<Key>,
+    key_events: Arc<Mutex<VecDeque<(Key, bool)>>>,
+    held_keys: Vec<Key>,
+    was_active: bool,
+    unfocused: bool,
+    suppressed_buttons: u8,
     last_x: u16,
     last_y: u16,
     last_buttons: u8,
@@ -121,7 +152,11 @@ pub struct InputTracker {
 impl Default for InputTracker {
     fn default() -> Self {
         Self {
-            pressed_keys: HashSet::new(),
+            key_events: Arc::new(Mutex::new(VecDeque::new())),
+            held_keys: Vec::new(),
+            was_active: false,
+            unfocused: false,
+            suppressed_buttons: 0,
             last_x: 0,
             last_y: 0,
             last_buttons: 0,
@@ -131,6 +166,52 @@ impl Default for InputTracker {
 }
 
 impl InputTracker {
+    pub fn attach_window(&mut self, window: &mut Window) {
+        self.key_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.was_active = window.is_active();
+        self.unfocused = false;
+        self.suppressed_buttons = 0;
+        window.set_input_callback(Box::new(KeyEventCollector(Arc::clone(&self.key_events))));
+    }
+
+    #[cfg(test)]
+    pub fn push_key_event(&self, key: Key, is_down: bool) {
+        self.key_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((key, is_down));
+    }
+
+    pub fn release_all(&mut self) -> Vec<ClientMsg> {
+        self.key_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let mut msgs = Vec::new();
+        for key in self.held_keys.drain(..).rev() {
+            if let Some(sc) = key_to_xt_scancode(key) {
+                msgs.push(ClientMsg::KeyEvent {
+                    scancode: sc,
+                    make: false,
+                });
+            }
+        }
+        if self.last_buttons != 0 {
+            self.last_buttons = 0;
+            msgs.push(ClientMsg::PointerEvent {
+                button_mask: 0,
+                x: self.last_x,
+                y: self.last_y,
+                wheel_delta: 0,
+            });
+        }
+        self.scroll_accum = 0.0;
+        msgs
+    }
+
     pub fn accumulate_scroll(&mut self, raw_dy: f32, backend: ScrollBackend) -> i16 {
         let notches = backend.normalize_delta(raw_dy);
         if !notches.is_finite() || notches == 0.0 {
@@ -152,54 +233,89 @@ impl InputTracker {
         (steps_f as i32).clamp(-8, 8) as i16
     }
 
-    pub fn poll(&mut self, window: &Window, width: u16, height: u16) -> Vec<ClientMsg> {
+    pub fn poll_snapshot(&mut self, snap: PollSnapshot, width: u16, height: u16) -> Vec<ClientMsg> {
         let mut msgs = Vec::new();
+        let events: Vec<(Key, bool)> = {
+            let mut q = self.key_events.lock().unwrap_or_else(|e| e.into_inner());
+            q.drain(..).collect()
+        };
 
-        let current_keys: HashSet<Key> = window.get_keys().into_iter().collect();
-        for &k in self.pressed_keys.difference(&current_keys) {
-            if let Some(sc) = key_to_xt_scancode(k) {
-                msgs.push(ClientMsg::KeyEvent {
-                    scancode: sc,
-                    make: false,
-                });
+        for (key, is_down) in events {
+            if is_down {
+                if (!self.unfocused || snap.is_active) && !self.held_keys.contains(&key) {
+                    if let Some(sc) = key_to_xt_scancode(key) {
+                        self.held_keys.push(key);
+                        msgs.push(ClientMsg::KeyEvent {
+                            scancode: sc,
+                            make: true,
+                        });
+                    }
+                }
+            } else if let Some(pos) = self.held_keys.iter().position(|&k| k == key) {
+                self.held_keys.swap_remove(pos);
+                if let Some(sc) = key_to_xt_scancode(key) {
+                    msgs.push(ClientMsg::KeyEvent {
+                        scancode: sc,
+                        make: false,
+                    });
+                }
             }
         }
-        for &k in current_keys.difference(&self.pressed_keys) {
-            if let Some(sc) = key_to_xt_scancode(k) {
-                msgs.push(ClientMsg::KeyEvent {
-                    scancode: sc,
-                    make: true,
+
+        if snap.is_active {
+            self.was_active = true;
+            self.unfocused = false;
+        } else if self.was_active {
+            self.was_active = false;
+            self.unfocused = true;
+            self.suppressed_buttons = snap.raw_buttons;
+            self.scroll_accum = 0.0;
+            for key in self.held_keys.drain(..).rev() {
+                if let Some(sc) = key_to_xt_scancode(key) {
+                    msgs.push(ClientMsg::KeyEvent {
+                        scancode: sc,
+                        make: false,
+                    });
+                }
+            }
+            if self.last_buttons != 0 {
+                self.last_buttons = 0;
+                msgs.push(ClientMsg::PointerEvent {
+                    button_mask: 0,
+                    x: self.last_x,
+                    y: self.last_y,
+                    wheel_delta: 0,
                 });
             }
-        }
-        self.pressed_keys = current_keys;
-
-        let mut button_mask = 0u8;
-        if window.get_mouse_down(MouseButton::Left) {
-            button_mask |= BTN_LEFT;
-        }
-        if window.get_mouse_down(MouseButton::Middle) {
-            button_mask |= BTN_MIDDLE;
-        }
-        if window.get_mouse_down(MouseButton::Right) {
-            button_mask |= BTN_RIGHT;
+            return msgs;
         }
 
-        let (win_w, win_h) = window.get_size();
-        let (nx, ny) = if let Some((mx, my)) = window.get_unscaled_mouse_pos(MouseMode::Pass) {
+        if self.unfocused {
+            self.suppressed_buttons &= snap.raw_buttons;
+            return msgs;
+        }
+
+        self.suppressed_buttons &= snap.raw_buttons;
+        let button_mask = snap.raw_buttons & !self.suppressed_buttons;
+
+        let (win_w, win_h) = snap.win_size;
+        let (nx, ny) = if let Some((mx, my)) = snap.mouse_pos {
             normalize_pointer_pos(mx, my, win_w, win_h, width, height)
                 .unwrap_or((self.last_x, self.last_y))
         } else {
             (self.last_x, self.last_y)
         };
 
-        let backend = ScrollBackend::from_window(window);
-        let wheel_delta = window
-            .get_scroll_wheel()
-            .map(|(_, dy)| self.accumulate_scroll(dy, backend))
+        let wheel_delta = snap
+            .raw_scroll_dy
+            .map(|dy| self.accumulate_scroll(dy, snap.scroll_backend))
             .unwrap_or(0);
 
-        if nx != self.last_x || ny != self.last_y || button_mask != self.last_buttons || wheel_delta != 0 {
+        if nx != self.last_x
+            || ny != self.last_y
+            || button_mask != self.last_buttons
+            || wheel_delta != 0
+        {
             self.last_x = nx;
             self.last_y = ny;
             self.last_buttons = button_mask;
@@ -212,6 +328,28 @@ impl InputTracker {
         }
 
         msgs
+    }
+
+    pub fn poll(&mut self, window: &Window, width: u16, height: u16) -> Vec<ClientMsg> {
+        let mut raw_buttons = 0u8;
+        if window.get_mouse_down(MouseButton::Left) {
+            raw_buttons |= BTN_LEFT;
+        }
+        if window.get_mouse_down(MouseButton::Middle) {
+            raw_buttons |= BTN_MIDDLE;
+        }
+        if window.get_mouse_down(MouseButton::Right) {
+            raw_buttons |= BTN_RIGHT;
+        }
+        let snap = PollSnapshot {
+            is_active: window.is_active(),
+            win_size: window.get_size(),
+            mouse_pos: window.get_unscaled_mouse_pos(MouseMode::Pass),
+            raw_buttons,
+            raw_scroll_dy: window.get_scroll_wheel().map(|(_, dy)| dy),
+            scroll_backend: ScrollBackend::from_window(window),
+        };
+        self.poll_snapshot(snap, width, height)
     }
 }
 
@@ -441,5 +579,126 @@ mod tests {
             .map(|_| wayland.accumulate_scroll(2.5, ScrollBackend::Wayland))
             .collect();
         assert_eq!(after_reverse, vec![0, 0, -1]);
+    }
+
+    fn snap(is_active: bool, raw_buttons: u8) -> PollSnapshot {
+        PollSnapshot {
+            is_active,
+            win_size: (800, 600),
+            mouse_pos: Some((100.0, 100.0)),
+            raw_buttons,
+            raw_scroll_dy: None,
+            scroll_backend: ScrollBackend::X11,
+        }
+    }
+
+    #[test]
+    fn keyboard_events_preserve_arrival_order_and_intra_poll_taps() {
+        let mut tracker = InputTracker::default();
+        tracker.push_key_event(Key::LeftShift, true);
+        tracker.push_key_event(Key::A, true);
+        tracker.push_key_event(Key::A, false);
+        tracker.push_key_event(Key::LeftShift, false);
+
+        let msgs = tracker.poll_snapshot(snap(true, 0), 800, 600);
+        let keys: Vec<(u16, bool)> = msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                ClientMsg::KeyEvent { scancode, make } => Some((scancode, make)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (0x2a, true),  // LeftShift make
+                (0x1e, true),  // A make
+                (0x1e, false), // A break
+                (0x2a, false), // LeftShift break
+            ]
+        );
+
+        // Host auto-repeat (repeated down for already-held key) does not duplicate make.
+        tracker.push_key_event(Key::B, true);
+        tracker.push_key_event(Key::B, true);
+        let msgs = tracker.poll_snapshot(snap(true, 0), 800, 600);
+        let keys: Vec<(u16, bool)> = msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                ClientMsg::KeyEvent { scancode, make } => Some((scancode, make)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![(0x30, true)]);
+    }
+
+    #[test]
+    fn focus_loss_releases_held_keys_and_buttons_cleanly() {
+        let mut tracker = InputTracker::default();
+
+        // While active, press LeftCtrl + A and left mouse button.
+        tracker.push_key_event(Key::LeftCtrl, true);
+        tracker.push_key_event(Key::A, true);
+        let msgs = tracker.poll_snapshot(snap(true, BTN_LEFT), 800, 600);
+        assert!(msgs.contains(&ClientMsg::KeyEvent {
+            scancode: 0x1d,
+            make: true
+        }));
+        assert!(msgs.contains(&ClientMsg::KeyEvent {
+            scancode: 0x1e,
+            make: true
+        }));
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT,
+                ..
+            }
+        )));
+
+        // Focus lost: emits reverse-order key breaks and button_mask=0 release.
+        let lost = tracker.poll_snapshot(snap(false, BTN_LEFT), 800, 600);
+        assert_eq!(
+            lost,
+            vec![
+                ClientMsg::KeyEvent {
+                    scancode: 0x1e,
+                    make: false,
+                },
+                ClientMsg::KeyEvent {
+                    scancode: 0x1d,
+                    make: false,
+                },
+                ClientMsg::PointerEvent {
+                    button_mask: 0,
+                    x: 4101,
+                    y: 5470,
+                    wheel_delta: 0,
+                },
+            ]
+        );
+
+        // Even if OS reports stuck button or stray key-down while unfocused, nothing is emitted.
+        tracker.push_key_event(Key::C, true);
+        let while_unfocused = tracker.poll_snapshot(snap(false, BTN_LEFT), 800, 600);
+        assert!(while_unfocused.is_empty());
+
+        // Refocusing while stuck BTN_LEFT hasn't been released suppresses BTN_LEFT.
+        let refocused_stuck = tracker.poll_snapshot(snap(true, BTN_LEFT), 800, 600);
+        assert!(!refocused_stuck.iter().any(|m| matches!(
+            m,
+            ClientMsg::PointerEvent { button_mask, .. } if *button_mask != 0
+        )));
+
+        // Once button is released (raw_buttons=0), a subsequent click works normally.
+        let _ = tracker.poll_snapshot(snap(true, 0), 800, 600);
+        let clicked = tracker.poll_snapshot(snap(true, BTN_LEFT), 800, 600);
+        assert!(clicked.iter().any(|m| matches!(
+            m,
+            ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT,
+                ..
+            }
+        )));
     }
 }

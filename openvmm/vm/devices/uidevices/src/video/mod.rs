@@ -757,15 +757,42 @@ async fn process_channel(
                                 user_context,
                                 situation,
                             } => {
-                                framebuffer
-                                    .set_format(FramebufferFormat {
-                                        width: u32::from(situation.width_pixels) as usize,
-                                        height: u32::from(situation.height_pixels) as usize,
-                                        bytes_per_line: u32::from(situation.pitch_bytes) as usize,
-                                        offset: u32::from(situation.primary_surface_vram_offset)
-                                            as usize,
-                                    })
-                                    .await;
+                                let width = u32::from(situation.width_pixels) as usize;
+                                let height = u32::from(situation.height_pixels) as usize;
+                                let bytes_per_line = u32::from(situation.pitch_bytes) as usize;
+                                let offset =
+                                    u32::from(situation.primary_surface_vram_offset) as usize;
+                                let valid = width > 0
+                                    && height > 0
+                                    && u16::try_from(width).is_ok()
+                                    && u16::try_from(height).is_ok()
+                                    && width
+                                        .checked_mul(4)
+                                        .is_some_and(|row_bytes| bytes_per_line >= row_bytes)
+                                    && (height - 1)
+                                        .checked_mul(bytes_per_line)
+                                        .and_then(|rows| rows.checked_add(width * 4))
+                                        .and_then(|surface| offset.checked_add(surface))
+                                        .is_some_and(|end| end <= vram_size);
+                                if valid {
+                                    framebuffer
+                                        .set_format(FramebufferFormat {
+                                            width,
+                                            height,
+                                            bytes_per_line,
+                                            offset,
+                                        })
+                                        .await;
+                                } else {
+                                    tracelimit::warn_ratelimited!(
+                                        width,
+                                        height,
+                                        bytes_per_line,
+                                        offset,
+                                        vram_size,
+                                        "ignoring out-of-bounds video situation update"
+                                    );
+                                }
                                 *substate = ActiveState::SendSituationUpdateAck { user_context };
                             }
                             Request::PointerPosition { is_visible, x, y } => {
@@ -1791,5 +1818,54 @@ mod tests {
                 y: 0,
             })
         );
+    }
+
+    #[async_test]
+    async fn test_situation_update_rejects_oversized_dimensions(driver: DefaultDriver) {
+        let (host, mut guest) = connected_message_pipes(16384);
+        let (_device, control, mut view) = framebuffer_fixture();
+        let worker = start_worker(&driver, control, None, host);
+
+        let version = protocol::Version::new(protocol::VERSION_MAJOR, protocol::VERSION_MINOR_BLUE);
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_VERSION_REQUEST,
+            &protocol::VersionRequestMessage { version },
+        )
+        .await;
+        let _ = recv_bytes(&mut guest).await;
+
+        assert_eq!(view.resolution(), (1024, 768));
+
+        // 65535x65535 against 8 MiB VRAM must be acked without mutating framebuffer format.
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_SITUATION_UPDATE,
+            &protocol::SituationUpdateMessage {
+                user_context: 0xdeadbeefu64.into(),
+                video_output_count: 1,
+                video_output: protocol::VideoOutputSituation {
+                    active: 1,
+                    primary_surface_vram_offset: 0.into(),
+                    depth_bits: 32,
+                    width_pixels: 65535u32.into(),
+                    height_pixels: 65535u32.into(),
+                    pitch_bytes: (65535u32 * 4).into(),
+                },
+            },
+        )
+        .await;
+
+        let packet = recv_bytes(&mut guest).await;
+        let (header, rest) = parse_header(&packet);
+        assert_eq!(header.typ.to_ne(), protocol::MESSAGE_SITUATION_UPDATE_ACK);
+        let ack = protocol::SituationUpdateAckMessage::ref_from_prefix(rest)
+            .unwrap()
+            .0;
+        assert_eq!(ack.user_context.to_ne(), 0xdeadbeef);
+        assert_eq!(view.resolution(), (1024, 768));
+
+        drop(guest);
+        worker.await.unwrap();
     }
 }

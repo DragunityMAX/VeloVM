@@ -45,6 +45,7 @@ use pal_async::socket::Listener;
 use pal_async::socket::PolledSocket;
 use pal_async::timer::PolledTimer;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::TcpListener;
 use std::pin::Pin;
@@ -137,24 +138,15 @@ impl<T: 'static + Listener + MeshField + Send> FastDeskWorker<T> {
             );
 
             let listener = PolledSocket::new(&driver, self.listener)?;
-            let mut view = self.view;
-            let format_recv = view.0.take_format_recv();
-            let mut server = MultiClientServer {
+            let mut server = MultiClientServer::new(
                 listener,
-                view: Arc::new(Mutex::new(view)),
-                format_recv,
-                shm_path: self.shm_path,
-                input_send: self.input_send,
-                dirty_recv: self.dirty_recv,
-                cursor_recv: self.cursor_recv,
-                cursor_state: Arc::new(Mutex::new(SharedCursorState::default())),
-                device_dirty_seen: Arc::new(AtomicBool::new(false)),
-                client_handles: Vec::new(),
-                clients: unicycle::FuturesUnordered::new(),
-                next_client_id: 0,
-                max_clients: self.max_clients,
-                start_time: Instant::now(),
-            };
+                self.view,
+                self.shm_path,
+                self.input_send,
+                self.dirty_recv,
+                self.cursor_recv,
+                self.max_clients,
+            );
 
             let rpc = loop {
                 let r = futures::select! {
@@ -205,6 +197,187 @@ struct SharedCursorState {
     pos: Option<CursorPosition>,
 }
 
+const MAX_HELD_KEYS_PER_CLIENT: usize = 512;
+
+#[derive(Default)]
+struct SharedInputState {
+    key_holders: HashMap<u16, usize>,
+    client_buttons: HashMap<u64, u8>,
+}
+
+impl SharedInputState {
+    fn combined_buttons(&self) -> u8 {
+        self.client_buttons
+            .values()
+            .copied()
+            .fold(0u8, |acc, mask| acc | mask)
+    }
+}
+
+struct ClientInputTracker {
+    client_id: u64,
+    input_send: mesh::Sender<InputData>,
+    shared: Arc<Mutex<SharedInputState>>,
+    held_keys: Vec<u16>,
+    held_buttons: u8,
+    last_pos: (u16, u16),
+}
+
+impl ClientInputTracker {
+    fn new(
+        client_id: u64,
+        input_send: mesh::Sender<InputData>,
+        shared: Arc<Mutex<SharedInputState>>,
+    ) -> Self {
+        Self {
+            client_id,
+            input_send,
+            shared,
+            held_keys: Vec::new(),
+            held_buttons: 0,
+            last_pos: (0, 0),
+        }
+    }
+
+    fn handle_key(&mut self, scancode: u16, make: bool) {
+        if make {
+            if self.held_keys.contains(&scancode) {
+                self.input_send
+                    .send(InputData::Keyboard(KeyboardData { code: scancode, make: true }));
+                return;
+            }
+            if self.held_keys.len() >= MAX_HELD_KEYS_PER_CLIENT {
+                tracing::warn!(
+                    client_id = self.client_id,
+                    scancode,
+                    "ignoring key make exceeding held key limit"
+                );
+                return;
+            }
+            self.held_keys.push(scancode);
+            {
+                let mut shared = self.shared.lock();
+                *shared.key_holders.entry(scancode).or_insert(0) += 1;
+            }
+            self.input_send
+                .send(InputData::Keyboard(KeyboardData { code: scancode, make: true }));
+        } else {
+            let should_send = {
+                let mut shared = self.shared.lock();
+                if let Some(pos) = self.held_keys.iter().position(|&k| k == scancode) {
+                    self.held_keys.swap_remove(pos);
+                    match shared.key_holders.get_mut(&scancode) {
+                        Some(count) if *count > 1 => {
+                            *count -= 1;
+                            false
+                        }
+                        Some(_) => {
+                            shared.key_holders.remove(&scancode);
+                            true
+                        }
+                        None => true,
+                    }
+                } else {
+                    !shared.key_holders.contains_key(&scancode)
+                }
+            };
+            if should_send {
+                self.input_send
+                    .send(InputData::Keyboard(KeyboardData { code: scancode, make: false }));
+            }
+        }
+    }
+
+    fn handle_pointer(&mut self, button_mask: u8, x: u16, y: u16, wheel_delta: i16) {
+        let btns = button_mask & 0x07;
+        self.held_buttons = btns;
+        self.last_pos = (x, y);
+        let effective_btns = {
+            let mut shared = self.shared.lock();
+            if btns != 0 {
+                shared.client_buttons.insert(self.client_id, btns);
+            } else {
+                shared.client_buttons.remove(&self.client_id);
+            }
+            shared.combined_buttons()
+        };
+
+        self.input_send.send(InputData::Mouse(MouseData {
+            button_mask: effective_btns,
+            x,
+            y,
+        }));
+        if wheel_delta != 0 {
+            let steps = wheel_delta.clamp(-8, 8);
+            let wheel_bit = if steps > 0 {
+                BTN_WHEEL_UP
+            } else {
+                BTN_WHEEL_DOWN
+            };
+            for _ in 0..steps.unsigned_abs() {
+                self.input_send.send(InputData::Mouse(MouseData {
+                    button_mask: effective_btns | wheel_bit,
+                    x,
+                    y,
+                }));
+            }
+            self.input_send.send(InputData::Mouse(MouseData {
+                button_mask: effective_btns,
+                x,
+                y,
+            }));
+        }
+    }
+
+    fn cleanup(&mut self) {
+        if self.held_keys.is_empty() && self.held_buttons == 0 {
+            return;
+        }
+        let mut keys_to_release = Vec::new();
+        let mut mouse_release = None;
+        {
+            let mut shared = self.shared.lock();
+            for scancode in self.held_keys.drain(..).rev() {
+                match shared.key_holders.get_mut(&scancode) {
+                    Some(count) if *count > 1 => {
+                        *count -= 1;
+                    }
+                    Some(_) => {
+                        shared.key_holders.remove(&scancode);
+                        keys_to_release.push(scancode);
+                    }
+                    None => {
+                        keys_to_release.push(scancode);
+                    }
+                }
+            }
+            if self.held_buttons != 0 {
+                self.held_buttons = 0;
+                let before = shared.combined_buttons();
+                shared.client_buttons.remove(&self.client_id);
+                let after = shared.combined_buttons();
+                if after != before {
+                    mouse_release = Some((after, self.last_pos));
+                }
+            }
+        }
+        for code in keys_to_release {
+            self.input_send
+                .send(InputData::Keyboard(KeyboardData { code, make: false }));
+        }
+        if let Some((button_mask, (x, y))) = mouse_release {
+            self.input_send
+                .send(InputData::Mouse(MouseData { button_mask, x, y }));
+        }
+    }
+}
+
+impl Drop for ClientInputTracker {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 struct ClientHandle {
     id: u64,
     dirty_send: async_channel::Sender<Arc<Vec<DirtyRect>>>,
@@ -219,6 +392,7 @@ struct MultiClientServer<T: Listener> {
     format_recv: Option<mesh::Receiver<video_core::FramebufferFormat>>,
     shm_path: Option<String>,
     input_send: mesh::Sender<InputData>,
+    input_state: Arc<Mutex<SharedInputState>>,
     dirty_recv: Option<mesh::Receiver<Vec<DirtyRect>>>,
     cursor_recv: Option<mesh::Receiver<CursorUpdate>>,
     cursor_state: Arc<Mutex<SharedCursorState>>,
@@ -231,8 +405,74 @@ struct MultiClientServer<T: Listener> {
 }
 
 impl<T: Listener> MultiClientServer<T> {
+    fn new(
+        listener: PolledSocket<T>,
+        mut view: ViewWrapper,
+        shm_path: Option<String>,
+        input_send: mesh::Sender<InputData>,
+        dirty_recv: Option<mesh::Receiver<Vec<DirtyRect>>>,
+        cursor_recv: Option<mesh::Receiver<CursorUpdate>>,
+        max_clients: usize,
+    ) -> Self {
+        let format_recv = view.0.take_format_recv();
+        let vram_size = view.0.len();
+        let base_offset = view.0.file_offset();
+        match view.0.format() {
+            Some(fmt) if validate_display_format(&fmt, vram_size, base_offset).is_some() => {}
+            Some(fmt) => {
+                tracing::warn!(
+                    width = fmt.width,
+                    height = fmt.height,
+                    bytes_per_line = fmt.bytes_per_line,
+                    offset = fmt.offset,
+                    vram_size,
+                    "ignoring invalid initial framebuffer format"
+                );
+                view.0
+                    .set_cached_format(fallback_framebuffer_format(vram_size));
+            }
+            None => {
+                view.0
+                    .set_cached_format(fallback_framebuffer_format(vram_size));
+            }
+        }
+        Self {
+            listener,
+            view: Arc::new(Mutex::new(view)),
+            format_recv,
+            shm_path,
+            input_send,
+            input_state: Arc::new(Mutex::new(SharedInputState::default())),
+            dirty_recv,
+            cursor_recv,
+            cursor_state: Arc::new(Mutex::new(SharedCursorState::default())),
+            device_dirty_seen: Arc::new(AtomicBool::new(false)),
+            client_handles: Vec::new(),
+            clients: unicycle::FuturesUnordered::new(),
+            next_client_id: 0,
+            max_clients,
+            start_time: Instant::now(),
+        }
+    }
+
     fn apply_format_change(&mut self, format: video_core::FramebufferFormat) {
-        self.view.lock().0.set_cached_format(format);
+        {
+            let mut guard = self.view.lock();
+            let vram_size = guard.0.len();
+            let base_offset = guard.0.file_offset();
+            if validate_display_format(&format, vram_size, base_offset).is_none() {
+                tracing::warn!(
+                    width = format.width,
+                    height = format.height,
+                    bytes_per_line = format.bytes_per_line,
+                    offset = format.offset,
+                    vram_size,
+                    "ignoring invalid framebuffer format"
+                );
+                return;
+            }
+            guard.0.set_cached_format(format);
+        }
         self.device_dirty_seen.store(false, Ordering::Release);
         for c in &self.client_handles {
             c.missed_dirty.store(true, Ordering::Release);
@@ -241,13 +481,27 @@ impl<T: Listener> MultiClientServer<T> {
     }
 
     fn drain_format_updates(&mut self) {
-        let mut latest = None;
+        let mut latest_valid = None;
         if let Some(recv) = &mut self.format_recv {
+            let guard = self.view.lock();
+            let vram_size = guard.0.len();
+            let base_offset = guard.0.file_offset();
             while let Ok(fmt) = recv.try_recv() {
-                latest = Some(fmt);
+                if validate_display_format(&fmt, vram_size, base_offset).is_some() {
+                    latest_valid = Some(fmt);
+                } else {
+                    tracing::warn!(
+                        width = fmt.width,
+                        height = fmt.height,
+                        bytes_per_line = fmt.bytes_per_line,
+                        offset = fmt.offset,
+                        vram_size,
+                        "ignoring invalid framebuffer format"
+                    );
+                }
             }
         }
-        if let Some(fmt) = latest {
+        if let Some(fmt) = latest_valid {
             self.apply_format_change(fmt);
         }
     }
@@ -333,13 +587,48 @@ impl<T: Listener> MultiClientServer<T> {
                     }
                 },
                 msg = format_fut.fuse() => match msg {
-                    Ok(mut fmt) => {
-                        if let Some(recv) = &mut self.format_recv {
-                            while let Ok(newer) = recv.try_recv() {
-                                fmt = newer;
+                    Ok(fmt) => {
+                        let mut latest_valid = None;
+                        {
+                            let guard = self.view.lock();
+                            let vram_size = guard.0.len();
+                            let base_offset = guard.0.file_offset();
+                            if validate_display_format(&fmt, vram_size, base_offset).is_some() {
+                                latest_valid = Some(fmt);
+                            } else {
+                                tracing::warn!(
+                                    width = fmt.width,
+                                    height = fmt.height,
+                                    bytes_per_line = fmt.bytes_per_line,
+                                    offset = fmt.offset,
+                                    vram_size,
+                                    "ignoring invalid framebuffer format"
+                                );
+                            }
+                            if let Some(recv) = &mut self.format_recv {
+                                while let Ok(newer) = recv.try_recv() {
+                                    if validate_display_format(&newer, vram_size, base_offset)
+                                        .is_some()
+                                    {
+                                        latest_valid = Some(newer);
+                                    } else {
+                                        tracing::warn!(
+                                            width = newer.width,
+                                            height = newer.height,
+                                            bytes_per_line = newer.bytes_per_line,
+                                            offset = newer.offset,
+                                            vram_size,
+                                            "ignoring invalid framebuffer format"
+                                        );
+                                    }
+                                }
                             }
                         }
-                        Event::FormatChanged(fmt)
+                        if let Some(valid) = latest_valid {
+                            Event::FormatChanged(valid)
+                        } else {
+                            continue;
+                        }
                     }
                     Err(_) => {
                         self.format_recv = None;
@@ -467,10 +756,12 @@ impl<T: Listener> MultiClientServer<T> {
         });
 
         let ctx = ClientContext {
+            client_id: id,
             socket,
             view: self.view.clone(),
             shm_path: self.shm_path.clone(),
             input_send: self.input_send.clone(),
+            input_state: self.input_state.clone(),
             dirty_recv,
             cursor_state: self.cursor_state.clone(),
             wakeup_recv,
@@ -512,10 +803,12 @@ impl<T: Listener> inspect::Inspect for MultiClientServer<T> {
 }
 
 struct ClientContext {
+    client_id: u64,
     socket: PolledSocket<socket2::Socket>,
     view: Arc<Mutex<ViewWrapper>>,
     shm_path: Option<String>,
     input_send: mesh::Sender<InputData>,
+    input_state: Arc<Mutex<SharedInputState>>,
     dirty_recv: async_channel::Receiver<Arc<Vec<DirtyRect>>>,
     cursor_state: Arc<Mutex<SharedCursorState>>,
     wakeup_recv: async_channel::Receiver<()>,
@@ -524,27 +817,77 @@ struct ClientContext {
     start_time: Instant,
 }
 
+fn validate_display_format(
+    fmt: &video_core::FramebufferFormat,
+    vram_size: usize,
+    base_offset: u64,
+) -> Option<(u16, u16, u32, u32)> {
+    let w = u16::try_from(fmt.width).ok().filter(|&w| w > 0)?;
+    let h = u16::try_from(fmt.height).ok().filter(|&h| h > 0)?;
+    let row_bytes = (w as usize).checked_mul(4)?;
+    if fmt.bytes_per_line < row_bytes {
+        return None;
+    }
+    let stride = u32::try_from(fmt.bytes_per_line).ok()?;
+    let surface_bytes = (h as usize - 1)
+        .checked_mul(fmt.bytes_per_line)
+        .and_then(|rows| rows.checked_add(row_bytes))?;
+    if !fmt
+        .offset
+        .checked_add(surface_bytes)
+        .is_some_and(|end| end <= vram_size)
+    {
+        return None;
+    }
+    let wire_offset = base_offset
+        .checked_add(fmt.offset as u64)
+        .and_then(|o| u32::try_from(o).ok())?;
+    Some((w, h, stride, wire_offset))
+}
+
+fn fallback_framebuffer_format(vram_size: usize) -> video_core::FramebufferFormat {
+    if 1024usize * 768 * 4 <= vram_size {
+        video_core::FramebufferFormat {
+            width: 1024,
+            height: 768,
+            bytes_per_line: 1024 * 4,
+            offset: 0,
+        }
+    } else {
+        let max_pixels = (vram_size / 4).max(1);
+        let width = max_pixels.isqrt().clamp(1, 1024);
+        let height = (max_pixels / width).clamp(1, 768);
+        video_core::FramebufferFormat {
+            width,
+            height,
+            bytes_per_line: width * 4,
+            offset: 0,
+        }
+    }
+}
+
 fn current_display_dims(view: &Arc<Mutex<ViewWrapper>>) -> (u16, u16, u32, u32, usize) {
     let mut guard = view.lock();
     let vram_size = guard.0.len();
     let base_offset = guard.0.file_offset();
     if let Some(fmt) = guard.0.format() {
-        let w = (fmt.width.max(1) as usize).min(u16::MAX as usize) as u16;
-        let h = (fmt.height.max(1) as usize).min(u16::MAX as usize) as u16;
-        let stride = fmt.bytes_per_line.max(w as usize * 4) as u32;
-        let offset = base_offset
-            .saturating_add(fmt.offset as u64)
-            .min(u32::MAX as u64) as u32;
-        (w, h, stride, offset, vram_size)
-    } else {
-        (
-            1024,
-            768,
-            1024 * 4,
-            base_offset.min(u32::MAX as u64) as u32,
+        if let Some((w, h, stride, offset)) = validate_display_format(&fmt, vram_size, base_offset) {
+            return (w, h, stride, offset, vram_size);
+        }
+        tracing::warn!(
+            width = fmt.width,
+            height = fmt.height,
+            bytes_per_line = fmt.bytes_per_line,
+            offset = fmt.offset,
             vram_size,
-        )
+            "invalid framebuffer format in view, falling back to safe bounds"
+        );
     }
+    let fallback = fallback_framebuffer_format(vram_size);
+    guard.0.set_cached_format(fallback);
+    let (w, h, stride, offset) = validate_display_format(&fallback, vram_size, base_offset)
+        .unwrap_or((1, 1, 4, base_offset.min(u32::MAX as u64) as u32));
+    (w, h, stride, offset, vram_size)
 }
 
 fn encode_cursor_shape_msg(shape: &CursorShape) -> ServerMsg {
@@ -607,7 +950,7 @@ async fn read_client_frame(socket: &mut PolledSocket<socket2::Socket>) -> anyhow
 
 fn dispatch_client_msg(
     msg: ClientMsg,
-    input_send: &mesh::Sender<InputData>,
+    input_tracker: &mut ClientInputTracker,
     force_full: &mut bool,
     use_shm: &mut bool,
     shm_available: bool,
@@ -617,10 +960,7 @@ fn dispatch_client_msg(
     match msg {
         ClientMsg::ClientHello { .. } => {}
         ClientMsg::KeyEvent { scancode, make } => {
-            input_send.send(InputData::Keyboard(KeyboardData {
-                code: scancode,
-                make,
-            }));
+            input_tracker.handle_key(scancode, make);
         }
         ClientMsg::PointerEvent {
             button_mask,
@@ -628,32 +968,7 @@ fn dispatch_client_msg(
             y,
             wheel_delta,
         } => {
-            let btns = button_mask & 0x07;
-            input_send.send(InputData::Mouse(MouseData {
-                button_mask: btns,
-                x,
-                y,
-            }));
-            if wheel_delta != 0 {
-                let steps = wheel_delta.clamp(-8, 8);
-                let wheel_bit = if steps > 0 {
-                    BTN_WHEEL_UP
-                } else {
-                    BTN_WHEEL_DOWN
-                };
-                for _ in 0..steps.unsigned_abs() {
-                    input_send.send(InputData::Mouse(MouseData {
-                        button_mask: btns | wheel_bit,
-                        x,
-                        y,
-                    }));
-                }
-                input_send.send(InputData::Mouse(MouseData {
-                    button_mask: btns,
-                    x,
-                    y,
-                }));
-            }
+            input_tracker.handle_pointer(button_mask, x, y, wheel_delta);
         }
         ClientMsg::RequestFullFrame { allow_shm } => {
             *force_full = true;
@@ -667,6 +982,9 @@ fn dispatch_client_msg(
 }
 
 async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
+    let mut input_tracker =
+        ClientInputTracker::new(ctx.client_id, ctx.input_send.clone(), ctx.input_state.clone());
+
     let (mut width, mut height, mut stride, mut offset, vram_size) =
         current_display_dims(&ctx.view);
 
@@ -678,7 +996,7 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
             height,
             stride,
             offset,
-            vram_size: vram_size as u32,
+            vram_size: vram_size.min(u32::MAX as usize) as u32,
             shm_path: ctx.shm_path.clone(),
         },
         &mut out_buf,
@@ -736,7 +1054,7 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
                 let msg = decode_client_msg(msg_type[0], &payload)?;
                 dispatch_client_msg(
                     msg,
-                    &ctx.input_send,
+                    &mut input_tracker,
                     &mut force_full,
                     &mut use_shm,
                     shm_available,
@@ -1068,24 +1386,16 @@ mod tests {
 
         let join = thread::spawn(move || {
             block_with_io(async |driver| -> anyhow::Result<()> {
-                let mut view = ViewWrapper(access.view().unwrap());
-                let format_recv = view.0.take_format_recv();
-                let mut server = MultiClientServer {
-                    listener: PolledSocket::new(&driver, listener)?,
-                    view: Arc::new(Mutex::new(view)),
-                    format_recv,
-                    shm_path: shm_path_str,
+                let view = ViewWrapper(access.view().unwrap());
+                let mut server = MultiClientServer::new(
+                    PolledSocket::new(&driver, listener)?,
+                    view,
+                    shm_path_str,
                     input_send,
-                    dirty_recv: Some(dirty_recv),
-                    cursor_recv: Some(cursor_recv),
-                    cursor_state: Arc::new(Mutex::new(SharedCursorState::default())),
-                    device_dirty_seen: Arc::new(AtomicBool::new(false)),
-                    client_handles: Vec::new(),
-                    clients: unicycle::FuturesUnordered::new(),
-                    next_client_id: 0,
-                    max_clients: 8,
-                    start_time: Instant::now(),
-                };
+                    Some(dirty_recv),
+                    Some(cursor_recv),
+                    8,
+                );
                 futures::select! {
                     r = server.process(&driver).fuse() => r,
                     _ = stop_recv.fuse() => Ok(()),
@@ -1890,6 +2200,342 @@ mod tests {
         ));
 
         drop(stream);
+        server.stop();
+    }
+
+    fn recv_input_with_timeout(
+        recv: &mut mesh::Receiver<InputData>,
+        timeout: Duration,
+    ) -> Option<InputData> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(ev) = recv.try_recv() {
+                return Some(ev);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        None
+    }
+
+    #[test]
+    fn rejects_oversized_and_malformed_framebuffer_formats_without_oom() {
+        // Invalid initial 65535x65535 format against 8 MiB VRAM falls back to safe bounds.
+        let server = start_test_server_with_vram(65535, 65535, 0, FRAMEBUFFER_SIZE, None);
+        let (mut stream, hello) = connect_client(server.addr, false);
+        assert!(matches!(
+            hello,
+            ServerMsg::ServerHello {
+                width: 1024,
+                height: 768,
+                stride: 4096,
+                offset: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read_server_msg(&mut stream).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        // Transition to a valid 64x64 mode.
+        server.format_send.send(FramebufferFormat {
+            width: 64,
+            height: 64,
+            bytes_per_line: 64 * 4,
+            offset: 0,
+        });
+        assert!(matches!(
+            read_server_msg(&mut stream).unwrap(),
+            ServerMsg::Resolution {
+                width: 64,
+                height: 64,
+                stride: 256,
+                offset: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read_server_msg(&mut stream).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        // Send a series of malformed/OOB formats that must all be rejected.
+        for bad in [
+            FramebufferFormat {
+                width: 65535,
+                height: 65535,
+                bytes_per_line: 65535 * 4,
+                offset: 0,
+            },
+            FramebufferFormat {
+                width: 0,
+                height: 64,
+                bytes_per_line: 256,
+                offset: 0,
+            },
+            FramebufferFormat {
+                width: 64,
+                height: 0,
+                bytes_per_line: 256,
+                offset: 0,
+            },
+            FramebufferFormat {
+                width: 1024,
+                height: 65535,
+                bytes_per_line: 4,
+                offset: 0,
+            },
+            FramebufferFormat {
+                width: 1920,
+                height: 1080,
+                bytes_per_line: 1920 * 4,
+                offset: FRAMEBUFFER_SIZE - 4096,
+            },
+            FramebufferFormat {
+                width: 1024,
+                height: 1024,
+                bytes_per_line: usize::MAX,
+                offset: 0,
+            },
+        ] {
+            server.format_send.send(bad);
+        }
+
+        // Send Ping and confirm Pong arrives without any Resolution message.
+        thread::sleep(Duration::from_millis(30));
+        write_client_msg(&mut stream, &ClientMsg::Ping { client_time_us: 77 }).unwrap();
+        loop {
+            match read_server_msg(&mut stream).unwrap() {
+                ServerMsg::Pong {
+                    client_time_us: 77, ..
+                } => break,
+                ServerMsg::FrameBatch { .. } => {}
+                ServerMsg::Resolution {
+                    width,
+                    height,
+                    stride,
+                    offset,
+                    ..
+                } => panic!("unexpected Resolution {width}x{height} stride={stride} offset={offset}"),
+                other => panic!("unexpected msg after invalid formats: {other:?}"),
+            }
+        }
+
+        // Valid format followed immediately by invalid format must keep the valid 80x80 format.
+        server.format_send.send(FramebufferFormat {
+            width: 80,
+            height: 80,
+            bytes_per_line: 80 * 4,
+            offset: 0,
+        });
+        server.format_send.send(FramebufferFormat {
+            width: 65535,
+            height: 65535,
+            bytes_per_line: 65535 * 4,
+            offset: 0,
+        });
+        loop {
+            match read_server_msg(&mut stream).unwrap() {
+                ServerMsg::Resolution {
+                    width,
+                    height,
+                    stride,
+                    offset,
+                    ..
+                } => {
+                    assert_eq!((width, height, stride, offset), (80, 80, 320, 0));
+                    break;
+                }
+                ServerMsg::FrameBatch { .. } => {}
+                other => panic!("unexpected msg waiting for 80x80 Resolution: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            read_server_msg(&mut stream).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        drop(stream);
+        server.stop();
+    }
+
+    #[test]
+    fn disconnect_releases_held_keys_and_mouse_buttons() {
+        let mut server = start_test_server(64, 64, None);
+
+        // Single-client abrupt disconnect releases held keys (reverse order) and mouse button.
+        let (mut s1, _) = connect_client(server.addr, false);
+        assert!(matches!(
+            read_server_msg(&mut s1).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        write_client_msg(
+            &mut s1,
+            &ClientMsg::KeyEvent {
+                scancode: 0x1d,
+                make: true,
+            },
+        )
+        .unwrap();
+        write_client_msg(
+            &mut s1,
+            &ClientMsg::KeyEvent {
+                scancode: 0x1e,
+                make: true,
+            },
+        )
+        .unwrap();
+        write_client_msg(
+            &mut s1,
+            &ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT,
+                x: 1200,
+                y: 3400,
+                wheel_delta: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x1d,
+                make: true
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x1e,
+                make: true
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Mouse(MouseData {
+                button_mask: BTN_LEFT,
+                x: 1200,
+                y: 3400
+            }))
+        ));
+
+        drop(s1);
+
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x1e,
+                make: false
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x1d,
+                make: false
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Mouse(MouseData {
+                button_mask: 0,
+                x: 1200,
+                y: 3400
+            }))
+        ));
+
+        // Multi-client overlapping holds: disconnecting client A preserves client B's held input
+        // until client B also disconnects.
+        let (mut ca, _) = connect_client(server.addr, false);
+        let (mut cb, _) = connect_client(server.addr, false);
+        assert!(matches!(
+            read_server_msg(&mut ca).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+        assert!(matches!(
+            read_server_msg(&mut cb).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        write_client_msg(
+            &mut ca,
+            &ClientMsg::KeyEvent {
+                scancode: 0x1d,
+                make: true,
+            },
+        )
+        .unwrap();
+        write_client_msg(
+            &mut ca,
+            &ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT,
+                x: 500,
+                y: 600,
+                wheel_delta: 0,
+            },
+        )
+        .unwrap();
+        assert!(recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)).is_some());
+        assert!(recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)).is_some());
+
+        write_client_msg(
+            &mut cb,
+            &ClientMsg::KeyEvent {
+                scancode: 0x1d,
+                make: true,
+            },
+        )
+        .unwrap();
+        write_client_msg(
+            &mut cb,
+            &ClientMsg::KeyEvent {
+                scancode: 0x2a,
+                make: true,
+            },
+        )
+        .unwrap();
+        write_client_msg(
+            &mut cb,
+            &ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT | fastdesk_proto::BTN_RIGHT,
+                x: 700,
+                y: 800,
+                wheel_delta: 0,
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            assert!(
+                recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)).is_some()
+            );
+        }
+
+        // Dropping client A must NOT release 0x1d or BTN_LEFT while client B still holds them.
+        drop(ca);
+        assert!(recv_input_with_timeout(&mut server.input_recv, Duration::from_millis(50)).is_none());
+
+        // Dropping client B releases 0x2a, 0x1d, and clears mouse buttons.
+        drop(cb);
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x2a,
+                make: false
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x1d,
+                make: false
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Mouse(MouseData { button_mask: 0, .. }))
+        ));
+
         server.stop();
     }
 }

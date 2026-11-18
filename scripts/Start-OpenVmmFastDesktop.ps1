@@ -33,6 +33,7 @@ param(
     [int]$VramMb = 32,
     [string]$ListenAddr = "127.0.0.1:5901",
     [string]$ShmPath = "",
+    [int]$StartupTimeoutMs = 30000,
     [switch]$UseHvSock,
     [int]$VsockPort = 5901,
     [switch]$NoNet,
@@ -66,6 +67,81 @@ function Format-ProcessArgument {
         return '"' + ($Arg -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
     }
     return $Arg
+}
+
+function Resolve-ListenEndpoint {
+    param(
+        [string]$Addr,
+        [int]$DefaultPort = 5901
+    )
+    $trimmed = $Addr.Trim()
+    $viewerAddr = $trimmed
+    $listenPort = $DefaultPort
+    $listenIp = $null
+
+    if ($trimmed -match '^\[([^\]]+)\]:(\d+)$') {
+        $hostPart = $Matches[1]
+        $listenPort = [int]$Matches[2]
+        [System.Net.IPAddress]$parsed = $null
+        if ([System.Net.IPAddress]::TryParse($hostPart, [ref]$parsed)) {
+            $listenIp = $parsed
+        }
+    } elseif ($trimmed -match '^([^:]+):(\d+)$') {
+        $hostPart = $Matches[1]
+        $listenPort = [int]$Matches[2]
+        [System.Net.IPAddress]$parsed = $null
+        if ([System.Net.IPAddress]::TryParse($hostPart, [ref]$parsed)) {
+            $listenIp = $parsed
+        }
+    } else {
+        $bare = $trimmed.Trim('[', ']')
+        [System.Net.IPAddress]$parsed = $null
+        if ([System.Net.IPAddress]::TryParse($bare, [ref]$parsed)) {
+            $listenIp = $parsed
+            if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+                $viewerAddr = "[$bare]:$DefaultPort"
+            } else {
+                $viewerAddr = "${bare}:$DefaultPort"
+            }
+        } else {
+            $viewerAddr = "${trimmed}:$DefaultPort"
+        }
+    }
+
+    return [PSCustomObject]@{
+        ViewerAddr = $viewerAddr
+        Port       = $listenPort
+        IpAddress  = $listenIp
+    }
+}
+
+function Test-FastDeskTcpListening {
+    param(
+        [int]$Port,
+        [System.Net.IPAddress]$IpAddress
+    )
+    $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    foreach ($ep in $listeners) {
+        if ($ep.Port -ne $Port) {
+            continue
+        }
+        if ($null -eq $IpAddress -or
+            $IpAddress.Equals([System.Net.IPAddress]::Any) -or
+            $IpAddress.Equals([System.Net.IPAddress]::IPv6Any)) {
+            return $true
+        }
+        if ($ep.Address.Equals($IpAddress) -or
+            $ep.Address.Equals([System.Net.IPAddress]::Any) -or
+            $ep.Address.Equals([System.Net.IPAddress]::IPv6Any)) {
+            return $true
+        }
+        if ($IpAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
+            $ep.Address.IsIPv4MappedToIPv6 -and
+            $ep.Address.MapToIPv4().Equals($IpAddress)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 # Verify Windows Hypervisor Platform (WHP) is enabled.
@@ -186,26 +262,66 @@ try {
         "--fastdesk-shm", $ShmPath
     )
 
+    $tcpEndpoint = $null
     if ($UseHvSock) {
         $vmmArgs += @("--fastdesk-vsock-port", "$VsockPort")
         $viewerTarget = "hvsock://loopback/$VsockPort"
     } else {
+        $tcpEndpoint = Resolve-ListenEndpoint -Addr $ListenAddr
         $vmmArgs += @("--fastdesk-listen", $ListenAddr)
-        $viewerTarget = "tcp://$ListenAddr"
+        $viewerTarget = "tcp://$($tcpEndpoint.ViewerAddr)"
     }
 
     $quotedVmmArgs = ($vmmArgs | ForEach-Object { Format-ProcessArgument $_ }) -join " "
     Write-Host "Starting OpenVMM FastDesk ($VramMb MiB VRAM, SHM=$ShmPath)..." -ForegroundColor Cyan
     $vmmProc = Start-Process -FilePath $resolvedOpenVmm -ArgumentList $quotedVmmArgs -PassThru -NoNewWindow
 
-    Start-Sleep -Milliseconds 700
-    if ($vmmProc.HasExited) {
-        throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
+    $deadline = (Get-Date).AddMilliseconds($StartupTimeoutMs)
+    if (-not $UseHvSock) {
+        Write-Host "Waiting for OpenVMM FastDesk listener on $($tcpEndpoint.ViewerAddr)..." -ForegroundColor Cyan
+        while ($true) {
+            $vmmProc.Refresh()
+            if ($vmmProc.HasExited) {
+                throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
+            }
+            if (Test-FastDeskTcpListening -Port $tcpEndpoint.Port -IpAddress $tcpEndpoint.IpAddress) {
+                break
+            }
+            if ((Get-Date) -ge $deadline) {
+                $vmmProc.Refresh()
+                if ($vmmProc.HasExited) {
+                    throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
+                }
+                throw "Timed out waiting for OpenVMM FastDesk listener on $($tcpEndpoint.ViewerAddr)."
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    } else {
+        $vmmProc.Refresh()
+        if ($vmmProc.HasExited) {
+            throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
+        }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($resolvedViewer)) {
         Write-Host "Launching fastdesk-viewer -> $viewerTarget" -ForegroundColor Green
-        & $resolvedViewer --connect $viewerTarget
+        while ($true) {
+            $attemptStart = Get-Date
+            & $resolvedViewer --connect $viewerTarget
+            $viewerExitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+            if ($viewerExitCode -eq 0) {
+                break
+            }
+            $vmmProc.Refresh()
+            if ($vmmProc.HasExited) {
+                throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
+            }
+            $elapsedMs = ((Get-Date) - $attemptStart).TotalMilliseconds
+            if ($elapsedMs -ge 2000 -or (Get-Date) -ge $deadline) {
+                throw "fastdesk-viewer.exe exited with code $viewerExitCode."
+            }
+            Start-Sleep -Milliseconds 100
+        }
     } else {
         Write-Warning "fastdesk-viewer.exe not found; OpenVMM is running (PID=$($vmmProc.Id)) on $viewerTarget."
         $vmmProc.WaitForExit()

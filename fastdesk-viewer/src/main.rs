@@ -57,6 +57,15 @@ struct Args {
     resolution: String,
 }
 
+fn detect_window_resize(last_size: &mut (usize, usize), current_size: (usize, usize)) -> bool {
+    if current_size != *last_size {
+        *last_size = current_size;
+        true
+    } else {
+        false
+    }
+}
+
 fn parse_resolution(s: &str) -> anyhow::Result<(u16, u16)> {
     let (w, h) = s
         .split_once('x')
@@ -153,6 +162,8 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
     }
 
     let mut input = InputTracker::default();
+    input.attach_window(&mut window);
+    let mut last_win_size = window.get_size();
     let mut frame_count = 0u64;
     let mut stat_window_start = Instant::now();
     let mut last_ping = Instant::now();
@@ -181,6 +192,9 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
                         fallback_pending = true;
                     }
                     if dims_changed {
+                        for msg in input.release_all() {
+                            write_client_msg(&mut writer_stream, &msg)?;
+                        }
                         window = Window::new(
                             &args.title,
                             comp.width as usize,
@@ -196,6 +210,8 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
                         } else {
                             window.set_target_fps(0);
                         }
+                        input.attach_window(&mut window);
+                        last_win_size = window.get_size();
                     }
                     dirty = true;
                 }
@@ -264,13 +280,55 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
             stat_window_start = Instant::now();
         }
 
+        if detect_window_resize(&mut last_win_size, window.get_size()) {
+            dirty = true;
+        }
         if dirty {
-            window.update_with_buffer(&comp.present_fb, comp.width as usize, comp.height as usize)?;
-            dirty = false;
+            if last_win_size.0 > 0 && last_win_size.1 > 0 {
+                window.update_with_buffer(
+                    &comp.present_fb,
+                    comp.width as usize,
+                    comp.height as usize,
+                )?;
+                dirty = false;
+            } else {
+                window.update();
+            }
+            if detect_window_resize(&mut last_win_size, window.get_size()) {
+                dirty = true;
+            }
         } else {
             window.update();
+            if detect_window_resize(&mut last_win_size, window.get_size()) {
+                if last_win_size.0 > 0 && last_win_size.1 > 0 {
+                    window.update_with_buffer(
+                        &comp.present_fb,
+                        comp.width as usize,
+                        comp.height as usize,
+                    )?;
+                    if detect_window_resize(&mut last_win_size, window.get_size()) {
+                        dirty = true;
+                    }
+                } else {
+                    dirty = true;
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_window_resize;
+
+    #[test]
+    fn detect_window_resize_tracks_size_transitions() {
+        let mut last = (800, 600);
+        assert!(!detect_window_resize(&mut last, (800, 600)));
+        assert!(detect_window_resize(&mut last, (1024, 768)));
+        assert_eq!(last, (1024, 768));
+        assert!(!detect_window_resize(&mut last, (1024, 768)));
+    }
 }

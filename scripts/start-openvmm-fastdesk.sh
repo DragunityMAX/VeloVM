@@ -138,8 +138,23 @@ UEFI_FD="$(resolve_first \
 }
 
 VMM_PID=""
+VMM_READ_FD=""
+VMM_STDIN_FD=""
+VMM_FIFO_DIR=""
 SHM_AUTO_CLEANUP=0
 cleanup() {
+    if [[ -n "${VMM_READ_FD:-}" ]]; then
+        exec {VMM_READ_FD}<&- 2>/dev/null || true
+        VMM_READ_FD=""
+    fi
+    if [[ -n "${VMM_STDIN_FD:-}" ]]; then
+        exec {VMM_STDIN_FD}>&- 2>/dev/null || true
+        VMM_STDIN_FD=""
+    fi
+    if [[ -n "${VMM_FIFO_DIR:-}" ]]; then
+        rm -rf -- "$VMM_FIFO_DIR" 2>/dev/null || true
+        VMM_FIFO_DIR=""
+    fi
     if [[ -n "${VMM_PID:-}" ]] && kill -0 "$VMM_PID" 2>/dev/null; then
         kill "$VMM_PID" 2>/dev/null || true
         wait "$VMM_PID" 2>/dev/null || true
@@ -215,16 +230,134 @@ if [[ -n "$ISO_PATH" ]]; then
     VMM_ARGS+=(--disk "file:${ISO_PATH},dvd,on=scsi0")
 fi
 
-echo "Starting OpenVMM FastDesk (${VRAM_MB} MiB VRAM, SHM=${SHM_PATH})..."
-"$OPENVMM_BIN" "${VMM_ARGS[@]}" &
-VMM_PID=$!
+STARTUP_TIMEOUT_MS="${FASTDESK_STARTUP_TIMEOUT_MS:-30000}"
 
-sleep 0.7
-if ! kill -0 "$VMM_PID" 2>/dev/null; then
-    wait "$VMM_PID" || true
-    echo "Error: openvmm exited prematurely." >&2
+LISTEN_HOST=""
+LISTEN_PORT="5901"
+VIEWER_ADDR="$LISTEN_ADDR"
+if [[ "$LISTEN_ADDR" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
+    LISTEN_HOST="${BASH_REMATCH[1]}"
+    LISTEN_PORT="${BASH_REMATCH[2]}"
+elif [[ "$LISTEN_ADDR" =~ ^([^:]+):([0-9]+)$ ]]; then
+    LISTEN_HOST="${BASH_REMATCH[1]}"
+    LISTEN_PORT="${BASH_REMATCH[2]}"
+elif [[ "$LISTEN_ADDR" == *:* ]]; then
+    LISTEN_HOST="${LISTEN_ADDR#[}"
+    LISTEN_HOST="${LISTEN_HOST%]}"
+    VIEWER_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
+else
+    LISTEN_HOST="$LISTEN_ADDR"
+    VIEWER_ADDR="${LISTEN_ADDR}:${LISTEN_PORT}"
+fi
+
+if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 65535 )); then
+    echo "Error: invalid TCP listen port in --listen: $LISTEN_ADDR" >&2
     exit 1
 fi
 
-echo "Launching fastdesk-viewer -> tcp://${LISTEN_ADDR}"
-"$VIEWER_BIN" --connect "tcp://${LISTEN_ADDR}"
+now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local sec frac
+        IFS='.' read -r sec frac <<< "$EPOCHREALTIME"
+        frac="${frac}000"
+        echo $(( sec * 1000 + 10#${frac:0:3} ))
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
+is_tcp_listening() {
+    local port_hex ip4_hex=""
+    port_hex="$(printf '%04X' "$LISTEN_PORT")"
+    if [[ "$LISTEN_HOST" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        ip4_hex="$(printf '%02X%02X%02X%02X' "${BASH_REMATCH[4]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}")"
+    fi
+
+    local proc_files=()
+    [[ -r /proc/net/tcp ]] && proc_files+=(/proc/net/tcp)
+    [[ -r /proc/net/tcp6 ]] && proc_files+=(/proc/net/tcp6)
+    if [[ ${#proc_files[@]} -gt 0 ]]; then
+        awk -v port=":$port_hex" -v ip4="$ip4_hex" '
+            FNR > 1 && $4 == "0A" {
+                addr = toupper($2)
+                if (length(addr) > length(port) && substr(addr, length(addr) - length(port) + 1) == port) {
+                    if (ip4 == "" || ip4 == "00000000") {
+                        found = 1
+                        exit 0
+                    }
+                    host = substr(addr, 1, length(addr) - length(port))
+                    if (host == ip4 || host == "00000000" || host == "00000000000000000000000000000000" || host == ("0000000000000000FFFF0000" ip4)) {
+                        found = 1
+                        exit 0
+                    }
+                }
+            }
+            END { exit(found ? 0 : 1) }
+        ' "${proc_files[@]}"
+        return $?
+    elif command -v ss >/dev/null 2>&1; then
+        ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep -q "LISTEN"
+        return $?
+    fi
+    return 1
+}
+
+VMM_FIFO_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/openvmm-fastdesk-stdin.XXXXXXXXXX")"
+VMM_FIFO_PATH="${VMM_FIFO_DIR}/stdin.fifo"
+mkfifo -m 0600 "$VMM_FIFO_PATH"
+exec {VMM_HOLD_FD}<>"$VMM_FIFO_PATH"
+exec {VMM_READ_FD}<"$VMM_FIFO_PATH"
+exec {VMM_STDIN_FD}>"$VMM_FIFO_PATH"
+exec {VMM_HOLD_FD}>&-
+rm -rf -- "$VMM_FIFO_DIR"
+VMM_FIFO_DIR=""
+
+echo "Starting OpenVMM FastDesk (${VRAM_MB} MiB VRAM, SHM=${SHM_PATH})..."
+(
+    exec <&"$VMM_READ_FD"
+    exec {VMM_READ_FD}<&-
+    exec {VMM_STDIN_FD}>&-
+    exec "$OPENVMM_BIN" "${VMM_ARGS[@]}"
+) &
+VMM_PID=$!
+exec {VMM_READ_FD}<&-
+VMM_READ_FD=""
+
+echo "Waiting for OpenVMM FastDesk listener on ${VIEWER_ADDR}..."
+START_MS="$(now_ms)"
+DEADLINE_MS=$(( START_MS + STARTUP_TIMEOUT_MS ))
+while true; do
+    if ! kill -0 "$VMM_PID" 2>/dev/null; then
+        wait "$VMM_PID" || true
+        echo "Error: openvmm exited prematurely." >&2
+        exit 1
+    fi
+    if is_tcp_listening; then
+        break
+    fi
+    if [[ "$(now_ms)" -ge "$DEADLINE_MS" ]]; then
+        echo "Error: timed out waiting for OpenVMM FastDesk to listen on ${VIEWER_ADDR}." >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+
+echo "Launching fastdesk-viewer -> tcp://${VIEWER_ADDR}"
+while true; do
+    ATTEMPT_START_MS="$(now_ms)"
+    VIEWER_RC=0
+    "$VIEWER_BIN" --connect "tcp://${VIEWER_ADDR}" || VIEWER_RC=$?
+    if [[ "$VIEWER_RC" -eq 0 ]]; then
+        break
+    fi
+    ATTEMPT_ELAPSED_MS=$(( $(now_ms) - ATTEMPT_START_MS ))
+    if ! kill -0 "$VMM_PID" 2>/dev/null; then
+        wait "$VMM_PID" || true
+        echo "Error: openvmm exited prematurely." >&2
+        exit 1
+    fi
+    if [[ "$ATTEMPT_ELAPSED_MS" -ge 2000 || "$(now_ms)" -ge "$DEADLINE_MS" ]]; then
+        exit "$VIEWER_RC"
+    fi
+    sleep 0.1
+done
