@@ -116,4 +116,7 @@ pub trait FramebufferControl: Send {
     async fn unmap(&mut self);
     /// Updates the framebuffer format.
     async fn set_format(&mut self, format: FramebufferFormat);
+    /// Notifies the framebuffer consumer that the video device channel closed
+    /// or reinitialized without unmapping VRAM, so dirty-reporting state can be reset.
+    async fn notify_lifecycle_reset(&mut self) {}
 }

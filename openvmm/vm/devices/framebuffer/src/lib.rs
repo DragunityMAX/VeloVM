@@ -140,7 +140,7 @@ impl FramebufferAccess {
         mapping.map_file(0, self.len, &self.vram, self.offset, false)?;
         Ok(View {
             mapping,
-            format_recv: self.format_recv,
+            format_recv: Some(self.format_recv),
             format: None,
             vram: self.vram,
             len: self.len,
@@ -153,7 +153,7 @@ impl FramebufferAccess {
 #[derive(Debug)]
 pub struct View {
     mapping: SparseMapping,
-    format_recv: mesh::Receiver<FramebufferFormat>,
+    format_recv: Option<mesh::Receiver<FramebufferFormat>>,
     format: Option<FramebufferFormat>,
     vram: Mappable,
     len: usize,
@@ -216,10 +216,30 @@ impl View {
     /// Drains any pending format updates and returns the current framebuffer
     /// format, if known.
     pub fn format(&mut self) -> Option<FramebufferFormat> {
-        while let Ok(format) = self.format_recv.try_recv() {
-            self.format = Some(format);
+        if let Some(format_recv) = &mut self.format_recv {
+            while let Ok(format) = format_recv.try_recv() {
+                self.format = Some(format);
+            }
         }
         self.format
+    }
+
+    /// Latches any queued format updates and extracts the format receiver so a
+    /// display worker can await format changes asynchronously.
+    pub fn take_format_recv(&mut self) -> Option<mesh::Receiver<FramebufferFormat>> {
+        let _ = self.format();
+        self.format_recv.take()
+    }
+
+    /// Updates the cached framebuffer format after reading from an externally
+    /// drained `format_recv`.
+    pub fn set_cached_format(&mut self, format: FramebufferFormat) {
+        self.format = Some(format);
+    }
+
+    /// Restores a previously extracted format receiver back into this view.
+    pub fn restore_format_recv(&mut self, format_recv: mesh::Receiver<FramebufferFormat>) {
+        self.format_recv = Some(format_recv);
     }
 
     /// Returns the current resolution.
@@ -238,7 +258,9 @@ impl View {
         if let Some(format) = self.format {
             send.send(format);
         }
-        send.bridge(self.format_recv);
+        if let Some(format_recv) = self.format_recv {
+            send.bridge(format_recv);
+        }
         FramebufferAccess {
             vram: self.vram,
             len: self.len,
@@ -372,6 +394,11 @@ impl ChangeDeviceState for FramebufferDevice {
         if let Some(mut state) = inner.mapping_state.take() {
             state.mem.unmap_from_guest();
         }
+        inner.format = default_framebuffer_format();
+        let format = inner.format;
+        if let Some(framebuffer) = &mut inner.framebuffer {
+            framebuffer.format_send.send(format);
+        }
 
         // TODO: clear VRAM
     }
@@ -469,12 +496,18 @@ impl FramebufferLocalControl {
     ///
     /// `framebuffer_range` is an optional subrange of the framebuffer to map.
     pub fn map(&mut self, gpa: u64, framebuffer_range: Option<MemoryRange>) {
-        if let Err(err) = self.inner.lock().map(gpa, framebuffer_range) {
+        let mut inner = self.inner.lock();
+        if let Err(err) = inner.map(gpa, framebuffer_range) {
             tracing::error!(
                 gpa,
                 error = err.as_ref() as &dyn std::error::Error,
                 "failed to map framebuffer to guest"
             );
+        } else {
+            let format = inner.format;
+            if let Some(framebuffer) = &mut inner.framebuffer {
+                framebuffer.format_send.send(format);
+            }
         }
     }
 
@@ -496,11 +529,19 @@ impl FramebufferLocalControl {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
 
-        if inner.format != format {
-            inner.format = format;
-            if let Some(framebuffer) = &mut inner.framebuffer {
-                framebuffer.format_send.send(inner.format);
-            }
+        inner.format = format;
+        if let Some(framebuffer) = &mut inner.framebuffer {
+            framebuffer.format_send.send(inner.format);
+        }
+    }
+
+    /// Notifies the framebuffer consumer of a video channel lifecycle reset
+    /// without unmapping VRAM.
+    pub fn notify_lifecycle_reset(&mut self) {
+        let mut inner = self.inner.lock();
+        let format = inner.format;
+        if let Some(framebuffer) = &mut inner.framebuffer {
+            framebuffer.format_send.send(format);
         }
     }
 
@@ -530,6 +571,9 @@ impl FramebufferControl for FramebufferLocalControl {
     }
     async fn set_format(&mut self, format: FramebufferFormat) {
         self.set_format(format);
+    }
+    async fn notify_lifecycle_reset(&mut self) {
+        self.notify_lifecycle_reset();
     }
 }
 

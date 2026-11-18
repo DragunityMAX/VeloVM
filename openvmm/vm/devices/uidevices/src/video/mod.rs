@@ -577,6 +577,17 @@ impl SimpleVmbusDevice for Video {
         .await?
     }
 
+    async fn close(&mut self) {
+        self.control.notify_lifecycle_reset().await;
+        if let Some(send) = &self.cursor_send {
+            send.send(CursorUpdate::Position(CursorPosition {
+                is_visible: false,
+                x: 0,
+                y: 0,
+            }));
+        }
+    }
+
     fn supports_save_restore(
         &mut self,
     ) -> Option<
@@ -702,6 +713,18 @@ async fn process_channel(
                 .await?;
                 if is_accepted != 0 {
                     tracelimit::info_ratelimited!(?version, "video negotiation succeeded");
+                    cursor_assembler.reset();
+                    if *feature_sent {
+                        *feature_sent = false;
+                        framebuffer.notify_lifecycle_reset().await;
+                        if let Some(send) = cursor_send {
+                            send.send(CursorUpdate::Position(CursorPosition {
+                                is_visible: false,
+                                x: 0,
+                                y: 0,
+                            }));
+                        }
+                    }
                     *state = ChannelState::Active {
                         version: *version,
                         substate: ActiveState::ReadRequest,
@@ -714,198 +737,210 @@ async fn process_channel(
             ChannelState::Active {
                 version: _,
                 substate,
-            } => match *substate {
-                ActiveState::ReadRequest => {
-                    let packet = packet_buf.recv_packet(channel).await?;
-                    match packet {
-                        Request::VramLocation {
-                            user_context,
-                            address,
-                        } => {
-                            framebuffer.unmap().await;
-                            if let Some(address) = address {
-                                framebuffer.map(address).await;
+            } => {
+                let mut reinit_version = None;
+                match *substate {
+                    ActiveState::ReadRequest => {
+                        let packet = packet_buf.recv_packet(channel).await?;
+                        match packet {
+                            Request::VramLocation {
+                                user_context,
+                                address,
+                            } => {
+                                framebuffer.unmap().await;
+                                if let Some(address) = address {
+                                    framebuffer.map(address).await;
+                                }
+                                *substate = ActiveState::SendVramAck { user_context };
                             }
-                            *substate = ActiveState::SendVramAck { user_context };
-                        }
-                        Request::SituationUpdate {
-                            user_context,
-                            situation,
-                        } => {
-                            framebuffer
-                                .set_format(FramebufferFormat {
-                                    width: u32::from(situation.width_pixels) as usize,
-                                    height: u32::from(situation.height_pixels) as usize,
-                                    bytes_per_line: u32::from(situation.pitch_bytes) as usize,
-                                    offset: u32::from(situation.primary_surface_vram_offset)
-                                        as usize,
-                                })
-                                .await;
-                            *substate = ActiveState::SendSituationUpdateAck { user_context };
-                        }
-                        Request::PointerPosition { is_visible, x, y } => {
-                            if let Some(send) = cursor_send {
-                                send.send(CursorUpdate::Position(CursorPosition {
-                                    is_visible,
-                                    x,
-                                    y,
-                                }));
+                            Request::SituationUpdate {
+                                user_context,
+                                situation,
+                            } => {
+                                framebuffer
+                                    .set_format(FramebufferFormat {
+                                        width: u32::from(situation.width_pixels) as usize,
+                                        height: u32::from(situation.height_pixels) as usize,
+                                        bytes_per_line: u32::from(situation.pitch_bytes) as usize,
+                                        offset: u32::from(situation.primary_surface_vram_offset)
+                                            as usize,
+                                    })
+                                    .await;
+                                *substate = ActiveState::SendSituationUpdateAck { user_context };
                             }
-                        }
-                        Request::PointerShape {
-                            partial_index,
-                            is_color,
-                            width,
-                            height,
-                            hotspot_x,
-                            hotspot_y,
-                            data,
-                        } => {
-                            if let Some(shape) = cursor_assembler.push_chunk(
+                            Request::PointerPosition { is_visible, x, y } => {
+                                if let Some(send) = cursor_send {
+                                    send.send(CursorUpdate::Position(CursorPosition {
+                                        is_visible,
+                                        x,
+                                        y,
+                                    }));
+                                }
+                            }
+                            Request::PointerShape {
                                 partial_index,
                                 is_color,
                                 width,
                                 height,
                                 hotspot_x,
                                 hotspot_y,
-                                &data,
-                            ) {
-                                if let Some(send) = cursor_send {
-                                    send.send(CursorUpdate::Shape(shape));
+                                data,
+                            } => {
+                                if let Some(shape) = cursor_assembler.push_chunk(
+                                    partial_index,
+                                    is_color,
+                                    width,
+                                    height,
+                                    hotspot_x,
+                                    hotspot_y,
+                                    &data,
+                                ) {
+                                    if let Some(send) = cursor_send {
+                                        send.send(CursorUpdate::Shape(shape));
+                                    }
                                 }
                             }
-                        }
-                        Request::Dirt(rects) => {
-                            if let Some(send) = dirt_send {
-                                let dirty: Vec<DirtyRect> = rects
-                                    .iter()
-                                    .map(|r| DirtyRect {
-                                        left: r.left.into(),
-                                        top: r.top.into(),
-                                        right: r.right.into(),
-                                        bottom: r.bottom.into(),
-                                    })
-                                    .collect();
-                                send.send(dirty);
+                            Request::Dirt(rects) => {
+                                if let Some(send) = dirt_send {
+                                    let dirty: Vec<DirtyRect> = rects
+                                        .iter()
+                                        .map(|r| DirtyRect {
+                                            left: r.left.into(),
+                                            top: r.top.into(),
+                                            right: r.right.into(),
+                                            bottom: r.bottom.into(),
+                                        })
+                                        .collect();
+                                    send.send(dirty);
+                                }
+                            }
+                            Request::BiosInfo => {
+                                *substate = ActiveState::SendBiosInfo;
+                            }
+                            Request::SupportedResolutions { maximum_count } => {
+                                *substate = ActiveState::SendSupportedResolutions { maximum_count };
+                            }
+                            Request::Capability => {
+                                *substate = ActiveState::SendCapability;
+                            }
+                            Request::Version(version) => {
+                                reinit_version = Some(version.into());
                             }
                         }
-                        Request::BiosInfo => {
-                            *substate = ActiveState::SendBiosInfo;
-                        }
-                        Request::SupportedResolutions { maximum_count } => {
-                            *substate = ActiveState::SendSupportedResolutions { maximum_count };
-                        }
-                        Request::Capability => {
-                            *substate = ActiveState::SendCapability;
-                        }
-                        Request::Version(_) => return Err(Error::UnexpectedPacketOrder),
                     }
-                }
-                ActiveState::SendVramAck { user_context } => {
-                    VideoChannel::send_packet(
-                        channel,
-                        protocol::MESSAGE_VRAM_LOCATION_ACK,
-                        &protocol::VramLocationAckMessage {
-                            user_context: user_context.into(),
-                        },
-                    )
-                    .await?;
-                    *substate = ActiveState::ReadRequest;
-                }
-                ActiveState::SendSituationUpdateAck { user_context } => {
-                    VideoChannel::send_packet(
-                        channel,
-                        protocol::MESSAGE_SITUATION_UPDATE_ACK,
-                        &protocol::SituationUpdateAckMessage {
-                            user_context: user_context.into(),
-                        },
-                    )
-                    .await?;
-                    if !*feature_sent && (dirt_send.is_some() || cursor_send.is_some()) {
+                    ActiveState::SendVramAck { user_context } => {
                         VideoChannel::send_packet(
                             channel,
-                            protocol::MESSAGE_FEATURE_CHANGE,
-                            &protocol::FeatureChangeMessage {
-                                is_dirt_needed: u8::from(dirt_send.is_some()),
-                                is_pointer_position_updates_needed: u8::from(cursor_send.is_some()),
-                                is_pointer_shape_updates_needed: u8::from(cursor_send.is_some()),
-                                is_video_situation_updates_needed: 1,
+                            protocol::MESSAGE_VRAM_LOCATION_ACK,
+                            &protocol::VramLocationAckMessage {
+                                user_context: user_context.into(),
                             },
                         )
                         .await?;
-                        *feature_sent = true;
+                        *substate = ActiveState::ReadRequest;
                     }
-                    *substate = ActiveState::ReadRequest;
-                }
-                ActiveState::SendBiosInfo => {
-                    VideoChannel::send_packet(
-                        channel,
-                        protocol::MESSAGE_BIOS_INFO_RESPONSE,
-                        &protocol::BiosInfoResponseMessage {
-                            stop_device_supported: 1.into(),
-                            reserved: [0; 12],
-                        },
-                    )
-                    .await?;
-                    *substate = ActiveState::ReadRequest;
-                }
-                ActiveState::SendSupportedResolutions { maximum_count } => {
-                    if maximum_count < protocol::MAXIMUM_RESOLUTIONS_COUNT {
+                    ActiveState::SendSituationUpdateAck { user_context } => {
                         VideoChannel::send_packet(
                             channel,
-                            protocol::MESSAGE_SUPPORTED_RESOLUTIONS_RESPONSE,
-                            &protocol::SupportedResolutionsResponseMessage {
-                                edid_block: protocol::EDID_BLOCK,
-                                resolution_count: 0,
-                                default_resolution_index: 0,
-                                is_standard: 0,
+                            protocol::MESSAGE_SITUATION_UPDATE_ACK,
+                            &protocol::SituationUpdateAckMessage {
+                                user_context: user_context.into(),
                             },
                         )
                         .await?;
-                    } else {
-                        let (resolutions, default_index) = supported_resolutions(vram_size);
+                        if !*feature_sent && (dirt_send.is_some() || cursor_send.is_some()) {
+                            VideoChannel::send_packet(
+                                channel,
+                                protocol::MESSAGE_FEATURE_CHANGE,
+                                &protocol::FeatureChangeMessage {
+                                    is_dirt_needed: u8::from(dirt_send.is_some()),
+                                    is_pointer_position_updates_needed: u8::from(
+                                        cursor_send.is_some(),
+                                    ),
+                                    is_pointer_shape_updates_needed: u8::from(
+                                        cursor_send.is_some(),
+                                    ),
+                                    is_video_situation_updates_needed: 1,
+                                },
+                            )
+                            .await?;
+                            *feature_sent = true;
+                        }
+                        *substate = ActiveState::ReadRequest;
+                    }
+                    ActiveState::SendBiosInfo => {
+                        VideoChannel::send_packet(
+                            channel,
+                            protocol::MESSAGE_BIOS_INFO_RESPONSE,
+                            &protocol::BiosInfoResponseMessage {
+                                stop_device_supported: 1.into(),
+                                reserved: [0; 12],
+                            },
+                        )
+                        .await?;
+                        *substate = ActiveState::ReadRequest;
+                    }
+                    ActiveState::SendSupportedResolutions { maximum_count } => {
+                        if maximum_count < protocol::MAXIMUM_RESOLUTIONS_COUNT {
+                            VideoChannel::send_packet(
+                                channel,
+                                protocol::MESSAGE_SUPPORTED_RESOLUTIONS_RESPONSE,
+                                &protocol::SupportedResolutionsResponseMessage {
+                                    edid_block: protocol::EDID_BLOCK,
+                                    resolution_count: 0,
+                                    default_resolution_index: 0,
+                                    is_standard: 0,
+                                },
+                            )
+                            .await?;
+                        } else {
+                            let (resolutions, default_index) = supported_resolutions(vram_size);
 
-                        let mut packet = Vec::new();
-                        packet.extend_from_slice(
-                            protocol::SupportedResolutionsResponseMessage {
-                                edid_block: protocol::EDID_BLOCK,
-                                resolution_count: resolutions.len().try_into().unwrap(),
-                                default_resolution_index: default_index,
-                                is_standard: 0,
-                            }
-                            .as_bytes(),
-                        );
-                        for r in resolutions {
+                            let mut packet = Vec::new();
                             packet.extend_from_slice(
-                                protocol::ScreenInfo {
-                                    width: r.0.into(),
-                                    height: r.1.into(),
+                                protocol::SupportedResolutionsResponseMessage {
+                                    edid_block: protocol::EDID_BLOCK,
+                                    resolution_count: resolutions.len().try_into().unwrap(),
+                                    default_resolution_index: default_index,
+                                    is_standard: 0,
                                 }
                                 .as_bytes(),
                             );
+                            for r in resolutions {
+                                packet.extend_from_slice(
+                                    protocol::ScreenInfo {
+                                        width: r.0.into(),
+                                        height: r.1.into(),
+                                    }
+                                    .as_bytes(),
+                                );
+                            }
+                            VideoChannel::send_packet(
+                                channel,
+                                protocol::MESSAGE_SUPPORTED_RESOLUTIONS_RESPONSE,
+                                packet.as_slice(),
+                            )
+                            .await?;
                         }
+                        *substate = ActiveState::ReadRequest;
+                    }
+                    ActiveState::SendCapability => {
                         VideoChannel::send_packet(
                             channel,
-                            protocol::MESSAGE_SUPPORTED_RESOLUTIONS_RESPONSE,
-                            packet.as_slice(),
+                            protocol::MESSAGE_CAPABILITY_RESPONSE,
+                            &protocol::CapabilityResponseMessage {
+                                lock_on_disconnect: 0.into(),
+                                reserved: [0.into(); 15],
+                            },
                         )
                         .await?;
+                        *substate = ActiveState::ReadRequest;
                     }
-                    *substate = ActiveState::ReadRequest;
                 }
-                ActiveState::SendCapability => {
-                    VideoChannel::send_packet(
-                        channel,
-                        protocol::MESSAGE_CAPABILITY_RESPONSE,
-                        &protocol::CapabilityResponseMessage {
-                            lock_on_disconnect: 0.into(),
-                            reserved: [0.into(); 15],
-                        },
-                    )
-                    .await?;
-                    *substate = ActiveState::ReadRequest;
+                if let Some(version) = reinit_version {
+                    *state = ChannelState::WriteVersion { version };
                 }
-            },
+            }
         }
     }
 }
@@ -1616,5 +1651,145 @@ mod tests {
 
         drop(guest);
         worker.await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_channel_close_and_reinit_notify_lifecycle_and_hide_cursor(driver: DefaultDriver) {
+        let (host, mut guest) = connected_message_pipes(32768);
+        let (device, control, mut view) = framebuffer_fixture();
+        let mut format_recv = view.take_format_recv().unwrap();
+        let (dirt_send, _dirt_recv) = mesh::channel();
+        let (cursor_send, mut cursor_recv) = mesh::channel();
+        let worker = start_worker_full(
+            &driver,
+            control,
+            Some(dirt_send),
+            Some(cursor_send.clone()),
+            DEFAULT_VRAM_SIZE,
+            host,
+        );
+
+        let version = protocol::Version::new(protocol::VERSION_MAJOR, protocol::VERSION_MINOR_BLUE);
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_VERSION_REQUEST,
+            &protocol::VersionRequestMessage { version },
+        )
+        .await;
+        let _ = with_timeout(&driver, recv_bytes(&mut guest)).await;
+
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_SITUATION_UPDATE,
+            &protocol::SituationUpdateMessage {
+                user_context: 1u64.into(),
+                video_output_count: 1,
+                video_output: protocol::VideoOutputSituation {
+                    active: 1,
+                    primary_surface_vram_offset: 0.into(),
+                    depth_bits: 32,
+                    width_pixels: 1280u32.into(),
+                    height_pixels: 720u32.into(),
+                    pitch_bytes: (1280u32 * 4).into(),
+                },
+            },
+        )
+        .await;
+        let _ = with_timeout(&driver, recv_bytes(&mut guest)).await; // SituationUpdateAck
+        let feat_pkt = with_timeout(&driver, recv_bytes(&mut guest)).await;
+        assert_eq!(
+            parse_header(&feat_pkt).0.typ.to_ne(),
+            protocol::MESSAGE_FEATURE_CHANGE
+        );
+        let fmt = with_timeout(&driver, format_recv.recv()).await.unwrap();
+        assert_eq!(fmt.width, 1280);
+        assert_eq!(fmt.height, 720);
+
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_POINTER_POSITION,
+            &protocol::PointerPositionMessage {
+                is_visible: 1,
+                video_output: 0,
+                image_x: 100i32.into(),
+                image_y: 200i32.into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            with_timeout(&driver, cursor_recv.recv()).await.unwrap(),
+            CursorUpdate::Position(CursorPosition {
+                is_visible: true,
+                x: 100,
+                y: 200,
+            })
+        );
+
+        // Re-negotiate SynthVid on the open channel (guest driver reload/reinit).
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_VERSION_REQUEST,
+            &protocol::VersionRequestMessage { version },
+        )
+        .await;
+        let ver_resp = with_timeout(&driver, recv_bytes(&mut guest)).await;
+        assert_eq!(
+            parse_header(&ver_resp).0.typ.to_ne(),
+            protocol::MESSAGE_VERSION_RESPONSE
+        );
+        let reset_fmt = with_timeout(&driver, format_recv.recv()).await.unwrap();
+        assert_eq!(reset_fmt.width, 1280);
+        assert_eq!(
+            with_timeout(&driver, cursor_recv.recv()).await.unwrap(),
+            CursorUpdate::Position(CursorPosition {
+                is_visible: false,
+                x: 0,
+                y: 0,
+            })
+        );
+
+        // Next SituationUpdate should re-emit MESSAGE_FEATURE_CHANGE.
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_SITUATION_UPDATE,
+            &protocol::SituationUpdateMessage {
+                user_context: 2u64.into(),
+                video_output_count: 1,
+                video_output: protocol::VideoOutputSituation {
+                    active: 1,
+                    primary_surface_vram_offset: 0.into(),
+                    depth_bits: 32,
+                    width_pixels: 1280u32.into(),
+                    height_pixels: 720u32.into(),
+                    pitch_bytes: (1280u32 * 4).into(),
+                },
+            },
+        )
+        .await;
+        let _ = with_timeout(&driver, recv_bytes(&mut guest)).await; // SituationUpdateAck
+        let feat_pkt2 = with_timeout(&driver, recv_bytes(&mut guest)).await;
+        assert_eq!(
+            parse_header(&feat_pkt2).0.typ.to_ne(),
+            protocol::MESSAGE_FEATURE_CHANGE
+        );
+        let _ = with_timeout(&driver, format_recv.recv()).await.unwrap();
+
+        drop(guest);
+        worker.await.unwrap();
+
+        // Closing the SimpleVmbusDevice emits a lifecycle reset notification and hides cursor.
+        let mut video =
+            Video::new(Box::new(device.control()), None, Some(cursor_send), None).unwrap();
+        video.close().await;
+        let close_fmt = with_timeout(&driver, format_recv.recv()).await.unwrap();
+        assert_eq!(close_fmt.width, 1280);
+        assert_eq!(
+            with_timeout(&driver, cursor_recv.recv()).await.unwrap(),
+            CursorUpdate::Position(CursorPosition {
+                is_visible: false,
+                x: 0,
+                y: 0,
+            })
+        );
     }
 }

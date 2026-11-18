@@ -22,7 +22,7 @@ Options:
   --memory <SIZE>     Guest RAM size (default: $MEMORY)
   --cpus <N>          Virtual processor count (default: $CPUS)
   --vram-mb <MB>      SynthVid framebuffer VRAM in MiB (default: $VRAM_MB)
-  --shm <PATH>        Shared-memory VRAM file path (default: /dev/shm/openvmm-fastdesk-<uid>/vram.shm, mode 0600)
+  --shm <PATH>        Shared-memory VRAM file path (default: unique /dev/shm/openvmm-fastdesk-<uid>/vram.shm.*, mode 0600)
   --listen <ADDR>     FastDesk TCP listen address (default: $LISTEN_ADDR)
   -h, --help          Show this help
 EOF
@@ -137,6 +137,23 @@ UEFI_FD="$(resolve_first \
     exit 1
 }
 
+VMM_PID=""
+SHM_AUTO_CLEANUP=0
+cleanup() {
+    if [[ -n "${VMM_PID:-}" ]] && kill -0 "$VMM_PID" 2>/dev/null; then
+        kill "$VMM_PID" 2>/dev/null || true
+        wait "$VMM_PID" 2>/dev/null || true
+    fi
+    VMM_PID=""
+    if [[ "$SHM_AUTO_CLEANUP" -eq 1 && -n "${SHM_PATH:-}" ]]; then
+        rm -f -- "$SHM_PATH" 2>/dev/null || true
+        SHM_PATH=""
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 if [[ "$SHM_CUSTOM" -eq 0 ]]; then
     if [[ -d /dev/shm && -w /dev/shm ]]; then
         SHM_BASE="/dev/shm"
@@ -144,13 +161,16 @@ if [[ "$SHM_CUSTOM" -eq 0 ]]; then
         SHM_BASE="${XDG_RUNTIME_DIR:-/tmp}"
     fi
     SHM_DIR="${SHM_BASE}/openvmm-fastdesk-$(id -u)"
-    SHM_PATH="${SHM_DIR}/vram.shm"
     (umask 077 && mkdir -p "$SHM_DIR")
     if [[ -L "$SHM_DIR" || ! -d "$SHM_DIR" || ! -O "$SHM_DIR" ]]; then
         echo "Error: unsafe shared-memory directory: $SHM_DIR" >&2
         exit 1
     fi
     chmod 0700 "$SHM_DIR"
+    SHM_PATH="$(umask 077 && mktemp "${SHM_DIR}/vram.shm.XXXXXXXXXX")"
+    SHM_AUTO_CLEANUP=1
+    chmod 0600 "$SHM_PATH"
+    truncate -s "${VRAM_MB}M" "$SHM_PATH"
 else
     SHM_DIR="$(dirname "$SHM_PATH")"
     if [[ ! -e "$SHM_DIR" ]]; then
@@ -161,23 +181,21 @@ else
         echo "Error: shared-memory parent is not a directory: $SHM_DIR" >&2
         exit 1
     fi
+    if [[ -L "$SHM_PATH" ]]; then
+        echo "Error: refusing symlink shared-memory file: $SHM_PATH" >&2
+        exit 1
+    fi
+    if [[ -e "$SHM_PATH" && ( ! -f "$SHM_PATH" || ! -O "$SHM_PATH" ) ]]; then
+        echo "Error: unsafe existing shared-memory file: $SHM_PATH" >&2
+        exit 1
+    fi
+    (
+        umask 077
+        : >> "$SHM_PATH"
+        chmod 0600 "$SHM_PATH"
+        truncate -s "${VRAM_MB}M" "$SHM_PATH"
+    )
 fi
-
-if [[ -L "$SHM_PATH" ]]; then
-    echo "Error: refusing symlink shared-memory file: $SHM_PATH" >&2
-    exit 1
-fi
-if [[ -e "$SHM_PATH" && ( ! -f "$SHM_PATH" || ! -O "$SHM_PATH" ) ]]; then
-    echo "Error: unsafe existing shared-memory file: $SHM_PATH" >&2
-    exit 1
-fi
-
-(
-    umask 077
-    : >> "$SHM_PATH"
-    chmod 0600 "$SHM_PATH"
-    truncate -s "${VRAM_MB}M" "$SHM_PATH"
-)
 
 VMM_ARGS=(
     --uefi "firmware=$UEFI_FD"
@@ -196,15 +214,6 @@ VMM_ARGS=(
 if [[ -n "$ISO_PATH" ]]; then
     VMM_ARGS+=(--disk "file:${ISO_PATH},dvd,on=scsi0")
 fi
-
-VMM_PID=""
-cleanup() {
-    if [[ -n "$VMM_PID" ]] && kill -0 "$VMM_PID" 2>/dev/null; then
-        kill "$VMM_PID" 2>/dev/null || true
-        wait "$VMM_PID" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
 
 echo "Starting OpenVMM FastDesk (${VRAM_MB} MiB VRAM, SHM=${SHM_PATH})..."
 "$OPENVMM_BIN" "${VMM_ARGS[@]}" &

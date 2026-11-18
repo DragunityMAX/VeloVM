@@ -11,8 +11,6 @@ struct CursorState {
     y: i32,
     width: u16,
     height: u16,
-    hotspot_x: u16,
-    hotspot_y: u16,
     bgra: Vec<u8>,
     prev_drawn: Option<(i32, i32, u16, u16)>,
 }
@@ -124,8 +122,8 @@ impl DesktopCompositor {
         &mut self,
         width: u16,
         height: u16,
-        hotspot_x: u16,
-        hotspot_y: u16,
+        _hotspot_x: u16,
+        _hotspot_y: u16,
         lz4_bgra: &[u8],
     ) -> anyhow::Result<()> {
         let expected = width as usize * height as usize * 4;
@@ -136,8 +134,6 @@ impl DesktopCompositor {
         }
         self.cursor.width = width;
         self.cursor.height = height;
-        self.cursor.hotspot_x = hotspot_x;
-        self.cursor.hotspot_y = hotspot_y;
         self.cursor.bgra = decoded;
         Ok(())
     }
@@ -263,8 +259,10 @@ impl DesktopCompositor {
         {
             return;
         }
-        let origin_x = self.cursor.x - self.cursor.hotspot_x as i32;
-        let origin_y = self.cursor.y - self.cursor.hotspot_y as i32;
+        // SynthVid PointerPositionMessage (and ServerMsg::CursorPosition) already
+        // supplies the upper-left coordinates of the pointer image.
+        let origin_x = self.cursor.x;
+        let origin_y = self.cursor.y;
         let cw = self.cursor.width;
         let ch = self.cursor.height;
         let fb_w = self.width as i32;
@@ -452,5 +450,45 @@ mod tests {
             }])
             .unwrap();
         assert!(need_fallback);
+    }
+
+    #[test]
+    fn cursor_uses_supplied_upper_left_image_origin_without_reapplying_hotspot() {
+        let mut comp = DesktopCompositor::new(16, 16, 16 * 4, 0, None, false).unwrap();
+
+        // 2x2 opaque cursor with 4 distinct pixels and nonzero hotspot (1, 1).
+        let p00 = [0x10u8, 0x20, 0x30, 0xff];
+        let p10 = [0x40u8, 0x50, 0x60, 0xff];
+        let p01 = [0x70u8, 0x80, 0x90, 0xff];
+        let p11 = [0xa0u8, 0xb0, 0xc0, 0xff];
+        let mut raw = Vec::with_capacity(16);
+        raw.extend_from_slice(&p00);
+        raw.extend_from_slice(&p10);
+        raw.extend_from_slice(&p01);
+        raw.extend_from_slice(&p11);
+        let cursor_lz4 = lz4_flex::compress_prepend_size(&raw);
+
+        comp.set_cursor_shape(2, 2, 1, 1, &cursor_lz4).unwrap();
+        comp.set_cursor_position(true, 5, 6);
+        comp.composite_cursor();
+
+        // SynthVid supplies the upper-left image coordinate directly (5, 6),
+        // so the cursor must NOT be shifted to (4, 5).
+        assert_eq!(comp.present_fb[4 * 16 + 4], 0);
+        assert_eq!(comp.present_fb[5 * 16 + 4], 0);
+        assert_eq!(comp.present_fb[6 * 16 + 5], 0x00302010);
+        assert_eq!(comp.present_fb[6 * 16 + 6], 0x00605040);
+        assert_eq!(comp.present_fb[7 * 16 + 5], 0x00908070);
+        assert_eq!(comp.present_fb[7 * 16 + 6], 0x00c0b0a0);
+
+        // When the pointer tip is at (0, 0) with hotspot (1, 1), SynthVid reports
+        // upper-left origin (-1, -1), placing pixel (1, 1) at (0, 0).
+        comp.set_cursor_position(true, -1, -1);
+        comp.composite_cursor();
+        assert_eq!(comp.present_fb[6 * 16 + 5], 0);
+        assert_eq!(comp.present_fb[6 * 16 + 6], 0);
+        assert_eq!(comp.present_fb[7 * 16 + 5], 0);
+        assert_eq!(comp.present_fb[7 * 16 + 6], 0);
+        assert_eq!(comp.present_fb[0], 0x00c0b0a0);
     }
 }

@@ -32,7 +32,7 @@ param(
     [int]$Processors = 4,
     [int]$VramMb = 32,
     [string]$ListenAddr = "127.0.0.1:5901",
-    [string]$ShmPath = "$env:TEMP\openvmm-fastdesk-vram.shm",
+    [string]$ShmPath = "",
     [switch]$UseHvSock,
     [int]$VsockPort = 5901,
     [switch]$NoNet,
@@ -69,11 +69,13 @@ function Format-ProcessArgument {
 }
 
 # Verify Windows Hypervisor Platform (WHP) is enabled.
-$whpFeature = Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction SilentlyContinue
-if ($null -ne $whpFeature -and $whpFeature.State -ne "Enabled") {
-    Write-Warning "Windows Hypervisor Platform (HypervisorPlatform) is currently $($whpFeature.State)."
-    Write-Warning "Enable it from an elevated PowerShell prompt with:"
-    Write-Warning "  Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform"
+if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+    $whpFeature = Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction SilentlyContinue
+    if ($null -ne $whpFeature -and $whpFeature.State -ne "Enabled") {
+        Write-Warning "Windows Hypervisor Platform (HypervisorPlatform) is currently $($whpFeature.State)."
+        Write-Warning "Enable it from an elevated PowerShell prompt with:"
+        Write-Warning "  Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform"
+    }
 }
 
 $resolvedOpenVmm = Resolve-FirstExisting -ExplicitPath $OpenVmmExe -Candidates @(
@@ -97,6 +99,15 @@ $resolvedUefi = Resolve-FirstExisting -ExplicitPath $UefiFirmware -Candidates @(
     (Join-Path $PSScriptRoot "..\openvmm\.packages\hyperv.uefi.mscoreuefi.x64.RELEASE\MsvmX64\RELEASE_VS2022\FV\MSVM.fd")
 )
 
+$uefiArgs = @()
+if (-not [string]::IsNullOrWhiteSpace($resolvedUefi)) {
+    $uefiArgs = @("--uefi", "firmware=$resolvedUefi")
+} elseif (-not [string]::IsNullOrWhiteSpace($env:X86_64_OPENVMM_UEFI_FIRMWARE) -and (Test-Path -LiteralPath $env:X86_64_OPENVMM_UEFI_FIRMWARE)) {
+    $uefiArgs = @("--uefi")
+} else {
+    throw "UEFI firmware (MSVM.fd) not found at '$PSScriptRoot\firmware\MSVM.fd'. Download a build artifact containing firmware\MSVM.fd or pass -UefiFirmware <path>."
+}
+
 if (-not (Test-Path -LiteralPath $DiskPath) -and [string]::IsNullOrWhiteSpace($CreateDiskSize)) {
     throw "Disk image not found: $DiskPath (pass -CreateDiskSize e.g. '64G' to create a new raw disk image)."
 }
@@ -109,78 +120,84 @@ if ($diskParent -and -not (Test-Path -LiteralPath $diskParent)) {
     New-Item -ItemType Directory -Path $diskParent -Force | Out-Null
 }
 
-# Pre-create/size shared VRAM backing file for zero-copy local viewer mapping.
-$vramBytes = [int64]$VramMb * 1MB
-$shmDir = Split-Path -Parent $ShmPath
-if ($shmDir -and -not (Test-Path -LiteralPath $shmDir)) {
-    New-Item -ItemType Directory -Path $shmDir -Force | Out-Null
-}
-$fs = [System.IO.File]::Open($ShmPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
-try {
-    $fs.SetLength($vramBytes)
-} finally {
-    $fs.Dispose()
-}
-
-$vmmArgs = @()
-if (-not [string]::IsNullOrWhiteSpace($resolvedUefi)) {
-    $vmmArgs += @("--uefi", "firmware=$resolvedUefi")
-} elseif (-not [string]::IsNullOrWhiteSpace($env:X86_64_OPENVMM_UEFI_FIRMWARE) -and (Test-Path -LiteralPath $env:X86_64_OPENVMM_UEFI_FIRMWARE)) {
-    $vmmArgs += "--uefi"
-} else {
-    throw "UEFI firmware (MSVM.fd) not found at '$PSScriptRoot\firmware\MSVM.fd'. Download a build artifact containing firmware\MSVM.fd or pass -UefiFirmware <path>."
-}
-
-$vmmArgs += @(
-    "-m", $Memory,
-    "-p", "$Processors",
-    "--vmbus-scsi", "id=scsi0"
-)
-
-$baseDiskSpec = if ($CreateDiskSize -and -not (Test-Path -LiteralPath $DiskPath)) {
-    "file:${DiskPath};create=${CreateDiskSize}"
-} else {
-    "file:${DiskPath}"
-}
-$diskSpec = if ($ReadOnlyDiff) {
-    "memdiff:${baseDiskSpec},on=scsi0"
-} else {
-    "${baseDiskSpec},on=scsi0"
-}
-$vmmArgs += @("--disk", $diskSpec)
-
-if (-not [string]::IsNullOrWhiteSpace($IsoPath)) {
-    $resolvedIso = (Resolve-Path -LiteralPath $IsoPath).Path
-    $vmmArgs += @("--disk", "file:${resolvedIso},dvd,on=scsi0")
-}
-
-if (-not $NoNet) {
-    $vmmArgs += @("--net", "consomme")
-}
-
-if (-not $SerialConsole) {
-    $vmmArgs += @("--com1", "null")
-}
-
-$vmmArgs += @(
-    "--fastdesk",
-    "--vram-mb", "$VramMb",
-    "--fastdesk-shm", $ShmPath
-)
-
-if ($UseHvSock) {
-    $vmmArgs += @("--fastdesk-vsock-port", "$VsockPort")
-    $viewerTarget = "hvsock://loopback/$VsockPort"
-} else {
-    $vmmArgs += @("--fastdesk-listen", $ListenAddr)
-    $viewerTarget = "tcp://$ListenAddr"
-}
-
-$quotedVmmArgs = ($vmmArgs | ForEach-Object { Format-ProcessArgument $_ }) -join " "
-Write-Host "Starting OpenVMM FastDesk ($VramMb MiB VRAM, SHM=$ShmPath)..." -ForegroundColor Cyan
-$vmmProc = Start-Process -FilePath $resolvedOpenVmm -ArgumentList $quotedVmmArgs -PassThru -NoNewWindow
+$autoShm = [string]::IsNullOrWhiteSpace($ShmPath)
+$vmmProc = $null
 
 try {
+    # Pre-create/size shared VRAM backing file for zero-copy local viewer mapping.
+    $vramBytes = [int64]$VramMb * 1MB
+    if ($autoShm) {
+        $shmDir = Join-Path ([System.IO.Path]::GetTempPath()) "openvmm-fastdesk"
+        if (-not (Test-Path -LiteralPath $shmDir)) {
+            New-Item -ItemType Directory -Path $shmDir -Force | Out-Null
+        }
+        $ShmPath = Join-Path $shmDir ("vram-{0}-{1}.shm" -f $PID, [Guid]::NewGuid().ToString("N"))
+        $shmFileMode = [System.IO.FileMode]::CreateNew
+    } else {
+        $shmDir = Split-Path -Parent $ShmPath
+        if ($shmDir -and -not (Test-Path -LiteralPath $shmDir)) {
+            New-Item -ItemType Directory -Path $shmDir -Force | Out-Null
+        }
+        $shmFileMode = [System.IO.FileMode]::OpenOrCreate
+    }
+    $fs = [System.IO.File]::Open($ShmPath, $shmFileMode, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+    try {
+        $fs.SetLength($vramBytes)
+    } finally {
+        $fs.Dispose()
+    }
+
+    $vmmArgs = @()
+    $vmmArgs += $uefiArgs
+    $vmmArgs += @(
+        "-m", $Memory,
+        "-p", "$Processors",
+        "--vmbus-scsi", "id=scsi0"
+    )
+
+    $baseDiskSpec = if ($CreateDiskSize -and -not (Test-Path -LiteralPath $DiskPath)) {
+        "file:${DiskPath};create=${CreateDiskSize}"
+    } else {
+        "file:${DiskPath}"
+    }
+    $diskSpec = if ($ReadOnlyDiff) {
+        "memdiff:${baseDiskSpec},on=scsi0"
+    } else {
+        "${baseDiskSpec},on=scsi0"
+    }
+    $vmmArgs += @("--disk", $diskSpec)
+
+    if (-not [string]::IsNullOrWhiteSpace($IsoPath)) {
+        $resolvedIso = (Resolve-Path -LiteralPath $IsoPath).Path
+        $vmmArgs += @("--disk", "file:${resolvedIso},dvd,on=scsi0")
+    }
+
+    if (-not $NoNet) {
+        $vmmArgs += @("--net", "consomme")
+    }
+
+    if (-not $SerialConsole) {
+        $vmmArgs += @("--com1", "null")
+    }
+
+    $vmmArgs += @(
+        "--fastdesk",
+        "--vram-mb", "$VramMb",
+        "--fastdesk-shm", $ShmPath
+    )
+
+    if ($UseHvSock) {
+        $vmmArgs += @("--fastdesk-vsock-port", "$VsockPort")
+        $viewerTarget = "hvsock://loopback/$VsockPort"
+    } else {
+        $vmmArgs += @("--fastdesk-listen", $ListenAddr)
+        $viewerTarget = "tcp://$ListenAddr"
+    }
+
+    $quotedVmmArgs = ($vmmArgs | ForEach-Object { Format-ProcessArgument $_ }) -join " "
+    Write-Host "Starting OpenVMM FastDesk ($VramMb MiB VRAM, SHM=$ShmPath)..." -ForegroundColor Cyan
+    $vmmProc = Start-Process -FilePath $resolvedOpenVmm -ArgumentList $quotedVmmArgs -PassThru -NoNewWindow
+
     Start-Sleep -Milliseconds 700
     if ($vmmProc.HasExited) {
         throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
@@ -197,5 +214,9 @@ try {
     if ($null -ne $vmmProc -and -not $vmmProc.HasExited) {
         Write-Host "Stopping OpenVMM (PID=$($vmmProc.Id))..." -ForegroundColor Yellow
         Stop-Process -Id $vmmProc.Id -Force -ErrorAction SilentlyContinue
+        try { $vmmProc.WaitForExit(5000) | Out-Null } catch {}
+    }
+    if ($autoShm -and -not [string]::IsNullOrWhiteSpace($ShmPath) -and (Test-Path -LiteralPath $ShmPath)) {
+        Remove-Item -LiteralPath $ShmPath -Force -ErrorAction SilentlyContinue
     }
 }
