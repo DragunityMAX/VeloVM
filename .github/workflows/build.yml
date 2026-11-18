@@ -266,10 +266,10 @@ jobs:
           set -euo pipefail
           HELP_TEXT="$(./openvmm/target/release/openvmm --help)"
           for flag in --fastdesk --fastdesk-shm --fastdesk-vsock-port --vram-mb; do
-            echo "$HELP_TEXT" | grep -q -- "$flag" || {
+            if [[ "$HELP_TEXT" != *"$flag"* ]]; then
               echo "Missing expected flag: $flag" >&2
               exit 1
-            }
+            fi
           done
 
           BENCH_FILE="$RUNNER_TEMP/bench-linux-x64.txt"

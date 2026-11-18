@@ -296,7 +296,7 @@ is_tcp_listening() {
         ' "${proc_files[@]}"
         return $?
     elif command -v ss >/dev/null 2>&1; then
-        ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep -q "LISTEN"
+        ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep "LISTEN" >/dev/null
         return $?
     fi
     return 1
