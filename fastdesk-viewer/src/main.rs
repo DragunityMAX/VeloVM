@@ -118,13 +118,219 @@ where
     }
 }
 
+#[cfg(any(windows, test))]
+const WIN32_HTCLIENT: u32 = 1;
+
+#[cfg(any(windows, test))]
+fn should_hide_win32_cursor_for_setcursor(
+    hide_client_cursor: bool,
+    target_hwnd: usize,
+    wparam_hwnd: usize,
+    lparam: isize,
+) -> bool {
+    let hit_test = (lparam as usize & 0xffff) as u32;
+    hide_client_cursor
+        && target_hwnd != 0
+        && target_hwnd == wparam_hwnd
+        && hit_test == WIN32_HTCLIENT
+}
+
+#[cfg(windows)]
+mod win32_cursor {
+    use super::should_hide_win32_cursor_for_setcursor;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::LPARAM;
+    use windows_sys::Win32::Foundation::LRESULT;
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Foundation::WPARAM;
+    use windows_sys::Win32::UI::WindowsAndMessaging::CallWindowProcW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetCursor;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCHITTEST;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WNDPROC;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+
+    #[derive(Clone, Copy)]
+    struct SubclassEntry {
+        prev_proc: isize,
+        hide_client_cursor: bool,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<usize, SubclassEntry>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<usize, SubclassEntry>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn proc_addr() -> isize {
+        client_cursor_wnd_proc as *const () as usize as isize
+    }
+
+    fn as_wndproc(addr: isize) -> WNDPROC {
+        if addr == 0 {
+            None
+        } else {
+            // SAFETY: `addr` was obtained from GetWindowLongPtrW/SetWindowLongPtrW(GWLP_WNDPROC).
+            Some(unsafe {
+                std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(addr)
+            })
+        }
+    }
+
+    unsafe extern "system" fn client_cursor_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        let key = hwnd as usize;
+        let our_addr = proc_addr();
+        let entry = {
+            let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+            if msg == WM_NCDESTROY {
+                map.remove(&key)
+            } else {
+                map.get(&key).copied()
+            }
+        };
+
+        if msg == WM_SETCURSOR {
+            if let Some(e) = entry {
+                if should_hide_win32_cursor_for_setcursor(e.hide_client_cursor, key, wparam, lparam)
+                {
+                    unsafe {
+                        SetCursor(std::ptr::null_mut());
+                    }
+                    return 1;
+                }
+            }
+        }
+
+        if let Some(e) = entry {
+            if e.prev_proc != 0 && e.prev_proc != our_addr {
+                return unsafe {
+                    CallWindowProcW(as_wndproc(e.prev_proc), hwnd, msg, wparam, lparam)
+                };
+            }
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    fn refresh_cursor_now(hwnd: HWND) {
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt) != 0 && WindowFromPoint(pt) == hwnd {
+                let packed_x = (pt.x as i16 as u16) as usize;
+                let packed_y = (pt.y as i16 as u16) as usize;
+                let hit_lparam = ((packed_y << 16) | packed_x) as LPARAM;
+                let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, hit_lparam);
+                if hit >= 0 {
+                    let setcursor_lparam = (hit as usize & 0xffff) as LPARAM;
+                    let _ = SendMessageW(hwnd, WM_SETCURSOR, hwnd as usize, setcursor_lparam);
+                }
+            }
+        }
+    }
+
+    pub fn set_client_cursor_visibility(hwnd: HWND, visible: bool) {
+        if hwnd.is_null() {
+            return;
+        }
+        let key = hwnd as usize;
+        let our_addr = proc_addr();
+        let hide = !visible;
+
+        if hide {
+            {
+                let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = map.get_mut(&key) {
+                    entry.hide_client_cursor = true;
+                    drop(map);
+                    refresh_cursor_now(hwnd);
+                    return;
+                }
+            }
+
+            let prev = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
+            if prev == 0 || prev == our_addr {
+                return;
+            }
+            {
+                let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+                map.insert(
+                    key,
+                    SubclassEntry {
+                        prev_proc: prev,
+                        hide_client_cursor: true,
+                    },
+                );
+            }
+            let actual_prev = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, our_addr) };
+            {
+                let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+                if actual_prev == 0 {
+                    map.remove(&key);
+                    return;
+                }
+                if actual_prev != our_addr {
+                    if let Some(entry) = map.get_mut(&key) {
+                        entry.prev_proc = actual_prev;
+                    }
+                }
+            }
+            refresh_cursor_now(hwnd);
+        } else {
+            let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
+            let prev_to_restore = {
+                let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+                if current == our_addr {
+                    map.remove(&key).map(|e| e.prev_proc)
+                } else {
+                    if let Some(entry) = map.get_mut(&key) {
+                        entry.hide_client_cursor = false;
+                    }
+                    None
+                }
+            };
+            if let Some(prev) = prev_to_restore {
+                if prev != 0 && prev != our_addr {
+                    unsafe {
+                        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev);
+                    }
+                }
+            }
+            refresh_cursor_now(hwnd);
+        }
+    }
+}
+
 trait CursorVisibilityTarget {
     fn set_native_cursor_visibility(&mut self, visible: bool);
 }
 
 impl CursorVisibilityTarget for Window {
     fn set_native_cursor_visibility(&mut self, visible: bool) {
-        self.set_cursor_visibility(visible);
+        #[cfg(windows)]
+        {
+            let hwnd = self.get_window_handle() as windows_sys::Win32::Foundation::HWND;
+            win32_cursor::set_client_cursor_visibility(hwnd, visible);
+        }
+        #[cfg(not(windows))]
+        {
+            self.set_cursor_visibility(visible);
+        }
     }
 }
 
@@ -142,32 +348,8 @@ impl NativeCursorController {
         self.hidden = hide;
     }
 
-    fn on_window_created_with_policy(
-        &mut self,
-        window: &mut impl CursorVisibilityTarget,
-        is_active: bool,
-        focus_scoped: bool,
-    ) {
-        self.sync(window, if focus_scoped { is_active } else { true });
-    }
-
-    fn on_window_created(&mut self, window: &mut impl CursorVisibilityTarget, is_active: bool) {
-        self.on_window_created_with_policy(window, is_active, cfg!(windows));
-    }
-
-    fn on_focus_state_with_policy(
-        &mut self,
-        window: &mut impl CursorVisibilityTarget,
-        is_active: bool,
-        focus_scoped: bool,
-    ) {
-        if focus_scoped {
-            self.sync(window, is_active);
-        }
-    }
-
-    fn on_focus_state(&mut self, window: &mut impl CursorVisibilityTarget, is_active: bool) {
-        self.on_focus_state_with_policy(window, is_active, cfg!(windows));
+    fn on_window_created(&mut self, window: &mut impl CursorVisibilityTarget) {
+        self.sync(window, true);
     }
 
     fn before_window_recreate(&mut self, old_window: &mut impl CursorVisibilityTarget) {
@@ -202,8 +384,7 @@ fn create_viewer_window(
     } else {
         window.set_target_fps(0);
     }
-    let is_active = window.is_active();
-    native_cursor.on_window_created(&mut window, is_active);
+    native_cursor.on_window_created(&mut window);
     input.attach_window(&mut window);
     Ok(window)
 }
@@ -393,8 +574,6 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
                 anyhow::bail!("server connection closed");
             }
 
-            let is_active = window.is_active();
-            native_cursor.on_focus_state(&mut window, is_active);
             for msg in input.poll(&window, comp.width, comp.height) {
                 write_client_msg(&mut writer_stream, &msg)?;
             }
@@ -648,19 +827,14 @@ mod tests {
 
     #[test]
     fn native_cursor_controller_manages_initial_creation_recreation_and_restore() {
-        // Non-focus-scoped backend (X11/Wayland): hides once per window instance,
-        // restores before recreation, stays hidden regardless of guest cursor visibility,
-        // and restores on exit.
         let mut ctrl = NativeCursorController::default();
         let mut win1 = MockCursorWindow::default();
-        ctrl.on_window_created_with_policy(&mut win1, false, false);
+
+        // Initial creation hides native cursor once; duplicate calls are idempotent.
+        ctrl.on_window_created(&mut win1);
+        ctrl.on_window_created(&mut win1);
         assert_eq!(win1.calls, vec![false]);
         assert_eq!(win1.show_cursor_count, -1);
-
-        // Repeated focus updates on non-focus-scoped backends are no-ops.
-        ctrl.on_focus_state_with_policy(&mut win1, true, false);
-        ctrl.on_focus_state_with_policy(&mut win1, false, false);
-        assert_eq!(win1.calls, vec![false]);
 
         // Resolution change recreates window: restore old window, hide new window.
         ctrl.before_window_recreate(&mut win1);
@@ -668,48 +842,81 @@ mod tests {
         assert_eq!(win1.show_cursor_count, 0);
 
         let mut win2 = MockCursorWindow::default();
-        ctrl.on_window_created_with_policy(&mut win2, true, false);
+        ctrl.on_window_created(&mut win2);
         assert_eq!(win2.calls, vec![false]);
         assert_eq!(win2.show_cursor_count, -1);
 
+        // Exit restores native cursor cleanly (and repeated restore is a no-op).
+        ctrl.restore(&mut win2);
         ctrl.restore(&mut win2);
         assert_eq!(win2.calls, vec![false, true]);
         assert_eq!(win2.show_cursor_count, 0);
+    }
 
-        // Focus-scoped backend (Windows ShowCursor): thread-global refcount must never drift
-        // across focus transitions, repeated polls, window recreation, or exit.
-        let mut win_ctrl = NativeCursorController::default();
-        let mut w1 = MockCursorWindow::default();
-        win_ctrl.on_window_created_with_policy(&mut w1, true, true);
-        assert_eq!(w1.show_cursor_count, -1);
+    #[test]
+    fn win32_setcursor_hides_only_for_client_area_of_target_window() {
+        let target_hwnd = 0x1234usize;
+        let other_hwnd = 0x5678usize;
 
-        // Repeated active polls must not decrement ShowCursor again.
-        win_ctrl.on_focus_state_with_policy(&mut w1, true, true);
-        win_ctrl.on_focus_state_with_policy(&mut w1, true, true);
-        assert_eq!(w1.show_cursor_count, -1);
-        assert_eq!(w1.calls, vec![false]);
+        // Client area (HTCLIENT = 1) hides when enabled for the target HWND,
+        // regardless of the mouse message code in HIWORD(lparam).
+        assert!(should_hide_win32_cursor_for_setcursor(
+            true,
+            target_hwnd,
+            target_hwnd,
+            WIN32_HTCLIENT as isize
+        ));
+        assert!(should_hide_win32_cursor_for_setcursor(
+            true,
+            target_hwnd,
+            target_hwnd,
+            ((0x0200usize << 16) | WIN32_HTCLIENT as usize) as isize
+        ));
 
-        // Focus loss shows cursor; regaining focus hides it once.
-        win_ctrl.on_focus_state_with_policy(&mut w1, false, true);
-        assert_eq!(w1.show_cursor_count, 0);
-        win_ctrl.on_focus_state_with_policy(&mut w1, false, true);
-        assert_eq!(w1.show_cursor_count, 0);
-        win_ctrl.on_focus_state_with_policy(&mut w1, true, true);
-        assert_eq!(w1.show_cursor_count, -1);
+        // Non-client controls (title bar, system menu, min/max/close buttons, resize borders,
+        // and error hit-test codes) must leave the native cursor visible.
+        for non_client_hit in [
+            0isize, // HTNOWHERE
+            2,      // HTCAPTION
+            3,      // HTSYSMENU
+            8,      // HTMINBUTTON
+            9,      // HTMAXBUTTON
+            10,     // HTLEFT
+            11,     // HTRIGHT
+            12,     // HTTOP
+            13,     // HTTOPLEFT
+            14,     // HTTOPRIGHT
+            15,     // HTBOTTOM
+            16,     // HTBOTTOMLEFT
+            17,     // HTBOTTOMRIGHT
+            20,     // HTCLOSE
+            0xfffe, // HTERROR (-2 as u16)
+        ] {
+            let lparam = ((0x0200usize << 16) | (non_client_hit as usize & 0xffff)) as isize;
+            assert!(
+                !should_hide_win32_cursor_for_setcursor(true, target_hwnd, target_hwnd, lparam),
+                "unexpectedly hid cursor for non-client hit test {non_client_hit}"
+            );
+        }
 
-        // Recreating window restores count to 0 before creating the new window.
-        win_ctrl.before_window_recreate(&mut w1);
-        assert_eq!(w1.show_cursor_count, 0);
-        let mut w2 = MockCursorWindow {
-            calls: Vec::new(),
-            show_cursor_count: w1.show_cursor_count,
-        };
-        win_ctrl.on_window_created_with_policy(&mut w2, false, true);
-        assert_eq!(w2.show_cursor_count, 0);
-        win_ctrl.on_focus_state_with_policy(&mut w2, true, true);
-        assert_eq!(w2.show_cursor_count, -1);
-
-        win_ctrl.restore(&mut w2);
-        assert_eq!(w2.show_cursor_count, 0);
+        // Disabled, mismatched HWND, or null HWND must not hide.
+        assert!(!should_hide_win32_cursor_for_setcursor(
+            false,
+            target_hwnd,
+            target_hwnd,
+            WIN32_HTCLIENT as isize
+        ));
+        assert!(!should_hide_win32_cursor_for_setcursor(
+            true,
+            target_hwnd,
+            other_hwnd,
+            WIN32_HTCLIENT as isize
+        ));
+        assert!(!should_hide_win32_cursor_for_setcursor(
+            true,
+            0,
+            0,
+            WIN32_HTCLIENT as isize
+        ));
     }
 }

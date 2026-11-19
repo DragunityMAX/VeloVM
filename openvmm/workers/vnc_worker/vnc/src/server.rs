@@ -72,10 +72,15 @@ pub struct Server<F, I> {
     clipboard: String,
 
     dirty_recv: Option<DirtyRectReceiver>,
-    /// Set by the coordinator when a dirty broadcast was dropped because
-    /// the per-client channel was full. The client checks and clears this
-    /// flag during collect_dirty to force a full refresh.
+    /// Set by the coordinator when a dirty broadcast was dropped or a guest
+    /// reset could not be queued because the per-client channel was full.
+    /// The client checks and clears this flag during collect_dirty to force a
+    /// full refresh.
     missed_dirty: Option<Arc<AtomicBool>>,
+    /// Authoritative shared flag indicating whether the upstream video device
+    /// is currently reporting dirty rectangles. Cleared out-of-band on reset so
+    /// a full per-client queue cannot drop the reset back to tile diff.
+    device_dirty_seen: Option<Arc<AtomicBool>>,
 }
 
 /// External handle that nudges the server's main loop to do an update pass.
@@ -94,10 +99,11 @@ impl Updater {
 }
 
 impl<F: Framebuffer, I: Input> Server<F, I> {
-    /// Builds a new `Server` bound to one client socket. `dirty_recv` (and
-    /// `missed_dirty`) are produced by the multi-client coordinator when
-    /// the synth video device is forwarding dirty rectangles; pass `None`
-    /// for both to fall back to whole-framebuffer tile-diff detection.
+    /// Builds a new `Server` bound to one client socket. `dirty_recv`,
+    /// `missed_dirty`, and `device_dirty_seen` are produced by the multi-client
+    /// coordinator when the synth video device is forwarding dirty rectangles;
+    /// pass `None` for all three to fall back to whole-framebuffer tile-diff
+    /// detection.
     pub fn new(
         name: String,
         socket: PolledSocket<socket2::Socket>,
@@ -105,6 +111,7 @@ impl<F: Framebuffer, I: Input> Server<F, I> {
         input: I,
         dirty_recv: Option<DirtyRectReceiver>,
         missed_dirty: Option<Arc<AtomicBool>>,
+        device_dirty_seen: Option<Arc<AtomicBool>>,
     ) -> Server<F, I> {
         let (update_send, update_recv) = async_channel::bounded(1);
         Self {
@@ -121,6 +128,7 @@ impl<F: Framebuffer, I: Input> Server<F, I> {
 
             dirty_recv,
             missed_dirty,
+            device_dirty_seen,
         }
     }
 
@@ -702,6 +710,7 @@ impl<F: Framebuffer, I: Input> Server<F, I> {
                     &mut self.dirty_recv,
                     cs.force_full_update,
                     &self.missed_dirty,
+                    &self.device_dirty_seen,
                 );
 
                 if !dirty.rects.is_empty() || cs.send_cursor {
@@ -1142,6 +1151,7 @@ mod tests {
                 input,
                 dirty_recv,
                 missed_dirty,
+                None,
             );
             let mut updater = server.updater();
             let mut timer = PolledTimer::new(&driver);

@@ -61,6 +61,7 @@ fn main() -> Result<(), Error> {
             IgnoreInput,
             None,
             None,
+            None,
         );
         server.run().await
     })
