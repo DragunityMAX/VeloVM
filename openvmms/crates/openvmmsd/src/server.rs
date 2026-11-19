@@ -66,6 +66,7 @@ impl ApiError {
             StatusCode::NOT_FOUND
         } else if msg.contains("already exists")
             || msg.contains("already Running")
+            || msg.contains("is already ")
             || msg.contains("occupied")
             || msg.contains("must be")
             || msg.contains("cannot ")
@@ -1500,6 +1501,362 @@ while not stop_evt.is_set():
             .await
             .unwrap();
         assert_eq!(final_stop.status(), 200);
+
+        daemon.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_stop_requests_wait_for_cleanup_and_preserve_restarted_vm() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let state_dir = dir.path().join("stub_state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let stub_path = dir.path().join("openvmm_stop_stub.py");
+        let stub_script = format!(
+            r#"#!/usr/bin/env python3
+import os, socket, struct, sys, threading, time
+
+STATE_DIR = {state_dir:?}
+sock_path = None
+args = sys.argv[1:]
+for i, a in enumerate(args):
+    if a == "--rpc" and i + 1 < len(args):
+        for part in args[i + 1].split(","):
+            if part.startswith("path="):
+                sock_path = part[5:]
+
+count_file = os.path.join(STATE_DIR, "launch_count")
+try:
+    with open(count_file, "r") as f:
+        launch = int(f.read().strip()) + 1
+except FileNotFoundError:
+    launch = 1
+with open(count_file, "w") as f:
+    f.write(str(launch))
+
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(32)
+stop_evt = threading.Event()
+
+def send_ok(conn, stream_id):
+    env = b"\x12\x00"
+    hdr = struct.pack(">IIBB", len(env), stream_id, 2, 0)
+    conn.sendall(hdr + env)
+
+def handle(conn):
+    try:
+        hdr = conn.recv(10)
+        if len(hdr) < 10:
+            return
+        length, stream_id, _, _ = struct.unpack(">IIBB", hdr)
+        data = b""
+        while len(data) < length:
+            chunk = conn.recv(length - len(data))
+            if not chunk:
+                return
+            data += chunk
+        if b"WaitVM" in data:
+            stop_evt.wait(timeout=15)
+            send_ok(conn, stream_id)
+        elif b"TeardownVM" in data:
+            if launch == 1:
+                open(os.path.join(STATE_DIR, "teardown_entered"), "w").close()
+                time.sleep(0.6)
+                open(os.path.join(STATE_DIR, "teardown_finished"), "w").close()
+            stop_evt.set()
+            send_ok(conn, stream_id)
+        elif b"Quit" in data:
+            if launch == 2:
+                open(os.path.join(STATE_DIR, "launch2_quit"), "w").close()
+            stop_evt.set()
+            send_ok(conn, stream_id)
+        else:
+            send_ok(conn, stream_id)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+while not stop_evt.is_set():
+    srv.settimeout(0.1)
+    try:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+"#,
+            state_dir = state_dir.to_string_lossy().into_owned(),
+        );
+        fs::write(&stub_path, stub_script).unwrap();
+        fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fw_path = dir.path().join("MSVM.fd");
+        fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+        let mut cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        cfg.openvmm_bin = Some(stub_path);
+        cfg.uefi_firmware_path = Some(fw_path);
+        assert_eq!(
+            client
+                .put(format!("{}/api/v1/host/config", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&cfg)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "ConcurrentStop-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: Some(openvmms_core::models::FastDeskSettings {
+                    enabled: false,
+                    ..Default::default()
+                }),
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: Some(vec![]),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+
+        let start1_resp = client
+            .post(format!(
+                "{}/api/v1/vms/ConcurrentStop-VM/start",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start1_resp.status(), 200);
+
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let stop1 = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/v1/vms/ConcurrentStop-VM/stop"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        let teardown_entered = state_dir.join("teardown_entered");
+        let teardown_finished = state_dir.join("teardown_finished");
+        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !teardown_entered.exists() {
+            assert!(
+                tokio::time::Instant::now() < wait_deadline,
+                "stub never entered first TeardownVM"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Starting while Stopping must be rejected with 409 Conflict.
+        let early_start = client
+            .post(format!(
+                "{}/api/v1/vms/ConcurrentStop-VM/start",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(early_start.status(), 409);
+
+        // Concurrent second stop must wait until the first stop's cleanup finishes.
+        let stop2_resp = client
+            .post(format!(
+                "{}/api/v1/vms/ConcurrentStop-VM/stop",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stop2_resp.status(), 200);
+        let stop2_vm: VmSummary = stop2_resp.json().await.unwrap();
+        assert_eq!(stop2_vm.runtime.status, VmStatus::Off);
+        assert!(
+            teardown_finished.exists(),
+            "second stop returned before first stop finished TeardownVM"
+        );
+
+        let stop1_resp = stop1.await.unwrap();
+        assert_eq!(stop1_resp.status(), 200);
+        let stop1_vm: VmSummary = stop1_resp.json().await.unwrap();
+        assert_eq!(stop1_vm.runtime.status, VmStatus::Off);
+
+        // Immediately restart the VM and verify the replacement instance stays Running.
+        let start2_resp = client
+            .post(format!(
+                "{}/api/v1/vms/ConcurrentStop-VM/start",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start2_resp.status(), 200);
+        let started2: VmSummary = start2_resp.json().await.unwrap();
+        assert_eq!(started2.runtime.status, VmStatus::Running);
+        let pid2 = started2.runtime.pid.expect("replacement VM must have PID");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !state_dir.join("launch2_quit").exists(),
+            "replacement VM received unexpected Quit from prior stop"
+        );
+        let check: VmSummary = client
+            .get(format!("{}/api/v1/vms/ConcurrentStop-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(check.runtime.status, VmStatus::Running);
+        assert_eq!(check.runtime.pid, Some(pid2));
+
+        let final_stop = client
+            .post(format!(
+                "{}/api/v1/vms/ConcurrentStop-VM/stop",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(final_stop.status(), 200);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_create_vm_does_not_leave_created_disk_behind_and_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let disk_path = dir.path().join("retry-os.img");
+        for bad_vcpus in [0, 512] {
+            let bad_resp = client
+                .post(format!("{}/api/v1/vms", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&CreateVmPayload {
+                    name: "Validate-First-VM".into(),
+                    description: String::new(),
+                    preset: VmPreset::Custom,
+                    vcpus: Some(bad_vcpus),
+                    memory_mb: Some(1024),
+                    nested_virt: None,
+                    uefi_firmware: None,
+                    secure_boot_enabled: None,
+                    secure_boot_template: None,
+                    fastdesk: None,
+                    disks: vec![],
+                    create_disk: Some(CreateDiskPayload {
+                        path: disk_path.clone(),
+                        size_bytes: 16 * 1024 * 1024,
+                        format: DiskFormat::Raw,
+                        fixed: false,
+                    }),
+                    iso_path: None,
+                    nics: None,
+                })
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                bad_resp.status().is_client_error(),
+                "expected 4xx error for bad vcpus={bad_vcpus}, got {}",
+                bad_resp.status()
+            );
+            let err_body = bad_resp.text().await.unwrap();
+            assert!(
+                err_body.contains("vcpus must be between 1 and 256"),
+                "unexpected error body: {err_body}"
+            );
+            assert!(
+                !disk_path.exists(),
+                "failed create_vm with vcpus={bad_vcpus} left disk {} behind",
+                disk_path.display()
+            );
+        }
+
+        // Retrying with corrected vcpus using the same disk path must now succeed.
+        let ok_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Validate-First-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(4),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: Some(CreateDiskPayload {
+                    path: disk_path.clone(),
+                    size_bytes: 16 * 1024 * 1024,
+                    format: DiskFormat::Raw,
+                    fixed: false,
+                }),
+                iso_path: None,
+                nics: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), 201);
+        let vm: VmSummary = ok_resp.json().await.unwrap();
+        assert_eq!(vm.config.disks.len(), 1);
+        assert_eq!(vm.config.disks[0].path, disk_path);
+        assert!(disk_path.exists());
 
         daemon.shutdown().await;
     }

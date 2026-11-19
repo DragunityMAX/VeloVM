@@ -56,9 +56,15 @@ pub fn create_disk(
                 .create_new(true)
                 .open(&req.path)
                 .with_context(|| format!("creating raw disk {}", req.path.display()))?;
-            file.set_len(req.size_bytes)
-                .with_context(|| format!("sizing raw disk {}", req.path.display()))?;
-            inspect_disk(&req.path, openvmm_img_bin)
+            let sized = file
+                .set_len(req.size_bytes)
+                .with_context(|| format!("sizing raw disk {}", req.path.display()));
+            drop(file);
+            let res = sized.and_then(|()| inspect_disk(&req.path, openvmm_img_bin));
+            if res.is_err() {
+                let _ = fs::remove_file(&req.path);
+            }
+            res
         }
         DiskFormat::Vhdx => {
             let img_bin = openvmm_img_bin.context(
@@ -78,6 +84,9 @@ pub fn create_disk(
                 .output()
                 .with_context(|| format!("running {}", img_bin.display()))?;
             if !output.status.success() {
+                if req.path.exists() {
+                    let _ = fs::remove_file(&req.path);
+                }
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 bail!(
@@ -91,7 +100,11 @@ pub fn create_disk(
                     }
                 );
             }
-            inspect_disk(&req.path, Some(img_bin))
+            let res = inspect_disk(&req.path, Some(img_bin));
+            if res.is_err() && req.path.exists() {
+                let _ = fs::remove_file(&req.path);
+            }
+            res
         }
     }
 }

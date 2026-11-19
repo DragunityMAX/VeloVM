@@ -22,14 +22,18 @@ use openvmms_core::models::VmPreset;
 use openvmms_core::models::VmStatus;
 use openvmms_core::models::VmSummary;
 use std::io::BufRead;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+
+type SharedEndpoint = Arc<RwLock<Option<(String, String)>>>;
 
 #[derive(Debug, Clone)]
 pub enum GuiRequest {
@@ -98,6 +102,7 @@ impl BackendHandle {
         thread::spawn(move || {
             let mut client: Option<ApiClient> = None;
             let sse_active = Arc::new(AtomicBool::new(false));
+            let shared_endpoint: SharedEndpoint = Arc::new(RwLock::new(None));
 
             let emit = |msg: GuiUpdate| {
                 let _ = upd_tx.send(msg);
@@ -109,6 +114,7 @@ impl BackendHandle {
                     GuiRequest::ConnectOrStartDaemon => {
                         match ensure_daemon_running(data_dir.as_deref(), daemon_url.as_deref()) {
                             Ok(c) => {
+                                set_shared_endpoint(&shared_endpoint, &c);
                                 if sse_active
                                     .compare_exchange(
                                         false,
@@ -119,8 +125,9 @@ impl BackendHandle {
                                     .is_ok()
                                 {
                                     spawn_sse_listener(
-                                        c.base_url().to_string(),
-                                        c.token().to_string(),
+                                        data_dir.clone(),
+                                        daemon_url.clone(),
+                                        Arc::clone(&shared_endpoint),
                                         upd_tx.clone(),
                                         repaint_ctx.clone(),
                                         Arc::clone(&sse_active),
@@ -155,8 +162,31 @@ impl BackendHandle {
                             ));
                             continue;
                         };
-                        if let Err(err) = handle_client_request(c, other, &emit) {
-                            emit(GuiUpdate::ErrorMessage(format!("{err:#}")));
+                        sync_client_before_request(
+                            c,
+                            data_dir.as_deref(),
+                            daemon_url.as_deref(),
+                            &shared_endpoint,
+                        );
+                        if let Err(err) =
+                            handle_client_request(c, other.clone(), &shared_endpoint, &emit)
+                        {
+                            if let Some(reloaded) = reload_client_from_data_dir(
+                                data_dir.as_deref(),
+                                daemon_url.as_deref(),
+                                &shared_endpoint,
+                            ) && (reloaded.base_url() != c.base_url()
+                                || reloaded.token() != c.token())
+                            {
+                                *c = reloaded;
+                                if let Err(retry_err) =
+                                    handle_client_request(c, other, &shared_endpoint, &emit)
+                                {
+                                    emit(GuiUpdate::ErrorMessage(format!("{retry_err:#}")));
+                                }
+                            } else {
+                                emit(GuiUpdate::ErrorMessage(format!("{err:#}")));
+                            }
                         }
                     }
                 }
@@ -175,6 +205,61 @@ impl BackendHandle {
     }
 }
 
+fn set_shared_endpoint(shared_endpoint: &SharedEndpoint, client: &ApiClient) {
+    *shared_endpoint.write().unwrap() =
+        Some((client.base_url().to_string(), client.token().to_string()));
+}
+
+fn reload_client_from_data_dir(
+    data_dir: Option<&Path>,
+    daemon_url: Option<&str>,
+    shared_endpoint: &SharedEndpoint,
+) -> Option<ApiClient> {
+    let current = shared_endpoint.read().unwrap().clone();
+    if let Ok(c) = ApiClient::from_data_dir(data_dir, None) {
+        let token_matches = current
+            .as_ref()
+            .is_none_or(|(_, cur_token)| c.token() == cur_token);
+        if (daemon_url.is_none() || token_matches) && c.health().is_ok() {
+            set_shared_endpoint(shared_endpoint, &c);
+            return Some(c);
+        }
+    }
+    if let Some((base_url, token)) = current
+        && let Ok(c) = ApiClient::new(base_url, token)
+        && c.health().is_ok()
+    {
+        return Some(c);
+    }
+    None
+}
+
+fn sync_client_before_request(
+    client: &mut ApiClient,
+    data_dir: Option<&Path>,
+    daemon_url: Option<&str>,
+    shared_endpoint: &SharedEndpoint,
+) {
+    if let Some((shared_url, shared_token)) = shared_endpoint.read().unwrap().clone()
+        && (shared_url != client.base_url() || shared_token != client.token())
+        && let Ok(updated) = ApiClient::new(shared_url, shared_token)
+        && updated.health().is_ok()
+    {
+        *client = updated;
+        return;
+    }
+
+    if let Ok(disk_client) = ApiClient::from_data_dir(data_dir, None) {
+        let token_matches = disk_client.token() == client.token();
+        let changed =
+            disk_client.base_url() != client.base_url() || disk_client.token() != client.token();
+        if changed && (daemon_url.is_none() || token_matches) && disk_client.health().is_ok() {
+            set_shared_endpoint(shared_endpoint, &disk_client);
+            *client = disk_client;
+        }
+    }
+}
+
 fn fetch_full_snapshot(
     client: &ApiClient,
 ) -> anyhow::Result<(HostInfo, HostConfig, Vec<VirtualSwitchInfo>, Vec<VmSummary>)> {
@@ -185,7 +270,12 @@ fn fetch_full_snapshot(
     Ok((host_info, host_config, switches, vms))
 }
 
-fn handle_client_request<F>(client: &mut ApiClient, req: GuiRequest, emit: &F) -> anyhow::Result<()>
+fn handle_client_request<F>(
+    client: &mut ApiClient,
+    req: GuiRequest,
+    shared_endpoint: &SharedEndpoint,
+    emit: &F,
+) -> anyhow::Result<()>
 where
     F: Fn(GuiUpdate),
 {
@@ -365,6 +455,7 @@ where
             let next_base = normalize_base_url(&updated.listen_addr);
             if next_base != client.base_url() {
                 *client = ApiClient::new(next_base, client.token())?;
+                set_shared_endpoint(shared_endpoint, client);
             }
             let host_info = client.host_info()?;
             emit(GuiUpdate::StatusMessage("Saved host settings".to_string()));
@@ -377,9 +468,62 @@ where
     }
 }
 
+fn resolve_updated_client(
+    current_base_url: &str,
+    current_token: &str,
+    data_dir: Option<&Path>,
+    daemon_url: Option<&str>,
+    shared_endpoint: &SharedEndpoint,
+) -> Option<ApiClient> {
+    if let Some(c) = reload_client_from_data_dir(data_dir, daemon_url, shared_endpoint) {
+        if c.base_url() != current_base_url {
+            return Some(c);
+        }
+        if let Ok(hc) = c.host_config() {
+            let next_base = normalize_base_url(&hc.listen_addr);
+            if next_base != current_base_url
+                && let Ok(next_client) = ApiClient::new(next_base, c.token())
+                && next_client.health().is_ok()
+            {
+                set_shared_endpoint(shared_endpoint, &next_client);
+                return Some(next_client);
+            }
+        }
+        return Some(c);
+    }
+    ApiClient::new(current_base_url, current_token).ok()
+}
+
+fn maybe_switch_endpoint_on_disconnect(
+    current_base_url: &str,
+    data_dir: Option<&Path>,
+    daemon_url: Option<&str>,
+    shared_endpoint: &SharedEndpoint,
+    upd_tx: &mpsc::Sender<GuiUpdate>,
+    repaint_ctx: &egui::Context,
+) -> bool {
+    if let Some(c) = reload_client_from_data_dir(data_dir, daemon_url, shared_endpoint)
+        && c.base_url() != current_base_url
+    {
+        if let Ok((host_info, host_config, switches, vms)) = fetch_full_snapshot(&c) {
+            let _ = upd_tx.send(GuiUpdate::DaemonConnected {
+                base_url: c.base_url().to_string(),
+                host_info,
+                host_config,
+                switches,
+                vms,
+            });
+            repaint_ctx.request_repaint();
+        }
+        return true;
+    }
+    false
+}
+
 fn spawn_sse_listener(
-    base_url: String,
-    token: String,
+    data_dir: Option<PathBuf>,
+    daemon_url: Option<String>,
+    shared_endpoint: SharedEndpoint,
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
     sse_active: Arc<AtomicBool>,
@@ -392,9 +536,22 @@ fn spawn_sse_listener(
                 return;
             }
         };
-        let url = format!("{base_url}/api/v1/events?token={token}");
         let mut stopping = false;
         while !stopping {
+            let endpoint = shared_endpoint.read().unwrap().clone().or_else(|| {
+                reload_client_from_data_dir(
+                    data_dir.as_deref(),
+                    daemon_url.as_deref(),
+                    &shared_endpoint,
+                )
+                .map(|c| (c.base_url().to_string(), c.token().to_string()))
+            });
+            let Some((base_url, token)) = endpoint else {
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            };
+            let url = format!("{base_url}/api/v1/events?token={token}");
+            let mut switched_endpoint = false;
             match http.get(&url).send() {
                 Ok(resp) if resp.status().is_success() => {
                     let reader = std::io::BufReader::new(resp);
@@ -412,18 +569,28 @@ fn spawn_sse_listener(
                                     repaint_ctx.request_repaint();
                                 }
                                 DaemonEvent::HostConfigUpdated => {
-                                    if let Ok(c) = ApiClient::new(&base_url, &token)
-                                        && let Ok((host_info, host_config, switches, vms)) =
-                                            fetch_full_snapshot(&c)
+                                    if let Some(c) = resolve_updated_client(
+                                        &base_url,
+                                        &token,
+                                        data_dir.as_deref(),
+                                        daemon_url.as_deref(),
+                                        &shared_endpoint,
+                                    ) && let Ok((host_info, host_config, switches, vms)) =
+                                        fetch_full_snapshot(&c)
                                     {
+                                        let new_base = c.base_url().to_string();
                                         let _ = upd_tx.send(GuiUpdate::DaemonConnected {
-                                            base_url: base_url.clone(),
+                                            base_url: new_base.clone(),
                                             host_info,
                                             host_config,
                                             switches,
                                             vms,
                                         });
                                         repaint_ctx.request_repaint();
+                                        if new_base != base_url {
+                                            switched_endpoint = true;
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonEvent::DaemonStopping => {
@@ -437,11 +604,31 @@ fn spawn_sse_listener(
                             }
                         }
                     }
-                    if !stopping {
+                    if !stopping && !switched_endpoint {
+                        if maybe_switch_endpoint_on_disconnect(
+                            &base_url,
+                            data_dir.as_deref(),
+                            daemon_url.as_deref(),
+                            &shared_endpoint,
+                            &upd_tx,
+                            &repaint_ctx,
+                        ) {
+                            continue;
+                        }
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
                 _ => {
+                    if maybe_switch_endpoint_on_disconnect(
+                        &base_url,
+                        data_dir.as_deref(),
+                        daemon_url.as_deref(),
+                        &shared_endpoint,
+                        &upd_tx,
+                        &repaint_ctx,
+                    ) {
+                        continue;
+                    }
                     thread::sleep(Duration::from_secs(2));
                 }
             }
@@ -555,4 +742,157 @@ pub fn run_self_test() -> anyhow::Result<()> {
     rt.block_on(daemon.shutdown());
     println!("SELF-TEST OK");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recv_until<F>(handle: &BackendHandle, timeout: Duration, mut pred: F) -> GuiUpdate
+    where
+        F: FnMut(&GuiUpdate) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            while let Some(upd) = handle.try_recv() {
+                if let GuiUpdate::ErrorMessage(err) = &upd {
+                    panic!("unexpected GuiUpdate::ErrorMessage: {err}");
+                }
+                if pred(&upd) {
+                    return upd;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for expected GuiUpdate"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn backend_handle_follows_external_daemon_port_change_for_requests_and_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let daemon = rt
+            .block_on(openvmmsd::TestDaemonHandle::spawn(dir.path().to_path_buf()))
+            .unwrap();
+        let old_base_url = daemon.base_url.clone();
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        }) {
+            GuiUpdate::DaemonConnected { base_url, .. } => {
+                assert_eq!(base_url, old_base_url);
+            }
+            _ => unreachable!(),
+        }
+
+        // Another client updates listen_addr to a fresh ephemeral port, closing the old listener.
+        let external_client = ApiClient::new(&old_base_url, &daemon.token).unwrap();
+        let mut cfg = external_client.host_config().unwrap();
+        cfg.listen_addr = "127.0.0.1:0".to_string();
+        let updated_cfg = external_client.update_host_config(&cfg).unwrap();
+        let new_base_url = normalize_base_url(&updated_cfg.listen_addr);
+        assert_ne!(new_base_url, old_base_url);
+
+        // Wait until the GUI's SSE listener emits the reconnected snapshot on the new URL.
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { base_url, .. } if base_url == &new_base_url
+            )
+        }) {
+            GuiUpdate::DaemonConnected { base_url, .. } => {
+                assert_eq!(base_url, new_base_url);
+            }
+            _ => unreachable!(),
+        }
+
+        // Ensure the old listener has completely stopped accepting connections before testing requests.
+        let old_addr: std::net::SocketAddr = old_base_url
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        let close_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::net::TcpStream::connect(old_addr).is_ok() {
+            assert!(
+                std::time::Instant::now() < close_deadline,
+                "old listener {old_addr} stayed open"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // GUI RefreshAll request must succeed using the new endpoint.
+        backend.send(GuiRequest::RefreshAll);
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        }) {
+            GuiUpdate::DaemonConnected { base_url, .. } => {
+                assert_eq!(base_url, new_base_url);
+            }
+            _ => unreachable!(),
+        }
+
+        // An external client creating a VM on the new port must arrive over the reconnected SSE stream.
+        let new_external = ApiClient::new(&new_base_url, &daemon.token).unwrap();
+        let created = new_external
+            .create_vm(&CreateVmPayload {
+                name: "PortSync-SSE-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: None,
+            })
+            .unwrap();
+
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::VmUpdated(vm) if vm.config.id == created.config.id)
+        }) {
+            GuiUpdate::VmUpdated(vm) => {
+                assert_eq!(vm.config.name, "PortSync-SSE-VM");
+            }
+            _ => unreachable!(),
+        }
+
+        // GUI mutation request after port change must also succeed on the new endpoint.
+        backend.send(GuiRequest::UpdateVm {
+            id: created.config.id,
+            payload: UpdateVmPayload {
+                description: Some("updated via GUI after port change".into()),
+                ..Default::default()
+            },
+        });
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::VmUpdated(vm)
+                    if vm.config.id == created.config.id
+                        && vm.config.description == "updated via GUI after port change"
+            )
+        }) {
+            GuiUpdate::VmUpdated(vm) => {
+                assert_eq!(vm.config.description, "updated via GUI after port change");
+            }
+            _ => unreachable!(),
+        }
+
+        rt.block_on(daemon.shutdown());
+    }
 }

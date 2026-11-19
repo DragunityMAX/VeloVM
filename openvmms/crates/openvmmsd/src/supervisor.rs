@@ -58,6 +58,7 @@ struct ManagedVm {
     monitor_handle: Option<tokio::task::AbortHandle>,
     generation: u64,
     start_cancel: Option<watch::Sender<bool>>,
+    stop_wait: Option<watch::Receiver<bool>>,
 }
 
 struct ActiveListener {
@@ -126,6 +127,7 @@ impl Supervisor {
                     monitor_handle: None,
                     generation: 0,
                     start_cancel: None,
+                    stop_wait: None,
                 },
             );
         }
@@ -439,7 +441,7 @@ impl Supervisor {
 
         let probe_id = Uuid::new_v4();
         let vm_dir = self.store.vm_dir(probe_id);
-        let mut cfg = VmConfig::from_preset(trimmed_name, payload.preset, &vm_dir);
+        let mut cfg = VmConfig::from_preset(trimmed_name.clone(), payload.preset, &vm_dir);
         cfg.id = probe_id;
         cfg.vmgs_path = Some(vm_dir.join("state.vmgs"));
         cfg.description = payload.description;
@@ -485,7 +487,7 @@ impl Supervisor {
             cfg.disks.push(disk_att);
         }
 
-        if let Some(mut disk_req) = payload.create_disk {
+        let pending_disk_req = if let Some(mut disk_req) = payload.create_disk {
             if disk_req.path.as_os_str().is_empty() {
                 let ext = match disk_req.format {
                     DiskFormat::Vhdx => "vhdx",
@@ -500,16 +502,18 @@ impl Supervisor {
             } else {
                 disk::sync_disk_path_extension(&mut disk_req.path, disk_req.format);
             }
-            let info = disk::create_disk(&disk_req, paths.openvmm_img_bin.as_deref())?;
             let lun = cfg.next_free_lun();
             cfg.disks.push(DiskAttachment {
                 lun,
                 kind: DiskKind::HardDisk,
-                path: info.path,
+                path: disk_req.path.clone(),
                 read_only: false,
                 format: disk_req.format,
             });
-        }
+            Some(disk_req)
+        } else {
+            None
+        };
 
         if let Some(iso_path) = payload.iso_path {
             let lun = cfg.next_free_lun();
@@ -523,18 +527,49 @@ impl Supervisor {
         }
 
         cfg.validate()?;
-        self.store.save_vm(&cfg)?;
 
-        let managed = ManagedVm {
-            config: cfg,
-            runtime: VmRuntimeState::default(),
-            child: None,
-            monitor_handle: None,
-            generation: 0,
-            start_cancel: None,
+        let created_disk_path = if let Some(disk_req) = pending_disk_req {
+            let info = disk::create_disk(&disk_req, paths.openvmm_img_bin.as_deref())?;
+            Some(info.path)
+        } else {
+            None
         };
-        let summary = managed.summary();
-        self.vms.write().unwrap().insert(summary.config.id, managed);
+
+        let persist_res: anyhow::Result<VmSummary> = (|| {
+            let mut guard = self.vms.write().unwrap();
+            if guard
+                .values()
+                .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
+            {
+                bail!("a VM named '{trimmed_name}' already exists");
+            }
+            self.store.save_vm(&cfg)?;
+
+            let managed = ManagedVm {
+                config: cfg,
+                runtime: VmRuntimeState::default(),
+                child: None,
+                monitor_handle: None,
+                generation: 0,
+                start_cancel: None,
+                stop_wait: None,
+            };
+            let summary = managed.summary();
+            guard.insert(summary.config.id, managed);
+            Ok(summary)
+        })();
+
+        let summary = match persist_res {
+            Ok(summary) => summary,
+            Err(err) => {
+                if let Some(path) = created_disk_path {
+                    let _ = fs::remove_file(path);
+                }
+                let _ = self.store.delete_vm_dir(probe_id);
+                return Err(err);
+            }
+        };
+
         self.emit(DaemonEvent::VmUpdated {
             vm: summary.clone(),
         });
@@ -945,15 +980,20 @@ impl Supervisor {
         let client = TtrpcClient::new(&sock_path);
         let wait_res = client.wait_vm().await;
 
-        let should_cleanup = {
-            let guard = self.vms.read().unwrap();
-            guard
-                .get(&id)
-                .is_some_and(|vm| vm.generation == run_gen && vm.runtime.status != VmStatus::Stopping)
+        let stop_done_tx = {
+            let mut guard = self.vms.write().unwrap();
+            let Some(vm) = guard.get_mut(&id) else {
+                return;
+            };
+            if vm.generation != run_gen || vm.runtime.status == VmStatus::Stopping {
+                return;
+            }
+            let (stop_done_tx, stop_done_rx) = watch::channel(false);
+            vm.runtime.status = VmStatus::Stopping;
+            vm.monitor_handle = None;
+            vm.stop_wait = Some(stop_done_rx);
+            stop_done_tx
         };
-        if !should_cleanup {
-            return;
-        }
 
         let props = client
             .properties_vm(vmservice::PropertiesVmRequest { types: vec![] })
@@ -967,7 +1007,7 @@ impl Supervisor {
             let mut guard = self.vms.write().unwrap();
             guard
                 .get_mut(&id)
-                .filter(|vm| vm.generation == run_gen && vm.runtime.status != VmStatus::Stopping)
+                .filter(|vm| vm.generation == run_gen)
                 .and_then(|vm| vm.child.take())
         };
 
@@ -997,9 +1037,11 @@ impl Supervisor {
         let summary = {
             let mut guard = self.vms.write().unwrap();
             let Some(vm) = guard.get_mut(&id) else {
+                let _ = stop_done_tx.send(true);
                 return;
             };
-            if vm.generation != run_gen || vm.runtime.status == VmStatus::Stopping {
+            if vm.generation != run_gen {
+                let _ = stop_done_tx.send(true);
                 return;
             }
             cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
@@ -1008,6 +1050,7 @@ impl Supervisor {
             vm.runtime.fastdesk_endpoint = None;
             vm.runtime.live_properties = None;
             vm.monitor_handle = None;
+            vm.stop_wait = None;
 
             let halt_reason = props.and_then(|p| p.halt_reason);
             match wait_res {
@@ -1028,12 +1071,13 @@ impl Supervisor {
             vm.summary()
         };
 
+        let _ = stop_done_tx.send(true);
         self.emit(DaemonEvent::VmUpdated { vm: summary });
     }
 
-    pub async fn stop_vm(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {
+    pub async fn stop_vm(self: &Arc<Self>, id_or_name: &str) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
-        let (stop_gen, sock_opt, shm_opt, child_opt, abort_opt) = {
+        let (wait_rx, stop_task_args) = {
             let mut guard = self.vms.write().unwrap();
             let vm = guard.get_mut(&id).context("VM not found")?;
             if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
@@ -1041,76 +1085,129 @@ impl Supervisor {
                 vm.runtime.last_error = None;
                 return Ok(vm.summary());
             }
-            vm.generation += 1;
-            let stop_gen = vm.generation;
-            if let Some(cancel_tx) = vm.start_cancel.take() {
-                let _ = cancel_tx.send(true);
-            }
-            vm.runtime.status = VmStatus::Stopping;
-            (
-                stop_gen,
-                vm.runtime.rpc_socket_path.take(),
-                vm.runtime.shm_path.take(),
-                vm.child.take(),
-                vm.monitor_handle.take(),
-            )
-        };
-        if let Some(abort) = abort_opt {
-            abort.abort();
-        }
-        self.emit_vm_snapshot(id);
-
-        if let Some(sock) = &sock_opt {
-            let client = TtrpcClient::new(sock);
-            let _ = tokio::time::timeout(Duration::from_secs(4), client.teardown_vm()).await;
-            let _ = tokio::time::timeout(Duration::from_secs(2), client.quit()).await;
-        }
-
-        if let Some(mut child) = child_opt {
-            let _ = tokio::task::spawn_blocking(move || {
-                let start = std::time::Instant::now();
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) if start.elapsed() < Duration::from_secs(3) => {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        _ => {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            break;
-                        }
-                    }
+            if vm.runtime.status == VmStatus::Stopping {
+                if let Some(rx) = vm.stop_wait.clone() {
+                    (Some(rx), None)
+                } else {
+                    bail!(
+                        "cannot stop VM '{}' while it is already Stopping",
+                        vm.config.name
+                    );
                 }
-            })
-            .await;
+            } else {
+                vm.generation += 1;
+                let stop_gen = vm.generation;
+                if let Some(cancel_tx) = vm.start_cancel.take() {
+                    let _ = cancel_tx.send(true);
+                }
+                let (stop_done_tx, stop_done_rx) = watch::channel(false);
+                vm.stop_wait = Some(stop_done_rx.clone());
+                vm.runtime.status = VmStatus::Stopping;
+                (
+                    Some(stop_done_rx),
+                    Some((
+                        stop_gen,
+                        vm.runtime.rpc_socket_path.take(),
+                        vm.runtime.shm_path.take(),
+                        vm.child.take(),
+                        vm.monitor_handle.take(),
+                        stop_done_tx,
+                    )),
+                )
+            }
+        };
+
+        if let Some((stop_gen, sock_opt, shm_opt, child_opt, abort_opt, stop_done_tx)) =
+            stop_task_args
+        {
+            if let Some(abort) = abort_opt {
+                abort.abort();
+            }
+            self.emit_vm_snapshot(id);
+            let sup = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Some(sock) = &sock_opt {
+                    let client = TtrpcClient::new(sock);
+                    let _ = tokio::time::timeout(Duration::from_secs(4), client.teardown_vm()).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), client.quit()).await;
+                }
+
+                if let Some(mut child) = child_opt {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let start = std::time::Instant::now();
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(_)) => break,
+                                Ok(None) if start.elapsed() < Duration::from_secs(3) => {
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+                                _ => {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                }
+
+                cleanup_runtime_files(sock_opt, shm_opt);
+                let summary = {
+                    let mut guard = sup.vms.write().unwrap();
+                    if let Some(vm) = guard.get_mut(&id) {
+                        if vm.generation == stop_gen {
+                            vm.runtime.status = VmStatus::Off;
+                            vm.runtime.pid = None;
+                            vm.runtime.started_at = None;
+                            vm.runtime.fastdesk_endpoint = None;
+                            vm.runtime.live_properties = None;
+                            vm.runtime.last_error = None;
+                            vm.stop_wait = None;
+                            Some(vm.summary())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let _ = stop_done_tx.send(true);
+                if let Some(summary) = summary {
+                    sup.emit(DaemonEvent::VmUpdated { vm: summary });
+                }
+            });
         }
 
-        cleanup_runtime_files(sock_opt, shm_opt);
+        if let Some(mut rx) = wait_rx {
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        let mut emit_normalized = None;
         let summary = {
             let mut guard = self.vms.write().unwrap();
             let vm = guard.get_mut(&id).context("VM not found")?;
-            if vm.generation == stop_gen {
+            if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
+                let changed = vm.runtime.status == VmStatus::Error || vm.runtime.last_error.is_some();
                 vm.runtime.status = VmStatus::Off;
-                vm.runtime.pid = None;
-                vm.runtime.started_at = None;
-                vm.runtime.fastdesk_endpoint = None;
-                vm.runtime.live_properties = None;
                 vm.runtime.last_error = None;
-                Some(vm.summary())
+                let s = vm.summary();
+                if changed {
+                    emit_normalized = Some(s.clone());
+                }
+                Ok(s)
             } else {
-                None
+                Ok(vm.summary())
             }
         };
-
-        if let Some(summary) = summary {
-            self.emit(DaemonEvent::VmUpdated {
-                vm: summary.clone(),
-            });
-            Ok(summary)
-        } else {
-            self.get_vm(&id.to_string())
+        if let Some(s) = emit_normalized {
+            self.emit(DaemonEvent::VmUpdated { vm: s });
         }
+        summary
     }
 
     pub async fn shutdown_vm(
@@ -1610,7 +1707,7 @@ impl Supervisor {
         Ok(out)
     }
 
-    pub async fn shutdown_all_vms(&self) {
+    pub async fn shutdown_all_vms(self: &Arc<Self>) {
         let ids: Vec<Uuid> = {
             let guard = self.vms.read().unwrap();
             guard

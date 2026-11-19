@@ -202,6 +202,10 @@ impl OpenVmmsApp {
                     host_info,
                     host_config,
                 } => {
+                    let base_url =
+                        openvmms_core::api_client::normalize_base_url(&host_config.listen_addr);
+                    self.connected = true;
+                    self.connection_status = format!("Connected ({base_url})");
                     self.host_info = Some(host_info);
                     self.host_config = host_config;
                 }

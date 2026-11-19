@@ -678,12 +678,13 @@ pub fn render_new_vm_wizard(
                             ui,
                             |ui| {
                                 ui.label("Virtual CPUs:");
-                                ui.add(egui::Slider::new(&mut w.vcpus, 1..=64));
+                                ui.add(egui::Slider::new(&mut w.vcpus, 1..=256));
                                 ui.end_row();
 
                                 ui.label("Startup Memory (MiB):");
                                 ui.horizontal(|ui| {
-                                    ui.add(egui::DragValue::new(&mut w.memory_mb).range(256..=262_144).speed(256));
+                                    let max_mem = w.memory_mb.max(262_144);
+                                    ui.add(egui::DragValue::new(&mut w.memory_mb).range(128..=max_mem).speed(256));
                                     for (label, mb) in [("4G", 4096), ("8G", 8192), ("16G", 16384), ("32G", 32768)] {
                                         if ui.button(label).clicked() {
                                             w.memory_mb = mb;
@@ -730,7 +731,7 @@ pub fn render_new_vm_wizard(
                                 |ui| {
                                     ui.label("Video Memory (VRAM MiB):");
                                     ui.horizontal(|ui| {
-                                        ui.add(egui::Slider::new(&mut w.vram_mb, 8..=128));
+                                        ui.add(egui::Slider::new(&mut w.vram_mb, 8..=256));
                                         ui.label("(32 MiB supports 4K)");
                                     });
                                     ui.end_row();
@@ -936,11 +937,12 @@ pub fn render_vm_settings_dialog(
                         ui,
                         |ui| {
                             ui.label("Virtual CPUs:");
-                            ui.add(egui::Slider::new(&mut d.vcpus, 1..=64));
+                            ui.add(egui::Slider::new(&mut d.vcpus, 1..=256));
                             ui.end_row();
 
                             ui.label("Memory (MiB):");
-                            ui.add(egui::DragValue::new(&mut d.memory_mb).range(256..=262_144).speed(256));
+                            let max_mem = d.memory_mb.max(262_144);
+                            ui.add(egui::DragValue::new(&mut d.memory_mb).range(128..=max_mem).speed(256));
                             ui.end_row();
 
                             ui.label("Secure Boot:");
@@ -988,7 +990,7 @@ pub fn render_vm_settings_dialog(
                             ui.end_row();
 
                             ui.label("VRAM (MiB):");
-                            ui.add(egui::Slider::new(&mut d.vram_mb, 8..=128));
+                            ui.add(egui::Slider::new(&mut d.vram_mb, 8..=256));
                             ui.end_row();
 
                             ui.label("Shared VRAM (SHM):");
@@ -1379,5 +1381,51 @@ mod tests {
         let nics = build_nics_from_switch_id("br0", &switches, &[]);
         assert_eq!(nics.len(), 1);
         assert!(matches!(nics[0].backend, NicBackendConfig::Consomme { .. }));
+    }
+
+    #[test]
+    fn vm_settings_dialog_rendering_preserves_max_vcpus_and_vram() {
+        let mut cfg = VmConfig::from_preset("HighSpec", VmPreset::Custom, Path::new("/tmp/highspec"));
+        cfg.vcpus = 128;
+        cfg.memory_mb = 524_288;
+        cfg.fastdesk.vram_mb = 256;
+        cfg.validate().unwrap();
+
+        let ctx = egui::Context::default();
+        let backend = BackendHandle::spawn(None, None, ctx.clone());
+        let mut dlg_opt = Some(VmSettingsDialog::from_config(&cfg, VmStatus::Off));
+        let mut file_picker = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            render_vm_settings_dialog(ctx, &mut dlg_opt, &[], &backend, &mut file_picker);
+        });
+
+        let dlg = dlg_opt.as_ref().unwrap();
+        assert_eq!(dlg.vcpus, 128);
+        assert_eq!(dlg.memory_mb, 524_288);
+        assert_eq!(dlg.vram_mb, 256);
+
+        let payload = dlg.build_update_payload(&[]);
+        assert_eq!(payload.vcpus, Some(128));
+        assert_eq!(payload.memory_mb, Some(524_288));
+        assert_eq!(payload.fastdesk.unwrap().vram_mb, 256);
+
+        // Wizard controls must also preserve supported upper/lower limits across renders.
+        let mut wiz = NewVmWizard::new(Path::new("/tmp/wiz"));
+        wiz.step = 1;
+        wiz.vcpus = 256;
+        wiz.memory_mb = 128;
+        wiz.vram_mb = 256;
+        let mut wiz_opt = Some(wiz);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            render_new_vm_wizard(ctx, &mut wiz_opt, &[], &backend, &mut file_picker);
+        });
+        wiz_opt.as_mut().unwrap().step = 2;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            render_new_vm_wizard(ctx, &mut wiz_opt, &[], &backend, &mut file_picker);
+        });
+        let wiz = wiz_opt.as_ref().unwrap();
+        assert_eq!(wiz.vcpus, 256);
+        assert_eq!(wiz.memory_mb, 128);
+        assert_eq!(wiz.vram_mb, 256);
     }
 }
