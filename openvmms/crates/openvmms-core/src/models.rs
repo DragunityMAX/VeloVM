@@ -606,6 +606,12 @@ impl VmConfig {
                 bail!("duplicate SCSI LUN {}", disk.lun);
             }
         }
+        #[cfg(target_os = "linux")]
+        for nic in &self.nics {
+            if let NicBackendConfig::Tap { name } = &nic.backend {
+                validate_tap_sysfs_dir(name, &Path::new("/sys/class/net").join(name))?;
+            }
+        }
         Ok(())
     }
 
@@ -614,6 +620,16 @@ impl VmConfig {
             .find(|lun| !self.disks.iter().any(|d| d.lun == *lun))
             .unwrap_or(0)
     }
+}
+
+/// Rejects Linux bridge interfaces passed where a persistent TAP device name is required.
+pub fn validate_tap_sysfs_dir(name: &str, net_dir: &Path) -> anyhow::Result<()> {
+    if net_dir.join("bridge").is_dir() {
+        bail!(
+            "interface '{name}' is a Linux bridge, not a TAP device; specify a persistent TAP interface"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -910,5 +926,19 @@ mod tests {
         let set: UpdateVmPayload =
             serde_json::from_str(r#"{"uefi_firmware":"/opt/MSVM.fd"}"#).unwrap();
         assert_eq!(set.uefi_firmware, Some(Some(PathBuf::from("/opt/MSVM.fd"))));
+    }
+
+    #[test]
+    fn linux_bridge_rejected_as_tap_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let br_dir = dir.path().join("br0");
+        std::fs::create_dir_all(br_dir.join("bridge")).unwrap();
+        let err = validate_tap_sysfs_dir("br0", &br_dir).unwrap_err();
+        assert!(err.to_string().contains("Linux bridge"));
+
+        let tap_dir = dir.path().join("tap0");
+        std::fs::create_dir_all(&tap_dir).unwrap();
+        std::fs::write(tap_dir.join("tun_flags"), "0x1002\n").unwrap();
+        validate_tap_sysfs_dir("tap0", &tap_dir).unwrap();
     }
 }

@@ -195,6 +195,61 @@ impl NewVmWizard {
         w
     }
 
+    pub fn build_create_payload(&mut self, switches: &[VirtualSwitchInfo]) -> CreateVmPayload {
+        let (disks, create_disk) = match self.disk_mode {
+            DiskMode::CreateNew => {
+                sync_disk_path_extension(&mut self.new_disk_path, self.new_disk_format);
+                (
+                    Vec::new(),
+                    Some(CreateDiskPayload {
+                        path: PathBuf::from(self.new_disk_path.trim()),
+                        size_bytes: self.new_disk_size_gb * 1024 * 1024 * 1024,
+                        format: self.new_disk_format,
+                        fixed: self.new_disk_fixed,
+                    }),
+                )
+            }
+            DiskMode::UseExisting => {
+                let p = PathBuf::from(self.existing_disk_path.trim());
+                (
+                    vec![DiskAttachment {
+                        lun: 0,
+                        kind: DiskKind::HardDisk,
+                        format: DiskFormat::from_path(&p),
+                        path: p,
+                        read_only: false,
+                    }],
+                    None,
+                )
+            }
+            DiskMode::None => (Vec::new(), None),
+        };
+        let nics = build_nics_from_switch_id(&self.selected_switch_id, switches, &[]);
+        CreateVmPayload {
+            name: self.name.trim().to_string(),
+            description: self.description.clone(),
+            preset: self.preset,
+            vcpus: Some(self.vcpus),
+            memory_mb: Some(self.memory_mb),
+            nested_virt: Some(self.nested_virt),
+            uefi_firmware: None,
+            secure_boot_enabled: Some(self.secure_boot_enabled),
+            secure_boot_template: Some(self.secure_boot_template),
+            fastdesk: Some(FastDeskSettings {
+                enabled: self.fastdesk_enabled,
+                vram_mb: self.vram_mb,
+                use_shm: self.use_shm,
+                transport: self.transport,
+                listen_addr: "127.0.0.1:0".to_string(),
+                vsock_port: (self.transport == FastDeskTransport::HvSock).then_some(5901),
+            }),
+            disks,
+            create_disk,
+            iso_path: string_to_opt(&self.iso_path),
+            nics: Some(nics),
+        }
+    }
+
     pub fn apply_preset(&mut self, preset: VmPreset) {
         self.preset = preset;
         match preset {
@@ -237,6 +292,8 @@ pub struct VmSettingsDialog {
     pub vram_mb: u32,
     pub use_shm: bool,
     pub transport: FastDeskTransport,
+    pub base_fastdesk: FastDeskSettings,
+    pub initial_switch_id: String,
     pub selected_switch_id: String,
     pub nics: Vec<NicAttachment>,
 }
@@ -268,8 +325,47 @@ impl VmSettingsDialog {
             vram_mb: cfg.fastdesk.vram_mb,
             use_shm: cfg.fastdesk.use_shm,
             transport: cfg.fastdesk.transport,
+            base_fastdesk: cfg.fastdesk.clone(),
+            initial_switch_id: selected_switch_id.clone(),
             selected_switch_id,
             nics: cfg.nics.clone(),
+        }
+    }
+
+    pub fn build_update_payload(&self, switches: &[VirtualSwitchInfo]) -> UpdateVmPayload {
+        if self.is_offline {
+            let nics = if self.selected_switch_id == self.initial_switch_id {
+                self.nics.clone()
+            } else {
+                build_nics_from_switch_id(&self.selected_switch_id, switches, &self.nics)
+            };
+            let mut fastdesk = self.base_fastdesk.clone();
+            fastdesk.enabled = self.fastdesk_enabled;
+            fastdesk.vram_mb = self.vram_mb;
+            fastdesk.use_shm = self.use_shm;
+            fastdesk.transport = self.transport;
+            if self.transport == FastDeskTransport::HvSock && fastdesk.vsock_port.is_none() {
+                fastdesk.vsock_port = Some(5901);
+            }
+            UpdateVmPayload {
+                name: Some(self.name.trim().to_string()),
+                description: Some(self.description.clone()),
+                vcpus: Some(self.vcpus),
+                memory_mb: Some(self.memory_mb),
+                nested_virt: Some(self.nested_virt),
+                uefi_firmware: Some(string_to_opt(&self.uefi_firmware)),
+                secure_boot_enabled: Some(self.secure_boot_enabled),
+                secure_boot_template: Some(self.secure_boot_template),
+                fastdesk: Some(fastdesk),
+                nics: Some(nics),
+                ..Default::default()
+            }
+        } else {
+            UpdateVmPayload {
+                name: Some(self.name.trim().to_string()),
+                description: Some(self.description.clone()),
+                ..Default::default()
+            }
         }
     }
 }
@@ -340,6 +436,19 @@ fn string_to_opt(s: &str) -> Option<PathBuf> {
     }
 }
 
+pub fn sync_disk_path_extension(path_str: &mut String, format: DiskFormat) {
+    let trimmed = path_str.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut path = PathBuf::from(trimmed);
+    let before = path.clone();
+    openvmms_core::disk::sync_disk_path_extension(&mut path, format);
+    if path != before {
+        *path_str = path.to_string_lossy().into_owned();
+    }
+}
+
 pub fn build_nics_from_switch_id(
     switch_id: &str,
     switches: &[VirtualSwitchInfo],
@@ -348,22 +457,32 @@ pub fn build_nics_from_switch_id(
     if switch_id == "none" {
         return Vec::new();
     }
+    let trailing = existing_nics.iter().skip(1).cloned();
     if switch_id == "consomme" {
-        if let Some(existing) = existing_nics
-            .iter()
-            .find(|n| matches!(n.backend, NicBackendConfig::Consomme { .. }))
-        {
-            return vec![existing.clone()];
+        let primary = match existing_nics.first() {
+            Some(existing) if matches!(existing.backend, NicBackendConfig::Consomme { .. }) => {
+                existing.clone()
+            }
+            _ => NicAttachment::default_consomme(),
+        };
+        let mut out = vec![primary];
+        out.extend(trailing);
+        return out;
+    }
+    let sw = switches.iter().find(|s| s.id == switch_id);
+    if sw.is_some_and(|s| s.kind == "bridge") {
+        // Linux bridges are not TAP devices; keep existing NICs or fall back to Consomme rather than emitting an unusable TAP config.
+        if !existing_nics.is_empty() {
+            return existing_nics.to_vec();
         }
         return vec![NicAttachment::default_consomme()];
     }
-    let sw = switches.iter().find(|s| s.id == switch_id);
     let mac = existing_nics
         .first()
         .map(|n| n.mac_address.clone())
         .unwrap_or_else(generate_hyperv_mac);
     let backend = match sw.map(|s| s.kind.as_str()) {
-        Some("tap") | Some("bridge") => NicBackendConfig::Tap {
+        Some("tap") => NicBackendConfig::Tap {
             name: switch_id.to_string(),
         },
         _ => NicBackendConfig::VmSwitch {
@@ -371,7 +490,7 @@ pub fn build_nics_from_switch_id(
             switch_name: sw.map(|s| s.name.clone()),
         },
     };
-    vec![NicAttachment {
+    let mut out = vec![NicAttachment {
         id: existing_nics
             .first()
             .map(|n| n.id)
@@ -381,7 +500,9 @@ pub fn build_nics_from_switch_id(
             .unwrap_or_else(|| format!("Switch ({switch_id})")),
         mac_address: mac,
         backend,
-    }]
+    }];
+    out.extend(trailing);
+    out
 }
 
 pub fn render_file_picker(
@@ -682,8 +803,12 @@ pub fn render_new_vm_wizard(
 
                                         ui.label("Format:");
                                         ui.horizontal(|ui| {
+                                            let prev_format = w.new_disk_format;
                                             ui.radio_value(&mut w.new_disk_format, DiskFormat::Vhdx, "VHDX");
                                             ui.radio_value(&mut w.new_disk_format, DiskFormat::Raw, "Raw (.img)");
+                                            if w.new_disk_format != prev_format {
+                                                sync_disk_path_extension(&mut w.new_disk_path, w.new_disk_format);
+                                            }
                                             if w.new_disk_format == DiskFormat::Vhdx {
                                                 ui.checkbox(&mut w.new_disk_fixed, "Fixed size");
                                             }
@@ -745,60 +870,7 @@ pub fn render_new_vm_wizard(
                                     w.error = Some("VM name cannot be empty".to_string());
                                     return;
                                 }
-                                let (disks, create_disk) = match w.disk_mode {
-                                    DiskMode::CreateNew => (
-                                        Vec::new(),
-                                        Some(CreateDiskPayload {
-                                            path: PathBuf::from(w.new_disk_path.trim()),
-                                            size_bytes: w.new_disk_size_gb * 1024 * 1024 * 1024,
-                                            format: w.new_disk_format,
-                                            fixed: w.new_disk_fixed,
-                                        }),
-                                    ),
-                                    DiskMode::UseExisting => {
-                                        let p = PathBuf::from(w.existing_disk_path.trim());
-                                        (
-                                            vec![DiskAttachment {
-                                                lun: 0,
-                                                kind: DiskKind::HardDisk,
-                                                format: DiskFormat::from_path(&p),
-                                                path: p,
-                                                read_only: false,
-                                            }],
-                                            None,
-                                        )
-                                    }
-                                    DiskMode::None => (Vec::new(), None),
-                                };
-                                let nics = build_nics_from_switch_id(
-                                    &w.selected_switch_id,
-                                    switches,
-                                    &[],
-                                );
-                                let payload = CreateVmPayload {
-                                    name: w.name.trim().to_string(),
-                                    description: w.description.clone(),
-                                    preset: w.preset,
-                                    vcpus: Some(w.vcpus),
-                                    memory_mb: Some(w.memory_mb),
-                                    nested_virt: Some(w.nested_virt),
-                                    uefi_firmware: None,
-                                    secure_boot_enabled: Some(w.secure_boot_enabled),
-                                    secure_boot_template: Some(w.secure_boot_template),
-                                    fastdesk: Some(FastDeskSettings {
-                                        enabled: w.fastdesk_enabled,
-                                        vram_mb: w.vram_mb,
-                                        use_shm: w.use_shm,
-                                        transport: w.transport,
-                                        listen_addr: "127.0.0.1:0".to_string(),
-                                        vsock_port: (w.transport == FastDeskTransport::HvSock)
-                                            .then_some(5901),
-                                    }),
-                                    disks,
-                                    create_disk,
-                                    iso_path: string_to_opt(&w.iso_path),
-                                    nics: Some(nics),
-                                };
+                                let payload = w.build_create_payload(switches);
                                 backend.send(GuiRequest::CreateVm(payload));
                                 close = true;
                             }
@@ -948,40 +1020,7 @@ pub fn render_vm_settings_dialog(
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Save Changes").clicked() {
-                        let payload = if d.is_offline {
-                            let nics = build_nics_from_switch_id(
-                                &d.selected_switch_id,
-                                switches,
-                                &d.nics,
-                            );
-                            UpdateVmPayload {
-                                name: Some(d.name.trim().to_string()),
-                                description: Some(d.description.clone()),
-                                vcpus: Some(d.vcpus),
-                                memory_mb: Some(d.memory_mb),
-                                nested_virt: Some(d.nested_virt),
-                                uefi_firmware: Some(string_to_opt(&d.uefi_firmware)),
-                                secure_boot_enabled: Some(d.secure_boot_enabled),
-                                secure_boot_template: Some(d.secure_boot_template),
-                                fastdesk: Some(FastDeskSettings {
-                                    enabled: d.fastdesk_enabled,
-                                    vram_mb: d.vram_mb,
-                                    use_shm: d.use_shm,
-                                    transport: d.transport,
-                                    listen_addr: "127.0.0.1:0".to_string(),
-                                    vsock_port: (d.transport == FastDeskTransport::HvSock)
-                                        .then_some(5901),
-                                }),
-                                nics: Some(nics),
-                                ..Default::default()
-                            }
-                        } else {
-                            UpdateVmPayload {
-                                name: Some(d.name.trim().to_string()),
-                                description: Some(d.description.clone()),
-                                ..Default::default()
-                            }
-                        };
+                        let payload = d.build_update_payload(switches);
                         backend.send(GuiRequest::UpdateVm {
                             id: d.vm_id,
                             payload,
@@ -1038,8 +1077,12 @@ pub fn render_disk_manager_dialog(
 
                             ui.label("Format:");
                             ui.horizontal(|ui| {
+                                let prev_format = d.create_format;
                                 ui.radio_value(&mut d.create_format, DiskFormat::Vhdx, "VHDX");
                                 ui.radio_value(&mut d.create_format, DiskFormat::Raw, "Raw (.img)");
+                                if d.create_format != prev_format {
+                                    sync_disk_path_extension(&mut d.create_path, d.create_format);
+                                }
                                 if d.create_format == DiskFormat::Vhdx {
                                     ui.checkbox(&mut d.create_fixed, "Fixed allocation");
                                 }
@@ -1053,6 +1096,7 @@ pub fn render_disk_manager_dialog(
                     );
                     ui.add_space(10.0);
                     if ui.button("Create Virtual Disk").clicked() {
+                        sync_disk_path_extension(&mut d.create_path, d.create_format);
                         backend.send(GuiRequest::CreateDisk(CreateDiskPayload {
                             path: PathBuf::from(d.create_path.trim()),
                             size_bytes: d.create_size_gb * 1024 * 1024 * 1024,
@@ -1272,5 +1316,68 @@ pub fn render_delete_vm_dialog(
     }
     if close {
         *dlg_opt = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openvmms_core::models::PortForward;
+    use std::path::Path;
+
+    #[test]
+    fn new_vm_wizard_raw_format_syncs_default_extension() {
+        let mut wizard = NewVmWizard::new(Path::new("/tmp/openvmms"));
+        assert!(wizard.new_disk_path.ends_with(".vhdx"));
+        wizard.new_disk_format = DiskFormat::Raw;
+        let payload = wizard.build_create_payload(&[]);
+        let disk = payload.create_disk.unwrap();
+        assert_eq!(disk.format, DiskFormat::Raw);
+        assert_eq!(disk.path.extension().and_then(|e| e.to_str()), Some("img"));
+    }
+
+    #[test]
+    fn vm_settings_dialog_preserves_extra_nics_and_custom_fastdesk() {
+        let mut cfg = VmConfig::from_preset("DualNic", VmPreset::Custom, Path::new("/tmp/vm"));
+        cfg.fastdesk.listen_addr = "127.0.0.1:5999".to_string();
+        cfg.fastdesk.vsock_port = Some(6000);
+        cfg.nics.push(NicAttachment {
+            id: Uuid::new_v4(),
+            name: "Secondary TAP".to_string(),
+            mac_address: generate_hyperv_mac(),
+            backend: NicBackendConfig::Tap {
+                name: "tap0".to_string(),
+            },
+        });
+        if let NicBackendConfig::Consomme { port_forwards, .. } = &mut cfg.nics[0].backend {
+            port_forwards.push(PortForward {
+                protocol: openvmms_core::models::IpProto::Tcp,
+                host_addr: "127.0.0.1".to_string(),
+                host_port: 2222,
+                guest_port: 22,
+            });
+        }
+
+        let dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Off);
+        let payload = dlg.build_update_payload(&[]);
+        let fd = payload.fastdesk.unwrap();
+        assert_eq!(fd.listen_addr, "127.0.0.1:5999");
+        assert_eq!(fd.vsock_port, Some(6000));
+        let nics = payload.nics.unwrap();
+        assert_eq!(nics.len(), 2);
+        assert!(matches!(nics[1].backend, NicBackendConfig::Tap { ref name } if name == "tap0"));
+    }
+
+    #[test]
+    fn bridge_switch_is_never_mapped_to_tap_backend() {
+        let switches = vec![VirtualSwitchInfo {
+            id: "br0".to_string(),
+            name: "br0".to_string(),
+            kind: "bridge".to_string(),
+            description: "Linux bridge".to_string(),
+        }];
+        let nics = build_nics_from_switch_id("br0", &switches, &[]);
+        assert_eq!(nics.len(), 1);
+        assert!(matches!(nics[0].backend, NicBackendConfig::Consomme { .. }));
     }
 }

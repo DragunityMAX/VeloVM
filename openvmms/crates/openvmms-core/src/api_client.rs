@@ -384,11 +384,25 @@ pub fn resolve_client_path(path: &Path) -> PathBuf {
     normalize_client_path(&joined)
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn strip_verbatim_prefix_str(s: &str) -> Option<String> {
+    if s.get(..8).is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\")) {
+        return Some(format!(r"\\{}", &s[8..]));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\")
+        && rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return Some(rest.to_string());
+    }
+    None
+}
+
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(s) = path.to_str()
-            && let Some(stripped) = s.strip_prefix(r"\\?\")
+            && let Some(stripped) = strip_verbatim_prefix_str(s)
         {
             return PathBuf::from(stripped);
         }
@@ -654,5 +668,25 @@ mod tests {
         let resolved = resolve_client_path(&link.join("..").join("disk.img"));
         assert_eq!(resolved, std::fs::canonicalize(&right_disk).unwrap());
         assert_ne!(resolved, std::fs::canonicalize(&wrong_disk).unwrap());
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_preserves_unc_root_and_volume_paths() {
+        assert_eq!(
+            strip_verbatim_prefix_str(r"\\?\UNC\server\share\dir\disk.vhdx").as_deref(),
+            Some(r"\\server\share\dir\disk.vhdx")
+        );
+        assert_eq!(
+            strip_verbatim_prefix_str(r"\\?\unc\server\share\disk.vhdx").as_deref(),
+            Some(r"\\server\share\disk.vhdx")
+        );
+        assert_eq!(
+            strip_verbatim_prefix_str(r"\\?\C:\vms\disk.vhdx").as_deref(),
+            Some(r"C:\vms\disk.vhdx")
+        );
+        assert_eq!(
+            strip_verbatim_prefix_str(r"\\?\Volume{12345678-1234-1234-1234-1234567890ab}\disk.vhdx"),
+            None
+        );
     }
 }

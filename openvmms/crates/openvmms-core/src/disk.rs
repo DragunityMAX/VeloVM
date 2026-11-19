@@ -5,7 +5,28 @@ use anyhow::Context;
 use anyhow::bail;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+
+/// Adjusts mismatched disk extensions so OpenVMM probes match the requested disk format.
+pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match (format, ext.as_deref()) {
+        (DiskFormat::Raw, Some("vhdx" | "vhd")) => {
+            path.set_extension("img");
+        }
+        (DiskFormat::Vhdx, Some("img" | "raw")) => {
+            path.set_extension("vhdx");
+        }
+        _ => {}
+    }
+}
 
 pub fn create_disk(
     req: &CreateDiskPayload,

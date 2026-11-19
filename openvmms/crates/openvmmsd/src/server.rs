@@ -249,13 +249,13 @@ async fn get_host_config(State(state): State<AppState>) -> Json<HostConfig> {
 async fn put_host_config(
     State(state): State<AppState>,
     Json(cfg): Json<HostConfig>,
-) -> Result<Json<HostConfig>, ApiError> {
-    state
+) -> Result<impl IntoResponse, ApiError> {
+    let updated = state
         .supervisor
         .update_host_config(cfg)
         .await
-        .map(Json)
-        .map_err(ApiError::map_anyhow)
+        .map_err(ApiError::map_anyhow)?;
+    Ok(([(axum::http::header::CONNECTION, "close")], Json(updated)))
 }
 
 async fn list_switches(State(state): State<AppState>) -> Json<Vec<VirtualSwitchInfo>> {
@@ -1098,6 +1098,25 @@ mod tests {
         assert!(health_ok);
         assert_eq!(vm_names, vec!["PortSwitch-VM".to_string()]);
 
+        // Previous listener must stop accepting new connections once the port changes.
+        let old_addr: std::net::SocketAddr = daemon
+            .base_url
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        let mut old_closed = false;
+        for _ in 0..40 {
+            if tokio::net::TcpStream::connect(old_addr).await.is_err() {
+                old_closed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            old_closed,
+            "old HTTP listener on {old_addr} kept accepting connections after port change"
+        );
+
         daemon.shutdown().await;
     }
 
@@ -1244,6 +1263,243 @@ mod tests {
         assert_eq!(clear_resp.status(), 200);
         let cleared: VmSummary = clear_resp.json().await.unwrap();
         assert_eq!(cleared.config.uefi_firmware, None);
+
+        daemon.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_vm_during_startup_then_restarting_preserves_replacement_vm() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let state_dir = dir.path().join("stub_state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let stub_path = dir.path().join("openvmm_stub.py");
+        let stub_script = format!(
+            r#"#!/usr/bin/env python3
+import os, socket, struct, sys, threading, time
+
+STATE_DIR = {state_dir:?}
+sock_path = None
+args = sys.argv[1:]
+for i, a in enumerate(args):
+    if a == "--rpc" and i + 1 < len(args):
+        for part in args[i + 1].split(","):
+            if part.startswith("path="):
+                sock_path = part[5:]
+
+count_file = os.path.join(STATE_DIR, "launch_count")
+try:
+    with open(count_file, "r") as f:
+        launch = int(f.read().strip()) + 1
+except FileNotFoundError:
+    launch = 1
+with open(count_file, "w") as f:
+    f.write(str(launch))
+
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(32)
+stop_evt = threading.Event()
+
+def send_ok(conn, stream_id):
+    env = b"\x12\x00"
+    hdr = struct.pack(">IIBB", len(env), stream_id, 2, 0)
+    conn.sendall(hdr + env)
+
+def send_err(conn, stream_id, msg):
+    msg_b = msg.encode()
+    st = b"\x08\x0d\x12" + bytes([len(msg_b)]) + msg_b
+    env = b"\x0a" + bytes([len(st)]) + st
+    hdr = struct.pack(">IIBB", len(env), stream_id, 2, 0)
+    conn.sendall(hdr + env)
+
+def handle(conn):
+    try:
+        hdr = conn.recv(10)
+        if len(hdr) < 10:
+            return
+        length, stream_id, _, _ = struct.unpack(">IIBB", hdr)
+        data = b""
+        while len(data) < length:
+            chunk = conn.recv(length - len(data))
+            if not chunk:
+                return
+            data += chunk
+        if b"CreateVM" in data:
+            if launch == 1:
+                open(os.path.join(STATE_DIR, "first_create_entered"), "w").close()
+                time.sleep(0.7)
+                send_err(conn, stream_id, "delayed failure from cancelled startup")
+            else:
+                send_ok(conn, stream_id)
+        elif b"WaitVM" in data:
+            stop_evt.wait(timeout=15)
+            send_ok(conn, stream_id)
+        elif b"TeardownVM" in data or b"Quit" in data:
+            stop_evt.set()
+            send_ok(conn, stream_id)
+        else:
+            send_ok(conn, stream_id)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+while not stop_evt.is_set():
+    srv.settimeout(0.1)
+    try:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+"#,
+            state_dir = state_dir.to_string_lossy().into_owned(),
+        );
+        fs::write(&stub_path, stub_script).unwrap();
+        fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fw_path = dir.path().join("MSVM.fd");
+        fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+        let mut cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        cfg.openvmm_bin = Some(stub_path);
+        cfg.uefi_firmware_path = Some(fw_path);
+        let cfg_resp = client
+            .put(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&cfg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cfg_resp.status(), 200);
+
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Race-Restart-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: Some(openvmms_core::models::FastDeskSettings {
+                    enabled: false,
+                    ..Default::default()
+                }),
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: Some(vec![]),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+
+        // Start #1 blocks inside CreateVM RPC in the stub.
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let start1 = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/v1/vms/Race-Restart-VM/start"))
+                .bearer_auth(token)
+                .send()
+                .await
+        });
+
+        let sentinel = state_dir.join("first_create_entered");
+        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sentinel.exists() {
+            assert!(
+                tokio::time::Instant::now() < wait_deadline,
+                "stub never entered first CreateVM"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Interrupt startup #1 with stop_vm.
+        let stop_resp = client
+            .post(format!(
+                "{}/api/v1/vms/Race-Restart-VM/stop",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stop_resp.status(), 200);
+
+        // Immediately start #2 (replacement process).
+        let start2_resp = client
+            .post(format!(
+                "{}/api/v1/vms/Race-Restart-VM/start",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start2_resp.status(), 200);
+        let started2: VmSummary = start2_resp.json().await.unwrap();
+        assert_eq!(
+            started2.runtime.status,
+            openvmms_core::models::VmStatus::Running
+        );
+        let pid2 = started2.runtime.pid.expect("replacement VM must have PID");
+
+        // Wait past launch #1's sleep and ensure start1 finished without harming replacement VM #2.
+        let _ = start1.await;
+        tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+
+        let check: VmSummary = client
+            .get(format!("{}/api/v1/vms/Race-Restart-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            check.runtime.status,
+            openvmms_core::models::VmStatus::Running
+        );
+        assert_eq!(check.runtime.pid, Some(pid2));
+
+        let final_stop = client
+            .post(format!(
+                "{}/api/v1/vms/Race-Restart-VM/stop",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(final_stop.status(), 200);
 
         daemon.shutdown().await;
     }
