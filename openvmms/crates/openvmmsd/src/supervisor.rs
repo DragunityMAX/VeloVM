@@ -44,7 +44,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
-use tokio::sync::Notify;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tracing::info;
@@ -102,7 +101,6 @@ pub struct Supervisor {
     draining_listeners: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     vms: RwLock<HashMap<Uuid, ManagedVm>>,
     events_tx: broadcast::Sender<DaemonEvent>,
-    shutdown_notify: Notify,
     shutdown_watch: watch::Sender<bool>,
 }
 
@@ -143,7 +141,6 @@ impl Supervisor {
             draining_listeners: std::sync::Mutex::new(Vec::new()),
             vms: RwLock::new(vm_map),
             events_tx,
-            shutdown_notify: Notify::new(),
             shutdown_watch,
         }))
     }
@@ -180,11 +177,15 @@ impl Supervisor {
 
     pub fn request_shutdown(&self) {
         self.mark_shutting_down();
-        self.shutdown_notify.notify_waiters();
     }
 
     pub async fn wait_for_shutdown_signal(&self) {
-        self.shutdown_notify.notified().await;
+        let mut rx = self.shutdown_watch.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     fn emit(&self, event: DaemonEvent) {
@@ -382,10 +383,14 @@ impl Supervisor {
 
     pub async fn get_vm_with_live_properties(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
-        let (status, sock_path) = {
+        let (status, sock_path, rpc_gen) = {
             let guard = self.vms.read().unwrap();
             let vm = guard.get(&id).context("VM not found")?;
-            (vm.runtime.status, vm.runtime.rpc_socket_path.clone())
+            (
+                vm.runtime.status,
+                vm.runtime.rpc_socket_path.clone(),
+                vm.generation,
+            )
         };
 
         if matches!(status, VmStatus::Running | VmStatus::Paused)
@@ -414,7 +419,10 @@ impl Supervisor {
                 total_runtime_ns: props.processor_stats.map(|p| p.total_runtime_ns),
             };
             let mut guard = self.vms.write().unwrap();
-            if let Some(vm) = guard.get_mut(&id) {
+            if let Some(vm) = guard.get_mut(&id)
+                && vm.generation == rpc_gen
+                && matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
+            {
                 vm.runtime.live_properties = Some(live);
                 return Ok(vm.summary());
             }
@@ -1254,30 +1262,43 @@ impl Supervisor {
 
     pub async fn pause_vm(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
-        let sock = self.require_running_socket(id)?;
+        let (sock, rpc_gen) = self.require_socket_with_generation(id, &[VmStatus::Running])?;
         TtrpcClient::new(sock).pause_vm().await?;
-
-        let summary = {
-            let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
-            vm.runtime.status = VmStatus::Paused;
-            vm.summary()
-        };
-        self.emit(DaemonEvent::VmUpdated {
-            vm: summary.clone(),
-        });
-        Ok(summary)
+        self.commit_power_transition(id, rpc_gen, "pause", VmStatus::Paused)
     }
 
     pub async fn resume_vm(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
-        let sock = self.require_active_socket(id)?;
+        let (sock, rpc_gen) =
+            self.require_socket_with_generation(id, &[VmStatus::Running, VmStatus::Paused])?;
         TtrpcClient::new(sock).resume_vm().await?;
+        self.commit_power_transition(id, rpc_gen, "resume", VmStatus::Running)
+    }
 
+    /// Applies the result of a pause/resume RPC only if the VM lifecycle did not move on
+    /// while the RPC was in flight. A stop or restart bumps the generation and sets
+    /// `Stopping`/`Starting`; overwriting that state would let a second stop or a premature
+    /// restart race with the in-progress teardown.
+    pub(crate) fn commit_power_transition(
+        &self,
+        id: Uuid,
+        rpc_gen: u64,
+        action: &str,
+        new_status: VmStatus,
+    ) -> anyhow::Result<VmSummary> {
         let summary = {
             let mut guard = self.vms.write().unwrap();
             let vm = guard.get_mut(&id).context("VM not found")?;
-            vm.runtime.status = VmStatus::Running;
+            if vm.generation != rpc_gen
+                || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
+            {
+                bail!(
+                    "cannot complete {action} because VM '{}' changed state to {}",
+                    vm.config.name,
+                    vm.runtime.status
+                );
+            }
+            vm.runtime.status = new_status;
             vm.summary()
         };
         self.emit(DaemonEvent::VmUpdated {
@@ -1327,7 +1348,7 @@ impl Supervisor {
                 format,
             };
             match active_sock {
-                Some(sock) => Ok((attachment, sock)),
+                Some(sock) => Ok((attachment, sock, vm.generation)),
                 None => {
                     let mut updated = vm.config.clone();
                     updated.disks.push(attachment);
@@ -1342,7 +1363,7 @@ impl Supervisor {
 
         let summary = match pending {
             Err(summary) => summary,
-            Ok((attachment, sock)) => {
+            Ok((attachment, sock, rpc_gen)) => {
                 TtrpcClient::new(sock)
                     .modify_resource(vmservice::ModifyResourceRequest {
                         r#type: vmservice::ModifyType::Add as i32,
@@ -1355,7 +1376,9 @@ impl Supervisor {
 
                 let mut guard = self.vms.write().unwrap();
                 let vm = guard.get_mut(&id).context("VM not found")?;
-                if !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
+                if vm.generation != rpc_gen
+                    || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
+                {
                     bail!(
                         "cannot complete disk attach because VM '{}' changed state to {}",
                         vm.config.name,
@@ -1395,7 +1418,7 @@ impl Supervisor {
                 .cloned()
                 .with_context(|| format!("no disk attached at SCSI LUN {lun}"))?;
             match active_sock {
-                Some(sock) => Ok((disk, sock)),
+                Some(sock) => Ok((disk, sock, vm.generation)),
                 None => {
                     let mut updated = vm.config.clone();
                     updated.disks.retain(|d| d.lun != lun);
@@ -1409,7 +1432,7 @@ impl Supervisor {
 
         let summary = match pending {
             Err(summary) => summary,
-            Ok((existing, sock)) => {
+            Ok((existing, sock, rpc_gen)) => {
                 TtrpcClient::new(sock)
                     .modify_resource(vmservice::ModifyResourceRequest {
                         r#type: vmservice::ModifyType::Remove as i32,
@@ -1426,7 +1449,9 @@ impl Supervisor {
 
                 let mut guard = self.vms.write().unwrap();
                 let vm = guard.get_mut(&id).context("VM not found")?;
-                if !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
+                if vm.generation != rpc_gen
+                    || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
+                {
                     bail!(
                         "cannot complete disk detach because VM '{}' changed state to {}",
                         vm.config.name,
@@ -1583,7 +1608,7 @@ impl Supervisor {
                 }
             }
             match sock_opt {
-                Some(sock) => Ok(sock),
+                Some(sock) => Ok((sock, vm.generation)),
                 None => {
                     let mut updated = vm.config.clone();
                     let nic = updated
@@ -1608,7 +1633,7 @@ impl Supervisor {
 
         let summary = match active_sock {
             Err(summary) => summary,
-            Ok(sock) => {
+            Ok((sock, rpc_gen)) => {
                 let modify_type = if add {
                     vmservice::ModifyType::Update as i32
                 } else {
@@ -1635,7 +1660,9 @@ impl Supervisor {
 
                 let mut guard = self.vms.write().unwrap();
                 let vm = guard.get_mut(&id).context("VM not found")?;
-                if !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
+                if vm.generation != rpc_gen
+                    || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
+                {
                     bail!(
                         "cannot complete port forward update because VM '{}' changed state to {}",
                         vm.config.name,
@@ -1673,6 +1700,20 @@ impl Supervisor {
     #[cfg(test)]
     pub fn set_vm_status_for_test(&self, id: Uuid, status: VmStatus) {
         if let Some(vm) = self.vms.write().unwrap().get_mut(&id) {
+            vm.runtime.status = status;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn generation_for_test(&self, id: Uuid) -> u64 {
+        self.vms.read().unwrap()[&id].generation
+    }
+
+    /// Simulates a lifecycle transition (stop/start) that bumps the generation.
+    #[cfg(test)]
+    pub fn advance_lifecycle_for_test(&self, id: Uuid, status: VmStatus) {
+        if let Some(vm) = self.vms.write().unwrap().get_mut(&id) {
+            vm.generation += 1;
             vm.runtime.status = status;
         }
     }
@@ -1724,35 +1765,37 @@ impl Supervisor {
     }
 
     fn require_running_socket(&self, id: Uuid) -> anyhow::Result<PathBuf> {
+        self.require_socket_with_generation(id, &[VmStatus::Running])
+            .map(|(sock, _)| sock)
+    }
+
+    fn require_socket_with_generation(
+        &self,
+        id: Uuid,
+        allowed: &[VmStatus],
+    ) -> anyhow::Result<(PathBuf, u64)> {
         let guard = self.vms.read().unwrap();
         let vm = guard.get(&id).context("VM not found")?;
-        if vm.runtime.status != VmStatus::Running {
+        if !allowed.contains(&vm.runtime.status) {
+            let names: Vec<String> = allowed.iter().map(ToString::to_string).collect();
             bail!(
-                "VM '{}' is {} (must be Running)",
+                "VM '{}' is {} (must be {})",
                 vm.config.name,
-                vm.runtime.status
+                vm.runtime.status,
+                names.join(" or ")
             );
         }
-        vm.runtime
+        let sock = vm
+            .runtime
             .rpc_socket_path
             .clone()
-            .context("VM has no active RPC socket")
+            .context("VM has no active RPC socket")?;
+        Ok((sock, vm.generation))
     }
 
     fn require_active_socket(&self, id: Uuid) -> anyhow::Result<PathBuf> {
-        let guard = self.vms.read().unwrap();
-        let vm = guard.get(&id).context("VM not found")?;
-        if !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
-            bail!(
-                "VM '{}' is {} (must be Running or Paused)",
-                vm.config.name,
-                vm.runtime.status
-            );
-        }
-        vm.runtime
-            .rpc_socket_path
-            .clone()
-            .context("VM has no active RPC socket")
+        self.require_socket_with_generation(id, &[VmStatus::Running, VmStatus::Paused])
+            .map(|(sock, _)| sock)
     }
 
     fn emit_vm_snapshot(&self, id: Uuid) {

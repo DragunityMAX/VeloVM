@@ -1206,6 +1206,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_pause_resume_result_does_not_clobber_stop_or_restart() {
+        use openvmms_core::models::VmStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let created = daemon
+            .supervisor
+            .create_vm(CreateVmPayload {
+                name: "Race-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: None,
+            })
+            .unwrap();
+        let id = created.config.id;
+        let sup = &daemon.supervisor;
+        sup.set_vm_status_for_test(id, VmStatus::Running);
+
+        // Pause RPC issued while Running, then a stop begins before the reply lands.
+        let rpc_gen = sup.generation_for_test(id);
+        sup.advance_lifecycle_for_test(id, VmStatus::Stopping);
+        assert!(sup.commit_power_transition(id, rpc_gen, "pause", VmStatus::Paused).is_err());
+        assert_eq!(sup.get_vm("Race-VM").unwrap().runtime.status, VmStatus::Stopping);
+        assert!(sup.commit_power_transition(id, rpc_gen, "resume", VmStatus::Running).is_err());
+        assert_eq!(sup.get_vm("Race-VM").unwrap().runtime.status, VmStatus::Stopping);
+
+        // Replacement VM is now Running; the stale reply must not pause it either.
+        sup.advance_lifecycle_for_test(id, VmStatus::Running);
+        assert!(sup.commit_power_transition(id, rpc_gen, "pause", VmStatus::Paused).is_err());
+        assert_eq!(sup.get_vm("Race-VM").unwrap().runtime.status, VmStatus::Running);
+
+        // A reply from the current lifecycle generation still applies.
+        let cur = sup.generation_for_test(id);
+        sup.commit_power_transition(id, cur, "pause", VmStatus::Paused).unwrap();
+        assert_eq!(sup.get_vm("Race-VM").unwrap().runtime.status, VmStatus::Paused);
+
+        sup.set_vm_status_for_test(id, VmStatus::Off);
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn update_vm_clears_firmware_on_null_and_preserves_when_omitted() {
         let dir = tempfile::tempdir().unwrap();
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
@@ -1857,6 +1909,409 @@ while not stop_evt.is_set():
         assert_eq!(vm.config.disks.len(), 1);
         assert_eq!(vm.config.disks[0].path, disk_path);
         assert!(disk_path.exists());
+
+        daemon.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let state_dir = dir.path().join("stub_state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let stub_path = dir.path().join("openvmm_pause_resume_stub.py");
+        let stub_script = format!(
+            r#"#!/usr/bin/env python3
+import os, socket, struct, sys, threading, time
+
+STATE_DIR = {state_dir:?}
+sock_path = None
+args = sys.argv[1:]
+for i, a in enumerate(args):
+    if a == "--rpc" and i + 1 < len(args):
+        for part in args[i + 1].split(","):
+            if part.startswith("path="):
+                sock_path = part[5:]
+
+count_file = os.path.join(STATE_DIR, "launch_count")
+try:
+    with open(count_file, "r") as f:
+        launch = int(f.read().strip()) + 1
+except FileNotFoundError:
+    launch = 1
+with open(count_file, "w") as f:
+    f.write(str(launch))
+
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(32)
+stop_evt = threading.Event()
+
+def send_ok(conn, stream_id):
+    env = b"\x12\x00"
+    hdr = struct.pack(">IIBB", len(env), stream_id, 2, 0)
+    conn.sendall(hdr + env)
+
+def handle(conn):
+    try:
+        hdr = conn.recv(10)
+        if len(hdr) < 10:
+            return
+        length, stream_id, _, _ = struct.unpack(">IIBB", hdr)
+        data = b""
+        while len(data) < length:
+            chunk = conn.recv(length - len(data))
+            if not chunk:
+                return
+            data += chunk
+        if b"WaitVM" in data:
+            stop_evt.wait(timeout=15)
+            send_ok(conn, stream_id)
+        elif b"PauseVM" in data:
+            if launch == 1:
+                open(os.path.join(STATE_DIR, "pause_entered"), "w").close()
+                time.sleep(0.35)
+            send_ok(conn, stream_id)
+        elif b"ResumeVM" in data:
+            if launch == 2:
+                open(os.path.join(STATE_DIR, "resume_entered"), "w").close()
+                time.sleep(0.35)
+            send_ok(conn, stream_id)
+        elif b"TeardownVM" in data:
+            if launch == 1:
+                open(os.path.join(STATE_DIR, "teardown_entered_1"), "w").close()
+                time.sleep(0.75)
+            elif launch == 2:
+                open(os.path.join(STATE_DIR, "teardown_entered_2"), "w").close()
+                time.sleep(0.75)
+            stop_evt.set()
+            send_ok(conn, stream_id)
+        elif b"Quit" in data:
+            if launch == 2:
+                open(os.path.join(STATE_DIR, "launch2_quit"), "w").close()
+            elif launch == 3:
+                open(os.path.join(STATE_DIR, "launch3_quit"), "w").close()
+            stop_evt.set()
+            send_ok(conn, stream_id)
+        else:
+            send_ok(conn, stream_id)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+while not stop_evt.is_set():
+    srv.settimeout(0.1)
+    try:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+"#,
+            state_dir = state_dir.to_string_lossy().into_owned(),
+        );
+        fs::write(&stub_path, stub_script).unwrap();
+        fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fw_path = dir.path().join("MSVM.fd");
+        fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+        let mut cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        cfg.openvmm_bin = Some(stub_path);
+        cfg.uefi_firmware_path = Some(fw_path);
+        assert_eq!(
+            client
+                .put(format!("{}/api/v1/host/config", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&cfg)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "PauseStop-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: Some(openvmms_core::models::FastDeskSettings {
+                    enabled: false,
+                    ..Default::default()
+                }),
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: Some(vec![]),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+
+        // Phase 1: delayed PauseVM vs concurrent StopVM.
+        let start1_resp = client
+            .post(format!("{}/api/v1/vms/PauseStop-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start1_resp.status(), 200);
+
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let pause_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/v1/vms/PauseStop-VM/pause"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        let wait_for = |sentinel: std::path::PathBuf| async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !sentinel.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "stub never reached {}",
+                    sentinel.display()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+
+        wait_for(state_dir.join("pause_entered")).await;
+
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let stop1_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/v1/vms/PauseStop-VM/stop"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        wait_for(state_dir.join("teardown_entered_1")).await;
+
+        let pause_resp = pause_task.await.unwrap();
+        assert_eq!(pause_resp.status(), 409);
+
+        let during_stop1: VmSummary = client
+            .get(format!("{}/api/v1/vms/PauseStop-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(during_stop1.runtime.status, VmStatus::Stopping);
+
+        let early_start = client
+            .post(format!("{}/api/v1/vms/PauseStop-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(early_start.status(), 409);
+
+        let stop1_resp = stop1_task.await.unwrap();
+        assert_eq!(stop1_resp.status(), 200);
+        let stop1_vm: VmSummary = stop1_resp.json().await.unwrap();
+        assert_eq!(stop1_vm.runtime.status, VmStatus::Off);
+
+        // Start launch 2 and verify launch 1's stop did not harm it.
+        let start2_resp = client
+            .post(format!("{}/api/v1/vms/PauseStop-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start2_resp.status(), 200);
+        assert!(!state_dir.join("launch2_quit").exists());
+
+        // Phase 2: pause launch 2 cleanly, then delayed ResumeVM vs concurrent StopVM.
+        let pause2_resp = client
+            .post(format!("{}/api/v1/vms/PauseStop-VM/pause", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pause2_resp.status(), 200);
+        let paused2: VmSummary = pause2_resp.json().await.unwrap();
+        assert_eq!(paused2.runtime.status, VmStatus::Paused);
+
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let resume_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/v1/vms/PauseStop-VM/resume"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        wait_for(state_dir.join("resume_entered")).await;
+
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let stop2_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/v1/vms/PauseStop-VM/stop"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        wait_for(state_dir.join("teardown_entered_2")).await;
+
+        let resume_resp = resume_task.await.unwrap();
+        assert_eq!(resume_resp.status(), 409);
+
+        let during_stop2: VmSummary = client
+            .get(format!("{}/api/v1/vms/PauseStop-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(during_stop2.runtime.status, VmStatus::Stopping);
+
+        let stop2_resp = stop2_task.await.unwrap();
+        assert_eq!(stop2_resp.status(), 200);
+        let stop2_vm: VmSummary = stop2_resp.json().await.unwrap();
+        assert_eq!(stop2_vm.runtime.status, VmStatus::Off);
+
+        // Start launch 3 and verify it remains Running with its socket intact.
+        let start3_resp = client
+            .post(format!("{}/api/v1/vms/PauseStop-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start3_resp.status(), 200);
+        let started3: VmSummary = start3_resp.json().await.unwrap();
+        assert_eq!(started3.runtime.status, VmStatus::Running);
+        let pid3 = started3.runtime.pid.expect("replacement VM must have PID");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !state_dir.join("launch3_quit").exists(),
+            "replacement VM received unexpected Quit from prior stop"
+        );
+        let check: VmSummary = client
+            .get(format!("{}/api/v1/vms/PauseStop-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(check.runtime.status, VmStatus::Running);
+        assert_eq!(check.runtime.pid, Some(pid3));
+        assert!(
+            check
+                .runtime
+                .rpc_socket_path
+                .as_ref()
+                .is_some_and(|p| p.exists()),
+            "replacement VM RPC socket should remain intact"
+        );
+
+        let final_stop = client
+            .post(format!("{}/api/v1/vms/PauseStop-VM/stop", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(final_stop.status(), 200);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn standalone_create_disk_rejects_incompatible_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        for (name, format) in [
+            ("disk.vhdx", DiskFormat::Raw),
+            ("disk.vhd", DiskFormat::Vhdx),
+            ("disk.img", DiskFormat::Vhdx),
+            ("disk.vmdk", DiskFormat::Raw),
+        ] {
+            let path = dir.path().join(name);
+            let resp = client
+                .post(format!("{}/api/v1/disks/create", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&CreateDiskPayload {
+                    path: path.clone(),
+                    size_bytes: 16 * 1024 * 1024,
+                    format,
+                    fixed: false,
+                })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{name} as {format:?} should fail with 400");
+            assert!(!path.exists(), "{name} must not be created");
+        }
+
+        let valid_path = dir.path().join("disk.img");
+        let ok_resp = client
+            .post(format!("{}/api/v1/disks/create", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateDiskPayload {
+                path: valid_path.clone(),
+                size_bytes: 16 * 1024 * 1024,
+                format: DiskFormat::Raw,
+                fixed: false,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), 200);
+        assert!(valid_path.exists());
 
         daemon.shutdown().await;
     }

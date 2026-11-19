@@ -153,6 +153,8 @@ pub struct NewVmWizard {
     pub selected_switch_id: String,
     pub disk_mode: DiskMode,
     pub new_disk_path: String,
+    /// Directory used to suggest a per-VM disk file name when browsing.
+    pub default_disk_dir: PathBuf,
     pub new_disk_size_gb: u64,
     pub new_disk_format: DiskFormat,
     pub new_disk_fixed: bool,
@@ -179,11 +181,10 @@ impl NewVmWizard {
             transport: FastDeskTransport::Tcp,
             selected_switch_id: "consomme".to_string(),
             disk_mode: DiskMode::CreateNew,
-            new_disk_path: default_dir
-                .join("disks")
-                .join("Windows-11-VM.vhdx")
-                .to_string_lossy()
-                .into_owned(),
+            // Empty means the daemon picks a unique `<name>-<id>-disk0.<ext>` path in its
+            // disks directory, so wizards for different VMs never collide on one file.
+            new_disk_path: String::new(),
+            default_disk_dir: default_dir.join("disks"),
             new_disk_size_gb: 64,
             new_disk_format: DiskFormat::Vhdx,
             new_disk_fixed: false,
@@ -193,6 +194,56 @@ impl NewVmWizard {
         };
         w.apply_preset(VmPreset::Windows11);
         w
+    }
+
+    fn sanitized_disk_stem(&self) -> String {
+        let stem: String = self
+            .name
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let trimmed = stem.trim_matches('-');
+        if trimmed.is_empty() {
+            "vm".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// Hint text shown for the optional disk path when no custom path is entered.
+    pub fn auto_disk_hint(&self) -> String {
+        let stem = self.sanitized_disk_stem();
+        let ext = if self.new_disk_format == DiskFormat::Vhdx {
+            "vhdx"
+        } else {
+            "img"
+        };
+        format!("auto: {stem}-<id>-disk0.{ext}")
+    }
+
+    /// Path pre-filled in the Browse dialog when no explicit disk path is set; derived
+    /// from the current VM name and avoids colliding with existing files in `default_disk_dir`.
+    pub fn suggested_disk_path(&self) -> String {
+        let stem = self.sanitized_disk_stem();
+        let ext = if self.new_disk_format == DiskFormat::Vhdx {
+            "vhdx"
+        } else {
+            "img"
+        };
+        let mut candidate = self.default_disk_dir.join(format!("{stem}.{ext}"));
+        let mut n = 2usize;
+        while candidate.exists() {
+            candidate = self.default_disk_dir.join(format!("{stem}-{n}.{ext}"));
+            n += 1;
+        }
+        candidate.to_string_lossy().into_owned()
     }
 
     pub fn build_create_payload(&mut self, switches: &[VirtualSwitchInfo]) -> CreateVmPayload {
@@ -785,12 +836,22 @@ pub fn render_new_vm_wizard(
                                     ui,
                                     |ui| {
                                         ui.label("Disk Path (optional):");
+                                        let auto_hint = w.auto_disk_hint();
                                         ui.horizontal(|ui| {
-                                            ui.add(egui::TextEdit::singleline(&mut w.new_disk_path).desired_width(300.0));
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut w.new_disk_path)
+                                                    .hint_text(auto_hint)
+                                                    .desired_width(300.0),
+                                            );
                                             if ui.button("Browse…").clicked() {
+                                                let initial = if w.new_disk_path.trim().is_empty() {
+                                                    w.suggested_disk_path()
+                                                } else {
+                                                    w.new_disk_path.clone()
+                                                };
                                                 *file_picker = Some(FilePickerModal::open(
                                                     FilePickerTarget::WizardNewDiskPath,
-                                                    &w.new_disk_path,
+                                                    &initial,
                                                     true,
                                                     vec!["vhdx", "img", "raw"],
                                                 ));
@@ -1330,12 +1391,65 @@ mod tests {
     #[test]
     fn new_vm_wizard_raw_format_syncs_default_extension() {
         let mut wizard = NewVmWizard::new(Path::new("/tmp/openvmms"));
-        assert!(wizard.new_disk_path.ends_with(".vhdx"));
+        wizard.new_disk_path = "/tmp/openvmms/disks/custom.vhdx".to_string();
         wizard.new_disk_format = DiskFormat::Raw;
         let payload = wizard.build_create_payload(&[]);
         let disk = payload.create_disk.unwrap();
         assert_eq!(disk.format, DiskFormat::Raw);
         assert_eq!(disk.path.extension().and_then(|e| e.to_str()), Some("img"));
+    }
+
+    #[test]
+    fn new_vm_wizards_do_not_share_a_default_disk_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = NewVmWizard::new(dir.path());
+        let mut second = NewVmWizard::new(dir.path());
+        second.name = "Build Server".to_string();
+        // Empty path lets the daemon allocate a unique `<name>-<id>-disk0` file per VM.
+        let a = first.build_create_payload(&[]).create_disk.unwrap();
+        let b = second.build_create_payload(&[]).create_disk.unwrap();
+        assert!(a.path.as_os_str().is_empty());
+        assert!(b.path.as_os_str().is_empty());
+        // Hint and Browse suggestions follow the VM name and format, and avoid existing files.
+        assert_eq!(first.auto_disk_hint(), "auto: Windows-11-VM-<id>-disk0.vhdx");
+        assert!(first.suggested_disk_path().ends_with("Windows-11-VM.vhdx"));
+        std::fs::create_dir_all(&first.default_disk_dir).unwrap();
+        std::fs::write(first.default_disk_dir.join("Windows-11-VM.vhdx"), b"existing").unwrap();
+        assert!(first.suggested_disk_path().ends_with("Windows-11-VM-2.vhdx"));
+
+        second.new_disk_format = DiskFormat::Raw;
+        assert_eq!(second.auto_disk_hint(), "auto: Build-Server-<id>-disk0.img");
+        assert!(second.suggested_disk_path().ends_with("Build-Server.img"));
+    }
+
+    #[test]
+    fn new_vm_wizards_create_distinct_disks_via_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let daemon = rt
+            .block_on(openvmmsd::TestDaemonHandle::spawn(dir.path().to_path_buf()))
+            .unwrap();
+        let client =
+            openvmms_core::api_client::ApiClient::new(&daemon.base_url, &daemon.token).unwrap();
+
+        let mut wiz1 = NewVmWizard::new(dir.path());
+        wiz1.new_disk_format = DiskFormat::Raw;
+        wiz1.new_disk_size_gb = 1;
+        let vm1 = client.create_vm(&wiz1.build_create_payload(&[])).unwrap();
+
+        let mut wiz2 = NewVmWizard::new(dir.path());
+        wiz2.name = "Ubuntu-Dev".to_string();
+        wiz2.new_disk_format = DiskFormat::Raw;
+        wiz2.new_disk_size_gb = 1;
+        let vm2 = client.create_vm(&wiz2.build_create_payload(&[])).unwrap();
+
+        assert_eq!(vm1.config.disks.len(), 1);
+        assert_eq!(vm2.config.disks.len(), 1);
+        assert_ne!(vm1.config.disks[0].path, vm2.config.disks[0].path);
+        assert!(vm1.config.disks[0].path.is_file());
+        assert!(vm2.config.disks[0].path.is_file());
+
+        rt.block_on(daemon.shutdown());
     }
 
     #[test]
