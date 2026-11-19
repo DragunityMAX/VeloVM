@@ -1305,33 +1305,9 @@ async fn vm_config_from_command_line(
         });
 
     let framebuffer = if opt.gfx || opt.fastdesk.fastdesk || opt.vtl2_gfx || opt.vnc.vnc || opt.pcat {
-        let vram = if let Some(shm_path) = &opt.fastdesk.fastdesk_shm {
-            let mut open_opts = fs_err::OpenOptions::new();
-            open_opts.read(true).write(true).create(true).truncate(false);
-            #[cfg(unix)]
-            {
-                fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
-            }
-            let file = open_opts
-                .open(shm_path)
-                .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .context("setting FastDesk SHM file permissions")?;
-            }
-            file.file()
-                .set_len(vram_size as u64)
-                .context("sizing FastDesk SHM file")?;
-            resources.fastdesk_shm_path = Some(shm_path.to_string_lossy().into_owned());
-            sparse_mmap::new_mappable_from_file(file.file(), true, false)
-                .context("creating FastDesk SHM mappable")?
-        } else {
-            alloc_shared_memory(vram_size, "vram")?
-        };
-        let (fb, fba) = framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer")?;
+        let (fb, fba, shm_path) =
+            alloc_framebuffer_vram(opt.fastdesk.fastdesk_shm.as_deref(), vram_size)?;
+        resources.fastdesk_shm_path = shm_path;
         resources.framebuffer_access = Some(fba);
         Some(fb)
     } else {
@@ -2430,7 +2406,7 @@ fn cleanup_socket(path: &Path) {
 }
 
 #[cfg(windows)]
-fn new_switch_port(
+pub(crate) fn new_switch_port(
     switch_id: Option<&str>,
 ) -> anyhow::Result<(
     openvmm_defs::config::SwitchPortId,
@@ -2976,7 +2952,45 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
     result
 }
 
-fn bind_display_tcp_listener(
+pub(crate) fn alloc_framebuffer_vram(
+    shm_path: Option<&Path>,
+    vram_size: usize,
+) -> anyhow::Result<(
+    framebuffer::Framebuffer,
+    FramebufferAccess,
+    Option<String>,
+)> {
+    let (vram, resolved_shm_path) = if let Some(shm_path) = shm_path {
+        let mut open_opts = fs_err::OpenOptions::new();
+        open_opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
+        }
+        let file = open_opts
+            .open(shm_path)
+            .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("setting FastDesk SHM file permissions")?;
+        }
+        file.file()
+            .set_len(vram_size as u64)
+            .context("sizing FastDesk SHM file")?;
+        let mappable = sparse_mmap::new_mappable_from_file(file.file(), true, false)
+            .context("creating FastDesk SHM mappable")?;
+        (mappable, Some(shm_path.to_string_lossy().into_owned()))
+    } else {
+        (alloc_shared_memory(vram_size, "vram")?, None)
+    };
+    let (fb, fba) = framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer")?;
+    Ok((fb, fba, resolved_shm_path))
+}
+
+pub(crate) fn bind_display_tcp_listener(
     label: &str,
     listen_str: &str,
     default_port: u16,

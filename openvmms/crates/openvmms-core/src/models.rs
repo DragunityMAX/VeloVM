@@ -1,0 +1,885 @@
+use anyhow::Context;
+use anyhow::bail;
+use chrono::DateTime;
+use chrono::Utc;
+use serde::Deserialize;
+use serde::Serialize;
+use std::path::Path;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+pub const DEFAULT_DAEMON_PORT: u16 = 47620;
+pub const DEFAULT_DAEMON_LISTEN: &str = "127.0.0.1:47620";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostConfig {
+    pub data_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub listen_addr: String,
+    pub openvmm_bin: Option<PathBuf>,
+    pub fastdesk_viewer_bin: Option<PathBuf>,
+    pub openvmm_img_bin: Option<PathBuf>,
+    pub uefi_firmware_path: Option<PathBuf>,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        let data_dir = default_data_dir();
+        let runtime_dir = default_runtime_dir(&data_dir);
+        Self {
+            data_dir,
+            runtime_dir,
+            listen_addr: DEFAULT_DAEMON_LISTEN.to_string(),
+            openvmm_bin: None,
+            fastdesk_viewer_bin: None,
+            openvmm_img_bin: None,
+            uefi_firmware_path: None,
+        }
+    }
+}
+
+pub fn default_data_dir() -> PathBuf {
+    if let Some(dir) = dirs::data_local_dir() {
+        return dir.join("openvmms");
+    }
+    PathBuf::from(".openvmms")
+}
+
+pub fn default_runtime_dir(data_dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    if let Some(runtime) = dirs::runtime_dir() {
+        return runtime.join("openvmms");
+    }
+    data_dir.join("run")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResolvedHostPaths {
+    pub openvmm_bin: Option<PathBuf>,
+    pub fastdesk_viewer_bin: Option<PathBuf>,
+    pub openvmm_img_bin: Option<PathBuf>,
+    pub uefi_firmware_path: Option<PathBuf>,
+}
+
+pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().ok();
+
+    let openvmm_name = if cfg!(windows) { "openvmm.exe" } else { "openvmm" };
+    let viewer_name = if cfg!(windows) {
+        "fastdesk-viewer.exe"
+    } else {
+        "fastdesk-viewer"
+    };
+    let img_name = if cfg!(windows) {
+        "openvmm-img.exe"
+    } else {
+        "openvmm-img"
+    };
+
+    let openvmm_bin = resolve_binary_candidate(
+        cfg.openvmm_bin.as_deref(),
+        exe_dir.as_deref(),
+        cwd.as_deref(),
+        openvmm_name,
+        &[
+            &format!("openvmm/target/release/{openvmm_name}"),
+            &format!("openvmm/target/debug/{openvmm_name}"),
+            &format!("../openvmm/target/release/{openvmm_name}"),
+            &format!("../openvmm/target/debug/{openvmm_name}"),
+        ],
+    );
+
+    let fastdesk_viewer_bin = resolve_binary_candidate(
+        cfg.fastdesk_viewer_bin.as_deref(),
+        exe_dir.as_deref(),
+        cwd.as_deref(),
+        viewer_name,
+        &[
+            &format!("fastdesk-viewer/target/release/{viewer_name}"),
+            &format!("fastdesk-viewer/target/debug/{viewer_name}"),
+            &format!("../fastdesk-viewer/target/release/{viewer_name}"),
+            &format!("../fastdesk-viewer/target/debug/{viewer_name}"),
+        ],
+    );
+
+    let openvmm_img_bin = resolve_binary_candidate(
+        cfg.openvmm_img_bin.as_deref(),
+        exe_dir.as_deref(),
+        cwd.as_deref(),
+        img_name,
+        &[
+            &format!("openvmm/target/release/{img_name}"),
+            &format!("openvmm/target/debug/{img_name}"),
+            &format!("../openvmm/target/release/{img_name}"),
+            &format!("../openvmm/target/debug/{img_name}"),
+        ],
+    );
+
+    let uefi_firmware_path = resolve_file_candidate(
+        cfg.uefi_firmware_path.as_deref(),
+        exe_dir.as_deref(),
+        cwd.as_deref(),
+        std::env::var_os("X86_64_OPENVMM_UEFI_FIRMWARE")
+            .map(PathBuf::from)
+            .as_deref(),
+        &[
+            "firmware/MSVM.fd",
+            "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
+            "../openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
+        ],
+    );
+
+    ResolvedHostPaths {
+        openvmm_bin,
+        fastdesk_viewer_bin,
+        openvmm_img_bin,
+        uefi_firmware_path,
+    }
+}
+
+fn resolve_binary_candidate(
+    explicit: Option<&Path>,
+    exe_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    bin_name: &str,
+    workspace_rel: &[&str],
+) -> Option<PathBuf> {
+    if let Some(p) = explicit
+        && p.is_file()
+    {
+        return Some(p.to_path_buf());
+    }
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join(bin_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // Walk up a couple directories in case running from target/debug or target/release
+        let mut cur = Some(dir);
+        for _ in 0..4 {
+            if let Some(parent) = cur {
+                for rel in workspace_rel {
+                    let c = parent.join(rel);
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+                cur = parent.parent();
+            }
+        }
+    }
+    if let Some(dir) = cwd {
+        let direct = dir.join(bin_name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        for rel in workspace_rel {
+            let c = dir.join(rel);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    find_in_path(bin_name)
+}
+
+fn resolve_file_candidate(
+    explicit: Option<&Path>,
+    exe_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    env_override: Option<&Path>,
+    rel_paths: &[&str],
+) -> Option<PathBuf> {
+    if let Some(p) = explicit
+        && p.is_file()
+    {
+        return Some(p.to_path_buf());
+    }
+    if let Some(p) = env_override
+        && p.is_file()
+    {
+        return Some(p.to_path_buf());
+    }
+    if let Some(dir) = exe_dir {
+        let mut cur = Some(dir);
+        for _ in 0..4 {
+            if let Some(parent) = cur {
+                for rel in rel_paths {
+                    let c = parent.join(rel);
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+                cur = parent.parent();
+            }
+        }
+    }
+    if let Some(dir) = cwd {
+        for rel in rel_paths {
+            let c = dir.join(rel);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn find_in_path(bin_name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let full = dir.join(bin_name);
+        if full.is_file() {
+            return Some(full);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VmPreset {
+    #[default]
+    Windows11,
+    LinuxDesktop,
+    Custom,
+}
+
+impl std::fmt::Display for VmPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Windows11 => write!(f, "Windows 11"),
+            Self::LinuxDesktop => write!(f, "Linux Desktop"),
+            Self::Custom => write!(f, "Custom"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SecureBootTemplateConfig {
+    None,
+    #[default]
+    MicrosoftWindows,
+    MicrosoftUefiCa,
+}
+
+impl std::fmt::Display for SecureBootTemplateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::MicrosoftWindows => write!(f, "Microsoft Windows"),
+            Self::MicrosoftUefiCa => write!(f, "Microsoft UEFI CA"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskFormat {
+    #[default]
+    Vhdx,
+    Raw,
+    Iso,
+}
+
+impl DiskFormat {
+    pub fn from_path(path: &Path) -> Self {
+        match path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("vhdx") | Some("vhd") => Self::Vhdx,
+            Some("iso") => Self::Iso,
+            _ => Self::Raw,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskKind {
+    #[default]
+    HardDisk,
+    Dvd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskAttachment {
+    pub lun: u32,
+    pub kind: DiskKind,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub format: DiskFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpProto {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Display for IpProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortForward {
+    #[serde(default)]
+    pub protocol: IpProto,
+    #[serde(default = "default_host_bind")]
+    pub host_addr: String,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+fn default_host_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+impl std::fmt::Display for PortForward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}->{}",
+            self.protocol, self.host_addr, self.host_port, self.guest_port
+        )
+    }
+}
+
+/// Parses specs like:
+/// - `tcp:127.0.0.1:3389->3389`
+/// - `tcp:8080->80`
+/// - `udp:5000->5000`
+/// - `8080->80` (defaults to tcp + 127.0.0.1)
+pub fn parse_port_forward(spec: &str) -> anyhow::Result<PortForward> {
+    let trimmed = spec.trim();
+    let (left, right) = trimmed
+        .split_once("->")
+        .or_else(|| trimmed.split_once("-:"))
+        .context("port forward must contain '->' (e.g. tcp:127.0.0.1:3389->3389)")?;
+
+    let guest_port: u16 = right
+        .trim()
+        .trim_start_matches(':')
+        .parse()
+        .with_context(|| format!("invalid guest port in '{spec}'"))?;
+
+    let (protocol, addr_part) = if let Some(rest) = left.strip_prefix("tcp:") {
+        (IpProto::Tcp, rest)
+    } else if let Some(rest) = left.strip_prefix("udp:") {
+        (IpProto::Udp, rest)
+    } else {
+        (IpProto::Tcp, left)
+    };
+
+    let (host_addr, host_port_str) = if let Some(bracketed) = addr_part.strip_prefix('[') {
+        let (ip, rest) = bracketed
+            .split_once("]:")
+            .context("invalid IPv6 host address in port forward")?;
+        (ip.to_string(), rest)
+    } else if let Some((addr, port)) = addr_part.rsplit_once(':') {
+        let h = if addr.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            addr.to_string()
+        };
+        (h, port)
+    } else {
+        ("127.0.0.1".to_string(), addr_part)
+    };
+
+    let host_port: u16 = host_port_str
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid host port in '{spec}'"))?;
+
+    Ok(PortForward {
+        protocol,
+        host_addr,
+        host_port,
+        guest_port,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NicBackendConfig {
+    Consomme {
+        #[serde(default)]
+        cidr: Option<String>,
+        #[serde(default)]
+        port_forwards: Vec<PortForward>,
+        #[serde(default = "default_true")]
+        internal_dns: bool,
+        #[serde(default)]
+        allow_host_local_access: bool,
+    },
+    VmSwitch {
+        switch_id: String,
+        #[serde(default)]
+        switch_name: Option<String>,
+    },
+    Tap {
+        name: String,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for NicBackendConfig {
+    fn default() -> Self {
+        Self::Consomme {
+            cidr: None,
+            port_forwards: Vec::new(),
+            internal_dns: true,
+            allow_host_local_access: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NicAttachment {
+    pub id: Uuid,
+    pub name: String,
+    pub mac_address: String,
+    pub backend: NicBackendConfig,
+}
+
+impl NicAttachment {
+    pub fn default_consomme() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: "Default NAT".to_string(),
+            mac_address: generate_hyperv_mac(),
+            backend: NicBackendConfig::default(),
+        }
+    }
+}
+
+/// Generates a random unicast MAC address in Microsoft's Hyper-V OUI (`00-15-5D-xx-xx-xx`).
+pub fn generate_hyperv_mac() -> String {
+    let bytes = Uuid::new_v4().into_bytes();
+    format!("00-15-5D-{:02X}-{:02X}-{:02X}", bytes[0], bytes[1], bytes[2])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FastDeskTransport {
+    #[default]
+    Tcp,
+    HvSock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FastDeskSettings {
+    pub enabled: bool,
+    pub vram_mb: u32,
+    pub use_shm: bool,
+    pub transport: FastDeskTransport,
+    pub listen_addr: String,
+    pub vsock_port: Option<u32>,
+}
+
+impl Default for FastDeskSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            vram_mb: 32,
+            use_shm: true,
+            transport: FastDeskTransport::Tcp,
+            listen_addr: "127.0.0.1:0".to_string(),
+            vsock_port: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmConfig {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub preset: VmPreset,
+    pub vcpus: u32,
+    pub memory_mb: u64,
+    #[serde(default)]
+    pub nested_virt: bool,
+    #[serde(default)]
+    pub uefi_firmware: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub secure_boot_enabled: bool,
+    #[serde(default)]
+    pub secure_boot_template: SecureBootTemplateConfig,
+    #[serde(default)]
+    pub vmgs_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tpm_enabled: bool,
+    #[serde(default)]
+    pub fastdesk: FastDeskSettings,
+    #[serde(default)]
+    pub disks: Vec<DiskAttachment>,
+    #[serde(default)]
+    pub nics: Vec<NicAttachment>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl VmConfig {
+    pub fn from_preset(name: impl Into<String>, preset: VmPreset, vm_dir: &Path) -> Self {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let (vcpus, memory_mb, secure_boot_enabled, secure_boot_template, tpm_enabled) =
+            match preset {
+                VmPreset::Windows11 => (
+                    4,
+                    8192,
+                    true,
+                    SecureBootTemplateConfig::MicrosoftWindows,
+                    false,
+                ),
+                VmPreset::LinuxDesktop => (
+                    4,
+                    4096,
+                    false,
+                    SecureBootTemplateConfig::MicrosoftUefiCa,
+                    false,
+                ),
+                VmPreset::Custom => (2, 4096, false, SecureBootTemplateConfig::None, false),
+            };
+        Self {
+            id,
+            name: name.into(),
+            description: String::new(),
+            preset,
+            vcpus,
+            memory_mb,
+            nested_virt: false,
+            uefi_firmware: None,
+            secure_boot_enabled,
+            secure_boot_template,
+            vmgs_path: Some(vm_dir.join("state.vmgs")),
+            tpm_enabled,
+            fastdesk: FastDeskSettings::default(),
+            disks: Vec::new(),
+            nics: vec![NicAttachment::default_consomme()],
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.name.trim().is_empty() {
+            bail!("VM name cannot be empty");
+        }
+        if self.vcpus == 0 || self.vcpus > 256 {
+            bail!("vcpus must be between 1 and 256");
+        }
+        if self.memory_mb < 128 {
+            bail!("memory_mb must be at least 128 MiB");
+        }
+        if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
+            bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
+        }
+        let mut seen_luns = std::collections::HashSet::new();
+        for disk in &self.disks {
+            if !seen_luns.insert(disk.lun) {
+                bail!("duplicate SCSI LUN {}", disk.lun);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn next_free_lun(&self) -> u32 {
+        (0u32..)
+            .find(|lun| !self.disks.iter().any(|d| d.lun == *lun))
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VmStatus {
+    #[default]
+    Off,
+    Starting,
+    Running,
+    Paused,
+    Stopping,
+    Error,
+}
+
+impl std::fmt::Display for VmStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "Off"),
+            Self::Starting => write!(f, "Starting"),
+            Self::Running => write!(f, "Running"),
+            Self::Paused => write!(f, "Paused"),
+            Self::Stopping => write!(f, "Stopping"),
+            Self::Error => write!(f, "Error"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LiveVmProperties {
+    pub state: String,
+    pub halt_reason: Option<String>,
+    pub working_set_bytes: Option<u64>,
+    pub total_runtime_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VmRuntimeState {
+    pub status: VmStatus,
+    pub pid: Option<u32>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub fastdesk_endpoint: Option<String>,
+    pub shm_path: Option<String>,
+    pub rpc_socket_path: Option<PathBuf>,
+    pub last_error: Option<String>,
+    pub live_properties: Option<LiveVmProperties>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmSummary {
+    pub config: VmConfig,
+    pub runtime: VmRuntimeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateVmPayload {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub preset: VmPreset,
+    pub vcpus: Option<u32>,
+    pub memory_mb: Option<u64>,
+    pub nested_virt: Option<bool>,
+    pub uefi_firmware: Option<PathBuf>,
+    pub secure_boot_enabled: Option<bool>,
+    pub secure_boot_template: Option<SecureBootTemplateConfig>,
+    pub fastdesk: Option<FastDeskSettings>,
+    #[serde(default)]
+    pub disks: Vec<DiskAttachment>,
+    #[serde(default)]
+    pub create_disk: Option<CreateDiskPayload>,
+    pub iso_path: Option<PathBuf>,
+    pub nics: Option<Vec<NicAttachment>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateVmPayload {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub vcpus: Option<u32>,
+    pub memory_mb: Option<u64>,
+    pub nested_virt: Option<bool>,
+    pub uefi_firmware: Option<Option<PathBuf>>,
+    pub secure_boot_enabled: Option<bool>,
+    pub secure_boot_template: Option<SecureBootTemplateConfig>,
+    pub fastdesk: Option<FastDeskSettings>,
+    pub disks: Option<Vec<DiskAttachment>>,
+    pub nics: Option<Vec<NicAttachment>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDiskPayload {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub format: DiskFormat,
+    #[serde(default)]
+    pub fixed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectDiskPayload {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachDiskPayload {
+    pub path: PathBuf,
+    pub lun: Option<u32>,
+    #[serde(default)]
+    pub read_only: bool,
+    pub format: Option<DiskFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountIsoPayload {
+    pub path: PathBuf,
+    pub lun: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortForwardPayload {
+    pub port: PortForward,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ShutdownVmPayload {
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub acpi: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskInfo {
+    pub path: PathBuf,
+    pub format: String,
+    pub disk_type: String,
+    pub virtual_size_bytes: u64,
+    pub file_size_bytes: u64,
+    pub block_size_bytes: Option<u32>,
+    pub sector_size_bytes: Option<u32>,
+    pub parent_path: Option<String>,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualSwitchInfo {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub cpu_count: usize,
+    pub daemon_version: String,
+    pub data_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub listen_addr: String,
+    pub resolved_paths: ResolvedHostPaths,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    VmUpdated { vm: VmSummary },
+    VmDeleted { id: Uuid },
+    HostConfigUpdated,
+    DaemonStopping,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiErrorBody {
+    pub error: String,
+}
+
+pub fn parse_byte_size(input: &str) -> anyhow::Result<u64> {
+    let s = input.trim();
+    if s.is_empty() {
+        bail!("size cannot be empty");
+    }
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(s.len());
+    let num: u64 = s[..split]
+        .parse()
+        .with_context(|| format!("invalid size number in '{input}'"))?;
+    let unit = s[split..].trim().to_ascii_uppercase();
+    let mult: u64 = match unit.as_str() {
+        "" | "B" => 1,
+        "K" | "KB" | "KIB" => 1024,
+        "M" | "MB" | "MIB" => 1024 * 1024,
+        "G" | "GB" | "GIB" => 1024 * 1024 * 1024,
+        "T" | "TB" | "TIB" => 1024 * 1024 * 1024 * 1024,
+        _ => bail!("unknown size unit '{unit}' in '{input}'"),
+    };
+    num.checked_mul(mult)
+        .context("size overflows u64")
+}
+
+pub fn parse_memory_mb(input: &str) -> anyhow::Result<u64> {
+    let trimmed = input.trim();
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return trimmed
+            .parse::<u64>()
+            .context("invalid memory MiB integer");
+    }
+    let bytes = parse_byte_size(trimmed)?;
+    Ok((bytes / (1024 * 1024)).max(1))
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+    if bytes >= TIB {
+        format!("{:.2} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_and_port_forward_parsing() {
+        assert_eq!(parse_byte_size("64G").unwrap(), 64 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_mb("8G").unwrap(), 8192);
+        assert_eq!(parse_memory_mb("4096").unwrap(), 4096);
+
+        let pf1 = parse_port_forward("tcp:127.0.0.1:3389->3389").unwrap();
+        assert_eq!(pf1.protocol, IpProto::Tcp);
+        assert_eq!(pf1.host_addr, "127.0.0.1");
+        assert_eq!(pf1.host_port, 3389);
+        assert_eq!(pf1.guest_port, 3389);
+
+        let pf2 = parse_port_forward("udp:5000->5001").unwrap();
+        assert_eq!(pf2.protocol, IpProto::Udp);
+        assert_eq!(pf2.host_addr, "127.0.0.1");
+        assert_eq!(pf2.host_port, 5000);
+        assert_eq!(pf2.guest_port, 5001);
+    }
+
+    #[test]
+    fn preset_configs_are_valid() {
+        let dir = Path::new("/tmp/test-vm");
+        for preset in [VmPreset::Windows11, VmPreset::LinuxDesktop, VmPreset::Custom] {
+            let cfg = VmConfig::from_preset("test-vm", preset, dir);
+            cfg.validate().unwrap();
+            assert_eq!(cfg.nics.len(), 1);
+            assert!(cfg.nics[0].mac_address.starts_with("00-15-5D-"));
+        }
+    }
+}
