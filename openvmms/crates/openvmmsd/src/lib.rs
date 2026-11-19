@@ -28,7 +28,6 @@ impl Default for DaemonOptions {
 
 pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
     let supervisor = Supervisor::new(&opts.data_dir, opts.listen_addr.as_deref())?;
-    let token = supervisor.auth_token().to_string();
     let listen_addr = supervisor.listen_addr();
     let addr: SocketAddr = listen_addr
         .parse()
@@ -37,30 +36,26 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding openvmmsd HTTP server on {addr}"))?;
-    let bound_addr = listener.local_addr()?;
+    let bound_addr = supervisor.serve_on_listener(listener)?;
+    let mut cfg = supervisor.host_config();
+    cfg.listen_addr = bound_addr.to_string();
+    let _ = supervisor.update_host_config(cfg).await?;
     info!(address = %bound_addr, data_dir = %opts.data_dir.display(), "openvmmsd listening");
 
-    let app = server::build_router(supervisor.clone(), token);
-    let shutdown_supervisor = supervisor.clone();
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let ctrl_c = async {
-                let _ = tokio::signal::ctrl_c().await;
-            };
-            tokio::select! {
-                _ = ctrl_c => {
-                    info!("received shutdown signal");
-                }
-                _ = shutdown_supervisor.wait_for_shutdown_signal() => {
-                    info!("received API shutdown request");
-                }
-            }
-            shutdown_supervisor.mark_shutting_down();
-            shutdown_supervisor.shutdown_all_vms().await;
-        })
-        .await
-        .context("openvmmsd HTTP server failed")?;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("received shutdown signal");
+        }
+        _ = supervisor.wait_for_shutdown_signal() => {
+            info!("received API shutdown request");
+        }
+    }
+    supervisor.mark_shutting_down();
+    supervisor.shutdown_all_vms().await;
+    supervisor.join_all_listeners().await;
 
     Ok(())
 }
@@ -77,22 +72,18 @@ impl TestDaemonHandle {
         let supervisor = Supervisor::new(&data_dir, Some("127.0.0.1:0"))?;
         let token = supervisor.auth_token().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let bound_addr = listener.local_addr()?;
+        let bound_addr = supervisor.serve_on_listener(listener)?;
         // Persist actual bound port in host config so ApiClient::from_data_dir works seamlessly.
         let mut cfg = supervisor.host_config();
         cfg.listen_addr = bound_addr.to_string();
         let _ = supervisor.update_host_config(cfg).await?;
 
-        let app = server::build_router(supervisor.clone(), token.clone());
         let shutdown_sup = supervisor.clone();
         let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    shutdown_sup.wait_for_shutdown_signal().await;
-                    shutdown_sup.mark_shutting_down();
-                    shutdown_sup.shutdown_all_vms().await;
-                })
-                .await;
+            shutdown_sup.wait_for_shutdown_signal().await;
+            shutdown_sup.mark_shutting_down();
+            shutdown_sup.shutdown_all_vms().await;
+            shutdown_sup.join_all_listeners().await;
         });
 
         Ok(Self {

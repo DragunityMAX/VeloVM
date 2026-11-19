@@ -696,12 +696,25 @@ pub struct UpdateVmPayload {
     pub vcpus: Option<u32>,
     pub memory_mb: Option<u64>,
     pub nested_virt: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
     pub uefi_firmware: Option<Option<PathBuf>>,
     pub secure_boot_enabled: Option<bool>,
     pub secure_boot_template: Option<SecureBootTemplateConfig>,
     pub fastdesk: Option<FastDeskSettings>,
     pub disks: Option<Vec<DiskAttachment>>,
     pub nics: Option<Vec<NicAttachment>>,
+}
+
+fn deserialize_nullable_path<'de, D>(deserializer: D) -> Result<Option<Option<PathBuf>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<PathBuf>::deserialize(deserializer)?;
+    Ok(Some(opt.filter(|p| !p.as_os_str().is_empty())))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -881,5 +894,21 @@ mod tests {
             assert_eq!(cfg.nics.len(), 1);
             assert!(cfg.nics[0].mac_address.starts_with("00-15-5D-"));
         }
+    }
+
+    #[test]
+    fn update_vm_payload_distinguishes_omitted_and_null_firmware() {
+        let omitted: UpdateVmPayload = serde_json::from_str(r#"{"name":"vm1"}"#).unwrap();
+        assert_eq!(omitted.uefi_firmware, None);
+
+        let cleared: UpdateVmPayload = serde_json::from_str(r#"{"uefi_firmware":null}"#).unwrap();
+        assert_eq!(cleared.uefi_firmware, Some(None));
+
+        let empty: UpdateVmPayload = serde_json::from_str(r#"{"uefi_firmware":""}"#).unwrap();
+        assert_eq!(empty.uefi_firmware, Some(None));
+
+        let set: UpdateVmPayload =
+            serde_json::from_str(r#"{"uefi_firmware":"/opt/MSVM.fd"}"#).unwrap();
+        assert_eq!(set.uefi_firmware, Some(Some(PathBuf::from("/opt/MSVM.fd"))));
     }
 }

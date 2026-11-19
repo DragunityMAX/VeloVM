@@ -293,6 +293,9 @@ struct CreateVmArgs {
     net: Option<String>,
     #[arg(long)]
     vram_mb: Option<u32>,
+    /// Optional UEFI firmware override (MSVM.fd)
+    #[arg(long)]
+    uefi_firmware: Option<PathBuf>,
     #[arg(long, value_enum)]
     secure_boot: Option<ToggleArg>,
     #[arg(long, value_enum)]
@@ -316,6 +319,12 @@ struct EditVmArgs {
     memory: Option<String>,
     #[arg(long)]
     vram_mb: Option<u32>,
+    /// Override the UEFI firmware image path (MSVM.fd)
+    #[arg(long)]
+    uefi_firmware: Option<PathBuf>,
+    /// Clear the per-VM UEFI firmware override and revert to the host default
+    #[arg(long, conflicts_with = "uefi_firmware")]
+    clear_uefi_firmware: bool,
     #[arg(long, value_enum)]
     secure_boot: Option<ToggleArg>,
     #[arg(long, value_enum)]
@@ -677,7 +686,11 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                 vcpus: args.cpus,
                 memory_mb,
                 nested_virt: args.nested_virt.map(bool::from),
-                uefi_firmware: None,
+                uefi_firmware: args
+                    .uefi_firmware
+                    .as_deref()
+                    .map(resolve_client_path)
+                    .filter(|p| !p.as_os_str().is_empty()),
                 secure_boot_enabled: args.secure_boot.map(bool::from),
                 secure_boot_template: None,
                 fastdesk,
@@ -697,12 +710,25 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                 fd.vram_mb = vram_mb;
                 fastdesk = Some(fd);
             }
+            let uefi_firmware = if args.clear_uefi_firmware {
+                Some(None)
+            } else if let Some(fw) = &args.uefi_firmware {
+                let resolved = resolve_client_path(fw);
+                if resolved.as_os_str().is_empty() {
+                    Some(None)
+                } else {
+                    Some(Some(resolved))
+                }
+            } else {
+                None
+            };
             let payload = UpdateVmPayload {
                 name: args.name.clone(),
                 description: args.description.clone(),
                 vcpus: args.cpus,
                 memory_mb: args.memory.as_deref().map(parse_memory_mb).transpose()?,
                 nested_virt: args.nested_virt.map(bool::from),
+                uefi_firmware,
                 secure_boot_enabled: args.secure_boot.map(bool::from),
                 fastdesk,
                 ..Default::default()
@@ -916,6 +942,9 @@ fn print_vm_summary(vm: &VmSummary, json: bool) -> anyhow::Result<()> {
             },
             vm.config.secure_boot_template
         );
+        if let Some(fw) = &vm.config.uefi_firmware {
+            println!("UEFI Path:    {}", fw.display());
+        }
         if let Some(ep) = &vm.runtime.fastdesk_endpoint {
             println!("FastDesk:     {ep}");
         } else {
@@ -1025,5 +1054,34 @@ mod tests {
         let resolved = resolve_client_path(Path::new("relative.img"));
         assert!(resolved.is_absolute());
         assert_eq!(resolved, cwd.join("relative.img"));
+    }
+
+    #[test]
+    fn cli_parses_vm_edit_firmware_override_and_clear() {
+        let parsed_set =
+            Cli::try_parse_from(["openvmms", "vm", "edit", "VM1", "--uefi-firmware", "MSVM.fd"])
+                .unwrap();
+        match parsed_set.command {
+            TopCommand::Vm {
+                action: VmCmd::Edit(args),
+            } => {
+                assert_eq!(args.uefi_firmware.as_deref(), Some(Path::new("MSVM.fd")));
+                assert!(!args.clear_uefi_firmware);
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let parsed_clear =
+            Cli::try_parse_from(["openvmms", "vm", "edit", "VM1", "--clear-uefi-firmware"])
+                .unwrap();
+        match parsed_clear.command {
+            TopCommand::Vm {
+                action: VmCmd::Edit(args),
+            } => {
+                assert!(args.clear_uefi_firmware);
+                assert!(args.uefi_firmware.is_none());
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 }

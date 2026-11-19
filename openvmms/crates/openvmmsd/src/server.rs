@@ -1010,4 +1010,241 @@ mod tests {
         .await
         .expect("SSE stream and daemon did not shut down within 2s");
     }
+
+    #[tokio::test]
+    async fn updating_host_config_listen_addr_serves_new_port_on_same_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        // Create a VM on the original port so we can confirm state continuity on the new port.
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "PortSwitch-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+
+        let mut cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Invalid listen address must fail without overwriting config.
+        let mut bad_cfg = cfg.clone();
+        bad_cfg.listen_addr = "not-a-socket-addr".into();
+        let bad_resp = client
+            .put(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&bad_cfg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), 400);
+
+        // Bind a fresh ephemeral port on the same daemon.
+        cfg.listen_addr = "127.0.0.1:0".into();
+        let put_resp = client
+            .put(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&cfg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 200);
+        let updated: openvmms_core::models::HostConfig = put_resp.json().await.unwrap();
+        let new_url = format!("http://{}", updated.listen_addr);
+        assert_ne!(new_url, daemon.base_url);
+
+        // ApiClient::from_data_dir resolves the persisted new listen_addr and talks to the SAME daemon.
+        let data_dir = dir.path().to_path_buf();
+        let (health_ok, vm_names): (bool, Vec<String>) = tokio::task::spawn_blocking(move || {
+            let api = openvmms_core::api_client::ApiClient::from_data_dir(Some(&data_dir), None)
+                .unwrap();
+            assert_eq!(api.base_url(), new_url);
+            api.health().unwrap();
+            let vms = api.list_vms().unwrap();
+            (
+                true,
+                vms.into_iter().map(|v| v.config.name).collect(),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(health_ok);
+        assert_eq!(vm_names, vec!["PortSwitch-VM".to_string()]);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn attach_disk_while_vm_starting_is_rejected_with_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Starting-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+        let created: VmSummary = create_resp.json().await.unwrap();
+
+        daemon
+            .supervisor
+            .set_vm_status_for_test(created.config.id, openvmms_core::models::VmStatus::Starting);
+
+        let disk_path = dir.path().join("extra.img");
+        fs::write(&disk_path, b"DISK").unwrap();
+        let attach_resp = client
+            .post(format!("{}/api/v1/vms/Starting-VM/disks", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::AttachDiskPayload {
+                path: disk_path,
+                lun: Some(0),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(attach_resp.status(), 409);
+
+        let iso_path = dir.path().join("boot.iso");
+        fs::write(&iso_path, b"ISO").unwrap();
+        let iso_resp = client
+            .post(format!("{}/api/v1/vms/Starting-VM/iso", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&MountIsoPayload {
+                path: iso_path,
+                lun: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(iso_resp.status(), 409);
+
+        let vm: VmSummary = client
+            .get(format!("{}/api/v1/vms/Starting-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(vm.config.disks.is_empty());
+
+        daemon
+            .supervisor
+            .set_vm_status_for_test(created.config.id, openvmms_core::models::VmStatus::Off);
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn update_vm_clears_firmware_on_null_and_preserves_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let fw_path = dir.path().join("custom-msvm.fd");
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Firmware-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: Some(fw_path.clone()),
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: None,
+                iso_path: None,
+                nics: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+        let created: VmSummary = create_resp.json().await.unwrap();
+        assert_eq!(created.config.uefi_firmware.as_ref(), Some(&fw_path));
+
+        // Omitting uefi_firmware must preserve the existing override.
+        let keep_resp = client
+            .put(format!("{}/api/v1/vms/Firmware-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({ "description": "updated" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(keep_resp.status(), 200);
+        let kept: VmSummary = keep_resp.json().await.unwrap();
+        assert_eq!(kept.config.description, "updated");
+        assert_eq!(kept.config.uefi_firmware.as_ref(), Some(&fw_path));
+
+        // Explicit JSON null must clear the override back to None.
+        let clear_resp = client
+            .put(format!("{}/api/v1/vms/Firmware-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({ "uefi_firmware": null }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clear_resp.status(), 200);
+        let cleared: VmSummary = clear_resp.json().await.unwrap();
+        assert_eq!(cleared.config.uefi_firmware, None);
+
+        daemon.shutdown().await;
+    }
 }

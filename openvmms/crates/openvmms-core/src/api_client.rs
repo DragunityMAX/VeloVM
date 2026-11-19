@@ -144,8 +144,11 @@ impl ApiClient {
 
     pub fn update_vm(&self, id_or_name: &str, req: &UpdateVmPayload) -> anyhow::Result<VmSummary> {
         let mut resolved = req.clone();
-        if let Some(Some(fw)) = &resolved.uefi_firmware {
-            resolved.uefi_firmware = Some(Some(resolve_client_path(fw)));
+        if let Some(fw_opt) = &resolved.uefi_firmware {
+            resolved.uefi_firmware = Some(match fw_opt {
+                Some(fw) if !fw.as_os_str().is_empty() => Some(resolve_client_path(fw)),
+                _ => None,
+            });
         }
         if let Some(disks) = &mut resolved.disks {
             for d in disks {
@@ -378,22 +381,38 @@ pub fn resolve_client_path(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     };
-    normalize_lexical(&joined)
+    normalize_client_path(&joined)
 }
 
-fn normalize_lexical(path: &Path) -> PathBuf {
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(s) = path.to_str()
+            && let Some(stripped) = s.strip_prefix(r"\\?\")
+        {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
+
+fn normalize_client_path(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
             Component::CurDir => {}
-            Component::ParentDir => match out.components().next_back() {
-                Some(Component::Normal(_)) => {
+            Component::ParentDir => {
+                // Canonicalize the prefix before resolving `..` so symlinks expand to their target's parent rather than being collapsed lexically.
+                if !out.as_os_str().is_empty()
+                    && let Ok(canon) = std::fs::canonicalize(&out)
+                {
+                    out = strip_verbatim_prefix(canon);
                     out.pop();
+                } else {
+                    out.push(comp.as_os_str());
                 }
-                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
-                _ => out.push(comp.as_os_str()),
-            },
+            }
             other => out.push(other.as_os_str()),
         }
     }
@@ -598,9 +617,42 @@ mod tests {
     #[test]
     fn resolve_client_path_resolves_relative_and_preserves_empty() {
         assert_eq!(resolve_client_path(Path::new("")), PathBuf::new());
-        let cwd = std::env::current_dir().unwrap();
-        let resolved = resolve_client_path(Path::new("./sub/../disk.img"));
-        assert_eq!(resolved, normalize_lexical(&cwd.join("disk.img")));
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let resolved = resolve_client_path(&sub.join("..").join("disk.img"));
+        assert_eq!(
+            resolved,
+            strip_verbatim_prefix(std::fs::canonicalize(dir.path()).unwrap()).join("disk.img")
+        );
         assert!(resolved.is_absolute());
+
+        // Non-existent intermediate directory should keep `..` instead of collapsing it away.
+        let nonexistent = resolve_client_path(&dir.path().join("missing").join("..").join("disk.img"));
+        assert_eq!(
+            nonexistent,
+            dir.path().join("missing").join("..").join("disk.img")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_client_path_preserves_symlink_parent_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real_parent");
+        let real_sub = real_parent.join("sub");
+        std::fs::create_dir_all(&real_sub).unwrap();
+
+        let wrong_disk = dir.path().join("disk.img");
+        let right_disk = real_parent.join("disk.img");
+        std::fs::write(&wrong_disk, b"WRONG").unwrap();
+        std::fs::write(&right_disk, b"RIGHT").unwrap();
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_sub, &link).unwrap();
+
+        let resolved = resolve_client_path(&link.join("..").join("disk.img"));
+        assert_eq!(resolved, std::fs::canonicalize(&right_disk).unwrap());
+        assert_ne!(resolved, std::fs::canonicalize(&wrong_disk).unwrap());
     }
 }

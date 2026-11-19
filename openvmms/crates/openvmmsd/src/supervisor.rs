@@ -33,8 +33,10 @@ use openvmms_core::store::RegistryStore;
 use openvmms_core::ttrpc::TtrpcClient;
 use openvmms_core::vmservice;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -64,12 +66,32 @@ impl ManagedVm {
             runtime: self.runtime.clone(),
         }
     }
+
+    fn active_rpc_socket(&self, action: &str) -> anyhow::Result<Option<PathBuf>> {
+        match self.runtime.status {
+            VmStatus::Starting | VmStatus::Stopping => bail!(
+                "cannot {action} while VM '{}' is {}",
+                self.config.name,
+                self.runtime.status
+            ),
+            VmStatus::Running | VmStatus::Paused => Ok(Some(
+                self.runtime
+                    .rpc_socket_path
+                    .clone()
+                    .context("VM is active but has no RPC socket")?,
+            )),
+            VmStatus::Off | VmStatus::Error => Ok(None),
+        }
+    }
 }
 
 pub struct Supervisor {
     store: RegistryStore,
     auth_token: String,
     host_config: RwLock<HostConfig>,
+    host_config_lock: tokio::sync::Mutex<()>,
+    bound_addrs: RwLock<HashSet<SocketAddr>>,
+    listener_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     vms: RwLock<HashMap<Uuid, ManagedVm>>,
     events_tx: broadcast::Sender<DaemonEvent>,
     shutdown_notify: Notify,
@@ -105,6 +127,9 @@ impl Supervisor {
             store,
             auth_token,
             host_config: RwLock::new(host_config),
+            host_config_lock: tokio::sync::Mutex::new(()),
+            bound_addrs: RwLock::new(HashSet::new()),
+            listener_tasks: std::sync::Mutex::new(Vec::new()),
             vms: RwLock::new(vm_map),
             events_tx,
             shutdown_notify: Notify::new(),
@@ -176,13 +201,79 @@ impl Supervisor {
         }
     }
 
-    pub async fn update_host_config(&self, mut new_cfg: HostConfig) -> anyhow::Result<HostConfig> {
+    /// Spawns an HTTP API server on `listener` tied to this supervisor's lifecycle.
+    pub fn serve_on_listener(
+        self: &Arc<Self>,
+        listener: tokio::net::TcpListener,
+    ) -> anyhow::Result<SocketAddr> {
+        let bound_addr = listener.local_addr()?;
+        let app = crate::server::build_router(Arc::clone(self), self.auth_token.clone());
+        let mut shutdown_rx = self.subscribe_shutdown();
+        let handle = tokio::spawn(async move {
+            let result = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let already_stopping = *shutdown_rx.borrow();
+                    if !already_stopping {
+                        let _ = shutdown_rx.changed().await;
+                    }
+                })
+                .await;
+            if let Err(err) = result {
+                warn!(address = %bound_addr, error = %err, "openvmmsd HTTP listener exited with error");
+            }
+        });
+        self.bound_addrs.write().unwrap().insert(bound_addr);
+        self.listener_tasks.lock().unwrap().push(handle);
+        Ok(bound_addr)
+    }
+
+    /// Waits for all active HTTP listener tasks started by this supervisor to exit.
+    pub async fn join_all_listeners(&self) {
+        let handles = {
+            let mut guard = self.listener_tasks.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    pub async fn update_host_config(
+        self: &Arc<Self>,
+        mut new_cfg: HostConfig,
+    ) -> anyhow::Result<HostConfig> {
+        let _lock = self.host_config_lock.lock().await;
         if new_cfg.data_dir.as_os_str().is_empty() {
             new_cfg.data_dir = self.store.data_dir().to_path_buf();
         }
         if new_cfg.runtime_dir.as_os_str().is_empty() {
             new_cfg.runtime_dir = openvmms_core::models::default_runtime_dir(&new_cfg.data_dir);
         }
+
+        let trimmed_addr = new_cfg
+            .listen_addr
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+        let target_addr: SocketAddr = trimmed_addr
+            .parse()
+            .with_context(|| format!("invalid listen address '{}'", new_cfg.listen_addr))?;
+
+        let should_bind = {
+            let addrs = self.bound_addrs.read().unwrap();
+            !addrs.is_empty() && !addrs.contains(&target_addr)
+        };
+        if should_bind {
+            let listener = tokio::net::TcpListener::bind(target_addr)
+                .await
+                .with_context(|| format!("binding openvmmsd HTTP server on {target_addr}"))?;
+            let bound_addr = self.serve_on_listener(listener)?;
+            new_cfg.listen_addr = bound_addr.to_string();
+        } else {
+            new_cfg.listen_addr = target_addr.to_string();
+        }
+
         self.store.save_host_config(&new_cfg)?;
         *self.host_config.write().unwrap() = new_cfg.clone();
         self.emit(DaemonEvent::HostConfigUpdated);
@@ -323,8 +414,8 @@ impl Supervisor {
         if let Some(nested) = payload.nested_virt {
             cfg.nested_virt = nested;
         }
-        if payload.uefi_firmware.is_some() {
-            cfg.uefi_firmware = payload.uefi_firmware;
+        if let Some(fw) = payload.uefi_firmware.filter(|p| !p.as_os_str().is_empty()) {
+            cfg.uefi_firmware = Some(fw);
         }
         if let Some(sb) = payload.secure_boot_enabled {
             cfg.secure_boot_enabled = sb;
@@ -460,7 +551,7 @@ impl Supervisor {
             updated.nested_virt = nested;
         }
         if let Some(fw) = payload.uefi_firmware {
-            updated.uefi_firmware = fw;
+            updated.uefi_firmware = fw.filter(|p| !p.as_os_str().is_empty());
         }
         if let Some(sb) = payload.secure_boot_enabled {
             updated.secure_boot_enabled = sb;
@@ -1004,50 +1095,71 @@ impl Supervisor {
         } else {
             DiskKind::HardDisk
         };
-        let (lun, active_sock) = {
-            let guard = self.vms.read().unwrap();
-            let vm = guard.get(&id).context("VM not found")?;
+
+        let pending = {
+            let mut guard = self.vms.write().unwrap();
+            let vm = guard.get_mut(&id).context("VM not found")?;
+            let active_sock = vm.active_rpc_socket("attach disk")?;
             let lun = req.lun.unwrap_or_else(|| vm.config.next_free_lun());
             if vm.config.disks.iter().any(|d| d.lun == lun) {
                 bail!("SCSI LUN {lun} is already occupied");
             }
-            let sock = matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
-                .then(|| vm.runtime.rpc_socket_path.clone())
-                .flatten();
-            (lun, sock)
+            let attachment = DiskAttachment {
+                lun,
+                kind,
+                path: req.path,
+                read_only: req.read_only || kind == DiskKind::Dvd,
+                format,
+            };
+            match active_sock {
+                Some(sock) => Ok((attachment, sock)),
+                None => {
+                    let mut updated = vm.config.clone();
+                    updated.disks.push(attachment);
+                    updated.disks.sort_by_key(|d| d.lun);
+                    updated.updated_at = Utc::now();
+                    self.store.save_vm(&updated)?;
+                    vm.config = updated;
+                    Err(vm.summary())
+                }
+            }
         };
 
-        let attachment = DiskAttachment {
-            lun,
-            kind,
-            path: req.path,
-            read_only: req.read_only || kind == DiskKind::Dvd,
-            format,
+        let summary = match pending {
+            Err(summary) => summary,
+            Ok((attachment, sock)) => {
+                TtrpcClient::new(sock)
+                    .modify_resource(vmservice::ModifyResourceRequest {
+                        r#type: vmservice::ModifyType::Add as i32,
+                        resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
+                            to_proto_scsi_disk(&attachment),
+                        )),
+                    })
+                    .await
+                    .context("hot-adding SCSI disk to running VM")?;
+
+                let mut guard = self.vms.write().unwrap();
+                let vm = guard.get_mut(&id).context("VM not found")?;
+                if !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
+                    bail!(
+                        "cannot complete disk attach because VM '{}' changed state to {}",
+                        vm.config.name,
+                        vm.runtime.status
+                    );
+                }
+                if vm.config.disks.iter().any(|d| d.lun == attachment.lun) {
+                    bail!("SCSI LUN {} is already occupied", attachment.lun);
+                }
+                let mut updated = vm.config.clone();
+                updated.disks.push(attachment);
+                updated.disks.sort_by_key(|d| d.lun);
+                updated.updated_at = Utc::now();
+                self.store.save_vm(&updated)?;
+                vm.config = updated;
+                vm.summary()
+            }
         };
 
-        if let Some(sock) = active_sock {
-            TtrpcClient::new(sock)
-                .modify_resource(vmservice::ModifyResourceRequest {
-                    r#type: vmservice::ModifyType::Add as i32,
-                    resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
-                        to_proto_scsi_disk(&attachment),
-                    )),
-                })
-                .await
-                .context("hot-adding SCSI disk to running VM")?;
-        }
-
-        let summary = {
-            let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
-            let mut updated = vm.config.clone();
-            updated.disks.push(attachment);
-            updated.disks.sort_by_key(|d| d.lun);
-            updated.updated_at = Utc::now();
-            self.store.save_vm(&updated)?;
-            vm.config = updated;
-            vm.summary()
-        };
         self.emit(DaemonEvent::VmUpdated {
             vm: summary.clone(),
         });
@@ -1056,9 +1168,10 @@ impl Supervisor {
 
     pub async fn detach_disk(&self, id_or_name: &str, lun: u32) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
-        let (existing, active_sock) = {
-            let guard = self.vms.read().unwrap();
-            let vm = guard.get(&id).context("VM not found")?;
+        let pending = {
+            let mut guard = self.vms.write().unwrap();
+            let vm = guard.get_mut(&id).context("VM not found")?;
+            let active_sock = vm.active_rpc_socket("detach disk")?;
             let disk = vm
                 .config
                 .disks
@@ -1066,38 +1179,54 @@ impl Supervisor {
                 .find(|d| d.lun == lun)
                 .cloned()
                 .with_context(|| format!("no disk attached at SCSI LUN {lun}"))?;
-            let sock = matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
-                .then(|| vm.runtime.rpc_socket_path.clone())
-                .flatten();
-            (disk, sock)
+            match active_sock {
+                Some(sock) => Ok((disk, sock)),
+                None => {
+                    let mut updated = vm.config.clone();
+                    updated.disks.retain(|d| d.lun != lun);
+                    updated.updated_at = Utc::now();
+                    self.store.save_vm(&updated)?;
+                    vm.config = updated;
+                    Err(vm.summary())
+                }
+            }
         };
 
-        if let Some(sock) = active_sock {
-            TtrpcClient::new(sock)
-                .modify_resource(vmservice::ModifyResourceRequest {
-                    r#type: vmservice::ModifyType::Remove as i32,
-                    resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
-                        vmservice::ScsiDisk {
-                            controller: 0,
-                            lun: existing.lun,
-                            ..Default::default()
-                        },
-                    )),
-                })
-                .await
-                .context("hot-removing SCSI disk from running VM")?;
-        }
+        let summary = match pending {
+            Err(summary) => summary,
+            Ok((existing, sock)) => {
+                TtrpcClient::new(sock)
+                    .modify_resource(vmservice::ModifyResourceRequest {
+                        r#type: vmservice::ModifyType::Remove as i32,
+                        resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
+                            vmservice::ScsiDisk {
+                                controller: 0,
+                                lun: existing.lun,
+                                ..Default::default()
+                            },
+                        )),
+                    })
+                    .await
+                    .context("hot-removing SCSI disk from running VM")?;
 
-        let summary = {
-            let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
-            let mut updated = vm.config.clone();
-            updated.disks.retain(|d| d.lun != lun);
-            updated.updated_at = Utc::now();
-            self.store.save_vm(&updated)?;
-            vm.config = updated;
-            vm.summary()
+                let mut guard = self.vms.write().unwrap();
+                let vm = guard.get_mut(&id).context("VM not found")?;
+                if !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
+                    bail!(
+                        "cannot complete disk detach because VM '{}' changed state to {}",
+                        vm.config.name,
+                        vm.runtime.status
+                    );
+                }
+                let mut updated = vm.config.clone();
+                updated.disks.retain(|d| d.lun != lun);
+                updated.updated_at = Utc::now();
+                self.store.save_vm(&updated)?;
+                vm.config = updated;
+                vm.summary()
+            }
         };
+
         self.emit(DaemonEvent::VmUpdated {
             vm: summary.clone(),
         });
@@ -1116,6 +1245,7 @@ impl Supervisor {
         let existing_dvd_lun = {
             let guard = self.vms.read().unwrap();
             let vm = guard.get(&id).context("VM not found")?;
+            let _ = vm.active_rpc_socket("mount ISO")?;
             match req.lun {
                 Some(l) => match vm.config.disks.iter().find(|d| d.lun == l) {
                     Some(d) if d.kind != DiskKind::Dvd => {
@@ -1167,6 +1297,7 @@ impl Supervisor {
         let target_lun = {
             let guard = self.vms.read().unwrap();
             let vm = guard.get(&id).context("VM not found")?;
+            let _ = vm.active_rpc_socket("eject ISO")?;
             match lun {
                 Some(l) => vm
                     .config
@@ -1216,80 +1347,119 @@ impl Supervisor {
     ) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
         let active_sock = {
-            let guard = self.vms.read().unwrap();
-            let vm = guard.get(&id).context("VM not found")?;
-            let nic = vm
-                .config
-                .nics
-                .iter()
-                .find(|n| n.id == nic_id)
-                .with_context(|| format!("NIC {nic_id} not found"))?;
-            let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend else {
-                bail!("port forwarding is only supported on Consomme NAT NICs");
-            };
-            if add && port_forwards.contains(&port) {
-                bail!("port forward {port} already exists");
-            }
-            if !add && !port_forwards.contains(&port) {
-                bail!("port forward {port} not found");
-            }
-            matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
-                .then(|| vm.runtime.rpc_socket_path.clone())
-                .flatten()
-        };
-
-        if let Some(sock) = active_sock {
-            let modify_type = if add {
-                vmservice::ModifyType::Update as i32
-            } else {
-                vmservice::ModifyType::Remove as i32
-            };
-            TtrpcClient::new(sock)
-                .modify_resource(vmservice::ModifyResourceRequest {
-                    r#type: modify_type,
-                    resource: Some(vmservice::modify_resource_request::Resource::NicConfig(
-                        vmservice::NicConfig {
-                            nic_id: nic_id.to_string(),
-                            backend: Some(vmservice::nic_config::Backend::Consomme(
-                                vmservice::ConsommeBackend {
-                                    ports: vec![to_proto_port_config(&port)],
-                                    ..Default::default()
-                                },
-                            )),
-                            ..Default::default()
-                        },
-                    )),
-                })
-                .await
-                .context("updating Consomme port forward on running VM")?;
-        }
-
-        let summary = {
             let mut guard = self.vms.write().unwrap();
             let vm = guard.get_mut(&id).context("VM not found")?;
-            let mut updated = vm.config.clone();
-            let nic = updated
-                .nics
-                .iter_mut()
-                .find(|n| n.id == nic_id)
-                .context("NIC vanished")?;
-            if let NicBackendConfig::Consomme { port_forwards, .. } = &mut nic.backend {
-                if add {
-                    port_forwards.push(port);
-                } else {
-                    port_forwards.retain(|p| p != &port);
+            let sock_opt = vm.active_rpc_socket("modify port forwarding")?;
+            {
+                let nic = vm
+                    .config
+                    .nics
+                    .iter()
+                    .find(|n| n.id == nic_id)
+                    .with_context(|| format!("NIC {nic_id} not found"))?;
+                let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend else {
+                    bail!("port forwarding is only supported on Consomme NAT NICs");
+                };
+                if add && port_forwards.contains(&port) {
+                    bail!("port forward {port} already exists");
+                }
+                if !add && !port_forwards.contains(&port) {
+                    bail!("port forward {port} not found");
                 }
             }
-            updated.updated_at = Utc::now();
-            self.store.save_vm(&updated)?;
-            vm.config = updated;
-            vm.summary()
+            match sock_opt {
+                Some(sock) => Ok(sock),
+                None => {
+                    let mut updated = vm.config.clone();
+                    let nic = updated
+                        .nics
+                        .iter_mut()
+                        .find(|n| n.id == nic_id)
+                        .context("NIC vanished")?;
+                    if let NicBackendConfig::Consomme { port_forwards, .. } = &mut nic.backend {
+                        if add {
+                            port_forwards.push(port.clone());
+                        } else {
+                            port_forwards.retain(|p| p != &port);
+                        }
+                    }
+                    updated.updated_at = Utc::now();
+                    self.store.save_vm(&updated)?;
+                    vm.config = updated;
+                    Err(vm.summary())
+                }
+            }
+        };
+
+        let summary = match active_sock {
+            Err(summary) => summary,
+            Ok(sock) => {
+                let modify_type = if add {
+                    vmservice::ModifyType::Update as i32
+                } else {
+                    vmservice::ModifyType::Remove as i32
+                };
+                TtrpcClient::new(sock)
+                    .modify_resource(vmservice::ModifyResourceRequest {
+                        r#type: modify_type,
+                        resource: Some(vmservice::modify_resource_request::Resource::NicConfig(
+                            vmservice::NicConfig {
+                                nic_id: nic_id.to_string(),
+                                backend: Some(vmservice::nic_config::Backend::Consomme(
+                                    vmservice::ConsommeBackend {
+                                        ports: vec![to_proto_port_config(&port)],
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            },
+                        )),
+                    })
+                    .await
+                    .context("updating Consomme port forward on running VM")?;
+
+                let mut guard = self.vms.write().unwrap();
+                let vm = guard.get_mut(&id).context("VM not found")?;
+                if !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
+                    bail!(
+                        "cannot complete port forward update because VM '{}' changed state to {}",
+                        vm.config.name,
+                        vm.runtime.status
+                    );
+                }
+                let mut updated = vm.config.clone();
+                let nic = updated
+                    .nics
+                    .iter_mut()
+                    .find(|n| n.id == nic_id)
+                    .context("NIC vanished")?;
+                if let NicBackendConfig::Consomme { port_forwards, .. } = &mut nic.backend {
+                    if add {
+                        if !port_forwards.contains(&port) {
+                            port_forwards.push(port);
+                        }
+                    } else {
+                        port_forwards.retain(|p| p != &port);
+                    }
+                }
+                updated.updated_at = Utc::now();
+                self.store.save_vm(&updated)?;
+                vm.config = updated;
+                vm.summary()
+            }
         };
 
         self.emit(DaemonEvent::VmUpdated {
             vm: summary.clone(),
         });
         Ok(summary)
+    }
+
+    #[cfg(test)]
+    pub fn set_vm_status_for_test(&self, id: Uuid, status: VmStatus) {
+        if let Some(vm) = self.vms.write().unwrap().get_mut(&id) {
+            vm.runtime.status = status;
+        }
     }
 
     pub fn create_disk(&self, req: CreateDiskPayload) -> anyhow::Result<DiskInfo> {

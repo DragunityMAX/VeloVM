@@ -2,6 +2,7 @@ use anyhow::Context;
 use openvmms_core::api_client::ApiClient;
 use openvmms_core::api_client::ensure_daemon_running;
 use openvmms_core::api_client::launch_fastdesk_viewer;
+use openvmms_core::api_client::normalize_base_url;
 use openvmms_core::models::AttachDiskPayload;
 use openvmms_core::models::CreateDiskPayload;
 use openvmms_core::models::CreateVmPayload;
@@ -148,7 +149,7 @@ impl BackendHandle {
                         }
                     }
                     other => {
-                        let Some(c) = client.as_ref() else {
+                        let Some(c) = client.as_mut() else {
                             emit(GuiUpdate::ErrorMessage(
                                 "Not connected to openvmmsd".to_string(),
                             ));
@@ -184,7 +185,7 @@ fn fetch_full_snapshot(
     Ok((host_info, host_config, switches, vms))
 }
 
-fn handle_client_request<F>(client: &ApiClient, req: GuiRequest, emit: &F) -> anyhow::Result<()>
+fn handle_client_request<F>(client: &mut ApiClient, req: GuiRequest, emit: &F) -> anyhow::Result<()>
 where
     F: Fn(GuiUpdate),
 {
@@ -361,6 +362,10 @@ where
         }
         GuiRequest::SaveHostConfig(cfg) => {
             let updated = client.update_host_config(&cfg)?;
+            let next_base = normalize_base_url(&updated.listen_addr);
+            if next_base != client.base_url() {
+                *client = ApiClient::new(next_base, client.token())?;
+            }
             let host_info = client.host_info()?;
             emit(GuiUpdate::StatusMessage("Saved host settings".to_string()));
             emit(GuiUpdate::HostConfigUpdated {
