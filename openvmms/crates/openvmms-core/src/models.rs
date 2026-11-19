@@ -83,7 +83,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
     let openvmm_bin = resolve_binary_candidate(
         cfg.openvmm_bin.as_deref(),
         exe_dir.as_deref(),
-        cwd.as_deref(),
         openvmm_name,
         &[
             &format!("openvmm/target/release/{openvmm_name}"),
@@ -96,7 +95,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
     let fastdesk_viewer_bin = resolve_binary_candidate(
         cfg.fastdesk_viewer_bin.as_deref(),
         exe_dir.as_deref(),
-        cwd.as_deref(),
         viewer_name,
         &[
             &format!("fastdesk-viewer/target/release/{viewer_name}"),
@@ -109,7 +107,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
     let openvmm_img_bin = resolve_binary_candidate(
         cfg.openvmm_img_bin.as_deref(),
         exe_dir.as_deref(),
-        cwd.as_deref(),
         img_name,
         &[
             &format!("openvmm/target/release/{img_name}"),
@@ -144,7 +141,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
 fn resolve_binary_candidate(
     explicit: Option<&Path>,
     exe_dir: Option<&Path>,
-    cwd: Option<&Path>,
     bin_name: &str,
     workspace_rel: &[&str],
 ) -> Option<PathBuf> {
@@ -158,9 +154,9 @@ fn resolve_binary_candidate(
         if candidate.is_file() {
             return Some(candidate);
         }
-        // Walk up a couple directories in case running from target/debug or target/release
+        // Walk up a few directories in case running from target/debug, target/debug/deps, or target/release
         let mut cur = Some(dir);
-        for _ in 0..4 {
+        for _ in 0..5 {
             if let Some(parent) = cur {
                 for rel in workspace_rel {
                     let c = parent.join(rel);
@@ -169,18 +165,6 @@ fn resolve_binary_candidate(
                     }
                 }
                 cur = parent.parent();
-            }
-        }
-    }
-    if let Some(dir) = cwd {
-        let direct = dir.join(bin_name);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        for rel in workspace_rel {
-            let c = dir.join(rel);
-            if c.is_file() {
-                return Some(c);
             }
         }
     }
@@ -287,6 +271,16 @@ pub enum DiskFormat {
     Iso,
 }
 
+/// Checks whether `path` begins with the 8-byte VHDX file signature (`b"vhdxfile"`).
+pub fn has_vhdx_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).is_ok() && &magic == b"vhdxfile"
+}
+
 impl DiskFormat {
     pub fn from_path(path: &Path) -> Self {
         match path
@@ -297,6 +291,7 @@ impl DiskFormat {
         {
             Some("vhdx") | Some("vhd") => Self::Vhdx,
             Some("iso") => Self::Iso,
+            _ if has_vhdx_magic(path) => Self::Vhdx,
             _ => Self::Raw,
         }
     }
@@ -555,7 +550,7 @@ impl VmConfig {
                     8192,
                     true,
                     SecureBootTemplateConfig::MicrosoftWindows,
-                    false,
+                    true,
                 ),
                 VmPreset::LinuxDesktop => (
                     4,
@@ -683,7 +678,7 @@ pub struct VmSummary {
     pub runtime: VmRuntimeState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateVmPayload {
     pub name: String,
     #[serde(default)]
@@ -696,6 +691,8 @@ pub struct CreateVmPayload {
     pub uefi_firmware: Option<PathBuf>,
     pub secure_boot_enabled: Option<bool>,
     pub secure_boot_template: Option<SecureBootTemplateConfig>,
+    #[serde(default)]
+    pub tpm_enabled: Option<bool>,
     pub fastdesk: Option<FastDeskSettings>,
     #[serde(default)]
     pub disks: Vec<DiskAttachment>,
@@ -720,6 +717,8 @@ pub struct UpdateVmPayload {
     pub uefi_firmware: Option<Option<PathBuf>>,
     pub secure_boot_enabled: Option<bool>,
     pub secure_boot_template: Option<SecureBootTemplateConfig>,
+    #[serde(default)]
+    pub tpm_enabled: Option<bool>,
     pub fastdesk: Option<FastDeskSettings>,
     pub disks: Option<Vec<DiskAttachment>>,
     pub nics: Option<Vec<NicAttachment>>,
@@ -837,7 +836,10 @@ pub fn parse_byte_size(input: &str) -> anyhow::Result<u64> {
         .with_context(|| format!("invalid size number in '{input}'"))?;
     let unit = s[split..].trim().to_ascii_uppercase();
     let mult: u64 = match unit.as_str() {
-        "" | "B" => 1,
+        "" => bail!(
+            "size '{input}' is missing a unit (specify B, K, M, G, or T, e.g. '{num}G' or '{num}M')"
+        ),
+        "B" => 1,
         "K" | "KB" | "KIB" => 1024,
         "M" | "MB" | "MIB" => 1024 * 1024,
         "G" | "GB" | "GIB" => 1024 * 1024 * 1024,
@@ -846,6 +848,93 @@ pub fn parse_byte_size(input: &str) -> anyhow::Result<u64> {
     };
     num.checked_mul(mult)
         .context("size overflows u64")
+}
+
+/// Computes the keyed challenge-response digest returned by `GET /api/v1/health?challenge=...`
+/// so clients can verify a local daemon knows the bearer token before sending it.
+pub fn compute_health_auth_proof(token: &str, challenge: &str) -> String {
+    let mut msg = Vec::with_capacity(20 + token.len() + challenge.len());
+    msg.extend_from_slice(b"openvmmsd-health-v1:");
+    msg.extend_from_slice(token.as_bytes());
+    msg.push(b':');
+    msg.extend_from_slice(challenge.as_bytes());
+    let digest = sha256_bytes(&msg);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn sha256_bytes(input: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((input.len() + 9).div_ceil(64) * 64);
+    padded.extend_from_slice(input);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, delta) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(delta);
+        }
+    }
+
+    let mut digest = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
 }
 
 pub fn parse_memory_mb(input: &str) -> anyhow::Result<u64> {
@@ -885,8 +974,21 @@ mod tests {
     fn size_and_port_forward_parsing() {
         assert_eq!(parse_byte_size("64G").unwrap(), 64 * 1024 * 1024 * 1024);
         assert_eq!(parse_byte_size("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_byte_size("4096B").unwrap(), 4096);
+        assert!(
+            parse_byte_size("64")
+                .unwrap_err()
+                .to_string()
+                .contains("missing a unit")
+        );
         assert_eq!(parse_memory_mb("8G").unwrap(), 8192);
         assert_eq!(parse_memory_mb("4096").unwrap(), 4096);
+
+        // SHA-256 test vector check via compute_health_auth_proof determinism & distinctness
+        let p1 = compute_health_auth_proof("tok", "c1");
+        let p2 = compute_health_auth_proof("tok", "c2");
+        assert_eq!(p1.len(), 64);
+        assert_ne!(p1, p2);
 
         let pf1 = parse_port_forward("tcp:127.0.0.1:3389->3389").unwrap();
         assert_eq!(pf1.protocol, IpProto::Tcp);
@@ -909,6 +1011,7 @@ mod tests {
             cfg.validate().unwrap();
             assert_eq!(cfg.nics.len(), 1);
             assert!(cfg.nics[0].mac_address.starts_with("00-15-5D-"));
+            assert_eq!(cfg.tpm_enabled, matches!(preset, VmPreset::Windows11));
         }
     }
 

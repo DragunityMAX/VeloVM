@@ -35,7 +35,6 @@ vm_resource::register_static_resolvers! {
     chipset_resources::cmos_rtc_time_source::SystemTimeClockResolver,
     firmware_uefi::resolver::UefiDeviceResolver,
     missing_dev::resolver::MissingDevResolver,
-    #[cfg(feature = "tpm")]
     tpm_device::resolver::TpmDeviceResolver,
     #[cfg(guest_arch = "x86_64")]
     serial_16550::resolver::Serial16550Resolver,

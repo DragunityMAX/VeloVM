@@ -24,6 +24,7 @@ jobs:
   build-windows-x64:
     name: Build & Package Windows x64 (WHP)
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -89,14 +90,10 @@ jobs:
 
       - name: Run OpenVMM display and FastDesk worker tests
         working-directory: openvmm
-        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
+        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry -p tpm_device --lib
 
       - name: Run fastdesk-viewer tests
         working-directory: fastdesk-viewer
-        run: cargo test
-
-      - name: Run openvmms tests
-        working-directory: openvmms
         run: cargo test
 
       - name: Build OpenVMM release binaries
@@ -106,6 +103,12 @@ jobs:
       - name: Build fastdesk-viewer release binary
         working-directory: fastdesk-viewer
         run: cargo build --release
+
+      - name: Run openvmms tests
+        working-directory: openvmms
+        env:
+          OPENVMM_REQUIRE_REAL_BINARY: "1"
+        run: cargo test
 
       - name: Build openvmms release binaries
         working-directory: openvmms
@@ -164,7 +167,29 @@ jobs:
               throw "openvmms vm list failed:`n$listJson"
             }
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              vm start "Smoke-VM" | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+                vm show "Smoke-VM" | Out-String | ConvertFrom-Json
+              if ($show.runtime.status -ne "running") {
+                throw "Expected Smoke-VM status running, got $($show.runtime.status)"
+              }
+            } else {
+              $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+                vm show "Smoke-VM" | Out-String | ConvertFrom-Json
+              if ($show.runtime.status -ne "error") {
+                throw "Expected Smoke-VM to recover cleanly to error when runner lacks WHP, got $($show.runtime.status)"
+              }
+            }
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              vm stop "Smoke-VM" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms vm stop failed" }
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               daemon stop | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop failed" }
+            if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
+              throw "openvmmsd smoke daemon did not exit cleanly (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
+            }
           } finally {
             if ($null -ne $smokeDaemon -and -not $smokeDaemon.HasExited) {
               Stop-Process -Id $smokeDaemon.Id -Force -ErrorAction SilentlyContinue
@@ -255,6 +280,7 @@ jobs:
   build-linux-x64:
     name: Build & Package Linux x64
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -316,14 +342,10 @@ jobs:
 
       - name: Run OpenVMM display and FastDesk worker tests
         working-directory: openvmm
-        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
+        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry -p tpm_device --lib
 
       - name: Run fastdesk-viewer tests
         working-directory: fastdesk-viewer
-        run: cargo test
-
-      - name: Run openvmms tests
-        working-directory: openvmms
         run: cargo test
 
       - name: Build OpenVMM release binaries
@@ -333,6 +355,12 @@ jobs:
       - name: Build fastdesk-viewer release binary
         working-directory: fastdesk-viewer
         run: cargo build --release
+
+      - name: Run openvmms tests
+        working-directory: openvmms
+        env:
+          OPENVMM_REQUIRE_REAL_BINARY: "1"
+        run: cargo test
 
       - name: Build openvmms release binaries
         working-directory: openvmms
@@ -372,15 +400,28 @@ jobs:
             fi
             sleep 0.1
           done
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm || true
+          fi
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.img" --size 16M --format raw >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm list | grep -q "Smoke-VM"
+          if ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm start "Smoke-VM" >/dev/null 2>&1; then
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-VM" | grep -q '"status": "running"'
+          else
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-VM" | grep -q '"status": "error"'
+          fi
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm stop "Smoke-VM" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop >/dev/null
-          wait "$SMOKE_PID" || true
+          wait "$SMOKE_PID"
           trap - EXIT
           rm -rf "$SMOKE_DIR"
 
@@ -463,6 +504,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs: [build-windows-x64, build-linux-x64]

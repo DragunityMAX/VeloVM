@@ -17,6 +17,26 @@ use vm_resource::IntoResource;
 use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
 
+#[cfg(unix)]
+fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+    if file.metadata().is_ok_and(|m| m.is_file()) {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!(
+                    "disk image '{}' is already locked for writing by another process",
+                    path.display()
+                );
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(err)
+                    .with_context(|| format!("failed to lock disk image {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Open a single VHDX file as a [`LayeredDiskHandle`] with one layer.
 ///
 /// Use this for base (non-differencing) VHDX files. For differencing chains,
@@ -28,6 +48,11 @@ pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource
         .read(true)
         .write(!read_only)
         .open(path)?;
+
+    #[cfg(unix)]
+    if !read_only {
+        acquire_writable_disk_lock(&file, path)?;
+    }
 
     Ok(Resource::new(LayeredDiskHandle::single_layer(
         VhdxDiskLayerHandle { file, read_only },
@@ -78,6 +103,11 @@ pub fn open_vhdx_chain_explicit(
                 .write(!layer_read_only)
                 .open(path)
                 .with_context(|| format!("failed to open vhdx layer {}: {}", i, path.display()))?;
+
+            #[cfg(unix)]
+            if !layer_read_only {
+                acquire_writable_disk_lock(&file, path)?;
+            }
 
             let handle = VhdxDiskLayerHandle {
                 file,
@@ -357,5 +387,27 @@ mod tests {
 
         let resource = open_vhdx_chain(&path, false).await.unwrap();
         let _ = resource;
+    }
+
+    #[cfg(unix)]
+    #[pal_async::async_test]
+    async fn rejects_concurrent_writable_vhdx_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.vhdx");
+
+        let bf = crate::io::BlockingFile::open(&path, false).unwrap();
+        let mut params = vhdx::CreateParams {
+            disk_size: 1024 * 1024,
+            ..Default::default()
+        };
+        vhdx::create(&bf, &mut params).await.unwrap();
+        drop(bf);
+
+        let first = open_vhdx_chain(&path, false).await.unwrap();
+        let err = open_vhdx_chain(&path, false).await.unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
+
+        drop(first);
+        open_vhdx_chain(&path, false).await.unwrap();
     }
 }

@@ -173,13 +173,33 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+#[derive(Deserialize)]
+struct HealthQuery {
+    challenge: Option<String>,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    service: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_proof: Option<String>,
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn health(
+    State(state): State<AppState>,
+    Query(query): Query<HealthQuery>,
+) -> Json<HealthResponse> {
+    let auth_proof = query
+        .challenge
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .map(|c| openvmms_core::models::compute_health_auth_proof(&state.token, c));
+    Json(HealthResponse {
+        status: "ok",
+        service: "openvmmsd",
+        auth_proof,
+    })
 }
 
 async fn events_handler(
@@ -613,6 +633,7 @@ mod tests {
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: Some(CreateDiskPayload {
@@ -740,6 +761,12 @@ mod tests {
         .find(|p| p.is_file());
 
         let Some(openvmm_bin) = openvmm_bin else {
+            if std::env::var_os("OPENVMM_REQUIRE_REAL_BINARY").is_some() {
+                panic!(
+                    "OPENVMM_REQUIRE_REAL_BINARY is set, but real openvmm binary was not found under {}",
+                    repo_root.display()
+                );
+            }
             eprintln!("skipping real_openvmm_ttrpc_handshake: openvmm binary not built yet");
             return;
         };
@@ -811,6 +838,7 @@ mod tests {
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: Some(CreateDiskPayload {
@@ -903,6 +931,7 @@ mod tests {
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![openvmms_core::models::DiskAttachment {
                     lun: 0,
@@ -1034,6 +1063,7 @@ mod tests {
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: None,
@@ -1142,6 +1172,7 @@ mod tests {
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: None,
@@ -1224,6 +1255,7 @@ mod tests {
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: None,
@@ -1279,6 +1311,7 @@ mod tests {
                 uefi_firmware: Some(fw_path.clone()),
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: None,
@@ -1459,6 +1492,7 @@ while not stop_evt.is_set():
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: Some(openvmms_core::models::FastDeskSettings {
                     enabled: false,
                     ..Default::default()
@@ -1694,6 +1728,7 @@ while not stop_evt.is_set():
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: Some(openvmms_core::models::FastDeskSettings {
                     enabled: false,
                     ..Default::default()
@@ -1845,6 +1880,7 @@ while not stop_evt.is_set():
                     uefi_firmware: None,
                     secure_boot_enabled: None,
                     secure_boot_template: None,
+                    tpm_enabled: None,
                     fastdesk: None,
                     disks: vec![],
                     create_disk: Some(CreateDiskPayload {
@@ -1890,6 +1926,7 @@ while not stop_evt.is_set():
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: Some(CreateDiskPayload {
@@ -2064,6 +2101,7 @@ while not stop_evt.is_set():
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: Some(openvmms_core::models::FastDeskSettings {
                     enabled: false,
                     ..Default::default()
@@ -2277,7 +2315,7 @@ while not stop_evt.is_set():
         for (name, format) in [
             ("disk.vhdx", DiskFormat::Raw),
             ("disk.vhd", DiskFormat::Vhdx),
-            ("disk.img", DiskFormat::Vhdx),
+            ("disk.iso", DiskFormat::Vhdx),
             ("disk.vmdk", DiskFormat::Raw),
         ] {
             let path = dir.path().join(name);

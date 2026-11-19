@@ -60,6 +60,21 @@ struct ManagedVm {
     stop_wait: Option<watch::Receiver<bool>>,
 }
 
+impl Drop for ManagedVm {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if self.runtime.rpc_socket_path.is_some() || self.runtime.shm_path.is_some() {
+            cleanup_runtime_files(
+                self.runtime.rpc_socket_path.take(),
+                self.runtime.shm_path.take(),
+            );
+        }
+    }
+}
+
 struct ActiveListener {
     addr: SocketAddr,
     stop_tx: watch::Sender<bool>,
@@ -94,6 +109,7 @@ impl ManagedVm {
 
 pub struct Supervisor {
     store: RegistryStore,
+    _daemon_lock: fs::File,
     auth_token: String,
     host_config: RwLock<HostConfig>,
     host_config_lock: tokio::sync::Mutex<()>,
@@ -107,6 +123,7 @@ pub struct Supervisor {
 impl Supervisor {
     pub fn new(data_dir: &Path, listen_override: Option<&str>) -> anyhow::Result<Arc<Self>> {
         let store = RegistryStore::new(data_dir)?;
+        let daemon_lock = store.try_acquire_daemon_lock()?;
         let mut host_config = store.load_or_init_host_config()?;
         if let Some(listen) = listen_override {
             host_config.listen_addr = listen.to_string();
@@ -115,15 +132,82 @@ impl Supervisor {
         let loaded_vms = store.load_all_vms()?;
 
         let mut vm_map = HashMap::new();
+        let mut adopted_vms = Vec::new();
         for cfg in loaded_vms {
+            let sock_path = host_config.runtime_dir.join(format!("{}.sock", cfg.id));
+            let pid_path = sock_path.with_extension("pid");
+            let shm_candidate = host_config.runtime_dir.join(format!("vram-{}.shm", cfg.id));
+            let mut runtime = VmRuntimeState::default();
+            let mut generation = 0u64;
+
+            if sock_path.exists() {
+                let saved_pid = fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let ttrpc_client = TtrpcClient::new(&sock_path);
+                match ttrpc_client.properties_vm_blocking(Duration::from_secs(2)) {
+                    Ok(props)
+                        if props.state == vmservice::VmState::Running as i32
+                            || props.state == vmservice::VmState::Paused as i32 =>
+                    {
+                        runtime.status = if props.state == vmservice::VmState::Paused as i32 {
+                            VmStatus::Paused
+                        } else {
+                            VmStatus::Running
+                        };
+                        runtime.pid = saved_pid;
+                        runtime.rpc_socket_path = Some(sock_path.clone());
+                        runtime.fastdesk_endpoint = props
+                            .fastdesk_listen_addr
+                            .as_deref()
+                            .map(normalize_fastdesk_endpoint);
+                        runtime.shm_path = props.fastdesk_shm_path.or_else(|| {
+                            shm_candidate
+                                .exists()
+                                .then(|| shm_candidate.to_string_lossy().into_owned())
+                        });
+                        generation = 1;
+                        adopted_vms.push((cfg.id, sock_path));
+                        info!(vm_id = %cfg.id, name = %cfg.name, status = %runtime.status, "re-adopted running OpenVMM VM");
+                    }
+                    Ok(_) => {
+                        let _ = ttrpc_client.teardown_and_quit_blocking(Duration::from_secs(2));
+                        cleanup_runtime_files(
+                            Some(sock_path),
+                            shm_candidate
+                                .exists()
+                                .then(|| shm_candidate.to_string_lossy().into_owned()),
+                        );
+                    }
+                    Err(_) => {
+                        if !ttrpc_client.is_socket_accepting() {
+                            cleanup_runtime_files(
+                                Some(sock_path),
+                                shm_candidate
+                                    .exists()
+                                    .then(|| shm_candidate.to_string_lossy().into_owned()),
+                            );
+                        } else {
+                            runtime.status = VmStatus::Running;
+                            runtime.pid = saved_pid;
+                            runtime.rpc_socket_path = Some(sock_path);
+                            runtime.shm_path = shm_candidate
+                                .exists()
+                                .then(|| shm_candidate.to_string_lossy().into_owned());
+                            generation = 1;
+                        }
+                    }
+                }
+            }
+
             vm_map.insert(
                 cfg.id,
                 ManagedVm {
                     config: cfg,
-                    runtime: VmRuntimeState::default(),
+                    runtime,
                     child: None,
                     monitor_handle: None,
-                    generation: 0,
+                    generation,
                     start_cancel: None,
                     stop_wait: None,
                 },
@@ -132,8 +216,9 @@ impl Supervisor {
 
         let (events_tx, _) = broadcast::channel(256);
         let (shutdown_watch, _) = watch::channel(false);
-        Ok(Arc::new(Self {
+        let supervisor = Arc::new(Self {
             store,
+            _daemon_lock: daemon_lock,
             auth_token,
             host_config: RwLock::new(host_config),
             host_config_lock: tokio::sync::Mutex::new(()),
@@ -142,7 +227,25 @@ impl Supervisor {
             vms: RwLock::new(vm_map),
             events_tx,
             shutdown_watch,
-        }))
+        });
+
+        if !adopted_vms.is_empty()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            for (id, sock_path) in adopted_vms {
+                let sup = Arc::clone(&supervisor);
+                let monitor = handle.spawn(async move {
+                    sup.monitor_vm(id, 1, sock_path).await;
+                });
+                if let Some(vm) = supervisor.vms.write().unwrap().get_mut(&id)
+                    && vm.generation == 1
+                {
+                    vm.monitor_handle = Some(monitor.abort_handle());
+                }
+            }
+        }
+
+        Ok(supervisor)
     }
 
     pub fn auth_token(&self) -> &str {
@@ -472,6 +575,9 @@ impl Supervisor {
         if let Some(tpl) = payload.secure_boot_template {
             cfg.secure_boot_template = tpl;
         }
+        if let Some(tpm) = payload.tpm_enabled {
+            cfg.tpm_enabled = tpm;
+        }
         if let Some(fd) = payload.fastdesk {
             cfg.fastdesk = fd;
         }
@@ -594,6 +700,7 @@ impl Supervisor {
             || payload.uefi_firmware.is_some()
             || payload.secure_boot_enabled.is_some()
             || payload.secure_boot_template.is_some()
+            || payload.tpm_enabled.is_some()
             || payload.fastdesk.is_some()
             || payload.disks.is_some()
             || payload.nics.is_some();
@@ -645,6 +752,9 @@ impl Supervisor {
         if let Some(tpl) = payload.secure_boot_template {
             updated.secure_boot_template = tpl;
         }
+        if let Some(tpm) = payload.tpm_enabled {
+            updated.tpm_enabled = tpm;
+        }
         if let Some(fd) = payload.fastdesk {
             updated.fastdesk = fd;
         }
@@ -684,9 +794,9 @@ impl Supervisor {
             if delete_disks {
                 vm.config
                     .disks
-                    .into_iter()
+                    .iter()
                     .filter(|d| d.kind == DiskKind::HardDisk && !d.read_only)
-                    .map(|d| d.path)
+                    .map(|d| d.path.clone())
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -743,14 +853,60 @@ impl Supervisor {
 
         self.emit_vm_snapshot(id);
 
-        let result = self
-            .start_vm_inner(id, start_gen, &mut cancel_rx, cfg, host_cfg, paths)
-            .await;
-        match result {
-            Ok(summary) => Ok(summary),
-            Err(err) => {
-                self.cleanup_failed_start(id, start_gen, &format!("{err:#}"));
-                Err(err)
+        struct StartCleanupGuard {
+            sup: Arc<Supervisor>,
+            id: Uuid,
+            start_gen: u64,
+            armed: bool,
+        }
+
+        impl Drop for StartCleanupGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.sup.cleanup_failed_start(
+                        self.id,
+                        self.start_gen,
+                        "VM startup task aborted",
+                    );
+                }
+            }
+        }
+
+        // Run startup in a detached task so an HTTP client disconnect (dropping the request future)
+        // cannot orphan the VM in Starting state without cleanup.
+        let sup = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let mut guard = StartCleanupGuard {
+                sup: Arc::clone(&sup),
+                id,
+                start_gen,
+                armed: true,
+            };
+            let result = sup
+                .start_vm_inner(id, start_gen, &mut cancel_rx, cfg, host_cfg, paths)
+                .await;
+            match result {
+                Ok(summary) => {
+                    guard.armed = false;
+                    Ok(summary)
+                }
+                Err(err) => {
+                    guard.armed = false;
+                    sup.cleanup_failed_start(id, start_gen, &format!("{err:#}"));
+                    Err(err)
+                }
+            }
+        });
+
+        match handle.await {
+            Ok(res) => res,
+            Err(join_err) => {
+                self.cleanup_failed_start(
+                    id,
+                    start_gen,
+                    &format!("VM startup task failed: {join_err}"),
+                );
+                Err(anyhow::anyhow!("VM startup task failed: {join_err}"))
             }
         }
     }
@@ -798,7 +954,25 @@ impl Supervisor {
         }
 
         let sock_path = runtime_dir.join(format!("{id}.sock"));
+        let pid_path = sock_path.with_extension("pid");
+        if sock_path.exists() {
+            let sock_check = sock_path.clone();
+            let pid_check = pid_path.clone();
+            let still_alive = tokio::task::spawn_blocking(move || {
+                reclaim_or_verify_inactive_socket(&sock_check, &pid_check)
+            })
+            .await
+            .context("checking existing OpenVMM RPC socket")?;
+            if still_alive {
+                bail!(
+                    "refusing to start VM '{}': existing openvmm instance on {} is still active",
+                    cfg.name,
+                    sock_path.display()
+                );
+            }
+        }
         let _ = fs::remove_file(&sock_path);
+        let _ = fs::remove_file(&pid_path);
 
         let shm_path = if cfg.fastdesk.enabled && cfg.fastdesk.use_shm {
             let path = runtime_dir.join(format!("vram-{id}.shm"));
@@ -860,6 +1034,7 @@ impl Supervisor {
             vm.runtime.pid = Some(pid);
             vm.runtime.rpc_socket_path = Some(sock_path.clone());
             vm.runtime.shm_path = shm_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+            write_pid_file(&pid_path, pid);
         }
 
         let client = TtrpcClient::new(&sock_path);
@@ -1060,14 +1235,17 @@ impl Supervisor {
             vm.monitor_handle = None;
             vm.stop_wait = None;
 
-            let halt_reason = props.and_then(|p| p.halt_reason);
+            let halt_reason = props.as_ref().and_then(|p| p.halt_reason.clone());
+            let is_halted = props
+                .as_ref()
+                .is_some_and(|p| p.state == vmservice::VmState::Halted as i32);
             match wait_res {
                 Ok(()) => {
                     vm.runtime.status = VmStatus::Off;
                     vm.runtime.last_error = halt_reason.filter(|r| r != "PowerOff");
                 }
                 Err(err) => {
-                    if exit_status.is_some_and(|st| st.success()) {
+                    if exit_status.is_some_and(|st| st.success()) || is_halted {
                         vm.runtime.status = VmStatus::Off;
                         vm.runtime.last_error = None;
                     } else {
@@ -1111,6 +1289,11 @@ impl Supervisor {
                 let (stop_done_tx, stop_done_rx) = watch::channel(false);
                 vm.stop_wait = Some(stop_done_rx.clone());
                 vm.runtime.status = VmStatus::Stopping;
+                let adopted_pid = if vm.child.is_none() {
+                    vm.runtime.pid
+                } else {
+                    None
+                };
                 (
                     Some(stop_done_rx),
                     Some((
@@ -1118,6 +1301,7 @@ impl Supervisor {
                         vm.runtime.rpc_socket_path.take(),
                         vm.runtime.shm_path.take(),
                         vm.child.take(),
+                        adopted_pid,
                         vm.monitor_handle.take(),
                         stop_done_tx,
                     )),
@@ -1125,7 +1309,7 @@ impl Supervisor {
             }
         };
 
-        if let Some((stop_gen, sock_opt, shm_opt, child_opt, abort_opt, stop_done_tx)) =
+        if let Some((stop_gen, sock_opt, shm_opt, child_opt, adopted_pid, abort_opt, stop_done_tx)) =
             stop_task_args
         {
             if let Some(abort) = abort_opt {
@@ -1156,6 +1340,12 @@ impl Supervisor {
                                 }
                             }
                         }
+                    })
+                    .await;
+                } else if let Some(pid) = adopted_pid {
+                    let sock_wait = sock_opt.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        wait_or_terminate_adopted_pid(sock_wait.as_deref(), pid);
                     })
                     .await;
                 }
@@ -1850,8 +2040,131 @@ fn preallocate_shm_file(path: &Path, vram_mb: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_pid_file(path: &Path, pid: u32) {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut file) = opts.open(path) {
+        use std::io::Write;
+        let _ = write!(file, "{pid}");
+    }
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn terminate_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pid_str = pid.to_string();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if !is_pid_alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn wait_or_terminate_adopted_pid(sock_path: Option<&Path>, pid: u32) {
+    let client = sock_path.map(TtrpcClient::new);
+    let start = std::time::Instant::now();
+    loop {
+        let sock_alive = client.as_ref().is_some_and(TtrpcClient::is_socket_accepting);
+        let pid_alive = is_pid_alive(pid);
+        if !sock_alive && !pid_alive {
+            return;
+        }
+        if start.elapsed() >= Duration::from_secs(3) {
+            terminate_pid(pid);
+            let kill_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < kill_deadline {
+                let still_sock = client.as_ref().is_some_and(TtrpcClient::is_socket_accepting);
+                if !still_sock && !is_pid_alive(pid) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn reclaim_or_verify_inactive_socket(sock_path: &Path, pid_path: &Path) -> bool {
+    let client = TtrpcClient::new(sock_path);
+    let saved_pid = fs::read_to_string(pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let responded = client.properties_vm_blocking(Duration::from_secs(1)).is_ok();
+    if responded || client.is_socket_accepting() {
+        let _ = client.teardown_and_quit_blocking(Duration::from_secs(2));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !client.is_socket_accepting() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(pid) = saved_pid {
+            terminate_pid(pid);
+            let kill_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < kill_deadline {
+                if !client.is_socket_accepting() {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        return client.is_socket_accepting();
+    }
+    false
+}
+
 fn cleanup_runtime_files(sock_path: Option<PathBuf>, shm_path: Option<String>) {
     if let Some(sock) = sock_path {
+        let _ = fs::remove_file(sock.with_extension("pid"));
         let _ = fs::remove_file(sock);
     }
     if let Some(shm) = shm_path {
@@ -1921,7 +2234,7 @@ fn build_create_vm_request(
                 FastDeskTransport::Tcp => None,
             },
             shm_path: shm_path.map(|p| p.to_string_lossy().into_owned()),
-            max_clients: 0,
+            max_clients: 16,
         })
     } else {
         None
@@ -1954,6 +2267,7 @@ fn build_create_vm_request(
             nested_virt: cfg.nested_virt,
             vmgs,
             fastdesk_config,
+            tpm_enabled: cfg.tpm_enabled,
             ..Default::default()
         }),
         log_id: cfg.id.to_string(),
@@ -2028,9 +2342,10 @@ fn to_proto_nic_config(nic: &NicAttachment) -> vmservice::NicConfig {
 }
 
 fn read_log_tail(path: &Path, tail: usize) -> anyhow::Result<String> {
+    let tail = tail.clamp(1, 10_000);
     let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
-    let mut ring = std::collections::VecDeque::with_capacity(tail);
+    let mut ring = std::collections::VecDeque::with_capacity(tail.min(1024));
     for line in reader.lines() {
         let line = line?;
         if ring.len() == tail {
@@ -2176,5 +2491,59 @@ mod tests {
         assert_eq!(switches[0].kind, "tap");
         #[cfg(unix)]
         assert!(switches[0].description.contains("br0"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_start_vm_future_does_not_leave_vm_stuck_in_starting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let fake_bin = dir.path().join("fake-openvmm.sh");
+        fs::write(&fake_bin, "#!/bin/sh\nsleep 0.1\nexit 1\n").unwrap();
+        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_uefi = dir.path().join("MSVM.fd");
+        fs::write(&fake_uefi, b"dummy").unwrap();
+
+        let mut host = store.load_or_init_host_config().unwrap();
+        host.openvmm_bin = Some(fake_bin);
+        host.uefi_firmware_path = Some(fake_uefi);
+        store.save_host_config(&host).unwrap();
+
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "DropStartTest".to_string(),
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                tpm_enabled: None,
+                ..Default::default()
+            })
+            .unwrap();
+        let vm_id = created.config.id;
+
+        // Drop the start_vm future before startup completes (simulating client HTTP disconnect).
+        tokio::select! {
+            res = sup.start_vm("DropStartTest") => {
+                panic!("expected start_vm to outlive 20ms cancel window, got {res:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        // Wait for the detached startup task to notice process exit and run cleanup_failed_start.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = sup.get_vm(&vm_id.to_string()).unwrap().runtime.status;
+            if status == VmStatus::Error {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "VM stayed in {status:?} after start_vm future was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }

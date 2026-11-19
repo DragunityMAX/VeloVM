@@ -9,6 +9,7 @@ use openvmms_core::api_client::ensure_daemon_running;
 use openvmms_core::api_client::find_openvmmsd_binary;
 use openvmms_core::api_client::launch_fastdesk_viewer;
 use openvmms_core::api_client::resolve_client_path;
+use openvmms_core::api_client::resolve_local_viewer_binary;
 use openvmms_core::models::AttachDiskPayload;
 use openvmms_core::models::CreateDiskPayload;
 use openvmms_core::models::CreateVmPayload;
@@ -100,7 +101,7 @@ enum DaemonCmd {
         #[arg(long)]
         foreground: bool,
     },
-    /// Gracefully stop openvmmsd and all managed VMs
+    /// Stop openvmmsd and power off all managed VMs
     Stop,
 }
 
@@ -299,6 +300,8 @@ struct CreateVmArgs {
     #[arg(long, value_enum)]
     secure_boot: Option<ToggleArg>,
     #[arg(long, value_enum)]
+    tpm: Option<ToggleArg>,
+    #[arg(long, value_enum)]
     nested_virt: Option<ToggleArg>,
     #[arg(long)]
     no_shm: bool,
@@ -327,6 +330,8 @@ struct EditVmArgs {
     clear_uefi_firmware: bool,
     #[arg(long, value_enum)]
     secure_boot: Option<ToggleArg>,
+    #[arg(long, value_enum)]
+    tpm: Option<ToggleArg>,
     #[arg(long, value_enum)]
     nested_virt: Option<ToggleArg>,
 }
@@ -693,6 +698,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                     .filter(|p| !p.as_os_str().is_empty()),
                 secure_boot_enabled: args.secure_boot.map(bool::from),
                 secure_boot_template: None,
+                tpm_enabled: args.tpm.map(bool::from),
                 fastdesk,
                 disks,
                 create_disk,
@@ -730,6 +736,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                 nested_virt: args.nested_virt.map(bool::from),
                 uefi_firmware,
                 secure_boot_enabled: args.secure_boot.map(bool::from),
+                tpm_enabled: args.tpm.map(bool::from),
                 fastdesk,
                 ..Default::default()
             };
@@ -739,7 +746,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
         VmCmd::Delete { vm, delete_disks } => {
             client.delete_vm(vm, *delete_disks)?;
             if cli.json {
-                println!("{{\"deleted\":\"{vm}\"}}");
+                println!("{}", serde_json::to_string(&serde_json::json!({ "deleted": vm }))?);
             } else {
                 println!("Deleted VM '{vm}'.");
             }
@@ -765,10 +772,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
             let endpoint = summary.runtime.fastdesk_endpoint.as_deref().context(
                 "VM does not have an active FastDesk endpoint (is it Running with FastDesk enabled?)",
             )?;
-            let host = client.host_info()?;
-            let viewer_bin = host.resolved_paths.fastdesk_viewer_bin.context(
-                "fastdesk-viewer binary not found; configure fastdesk_viewer_bin in host settings",
-            )?;
+            let viewer_bin = resolve_local_viewer_binary(cli.data_dir.as_deref())?;
             let mut child = launch_fastdesk_viewer(&viewer_bin, endpoint, &summary.config.name, *no_shm)?;
             if cli.json {
                 println!(
@@ -934,13 +938,14 @@ fn print_vm_summary(vm: &VmSummary, json: bool) -> anyhow::Result<()> {
         println!("State:        {}", vm.runtime.status);
         println!("Compute:      {} vCPU, {}", vm.config.vcpus, format_bytes(vm.config.memory_mb * 1024 * 1024));
         println!(
-            "Firmware:     UEFI (Secure Boot: {}, Template: {})",
+            "Firmware:     UEFI (Secure Boot: {}, Template: {}, vTPM 2.0: {})",
             if vm.config.secure_boot_enabled {
                 "On"
             } else {
                 "Off"
             },
-            vm.config.secure_boot_template
+            vm.config.secure_boot_template,
+            if vm.config.tpm_enabled { "On" } else { "Off" }
         );
         if let Some(fw) = &vm.config.uefi_firmware {
             println!("UEFI Path:    {}", fw.display());

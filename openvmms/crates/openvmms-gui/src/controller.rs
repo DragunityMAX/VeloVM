@@ -3,6 +3,7 @@ use openvmms_core::api_client::ApiClient;
 use openvmms_core::api_client::ensure_daemon_running;
 use openvmms_core::api_client::launch_fastdesk_viewer;
 use openvmms_core::api_client::normalize_base_url;
+use openvmms_core::api_client::resolve_local_viewer_binary;
 use openvmms_core::models::AttachDiskPayload;
 use openvmms_core::models::CreateDiskPayload;
 use openvmms_core::models::CreateVmPayload;
@@ -168,8 +169,13 @@ impl BackendHandle {
                             daemon_url.as_deref(),
                             &shared_endpoint,
                         );
-                        if let Err(err) =
-                            handle_client_request(c, other.clone(), &shared_endpoint, &emit)
+                        if let Err(err) = handle_client_request(
+                            c,
+                            data_dir.as_deref(),
+                            other.clone(),
+                            &shared_endpoint,
+                            &emit,
+                        )
                         {
                             if let Some(reloaded) = reload_client_from_data_dir(
                                 data_dir.as_deref(),
@@ -179,11 +185,20 @@ impl BackendHandle {
                                 || reloaded.token() != c.token())
                             {
                                 *c = reloaded;
-                                if let Err(retry_err) =
-                                    handle_client_request(c, other, &shared_endpoint, &emit)
-                                {
+                                if let Err(retry_err) = handle_client_request(
+                                    c,
+                                    data_dir.as_deref(),
+                                    other,
+                                    &shared_endpoint,
+                                    &emit,
+                                ) {
                                     emit(GuiUpdate::ErrorMessage(format!("{retry_err:#}")));
                                 }
+                            } else if c.health().is_err() {
+                                client = None;
+                                emit(GuiUpdate::DaemonDisconnected(format!(
+                                    "Lost connection to openvmmsd: {err:#}"
+                                )));
                             } else {
                                 emit(GuiUpdate::ErrorMessage(format!("{err:#}")));
                             }
@@ -272,6 +287,7 @@ fn fetch_full_snapshot(
 
 fn handle_client_request<F>(
     client: &mut ApiClient,
+    data_dir: Option<&Path>,
     req: GuiRequest,
     shared_endpoint: &SharedEndpoint,
     emit: &F,
@@ -387,10 +403,7 @@ where
                 .fastdesk_endpoint
                 .as_deref()
                 .context("VM does not have an active FastDesk endpoint")?;
-            let info = client.host_info()?;
-            let viewer_bin = info.resolved_paths.fastdesk_viewer_bin.context(
-                "fastdesk-viewer binary not found; configure it in Host Settings",
-            )?;
+            let viewer_bin = resolve_local_viewer_binary(data_dir)?;
             let _child = launch_fastdesk_viewer(&viewer_bin, endpoint, &vm.config.name, no_shm)?;
             emit(GuiUpdate::StatusMessage(format!(
                 "Launched FastDesk viewer for '{}' ({endpoint})",
@@ -537,6 +550,7 @@ fn spawn_sse_listener(
             }
         };
         let mut stopping = false;
+        let mut was_connected = true;
         while !stopping {
             let endpoint = shared_endpoint.read().unwrap().clone().or_else(|| {
                 reload_client_from_data_dir(
@@ -550,10 +564,38 @@ fn spawn_sse_listener(
                 thread::sleep(Duration::from_secs(1));
                 continue;
             };
+            // Verify health authentication challenge before transmitting token on the SSE URL.
+            if !ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok()) {
+                if was_connected {
+                    was_connected = false;
+                    let _ = upd_tx.send(GuiUpdate::DaemonDisconnected(
+                        "Lost connection or failed daemon verification".to_string(),
+                    ));
+                    repaint_ctx.request_repaint();
+                }
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
             let url = format!("{base_url}/api/v1/events?token={token}");
             let mut switched_endpoint = false;
             match http.get(&url).send() {
                 Ok(resp) if resp.status().is_success() => {
+                    if !was_connected {
+                        was_connected = true;
+                        if let Ok(c) = ApiClient::new(&base_url, &token)
+                            && let Ok((host_info, host_config, switches, vms)) =
+                                fetch_full_snapshot(&c)
+                        {
+                            let _ = upd_tx.send(GuiUpdate::DaemonConnected {
+                                base_url: base_url.clone(),
+                                host_info,
+                                host_config,
+                                switches,
+                                vms,
+                            });
+                            repaint_ctx.request_repaint();
+                        }
+                    }
                     let reader = std::io::BufReader::new(resp);
                     for line in reader.lines().map_while(Result::ok) {
                         if let Some(json_str) = line.strip_prefix("data: ")
@@ -615,6 +657,15 @@ fn spawn_sse_listener(
                         ) {
                             continue;
                         }
+                        let healthy =
+                            ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
+                        if !healthy && was_connected {
+                            was_connected = false;
+                            let _ = upd_tx.send(GuiUpdate::DaemonDisconnected(
+                                "Lost connection to openvmmsd".to_string(),
+                            ));
+                            repaint_ctx.request_repaint();
+                        }
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
@@ -628,6 +679,15 @@ fn spawn_sse_listener(
                         &repaint_ctx,
                     ) {
                         continue;
+                    }
+                    let healthy =
+                        ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
+                    if !healthy && was_connected {
+                        was_connected = false;
+                        let _ = upd_tx.send(GuiUpdate::DaemonDisconnected(
+                            "Lost connection to openvmmsd".to_string(),
+                        ));
+                        repaint_ctx.request_repaint();
                     }
                     thread::sleep(Duration::from_secs(2));
                 }
@@ -677,6 +737,7 @@ pub fn run_self_test() -> anyhow::Result<()> {
         uefi_firmware: None,
         secure_boot_enabled: None,
         secure_boot_template: None,
+        tpm_enabled: None,
         fastdesk: None,
         disks: vec![],
         create_disk: Some(CreateDiskPayload {
@@ -854,6 +915,7 @@ mod tests {
                 uefi_firmware: None,
                 secure_boot_enabled: None,
                 secure_boot_template: None,
+                tpm_enabled: None,
                 fastdesk: None,
                 disks: vec![],
                 create_disk: None,

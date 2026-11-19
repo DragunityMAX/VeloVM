@@ -865,6 +865,8 @@ message VMConfig {
     // Enable FastDesk 2D synthetic video, keyboard, and mouse devices and
     // launch the event-driven FastDesk display/input worker.
     FastDeskConfig fastdesk_config = 23;
+    // Enable an emulated vTPM 2.0 device (requires UEFI boot).
+    bool tpm_enabled = 24;
 }
 
 // WindowsOptions contains virtual machine configurations that are only present on a Windows host.

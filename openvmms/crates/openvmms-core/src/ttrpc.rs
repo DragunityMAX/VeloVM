@@ -162,6 +162,44 @@ impl TtrpcClient {
         Ok(())
     }
 
+    pub fn properties_vm_blocking(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<vmservice::PropertiesVmResponse> {
+        let req_bytes = vmservice::PropertiesVmRequest { types: vec![] }.encode_to_vec();
+        let resp_bytes = call_blocking(
+            &self.socket_path,
+            SERVICE_VM,
+            "PropertiesVM",
+            &req_bytes,
+            Some(timeout),
+        )?;
+        vmservice::PropertiesVmResponse::decode(resp_bytes.as_slice())
+            .context("decoding ttrpc PropertiesVM response")
+    }
+
+    pub fn teardown_and_quit_blocking(&self, timeout: Duration) -> anyhow::Result<()> {
+        let _ = call_blocking(
+            &self.socket_path,
+            SERVICE_VM,
+            "TeardownVM",
+            &[],
+            Some(timeout),
+        );
+        let _ = call_blocking(&self.socket_path, SERVICE_VM, "Quit", &[], Some(timeout))?;
+        Ok(())
+    }
+
+    pub fn is_socket_accepting(&self) -> bool {
+        let Ok(sock) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+            return false;
+        };
+        let Ok(addr) = SockAddr::unix(&self.socket_path) else {
+            return false;
+        };
+        sock.connect(&addr).is_ok()
+    }
+
     async fn call_unary<Req: Message, Resp: Message + Default>(
         &self,
         method: &'static str,

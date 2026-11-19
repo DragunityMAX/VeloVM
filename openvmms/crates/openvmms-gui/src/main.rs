@@ -171,6 +171,12 @@ impl OpenVmmsApp {
                 }
                 GuiUpdate::VmUpdated(vm) => {
                     let id = vm.config.id;
+                    if let Some(dlg) = self.vm_settings_dlg.as_mut()
+                        && dlg.vm_id == id
+                    {
+                        dlg.nics = vm.config.nics.clone();
+                        dlg.is_offline = matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error);
+                    }
                     if let Some(slot) = self.vms.iter_mut().find(|v| v.config.id == id) {
                         *slot = vm;
                     } else {
@@ -448,6 +454,7 @@ impl eframe::App for OpenVmmsApp {
                     let is_running = status == VmStatus::Running;
                     let is_paused = status == VmStatus::Paused;
                     let is_active = is_running || is_paused;
+                    let can_turn_off = is_active || status == VmStatus::Starting;
                     let has_fastdesk = vm.runtime.fastdesk_endpoint.is_some();
 
                     ui.label(RichText::new(&vm.config.name).strong());
@@ -475,7 +482,7 @@ impl eframe::App for OpenVmmsApp {
                         });
                     }
                     if ui
-                        .add_enabled(is_active, egui::Button::new("⏹ Turn Off"))
+                        .add_enabled(can_turn_off, egui::Button::new("⏹ Turn Off"))
                         .clicked()
                     {
                         self.backend.send(GuiRequest::StopVm { id });

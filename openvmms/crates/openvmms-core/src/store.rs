@@ -43,6 +43,60 @@ impl RegistryStore {
         self.data_dir.join("daemon.token")
     }
 
+    pub fn lock_path(&self) -> PathBuf {
+        self.data_dir.join("daemon.lock")
+    }
+
+    /// Acquires an exclusive non-blocking lock on `<data_dir>/daemon.lock` for the
+    /// lifetime of the returned `File`, preventing two `openvmmsd` instances from
+    /// managing the same registry simultaneously.
+    pub fn try_acquire_daemon_lock(&self) -> anyhow::Result<fs::File> {
+        let path = self.lock_path();
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&path)
+            .with_context(|| format!("opening daemon lock at {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => {
+                bail!(
+                    "another openvmmsd instance is already running for data directory {}",
+                    self.data_dir.display()
+                );
+            }
+            Err(fs::TryLockError::Error(err)) => {
+                Err(err).with_context(|| format!("acquiring daemon lock at {}", path.display()))
+            }
+        }
+    }
+
+    /// Returns `true` if another open file handle currently holds `<data_dir>/daemon.lock`.
+    pub fn is_daemon_locked(&self) -> bool {
+        let path = self.lock_path();
+        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(fs::TryLockError::WouldBlock) => true,
+            Err(fs::TryLockError::Error(_)) => false,
+        }
+    }
+
     pub fn vms_dir(&self) -> PathBuf {
         self.data_dir.join("vms")
     }
@@ -140,10 +194,20 @@ impl RegistryStore {
             if !cfg_path.is_file() {
                 continue;
             }
-            let text = fs::read_to_string(&cfg_path)
-                .with_context(|| format!("reading {}", cfg_path.display()))?;
-            let vm: VmConfig = toml::from_str(&text)
-                .with_context(|| format!("parsing {}", cfg_path.display()))?;
+            let text = match fs::read_to_string(&cfg_path) {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::warn!(path = %cfg_path.display(), error = %err, "skipping unreadable vm.toml");
+                    continue;
+                }
+            };
+            let vm: VmConfig = match toml::from_str(&text) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(path = %cfg_path.display(), error = %err, "skipping corrupt vm.toml");
+                    continue;
+                }
+            };
             out.push(vm);
         }
         out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
@@ -249,5 +313,40 @@ mod tests {
         assert!(store.load_all_vms().unwrap().is_empty());
         assert!(disk_in_vm_dir.exists());
         assert!(!store.vm_config_path(vm.id).exists());
+    }
+
+    #[test]
+    fn daemon_lock_prevents_duplicate_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        assert!(!store.is_daemon_locked());
+
+        let lock = store.try_acquire_daemon_lock().unwrap();
+        assert!(store.is_daemon_locked());
+        let err = store.try_acquire_daemon_lock().unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err:#}");
+
+        drop(lock);
+        assert!(!store.is_daemon_locked());
+        let _reacquired = store.try_acquire_daemon_lock().unwrap();
+    }
+
+    #[test]
+    fn corrupt_vm_toml_is_skipped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+
+        let good_dir = store.vm_dir(Uuid::new_v4());
+        let good = VmConfig::from_preset("Valid-VM", VmPreset::LinuxDesktop, &good_dir);
+        store.save_vm(&good).unwrap();
+
+        let bad_id = Uuid::new_v4();
+        let bad_dir = store.vm_dir(bad_id);
+        fs::create_dir_all(&bad_dir).unwrap();
+        fs::write(bad_dir.join("vm.toml"), "not = [valid toml").unwrap();
+
+        let loaded = store.load_all_vms().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, good.id);
     }
 }

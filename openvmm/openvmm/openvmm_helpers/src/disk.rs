@@ -31,15 +31,76 @@ pub struct OpenDiskOptions {
     pub direct: bool,
 }
 
+#[cfg(unix)]
+fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+    if file.metadata().is_ok_and(|m| m.is_file()) {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!(
+                    "disk image '{}' is already locked for writing by another process",
+                    path.display()
+                );
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(err).with_context(|| disk_open_error(path, "failed to lock"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks whether `path` starts with the 8-byte VHDX file signature (`b"vhdxfile"`).
+pub fn has_vhdx_signature(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).is_ok() && &magic == b"vhdxfile"
+}
+
+/// Opens `path` as a VHDX disk regardless of its file extension.
+pub async fn open_vhdx_disk(
+    path: &Path,
+    options: OpenDiskOptions,
+) -> anyhow::Result<Resource<DiskHandleKind>> {
+    #[cfg(windows)]
+    {
+        if !options.direct
+            && !path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("vhdx"))
+        {
+            return disklayer_vhdx::chain::open_vhdx_chain(path, options.read_only).await;
+        }
+        Ok(Resource::new(disk_vhdmp::OpenVhdmpDiskConfig(
+            disk_vhdmp::VhdmpDisk::options()
+                .read_only(options.read_only)
+                .cached_io(!options.direct)
+                .open(path)
+                .with_context(|| disk_open_error(path, "failed to open"))?,
+        )))
+    }
+    #[cfg(not(windows))]
+    {
+        if options.direct {
+            anyhow::bail!("direct I/O is not supported for .vhdx files");
+        }
+        disklayer_vhdx::chain::open_vhdx_chain(path, options.read_only).await
+    }
+}
+
 /// Opens the resources needed for using a disk from a file at `path`.
 ///
 /// If the file ends with .vhd and is a fixed VHD1, it will be opened using
 /// the user-mode VHD parser. Otherwise, if the file ends with .vhd, the
 /// file will be opened using the kernel-mode VHD parser (Windows only).
 ///
-/// If the file ends with .vhdx, the kernel-mode VHD parser is used on
-/// Windows. On Linux, the pure-Rust VHDX parser is used, with automatic
-/// parent-locator walking for differencing chains.
+/// If the file ends with .vhdx (case-insensitively) or carries a VHDX header
+/// signature, the VHDX backend is used (kernel-mode VHD parser for `.vhdx` on
+/// Windows, or the pure-Rust VHDX parser on Linux and non-`.vhdx` paths).
 ///
 /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
 pub async fn open_disk_type(
@@ -53,7 +114,11 @@ pub async fn open_disk_type(
         };
         Ok(())
     };
-    Ok(match path.extension().and_then(|s| s.to_str()) {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    Ok(match ext.as_deref() {
         Some("vmdk") => {
             ensure_no_direct(".vmdk")?;
             disk_vmdk::open_vmdk(path, read_only)
@@ -65,6 +130,11 @@ pub async fn open_disk_type(
                 .write(!read_only)
                 .open(path)
                 .with_context(|| disk_open_error(path, "failed to open"))?;
+
+            #[cfg(unix)]
+            if !read_only {
+                acquire_writable_disk_lock(&file, path)?;
+            }
 
             match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
                 Ok(vhd) => {
@@ -90,23 +160,7 @@ pub async fn open_disk_type(
                 Err(err) => return Err(err.into()),
             }
         }
-        Some("vhdx") => {
-            #[cfg(windows)]
-            {
-                Resource::new(disk_vhdmp::OpenVhdmpDiskConfig(
-                    disk_vhdmp::VhdmpDisk::options()
-                        .read_only(read_only)
-                        .cached_io(!options.direct)
-                        .open(path)
-                        .with_context(|| disk_open_error(path, "failed to open"))?,
-                ))
-            }
-            #[cfg(not(windows))]
-            {
-                ensure_no_direct(".vhdx")?;
-                disklayer_vhdx::chain::open_vhdx_chain(path, read_only).await?
-            }
-        }
+        Some("vhdx") => open_vhdx_disk(path, options).await?,
         Some("iso") if !read_only => {
             anyhow::bail!("iso file cannot be opened as read/write")
         }
@@ -120,8 +174,14 @@ pub async fn open_disk_type(
                 .open(path)
                 .with_context(|| disk_open_error(path, "failed to open"))?;
 
+            #[cfg(unix)]
+            if !read_only {
+                acquire_writable_disk_lock(&file, path)?;
+            }
+
             Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
         }
+        _ if !options.direct && has_vhdx_signature(path) => open_vhdx_disk(path, options).await?,
         _ => open_raw_disk(path, options, None)?,
     })
 }
@@ -132,7 +192,11 @@ pub fn create_disk_type(
     size: u64,
     options: OpenDiskOptions,
 ) -> anyhow::Result<Resource<DiskHandleKind>> {
-    Ok(match path.extension().and_then(|s| s.to_str()) {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    Ok(match ext.as_deref() {
         Some("vhd") | Some("vmgs") => {
             if options.direct {
                 anyhow::bail!("direct I/O is not supported for VHD files");
@@ -194,6 +258,11 @@ fn open_raw_disk(
     let file = opts
         .open(path)
         .with_context(|| disk_open_error(path, verb))?;
+
+    #[cfg(unix)]
+    if !options.read_only {
+        acquire_writable_disk_lock(&file, path)?;
+    }
 
     if let Some(size) = size {
         file.set_len(size)?;
@@ -286,6 +355,85 @@ mod tests {
                 },
             )
             .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[async_test]
+    async fn rejects_concurrent_writable_raw_disk_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.img");
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+
+        let first = open_disk_type(
+            &path,
+            OpenDiskOptions {
+                read_only: false,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = open_disk_type(
+            &path,
+            OpenDiskOptions {
+                read_only: false,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
+
+        drop(first);
+        open_disk_type(
+            &path,
+            OpenDiskOptions {
+                read_only: false,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[async_test]
+    async fn uppercase_vhdx_and_vhdx_signature_dispatch_to_vhdx_backend() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A file ending in .VHDX must not fall back to raw disk open.
+        let upper_vhdx = dir.path().join("Disk.VHDX");
+        std::fs::write(&upper_vhdx, b"not-a-valid-vhdx-payload").unwrap();
+        let err = open_disk_type(
+            &upper_vhdx,
+            OpenDiskOptions {
+                read_only: true,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        // Raw open would have succeeded on arbitrary bytes; VHDX backend fails parsing.
+        assert!(err.to_string().contains("vhdx") || err.chain().any(|c| c.to_string().contains("vhdx")), "{err:#}");
+
+        // A .img file starting with the VHDX header signature must also dispatch to VHDX, not raw.
+        let sig_img = dir.path().join("data.img");
+        std::fs::write(&sig_img, b"vhdxfile\x00\x00\x00\x00").unwrap();
+        assert!(has_vhdx_signature(&sig_img));
+        let err = open_disk_type(
+            &sig_img,
+            OpenDiskOptions {
+                read_only: true,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|c| c.to_string().to_ascii_lowercase().contains("vhdx")),
+            "{err:#}"
         );
     }
 }

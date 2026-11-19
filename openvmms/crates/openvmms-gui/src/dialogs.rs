@@ -145,6 +145,7 @@ pub struct NewVmWizard {
     pub memory_mb: u64,
     pub secure_boot_enabled: bool,
     pub secure_boot_template: SecureBootTemplateConfig,
+    pub tpm_enabled: bool,
     pub nested_virt: bool,
     pub fastdesk_enabled: bool,
     pub vram_mb: u32,
@@ -174,6 +175,7 @@ impl NewVmWizard {
             memory_mb: 8192,
             secure_boot_enabled: true,
             secure_boot_template: SecureBootTemplateConfig::MicrosoftWindows,
+            tpm_enabled: true,
             nested_virt: false,
             fastdesk_enabled: true,
             vram_mb: 32,
@@ -286,6 +288,7 @@ impl NewVmWizard {
             uefi_firmware: None,
             secure_boot_enabled: Some(self.secure_boot_enabled),
             secure_boot_template: Some(self.secure_boot_template),
+            tpm_enabled: Some(self.tpm_enabled),
             fastdesk: Some(FastDeskSettings {
                 enabled: self.fastdesk_enabled,
                 vram_mb: self.vram_mb,
@@ -309,6 +312,7 @@ impl NewVmWizard {
                 self.memory_mb = 8192;
                 self.secure_boot_enabled = true;
                 self.secure_boot_template = SecureBootTemplateConfig::MicrosoftWindows;
+                self.tpm_enabled = true;
                 self.vram_mb = 32;
             }
             VmPreset::LinuxDesktop => {
@@ -316,6 +320,7 @@ impl NewVmWizard {
                 self.memory_mb = 4096;
                 self.secure_boot_enabled = false;
                 self.secure_boot_template = SecureBootTemplateConfig::MicrosoftUefiCa;
+                self.tpm_enabled = false;
                 self.vram_mb = 32;
             }
             VmPreset::Custom => {
@@ -323,6 +328,7 @@ impl NewVmWizard {
                 self.memory_mb = 4096;
                 self.secure_boot_enabled = false;
                 self.secure_boot_template = SecureBootTemplateConfig::None;
+                self.tpm_enabled = false;
             }
         }
     }
@@ -338,6 +344,7 @@ pub struct VmSettingsDialog {
     pub nested_virt: bool,
     pub secure_boot_enabled: bool,
     pub secure_boot_template: SecureBootTemplateConfig,
+    pub tpm_enabled: bool,
     pub uefi_firmware: String,
     pub fastdesk_enabled: bool,
     pub vram_mb: u32,
@@ -367,6 +374,7 @@ impl VmSettingsDialog {
             nested_virt: cfg.nested_virt,
             secure_boot_enabled: cfg.secure_boot_enabled,
             secure_boot_template: cfg.secure_boot_template,
+            tpm_enabled: cfg.tpm_enabled,
             uefi_firmware: cfg
                 .uefi_firmware
                 .as_ref()
@@ -385,10 +393,16 @@ impl VmSettingsDialog {
 
     pub fn build_update_payload(&self, switches: &[VirtualSwitchInfo]) -> UpdateVmPayload {
         if self.is_offline {
+            // Only send `nics` when the user changed the switch dropdown so concurrent
+            // CLI/API NIC or port-forward changes are not clobbered on Save Changes.
             let nics = if self.selected_switch_id == self.initial_switch_id {
-                self.nics.clone()
+                None
             } else {
-                build_nics_from_switch_id(&self.selected_switch_id, switches, &self.nics)
+                Some(build_nics_from_switch_id(
+                    &self.selected_switch_id,
+                    switches,
+                    &self.nics,
+                ))
             };
             let mut fastdesk = self.base_fastdesk.clone();
             fastdesk.enabled = self.fastdesk_enabled;
@@ -407,8 +421,9 @@ impl VmSettingsDialog {
                 uefi_firmware: Some(string_to_opt(&self.uefi_firmware)),
                 secure_boot_enabled: Some(self.secure_boot_enabled),
                 secure_boot_template: Some(self.secure_boot_template),
+                tpm_enabled: Some(self.tpm_enabled),
                 fastdesk: Some(fastdesk),
-                nics: Some(nics),
+                nics,
                 ..Default::default()
             }
         } else {
@@ -769,6 +784,10 @@ pub fn render_new_vm_wizard(
                                 ui.label("Nested Virtualization:");
                                 ui.checkbox(&mut w.nested_virt, "Expose hardware virtualization extensions");
                                 ui.end_row();
+
+                                ui.label("vTPM 2.0:");
+                                ui.checkbox(&mut w.tpm_enabled, "Enable Trusted Platform Module 2.0");
+                                ui.end_row();
                             },
                         );
                     }
@@ -967,6 +986,7 @@ pub fn render_vm_settings_dialog(
     let mut close = false;
     if let Some(d) = dlg_opt.as_mut() {
         egui::Window::new(format!("Settings — {}", d.name))
+            .id(egui::Id::new(("vm_settings_dialog", d.vm_id)))
             .collapsible(false)
             .resizable(true)
             .default_size([560.0, 440.0])
@@ -1030,6 +1050,10 @@ pub fn render_vm_settings_dialog(
 
                             ui.label("Nested Virt:");
                             ui.checkbox(&mut d.nested_virt, "Expose hardware virtualization");
+                            ui.end_row();
+
+                            ui.label("vTPM 2.0:");
+                            ui.checkbox(&mut d.tpm_enabled, "Enable Trusted Platform Module 2.0");
                             ui.end_row();
 
                             ui.label("UEFI Firmware:");
@@ -1348,6 +1372,7 @@ pub fn render_delete_vm_dialog(
     let mut close = false;
     if let Some(d) = dlg_opt.as_mut() {
         egui::Window::new("Delete Virtual Machine")
+            .id(egui::Id::new(("delete_vm_dialog", d.vm_id)))
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
@@ -1474,13 +1499,26 @@ mod tests {
             });
         }
 
-        let dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Off);
+        let mut dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Off);
         let payload = dlg.build_update_payload(&[]);
         let fd = payload.fastdesk.unwrap();
         assert_eq!(fd.listen_addr, "127.0.0.1:5999");
         assert_eq!(fd.vsock_port, Some(6000));
-        let nics = payload.nics.unwrap();
+        // Unchanged switch selection leaves NICs untouched on the daemon (`None`).
+        assert!(payload.nics.is_none());
+
+        // Switching NIC backend still preserves extra NICs on the update payload.
+        let switches = vec![VirtualSwitchInfo {
+            id: "tap1".to_string(),
+            name: "tap1".to_string(),
+            kind: "tap".to_string(),
+            description: "Secondary test TAP".to_string(),
+        }];
+        dlg.selected_switch_id = "tap1".to_string();
+        let switched_payload = dlg.build_update_payload(&switches);
+        let nics = switched_payload.nics.unwrap();
         assert_eq!(nics.len(), 2);
+        assert!(matches!(nics[0].backend, NicBackendConfig::Tap { ref name } if name == "tap1"));
         assert!(matches!(nics[1].backend, NicBackendConfig::Tap { ref name } if name == "tap0"));
     }
 

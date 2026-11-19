@@ -25,6 +25,9 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -33,19 +36,30 @@ pub struct ApiClient {
     base_url: String,
     token: String,
     client: reqwest::blocking::Client,
+    verified: Arc<AtomicBool>,
+}
+
+#[derive(serde::Deserialize)]
+struct HealthCheckBody {
+    status: String,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    auth_proof: Option<String>,
 }
 
 impl ApiClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> anyhow::Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(180))
             .build()
             .context("building HTTP client")?;
         Ok(Self {
             base_url,
             token: token.into(),
             client,
+            verified: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -74,14 +88,44 @@ impl ApiClient {
     }
 
     pub fn health(&self) -> anyhow::Result<()> {
+        let challenge = Uuid::new_v4().to_string();
         let resp = self
             .client
             .get(format!("{}/api/v1/health", self.base_url))
+            .query(&[("challenge", challenge.as_str())])
             .timeout(Duration::from_secs(2))
             .send()
             .context("connecting to openvmmsd")?;
         if !resp.status().is_success() {
             bail!("openvmmsd health returned {}", resp.status());
+        }
+        let body: HealthCheckBody = resp
+            .json()
+            .context("decoding openvmmsd health response")?;
+        if body.status != "ok" {
+            bail!("openvmmsd health status was '{}'", body.status);
+        }
+        if let Some(service) = body.service.as_deref()
+            && service != "openvmmsd"
+        {
+            bail!("unexpected service '{service}' at {}", self.base_url);
+        }
+        if !self.token.is_empty() {
+            let expected = crate::models::compute_health_auth_proof(&self.token, &challenge);
+            if body.auth_proof.as_deref() != Some(expected.as_str()) {
+                bail!(
+                    "daemon at {} failed health authentication challenge; refusing to send bearer token",
+                    self.base_url
+                );
+            }
+        }
+        self.verified.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn ensure_verified(&self) -> anyhow::Result<()> {
+        if !self.verified.load(Ordering::Acquire) {
+            self.health()?;
         }
         Ok(())
     }
@@ -159,6 +203,7 @@ impl ApiClient {
     }
 
     pub fn delete_vm(&self, id_or_name: &str, delete_disks: bool) -> anyhow::Result<()> {
+        self.ensure_verified()?;
         let suffix = if delete_disks {
             "?delete_disks=true"
         } else {
@@ -264,6 +309,7 @@ impl ApiClient {
         nic_id: Uuid,
         port: PortForward,
     ) -> anyhow::Result<VmSummary> {
+        self.ensure_verified()?;
         let url = format!(
             "{}/api/v1/vms/{}/nics/{nic_id}/ports",
             self.base_url,
@@ -307,6 +353,7 @@ impl ApiClient {
     }
 
     pub fn shutdown_daemon(&self) -> anyhow::Result<()> {
+        self.ensure_verified()?;
         let url = format!("{}/api/v1/daemon/shutdown", self.base_url);
         let resp = self
             .client
@@ -318,6 +365,7 @@ impl ApiClient {
     }
 
     fn get<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        self.ensure_verified()?;
         let resp = self
             .client
             .get(format!("{}{path}", self.base_url))
@@ -328,6 +376,7 @@ impl ApiClient {
     }
 
     fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> anyhow::Result<T> {
+        self.ensure_verified()?;
         let resp = self
             .client
             .post(format!("{}{path}", self.base_url))
@@ -339,6 +388,7 @@ impl ApiClient {
     }
 
     fn post_empty<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        self.ensure_verified()?;
         let resp = self
             .client
             .post(format!("{}{path}", self.base_url))
@@ -349,6 +399,7 @@ impl ApiClient {
     }
 
     fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> anyhow::Result<T> {
+        self.ensure_verified()?;
         let resp = self
             .client
             .put(format!("{}{path}", self.base_url))
@@ -360,6 +411,7 @@ impl ApiClient {
     }
 
     fn delete_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        self.ensure_verified()?;
         let resp = self
             .client
             .delete(format!("{}{path}", self.base_url))
@@ -501,16 +553,11 @@ pub fn find_openvmmsd_binary() -> anyhow::Result<PathBuf> {
         if sibling.is_file() {
             return Ok(sibling);
         }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        for rel in [
-            bin_name.to_string(),
-            format!("openvmms/target/release/{bin_name}"),
-            format!("openvmms/target/debug/{bin_name}"),
-        ] {
-            let p = cwd.join(rel);
-            if p.is_file() {
-                return Ok(p);
+        // Test binaries reside in target/<profile>/deps while workspace binaries live one level up.
+        if let Some(parent) = dir.parent() {
+            let up = parent.join(bin_name);
+            if up.is_file() {
+                return Ok(up);
             }
         }
     }
@@ -525,6 +572,21 @@ pub fn find_openvmmsd_binary() -> anyhow::Result<PathBuf> {
     bail!("could not locate {bin_name} binary next to current executable or in PATH");
 }
 
+/// Resolves `fastdesk-viewer` locally from client config, executable siblings, or `PATH`
+/// without trusting binary paths supplied over HTTP by a daemon.
+pub fn resolve_local_viewer_binary(data_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let dir = data_dir
+        .map(resolve_client_path)
+        .unwrap_or_else(default_data_dir);
+    let configured = RegistryStore::new(&dir)
+        .ok()
+        .and_then(|store| store.load_or_init_host_config().ok())
+        .unwrap_or_default();
+    crate::models::resolve_host_paths(&configured)
+        .fastdesk_viewer_bin
+        .context("fastdesk-viewer binary not found next to current executable or in PATH")
+}
+
 pub fn ensure_daemon_running(
     data_dir: Option<&Path>,
     daemon_url_override: Option<&str>,
@@ -535,13 +597,41 @@ pub fn ensure_daemon_running(
         return Ok(client);
     }
 
-    let daemon_bin = find_openvmmsd_binary()?;
     let dir = data_dir
         .map(resolve_client_path)
         .unwrap_or_else(default_data_dir);
     let store = RegistryStore::new(&dir)?;
     let cfg = store.load_or_init_host_config()?;
     let _ = store.load_or_create_token()?;
+
+    if store.is_daemon_locked() {
+        if let Some(url) = daemon_url_override {
+            bail!(
+                "cannot auto-start openvmmsd at {url}: another openvmmsd instance is already running for data directory {} (listening on {})",
+                dir.display(),
+                cfg.listen_addr
+            );
+        }
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while store.is_daemon_locked() {
+            if let Ok(client) = ApiClient::from_data_dir(Some(&dir), None)
+                && client.health().is_ok()
+            {
+                return Ok(client);
+            }
+            if std::time::Instant::now() >= wait_deadline {
+                let latest_cfg = store.load_or_init_host_config().unwrap_or(cfg);
+                bail!(
+                    "another openvmmsd instance holds the lock for {} but is not healthy at {}",
+                    dir.display(),
+                    latest_cfg.listen_addr
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let daemon_bin = find_openvmmsd_binary()?;
 
     let mut cmd = Command::new(&daemon_bin);
     cmd.arg("--data-dir").arg(&dir);
@@ -553,7 +643,15 @@ pub fn ensure_daemon_running(
             .trim_end_matches('/');
         cmd.arg("--listen").arg(listen);
     } else {
-        cmd.arg("--listen").arg(&cfg.listen_addr);
+        let listen = match std::net::TcpListener::bind(&cfg.listen_addr) {
+            Ok(probe) => {
+                drop(probe);
+                cfg.listen_addr.as_str()
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => "127.0.0.1:0",
+            Err(_) => cfg.listen_addr.as_str(),
+        };
+        cmd.arg("--listen").arg(listen);
     }
     let log_file_path = dir.join("openvmmsd.log");
     if let Ok(log_file) = std::fs::OpenOptions::new()
@@ -570,6 +668,12 @@ pub fn ensure_daemon_running(
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
     cmd.stdin(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     #[cfg(windows)]
     {
@@ -688,5 +792,53 @@ mod tests {
             strip_verbatim_prefix_str(r"\\?\Volume{12345678-1234-1234-1234-1234567890ab}\disk.vhdx"),
             None
         );
+    }
+
+    #[test]
+    fn client_refuses_to_send_bearer_token_to_unauthenticated_impostor_health() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let saw_auth = Arc::new(AtomicBool::new(false));
+        let saw_auth_srv = Arc::clone(&saw_auth);
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.to_ascii_lowercase().contains("authorization:") {
+                    saw_auth_srv.store(true, Ordering::SeqCst);
+                }
+                let body = r#"{"status":"ok","service":"openvmmsd"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = ApiClient::new(format!("http://{addr}"), "secret-bearer-token").unwrap();
+        let err = client.list_vms().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed health authentication challenge"),
+            "{err:#}"
+        );
+        assert!(
+            !saw_auth.load(Ordering::SeqCst),
+            "bearer token must never be transmitted to an impostor health listener"
+        );
+        drop(srv);
     }
 }

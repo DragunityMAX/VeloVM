@@ -131,6 +131,7 @@ use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vmgs_resources::GuestStateEncryptionPolicy;
 use vmgs_resources::VmgsResource;
+use vmotherboard::ChipsetDeviceHandle;
 use vmservice::uefi::initial_variables::SecureBootTemplate;
 
 #[cfg(guest_arch = "aarch64")]
@@ -1177,6 +1178,10 @@ impl VmService {
         // Build SMBIOS identity for direct Linux or UEFI boot.
         let smbios_requested = req_config.smbios_config.is_some();
         let smbios = Box::new(smbios_config_from_proto(req_config.smbios_config.take())?);
+        let bios_guid = smbios.system.uuid;
+        let tpm_version = req_config
+            .tpm_enabled
+            .then_some(tpm_resources::TpmVersion::V185);
 
         let isolation = match req_config.isolation_config.take() {
             // Unset isolation config defaults to no isolation
@@ -1214,6 +1219,9 @@ impl VmService {
                 if isolation.is_some() {
                     bail!("VM-service SNP isolation currently supports only IGVM boot");
                 }
+                if tpm_version.is_some() {
+                    bail!("vTPM requires UEFI boot");
+                }
                 let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
                 let initrd = if boot.initrd_path.is_empty() {
                     None
@@ -1245,6 +1253,9 @@ impl VmService {
                 }
                 if !matches!(isolation, Some(IsolationType::Snp { .. })) {
                     bail!("VM-service IGVM boot currently supports only SNP isolation");
+                }
+                if tpm_version.is_some() {
+                    bail!("vTPM requires UEFI boot");
                 }
                 let base_chipset_type = match boot.personality() {
                     vmservice::igvm_boot::Personality::Unspecified => {
@@ -1308,7 +1319,7 @@ impl VmService {
                         enable_memory_protections: false,
                         enable_debugging: false,
                         disable_frontpage: false,
-                        tpm_version: None,
+                        tpm_version,
                         enable_battery: false,
                         enable_vpci_boot: false,
                         default_boot_always_attempt: false,
@@ -1658,6 +1669,45 @@ impl VmService {
             .await
             .context("spawning vm process failed")?;
 
+        if let Some(tpm_version) = tpm_version {
+            let register_layout = if cfg!(guest_arch = "x86_64") {
+                tpm_resources::TpmRegisterLayout::IoPort
+            } else {
+                tpm_resources::TpmRegisterLayout::Mmio
+            };
+            let with_vmgs = config.vmgs.is_some();
+            let ppi_store =
+                crate::non_volatile_store_resource(with_vmgs, vmgs_format::FileId::TPM_PPI);
+            let nvram_store = crate::non_volatile_store_resource(
+                with_vmgs,
+                tpm_vmgs::tpm_nvram_file_id(tpm_version),
+            );
+            config.chipset_devices.push(ChipsetDeviceHandle {
+                name: "tpm".to_string(),
+                resource: chipset_device_worker_defs::RemoteChipsetDeviceHandle {
+                    device: tpm_resources::TpmDeviceHandle {
+                        version: tpm_version,
+                        ppi_store,
+                        nvram_store,
+                        nvram_size: None,
+                        refresh_tpm_seeds: false,
+                        ak_cert_type: tpm_resources::TpmAkCertTypeResource::None,
+                        register_layout,
+                        guest_secret_key: None,
+                        logger: None,
+                        is_confidential_vm: false,
+                        bios_guid,
+                    }
+                    .into_resource(),
+                    worker_host: mesh
+                        .make_host("tpm", None)
+                        .await
+                        .context("spawning tpm process failed")?,
+                }
+                .into_resource(),
+            });
+        }
+
         let (shared_memory, saved_state, active_memory_backing_file, snapshot_id) =
             if let Some(restore) = &restore {
                 let prepared =
@@ -1687,7 +1737,7 @@ impl VmService {
             let shm_path = fastdesk_shm_path.clone();
             let dirty_recv = fastdesk_dirty_recv.take();
             let cursor_recv = fastdesk_cursor_recv.take();
-            let max_clients = fd.max_clients as usize;
+            let max_clients = resolve_fastdesk_max_clients(fd.max_clients);
             let fastdesk_host = mesh
                 .make_host("fastdesk", None)
                 .await
@@ -2719,6 +2769,10 @@ fn parse_nic_config(
 
 async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDeviceAndPath> {
     let read_only = disk.read_only || disk.is_dvd;
+    let options = OpenDiskOptions {
+        read_only,
+        direct: false,
+    };
     let device = if disk.is_dvd {
         let media = if disk.host_path.is_empty() {
             None
@@ -2741,16 +2795,14 @@ async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDevic
         }
         .into_resource()
     } else {
+        let disk_handle = if disk.r#type == vmservice::DiskType::ScsiDiskTypeVhdx as i32 {
+            openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await
+        } else {
+            open_disk_type(disk.host_path.as_ref(), options).await
+        }
+        .with_context(|| format!("failed to open {}", disk.host_path))?;
         SimpleScsiDiskHandle {
-            disk: open_disk_type(
-                disk.host_path.as_ref(),
-                OpenDiskOptions {
-                    read_only,
-                    direct: false,
-                },
-            )
-            .await
-            .with_context(|| format!("failed to open {}", disk.host_path))?,
+            disk: disk_handle,
             read_only,
             parameters: Default::default(),
         }
@@ -2764,6 +2816,14 @@ async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDevic
         },
         device,
     })
+}
+
+fn resolve_fastdesk_max_clients(max_clients: u32) -> usize {
+    if max_clients == 0 {
+        fastdesk_worker_defs::DEFAULT_MAX_CLIENTS
+    } else {
+        max_clients as usize
+    }
 }
 
 /// Applies the MMIO gap sizes from the request's `MemoryConfig` to the
@@ -5205,5 +5265,11 @@ mod tests {
                 Some("/dev/shm/vram.shm")
             );
         });
+    }
+
+    #[test]
+    fn fastdesk_max_clients_zero_uses_worker_default() {
+        assert_eq!(resolve_fastdesk_max_clients(0), 16);
+        assert_eq!(resolve_fastdesk_max_clients(4), 4);
     }
 }

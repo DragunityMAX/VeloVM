@@ -10,8 +10,8 @@ rust-version.workspace = true
 # Enable gdbstub support.
 gdb = ["openvmm_core/gdb", "dep:debug_worker"]
 
-# Enable building with TPM device support.
-tpm = ["dep:tpm_device"]
+# Enable building with the Microsoft C reference TPM engine.
+tpm = ["tpm_device/tpm"]
 
 # Enable building with /dev/mshv support.
 virt_mshv = ["dep:virt_mshv"]
@@ -54,7 +54,7 @@ chipset_resources.workspace = true
 firmware_uefi.workspace = true
 missing_dev.workspace = true
 guest_watchdog.workspace = true
-tpm_device = { workspace = true, optional = true, features = ["tpm"] }
+tpm_device.workspace = true
 
 # Non-volatile stores
 vmcore.workspace = true

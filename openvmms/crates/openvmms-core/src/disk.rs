@@ -8,51 +8,58 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Validates that `path` has a file name and an extension compatible with `format`
-/// under OpenVMM's `open_disk_type` dispatch rules.
+/// Validates that `path` has a file name and does not collide with another disk format's
+/// reserved extension.
 pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow::Result<()> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         bail!("disk path must specify a file name");
     }
+    let lower = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
     match format {
         DiskFormat::Iso => bail!("cannot create an ISO file; specify Raw or Vhdx format"),
         DiskFormat::Vhdx => {
-            // OpenVMM's `open_disk_type` requires an exact lowercase `.vhdx` extension
-            // (`.vhd` invokes the VHD1 parser and `.VHDX`/others fall through to raw).
-            if path.extension().and_then(|e| e.to_str()) != Some("vhdx") {
+            if matches!(lower.as_deref(), Some("iso" | "vmdk" | "vmgs" | "vhd")) {
                 bail!(
-                    "disk path {} is incompatible with vhdx format: use a .vhdx extension",
-                    path.display()
+                    "disk path {} is incompatible with vhdx format: extension .{} is reserved for another disk format (use .vhdx)",
+                    path.display(),
+                    lower.as_deref().unwrap_or_default()
                 );
             }
         }
         DiskFormat::Raw => {
-            if let Some(raw_ext) = path.extension().and_then(|e| e.to_str()) {
-                let lower = raw_ext.to_ascii_lowercase();
-                if matches!(lower.as_str(), "vhdx" | "vhd" | "vmdk" | "vmgs" | "iso") {
-                    bail!(
-                        "disk path {} is incompatible with raw format: extension .{raw_ext} is reserved for another disk format (use e.g. .img or .raw)",
-                        path.display()
-                    );
-                }
+            if matches!(
+                lower.as_deref(),
+                Some("vhdx" | "vhd" | "vmdk" | "vmgs" | "iso")
+            ) {
+                bail!(
+                    "disk path {} is incompatible with raw format: extension .{} is reserved for another disk format (use e.g. .img or .raw)",
+                    path.display(),
+                    lower.as_deref().unwrap_or_default()
+                );
             }
         }
     }
     Ok(())
 }
 
-/// Adjusts mismatched disk extensions so OpenVMM probes match the requested disk format.
+/// Adjusts mismatched disk extensions so GUI defaults match the requested disk format.
 pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
-        return;
-    }
-    if validate_disk_path_for_format(path, format).is_ok() {
         return;
     }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
+    let raw_ext = path.extension().and_then(|e| e.to_str());
+    match format {
+        DiskFormat::Raw if validate_disk_path_for_format(path, format).is_ok() => return,
+        DiskFormat::Vhdx if raw_ext == Some("vhdx") => return,
+        _ => {}
+    }
     match (format, ext.as_deref()) {
         (DiskFormat::Raw, _) => {
             path.set_extension("img");
@@ -81,11 +88,9 @@ pub fn create_disk(
     req: &CreateDiskPayload,
     openvmm_img_bin: Option<&Path>,
 ) -> anyhow::Result<DiskInfo> {
-    if req.size_bytes == 0 {
-        bail!("disk size must be greater than 0");
+    if req.size_bytes < 512 || req.size_bytes % 512 != 0 {
+        bail!("disk size must be at least 512 bytes and a multiple of 512 bytes");
     }
-    // Disk attachment infers the parser from the file extension, so a mismatch would
-    // produce a disk that can never be attached correctly.
     validate_disk_path_for_format(&req.path, req.format)?;
     let vhdx_img_bin = if req.format == DiskFormat::Vhdx {
         Some(openvmm_img_bin.context(
@@ -188,7 +193,8 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
-    if ext.as_deref() == Some("vhdx")
+    let is_vhdx = ext.as_deref() == Some("vhdx") || crate::models::has_vhdx_magic(path);
+    if is_vhdx
         && let Some(img_bin) = openvmm_img_bin
     {
         let output = Command::new(img_bin)
@@ -225,8 +231,8 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
     }
 
     let (format, disk_type) = match ext.as_deref() {
+        _ if is_vhdx => ("vhdx".to_string(), "vhdx".to_string()),
         Some("iso") => ("iso".to_string(), "read-only image".to_string()),
-        Some("vhdx") => ("vhdx".to_string(), "vhdx".to_string()),
         Some("vhd") => ("vhd".to_string(), "vhd".to_string()),
         _ => ("raw".to_string(), "sparse/flat".to_string()),
     };
@@ -277,10 +283,10 @@ mod tests {
             ("disk.vmdk", DiskFormat::Raw),
             ("disk.vmgs", DiskFormat::Raw),
             ("disk.iso", DiskFormat::Raw),
-            ("disk.img", DiskFormat::Vhdx),
             ("disk.vhd", DiskFormat::Vhdx),
-            ("disk.VHDX", DiskFormat::Vhdx),
-            ("disk", DiskFormat::Vhdx),
+            ("disk.vmdk", DiskFormat::Vhdx),
+            ("disk.vmgs", DiskFormat::Vhdx),
+            ("disk.iso", DiskFormat::Vhdx),
         ] {
             let path = dir.path().join(name);
             let err = create_disk(
@@ -471,6 +477,33 @@ mod tests {
             assert_eq!(vhdx_ok, 1);
             assert_eq!(vhdx_err, 7);
             assert_eq!(fs::read(&vhdx_path).unwrap(), b"VHDX_WINNER_PAYLOAD");
+
+            // Case-insensitive .VHDX and explicit --format vhdx on .img both succeed
+            // and inspect/infer as VHDX via magic bytes.
+            let magic_stub = dir.path().join("magic-stub-openvmm-img.sh");
+            fs::write(
+                &magic_stub,
+                "#!/bin/sh\nset -eu\ncmd=\"$1\"\npath=\"$2\"\nif [ \"$cmd\" = \"create\" ]; then\n  printf \"vhdxfileDUMMY\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
+            )
+            .unwrap();
+            fs::set_permissions(&magic_stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+            for custom_name in ["data.img", "Disk.VHDX"] {
+                let p = dir.path().join(custom_name);
+                let created = create_disk(
+                    &CreateDiskPayload {
+                        path: p.clone(),
+                        size_bytes,
+                        format: DiskFormat::Vhdx,
+                        fixed: false,
+                    },
+                    Some(&magic_stub),
+                )
+                .unwrap();
+                assert_eq!(created.format, "vhdx", "{custom_name}");
+                assert_eq!(created.virtual_size_bytes, size_bytes, "{custom_name}");
+                assert_eq!(DiskFormat::from_path(&p), DiskFormat::Vhdx, "{custom_name}");
+            }
         }
     }
 }
