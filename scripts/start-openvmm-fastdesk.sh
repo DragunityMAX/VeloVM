@@ -255,6 +255,13 @@ if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 655
     exit 1
 fi
 
+LISTEN_HOST_LC="${LISTEN_HOST,,}"
+if [[ "$LISTEN_HOST_LC" == "0.0.0.0" || "$LISTEN_HOST_LC" == "::ffff:0.0.0.0" || "$LISTEN_HOST_LC" == "0:0:0:0:0:ffff:0.0.0.0" ]]; then
+    VIEWER_ADDR="127.0.0.1:${LISTEN_PORT}"
+elif [[ "$LISTEN_HOST_LC" == *:*:* && "$LISTEN_HOST_LC" =~ ^[0:]+$ ]]; then
+    VIEWER_ADDR="[::1]:${LISTEN_PORT}"
+fi
+
 now_ms() {
     if [[ -n "${EPOCHREALTIME:-}" ]]; then
         local sec frac
@@ -323,7 +330,7 @@ VMM_PID=$!
 exec {VMM_READ_FD}<&-
 VMM_READ_FD=""
 
-echo "Waiting for OpenVMM FastDesk listener on ${VIEWER_ADDR}..."
+echo "Waiting for OpenVMM FastDesk listener on ${LISTEN_ADDR}..."
 START_MS="$(now_ms)"
 DEADLINE_MS=$(( START_MS + STARTUP_TIMEOUT_MS ))
 while true; do
@@ -336,7 +343,7 @@ while true; do
         break
     fi
     if [[ "$(now_ms)" -ge "$DEADLINE_MS" ]]; then
-        echo "Error: timed out waiting for OpenVMM FastDesk to listen on ${VIEWER_ADDR}." >&2
+        echo "Error: timed out waiting for OpenVMM FastDesk to listen on ${LISTEN_ADDR}." >&2
         exit 1
     fi
     sleep 0.05

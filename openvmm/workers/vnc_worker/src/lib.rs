@@ -305,7 +305,14 @@ impl<T: Listener> MultiClientServer<T> {
                     tracing::info!(id, count = self.clients.len(), "VNC client disconnected");
                 }
                 Event::DirtyRects(rects) => {
-                    if !device_dirty_seen {
+                    if rects.is_empty() {
+                        if device_dirty_seen {
+                            device_dirty_seen = false;
+                            tracing::info!(
+                                "device dirty reset received, falling back to tile diff"
+                            );
+                        }
+                    } else if !device_dirty_seen {
                         device_dirty_seen = true;
                         tracing::info!("device dirty rects active, preferring over tile diff");
                     }

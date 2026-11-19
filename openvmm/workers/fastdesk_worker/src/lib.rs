@@ -46,6 +46,7 @@ use pal_async::socket::PolledSocket;
 use pal_async::timer::PolledTimer;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::net::TcpListener;
 use std::pin::Pin;
@@ -455,6 +456,14 @@ impl<T: Listener> MultiClientServer<T> {
         }
     }
 
+    fn reset_dirty_reporting(&mut self) {
+        self.device_dirty_seen.store(false, Ordering::Release);
+        for c in &self.client_handles {
+            c.missed_dirty.store(true, Ordering::Release);
+            let _ = c.wakeup_send.try_send(());
+        }
+    }
+
     fn apply_format_change(&mut self, format: video_core::FramebufferFormat) {
         {
             let mut guard = self.view.lock();
@@ -473,36 +482,63 @@ impl<T: Listener> MultiClientServer<T> {
             }
             guard.0.set_cached_format(format);
         }
-        self.device_dirty_seen.store(false, Ordering::Release);
-        for c in &self.client_handles {
-            c.missed_dirty.store(true, Ordering::Release);
-            let _ = c.wakeup_send.try_send(());
+        if let Some(recv) = &mut self.dirty_recv {
+            loop {
+                match recv.try_recv() {
+                    Ok(_) => {}
+                    Err(mesh::TryRecvError::Empty) => break,
+                    Err(mesh::TryRecvError::Closed | mesh::TryRecvError::Error(_)) => {
+                        self.dirty_recv = None;
+                        break;
+                    }
+                }
+            }
         }
+        self.reset_dirty_reporting();
     }
 
-    fn drain_format_updates(&mut self) {
+    fn drain_format_updates(&mut self) -> bool {
         let mut latest_valid = None;
+        let mut channel_closed = false;
         if let Some(recv) = &mut self.format_recv {
             let guard = self.view.lock();
             let vram_size = guard.0.len();
             let base_offset = guard.0.file_offset();
-            while let Ok(fmt) = recv.try_recv() {
-                if validate_display_format(&fmt, vram_size, base_offset).is_some() {
-                    latest_valid = Some(fmt);
-                } else {
-                    tracing::warn!(
-                        width = fmt.width,
-                        height = fmt.height,
-                        bytes_per_line = fmt.bytes_per_line,
-                        offset = fmt.offset,
-                        vram_size,
-                        "ignoring invalid framebuffer format"
-                    );
+            loop {
+                match recv.try_recv() {
+                    Ok(fmt) => {
+                        if validate_display_format(&fmt, vram_size, base_offset).is_some() {
+                            latest_valid = Some(fmt);
+                        } else {
+                            tracing::warn!(
+                                width = fmt.width,
+                                height = fmt.height,
+                                bytes_per_line = fmt.bytes_per_line,
+                                offset = fmt.offset,
+                                vram_size,
+                                "ignoring invalid framebuffer format"
+                            );
+                        }
+                    }
+                    Err(mesh::TryRecvError::Empty) => break,
+                    Err(mesh::TryRecvError::Closed | mesh::TryRecvError::Error(_)) => {
+                        channel_closed = true;
+                        break;
+                    }
                 }
             }
         }
+        if channel_closed {
+            self.format_recv = None;
+        }
         if let Some(fmt) = latest_valid {
             self.apply_format_change(fmt);
+            true
+        } else if channel_closed {
+            self.reset_dirty_reporting();
+            true
+        } else {
+            false
         }
     }
 
@@ -571,11 +607,7 @@ impl<T: Listener> MultiClientServer<T> {
                     Err(_) => {
                         tracing::warn!("device dirty channel closed, enabling fallback diff");
                         self.dirty_recv = None;
-                        self.device_dirty_seen.store(false, Ordering::Release);
-                        for c in &self.client_handles {
-                            c.missed_dirty.store(true, Ordering::Release);
-                            let _ = c.wakeup_send.try_send(());
-                        }
+                        self.reset_dirty_reporting();
                         continue;
                     }
                 },
@@ -632,11 +664,7 @@ impl<T: Listener> MultiClientServer<T> {
                     }
                     Err(_) => {
                         self.format_recv = None;
-                        self.device_dirty_seen.store(false, Ordering::Release);
-                        for c in &self.client_handles {
-                            c.missed_dirty.store(true, Ordering::Release);
-                            let _ = c.wakeup_send.try_send(());
-                        }
+                        self.reset_dirty_reporting();
                         continue;
                     }
                 },
@@ -673,20 +701,65 @@ impl<T: Listener> MultiClientServer<T> {
                         "FastDesk client disconnected"
                     );
                 }
-                Event::DirtyRects(mut rects) => {
-                    self.drain_format_updates();
+                Event::DirtyRects(first_rects) => {
+                    if self.drain_format_updates() {
+                        continue;
+                    }
+                    let mut rects = Vec::new();
+                    let mut saw_reset = false;
+                    let mut saw_dirty_after_reset = false;
+                    let mut dirty_closed = false;
+                    let mut process_batch = |batch: Vec<DirtyRect>| {
+                        if batch.is_empty() {
+                            rects.clear();
+                            saw_reset = true;
+                            saw_dirty_after_reset = false;
+                        } else {
+                            rects.extend(batch);
+                            saw_dirty_after_reset = true;
+                        }
+                    };
+                    process_batch(first_rects);
                     if let Some(recv) = &mut self.dirty_recv {
-                        while let Ok(more) = recv.try_recv() {
-                            rects.extend(more);
+                        loop {
+                            match recv.try_recv() {
+                                Ok(more) => process_batch(more),
+                                Err(mesh::TryRecvError::Empty) => break,
+                                Err(mesh::TryRecvError::Closed | mesh::TryRecvError::Error(_)) => {
+                                    dirty_closed = true;
+                                    break;
+                                }
+                            }
                         }
                     }
-                    self.device_dirty_seen.store(true, Ordering::Release);
-                    let rects = Arc::new(rects);
-                    for c in &self.client_handles {
-                        if c.dirty_send.try_send(Arc::clone(&rects)).is_err() {
-                            c.missed_dirty.store(true, Ordering::Release);
+                    if self.drain_format_updates() {
+                        if dirty_closed {
+                            self.dirty_recv = None;
                         }
-                        let _ = c.wakeup_send.try_send(());
+                        continue;
+                    }
+                    if dirty_closed {
+                        tracing::warn!("device dirty channel closed, enabling fallback diff");
+                        self.dirty_recv = None;
+                        self.reset_dirty_reporting();
+                        continue;
+                    }
+                    if saw_reset && !saw_dirty_after_reset {
+                        self.reset_dirty_reporting();
+                        continue;
+                    }
+                    if !rects.is_empty() {
+                        self.device_dirty_seen.store(true, Ordering::Release);
+                        let rects = Arc::new(rects);
+                        for c in &self.client_handles {
+                            if saw_reset {
+                                c.missed_dirty.store(true, Ordering::Release);
+                            }
+                            if c.dirty_send.try_send(Arc::clone(&rects)).is_err() {
+                                c.missed_dirty.store(true, Ordering::Release);
+                            }
+                            let _ = c.wakeup_send.try_send(());
+                        }
                     }
                 }
                 Event::Cursor(first_update) => {
@@ -719,7 +792,7 @@ impl<T: Listener> MultiClientServer<T> {
                     self.apply_format_change(fmt);
                 }
                 Event::FallbackTick => {
-                    self.drain_format_updates();
+                    let _ = self.drain_format_updates();
                     for c in &self.client_handles {
                         let _ = c.wakeup_send.try_send(());
                     }
@@ -939,7 +1012,31 @@ fn emit_pending_cursor_updates(
     Ok(())
 }
 
-async fn read_client_frame(socket: &mut PolledSocket<socket2::Socket>) -> anyhow::Result<ClientMsg> {
+const MAX_PENDING_PONGS: usize = 16;
+
+struct ClientControlState {
+    force_full: bool,
+    use_shm: bool,
+    pending_pongs: VecDeque<u64>,
+}
+
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
+async fn read_client_frame(
+    socket: &mut (impl futures::AsyncRead + Unpin),
+) -> anyhow::Result<ClientMsg> {
     let mut hdr = [0u8; 5];
     socket.read_exact(&mut hdr).await?;
     let (msg_type, payload_len) = fastdesk_proto::decode_frame_header(&hdr)?;
@@ -948,37 +1045,33 @@ async fn read_client_frame(socket: &mut PolledSocket<socket2::Socket>) -> anyhow
     Ok(decode_client_msg(msg_type, &payload)?)
 }
 
-fn dispatch_client_msg(
-    msg: ClientMsg,
-    input_tracker: &mut ClientInputTracker,
-    force_full: &mut bool,
-    use_shm: &mut bool,
-    shm_available: bool,
-    wakeup_ready: &mut bool,
-    pong_out: &mut Option<u64>,
-) {
-    match msg {
-        ClientMsg::ClientHello { .. } => {}
-        ClientMsg::KeyEvent { scancode, make } => {
-            input_tracker.handle_key(scancode, make);
-        }
-        ClientMsg::PointerEvent {
-            button_mask,
-            x,
-            y,
-            wheel_delta,
-        } => {
-            input_tracker.handle_pointer(button_mask, x, y, wheel_delta);
-        }
-        ClientMsg::RequestFullFrame { allow_shm } => {
-            *force_full = true;
-            *use_shm = allow_shm && shm_available;
-            *wakeup_ready = true;
-        }
-        ClientMsg::Ping { client_time_us } => {
-            *pong_out = Some(client_time_us);
+async fn read_client_frame_or_eof(
+    socket: &mut (impl futures::AsyncRead + Unpin),
+    payload: &mut Vec<u8>,
+) -> anyhow::Result<Option<ClientMsg>> {
+    let mut msg_type = [0u8; 1];
+    loop {
+        match socket.read(&mut msg_type).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
+            Err(e) => return Err(e.into()),
         }
     }
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let payload_len = u32::from_le_bytes(len_buf) as usize;
+    if payload_len > fastdesk_proto::MAX_FRAME_PAYLOAD_BYTES {
+        anyhow::bail!("client frame payload too large: {payload_len}");
+    }
+    payload.resize(payload_len, 0);
+    socket.read_exact(payload).await?;
+    let msg = decode_client_msg(msg_type[0], payload)?;
+    if payload.capacity() > 64 * 1024 {
+        *payload = Vec::new();
+    }
+    Ok(Some(msg))
 }
 
 async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
@@ -1004,281 +1097,353 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
     ctx.socket.write_all(&out_buf).await?;
 
     let shm_available = ctx.shm_path.is_some();
-    let mut use_shm = match read_client_frame(&mut ctx.socket).await? {
+    let use_shm = match read_client_frame(&mut ctx.socket).await? {
         ClientMsg::ClientHello { prefer_shm, .. } => prefer_shm && shm_available,
         other => anyhow::bail!("expected ClientHello, got {other:?}"),
     };
 
-    let mut tracker = DirtyTileTracker::new(width, height);
-    let mut merged_rects: Vec<TileRect> = Vec::new();
-    let mut raw_scratch: Vec<u8> = Vec::new();
-    let mut prev_fb: Vec<u8> = Vec::new();
-    let mut cur_fb: Vec<u8> = Vec::new();
-    let mut frame_seq = 0u64;
-    let mut sent_shape_seq = 0u64;
-    let mut sent_pos_seq = 0u64;
-    let mut force_full = true;
-    let mut msg_type = [0u8; 1];
+    let (mut read_half, mut write_half) = ctx.socket.split();
+    let control = Arc::new(Mutex::new(ClientControlState {
+        force_full: true,
+        use_shm,
+        pending_pongs: VecDeque::new(),
+    }));
+    let (ctrl_tx, ctrl_rx) = async_channel::bounded::<()>(1);
 
-    loop {
-        let mut wakeup_ready = force_full;
-        let mut pending_pong: Option<u64> = None;
-        if !wakeup_ready {
-            let mut read_ready = false;
-            futures::select! {
-                r = ctx.socket.read(&mut msg_type).fuse() => {
-                    match r {
-                        Ok(0) => return Ok(()),
-                        Ok(_) => read_ready = true,
-                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
-                        Err(e) => return Err(e.into()),
+    let reader_control = Arc::clone(&control);
+    let reader_fut = async move {
+        let mut payload = Vec::new();
+        while let Some(msg) = read_client_frame_or_eof(&mut read_half, &mut payload).await? {
+            match msg {
+                ClientMsg::ClientHello { .. } => {}
+                ClientMsg::KeyEvent { scancode, make } => {
+                    input_tracker.handle_key(scancode, make);
+                }
+                ClientMsg::PointerEvent {
+                    button_mask,
+                    x,
+                    y,
+                    wheel_delta,
+                } => {
+                    input_tracker.handle_pointer(button_mask, x, y, wheel_delta);
+                }
+                ClientMsg::RequestFullFrame { allow_shm } => {
+                    {
+                        let mut ctrl = reader_control.lock();
+                        ctrl.force_full = true;
+                        ctrl.use_shm = allow_shm && shm_available;
                     }
+                    let _ = ctrl_tx.try_send(());
                 }
-                w = Box::pin(ctx.wakeup_recv.recv()).fuse() => {
-                    if w.is_err() {
-                        return Ok(());
+                ClientMsg::Ping { client_time_us } => {
+                    {
+                        let mut ctrl = reader_control.lock();
+                        if ctrl.pending_pongs.len() >= MAX_PENDING_PONGS {
+                            ctrl.pending_pongs.pop_front();
+                        }
+                        ctrl.pending_pongs.push_back(client_time_us);
                     }
-                    wakeup_ready = true;
-                }
-            }
-
-            if read_ready {
-                let mut len_buf = [0u8; 4];
-                ctx.socket.read_exact(&mut len_buf).await?;
-                let payload_len = u32::from_le_bytes(len_buf) as usize;
-                if payload_len > fastdesk_proto::MAX_FRAME_PAYLOAD_BYTES {
-                    anyhow::bail!("client frame payload too large: {payload_len}");
-                }
-                let mut payload = vec![0u8; payload_len];
-                ctx.socket.read_exact(&mut payload).await?;
-                let msg = decode_client_msg(msg_type[0], &payload)?;
-                dispatch_client_msg(
-                    msg,
-                    &mut input_tracker,
-                    &mut force_full,
-                    &mut use_shm,
-                    shm_available,
-                    &mut wakeup_ready,
-                    &mut pending_pong,
-                );
-                if !wakeup_ready && ctx.wakeup_recv.try_recv().is_ok() {
-                    wakeup_ready = true;
+                    let _ = ctrl_tx.try_send(());
                 }
             }
         }
+        Ok::<(), anyhow::Error>(())
+    };
 
-        if !wakeup_ready {
-            if let Some(client_time_us) = pending_pong {
+    let view = ctx.view;
+    let shm_path = ctx.shm_path;
+    let dirty_recv = ctx.dirty_recv;
+    let cursor_state = ctx.cursor_state;
+    let wakeup_recv = ctx.wakeup_recv;
+    let missed_dirty = ctx.missed_dirty;
+    let device_dirty_seen = ctx.device_dirty_seen;
+    let start_time = ctx.start_time;
+    let writer_control = control;
+
+    let writer_fut = async move {
+        let mut tracker = DirtyTileTracker::new(width, height);
+        let mut merged_rects: Vec<TileRect> = Vec::new();
+        let mut raw_scratch: Vec<u8> = Vec::new();
+        let mut prev_fb: Vec<u8> = Vec::new();
+        let mut cur_fb: Vec<u8> = Vec::new();
+        let mut frame_seq = 0u64;
+        let mut sent_shape_seq = 0u64;
+        let mut sent_pos_seq = 0u64;
+        let mut force_full = false;
+
+        loop {
+            let mut display_wakeup = false;
+            let mut pending_pongs = VecDeque::new();
+            let mut use_shm_now;
+
+            loop {
+                while ctrl_rx.try_recv().is_ok() {}
+                while wakeup_recv.try_recv().is_ok() {
+                    display_wakeup = true;
+                }
+                if missed_dirty.load(Ordering::Acquire) {
+                    display_wakeup = true;
+                }
+                {
+                    let mut ctrl = writer_control.lock();
+                    if std::mem::take(&mut ctrl.force_full) {
+                        force_full = true;
+                        display_wakeup = true;
+                    }
+                    use_shm_now = ctrl.use_shm;
+                    pending_pongs.append(&mut ctrl.pending_pongs);
+                }
+                if force_full {
+                    display_wakeup = true;
+                }
+                if display_wakeup || !pending_pongs.is_empty() {
+                    break;
+                }
+
+                enum WakeEvent {
+                    Display(Result<(), async_channel::RecvError>),
+                    Control(Result<(), async_channel::RecvError>),
+                }
+                let ev = futures::select! {
+                    w = Box::pin(wakeup_recv.recv()).fuse() => WakeEvent::Display(w),
+                    c = Box::pin(ctrl_rx.recv()).fuse() => WakeEvent::Control(c),
+                };
+                match ev {
+                    WakeEvent::Display(Ok(())) => {
+                        display_wakeup = true;
+                    }
+                    WakeEvent::Display(Err(_)) | WakeEvent::Control(Err(_)) => return Ok(()),
+                    WakeEvent::Control(Ok(())) => {}
+                }
+            }
+
+            if !display_wakeup {
                 out_buf.clear();
+                for client_time_us in pending_pongs {
+                    encode_server_msg(
+                        &ServerMsg::Pong {
+                            client_time_us,
+                            host_time_us: start_time.elapsed().as_micros() as u64,
+                        },
+                        &mut out_buf,
+                    )?;
+                }
+                if !out_buf.is_empty() {
+                    write_half.write_all(&out_buf).await?;
+                    yield_now().await;
+                }
+                continue;
+            }
+
+            out_buf.clear();
+
+            // 1. Emit latest hardware cursor shape and position if changed.
+            emit_pending_cursor_updates(
+                &cursor_state,
+                &mut sent_shape_seq,
+                &mut sent_pos_seq,
+                &mut out_buf,
+            )?;
+
+            // 2. Check resolution changes.
+            let (new_w, new_h, new_stride, new_offset, _) = current_display_dims(&view);
+            if new_w != width || new_h != height || new_stride != stride || new_offset != offset {
+                width = new_w;
+                height = new_h;
+                stride = new_stride;
+                offset = new_offset;
+                tracker.resize(width, height);
+                prev_fb.clear();
+                cur_fb.clear();
+                force_full = true;
                 encode_server_msg(
-                    &ServerMsg::Pong {
-                        client_time_us,
-                        host_time_us: ctx.start_time.elapsed().as_micros() as u64,
+                    &ServerMsg::Resolution {
+                        width,
+                        height,
+                        stride,
+                        offset,
+                        shm_path: shm_path.clone(),
                     },
                     &mut out_buf,
                 )?;
-                ctx.socket.write_all(&out_buf).await?;
             }
-            continue;
-        }
 
-        while ctx.wakeup_recv.try_recv().is_ok() {}
-        out_buf.clear();
-
-        // 1. Emit latest hardware cursor shape and position if changed.
-        emit_pending_cursor_updates(
-            &ctx.cursor_state,
-            &mut sent_shape_seq,
-            &mut sent_pos_seq,
-            &mut out_buf,
-        )?;
-
-        // 2. Check resolution changes.
-        let (new_w, new_h, new_stride, new_offset, _) = current_display_dims(&ctx.view);
-        if new_w != width || new_h != height || new_stride != stride || new_offset != offset {
-            width = new_w;
-            height = new_h;
-            stride = new_stride;
-            offset = new_offset;
-            tracker.resize(width, height);
-            prev_fb.clear();
-            cur_fb.clear();
-            force_full = true;
-            encode_server_msg(
-                &ServerMsg::Resolution {
-                    width,
-                    height,
-                    stride,
-                    offset,
-                    shm_path: ctx.shm_path.clone(),
-                },
-                &mut out_buf,
-            )?;
-        }
-
-        // 3. Collect dirty regions.
-        tracker.clear();
-        let mut saw_rects = false;
-        while let Ok(rects) = ctx.dirty_recv.try_recv() {
-            saw_rects = true;
-            for r in rects.iter() {
-                tracker.mark_rect(r.left, r.top, r.right, r.bottom);
+            // 3. Collect dirty regions.
+            tracker.clear();
+            let mut saw_rects = false;
+            while let Ok(rects) = dirty_recv.try_recv() {
+                saw_rects = true;
+                for r in rects.iter() {
+                    tracker.mark_rect(r.left, r.top, r.right, r.bottom);
+                }
             }
-        }
 
-        let need_full = force_full || ctx.missed_dirty.swap(false, Ordering::AcqRel);
-        if need_full {
-            tracker.mark_all();
-            force_full = false;
-            if !ctx.device_dirty_seen.load(Ordering::Acquire) {
+            let missed = missed_dirty.swap(false, Ordering::AcqRel);
+            let need_full = force_full || missed;
+            if need_full {
+                tracker.mark_all();
+                force_full = false;
+                if !device_dirty_seen.load(Ordering::Acquire) {
+                    let line_bytes = width as usize * 4;
+                    let total_bytes = line_bytes * height as usize;
+                    prev_fb.resize(total_bytes, 0);
+                    let mut guard = view.lock();
+                    for y in 0..height {
+                        let row =
+                            &mut prev_fb[y as usize * line_bytes..(y as usize + 1) * line_bytes];
+                        guard.0.read_line(y, row);
+                    }
+                }
+            } else if !saw_rects && !device_dirty_seen.load(Ordering::Acquire) {
                 let line_bytes = width as usize * 4;
                 let total_bytes = line_bytes * height as usize;
-                prev_fb.resize(total_bytes, 0);
-                let mut guard = ctx.view.lock();
-                for y in 0..height {
-                    let row = &mut prev_fb[y as usize * line_bytes..(y as usize + 1) * line_bytes];
-                    guard.0.read_line(y, row);
-                }
-            }
-        } else if !saw_rects && !ctx.device_dirty_seen.load(Ordering::Acquire) {
-            let line_bytes = width as usize * 4;
-            let total_bytes = line_bytes * height as usize;
-            cur_fb.resize(total_bytes, 0);
-            {
-                let mut guard = ctx.view.lock();
-                for y in 0..height {
-                    let row = &mut cur_fb[y as usize * line_bytes..(y as usize + 1) * line_bytes];
-                    guard.0.read_line(y, row);
-                }
-            }
-            if prev_fb.len() != total_bytes {
-                tracker.mark_all();
-            } else {
-                tracker.diff_frames(&prev_fb, &cur_fb, line_bytes);
-            }
-            std::mem::swap(&mut prev_fb, &mut cur_fb);
-        } else if ctx.device_dirty_seen.load(Ordering::Acquire) && !prev_fb.is_empty() {
-            prev_fb = Vec::new();
-            cur_fb = Vec::new();
-        }
-
-        // 4. Encode dirty rectangles (SHM zero-copy vs LZ4 dirty-column read),
-        // splitting into multiple FrameBatch messages if needed to stay within
-        // MAX_RECTS_PER_BATCH and MAX_FRAME_PAYLOAD_BYTES.
-        if !tracker.is_empty() {
-            tracker.merge_into(&mut merged_rects);
-
-            const FRAME_BATCH_HEADER_BYTES: usize = 18;
-            const ENCODED_RECT_HEADER_BYTES: usize = 13;
-
-            let host_time_us = ctx.start_time.elapsed().as_micros() as u64;
-            let mut batch_rects: Vec<EncodedRect> = Vec::new();
-            let mut batch_payload_bytes = FRAME_BATCH_HEADER_BYTES;
-
-            let mut push_rect = |rect: EncodedRect, out_buf: &mut Vec<u8>| -> anyhow::Result<()> {
-                let rect_wire_bytes = ENCODED_RECT_HEADER_BYTES + rect.data.len();
-                if !batch_rects.is_empty()
-                    && (batch_rects.len() >= fastdesk_proto::MAX_RECTS_PER_BATCH
-                        || batch_payload_bytes + rect_wire_bytes
-                            > fastdesk_proto::MAX_FRAME_PAYLOAD_BYTES)
+                cur_fb.resize(total_bytes, 0);
                 {
+                    let mut guard = view.lock();
+                    for y in 0..height {
+                        let row =
+                            &mut cur_fb[y as usize * line_bytes..(y as usize + 1) * line_bytes];
+                        guard.0.read_line(y, row);
+                    }
+                }
+                if prev_fb.len() != total_bytes {
+                    tracker.mark_all();
+                } else {
+                    tracker.diff_frames(&prev_fb, &cur_fb, line_bytes);
+                }
+                std::mem::swap(&mut prev_fb, &mut cur_fb);
+            } else if device_dirty_seen.load(Ordering::Acquire) && !prev_fb.is_empty() {
+                prev_fb = Vec::new();
+                cur_fb = Vec::new();
+            }
+
+            // 4. Encode dirty rectangles (SHM zero-copy vs LZ4 dirty-column read),
+            // splitting into multiple FrameBatch messages if needed to stay within
+            // MAX_RECTS_PER_BATCH and MAX_FRAME_PAYLOAD_BYTES.
+            if !tracker.is_empty() {
+                tracker.merge_into(&mut merged_rects);
+
+                const FRAME_BATCH_HEADER_BYTES: usize = 18;
+                const ENCODED_RECT_HEADER_BYTES: usize = 13;
+
+                let host_time_us = start_time.elapsed().as_micros() as u64;
+                let mut batch_rects: Vec<EncodedRect> = Vec::new();
+                let mut batch_payload_bytes = FRAME_BATCH_HEADER_BYTES;
+
+                let mut push_rect =
+                    |rect: EncodedRect, out_buf: &mut Vec<u8>| -> anyhow::Result<()> {
+                        let rect_wire_bytes = ENCODED_RECT_HEADER_BYTES + rect.data.len();
+                        if !batch_rects.is_empty()
+                            && (batch_rects.len() >= fastdesk_proto::MAX_RECTS_PER_BATCH
+                                || batch_payload_bytes + rect_wire_bytes
+                                    > fastdesk_proto::MAX_FRAME_PAYLOAD_BYTES)
+                        {
+                            frame_seq += 1;
+                            encode_server_msg(
+                                &ServerMsg::FrameBatch {
+                                    frame_seq,
+                                    host_time_us,
+                                    rects: std::mem::take(&mut batch_rects),
+                                },
+                                out_buf,
+                            )?;
+                            batch_payload_bytes = FRAME_BATCH_HEADER_BYTES;
+                        }
+                        batch_payload_bytes += rect_wire_bytes;
+                        batch_rects.push(rect);
+                        Ok(())
+                    };
+
+                if use_shm_now {
+                    for r in &merged_rects {
+                        push_rect(
+                            EncodedRect {
+                                x: r.x,
+                                y: r.y,
+                                w: r.w,
+                                h: r.h,
+                                encoding: RectEncoding::ShmDirtyOnly,
+                                data: Vec::new(),
+                            },
+                            &mut out_buf,
+                        )?;
+                    }
+                } else {
+                    let max_rect_raw_bytes = fastdesk_proto::MAX_FRAME_PAYLOAD_BYTES
+                        - FRAME_BATCH_HEADER_BYTES
+                        - ENCODED_RECT_HEADER_BYTES;
+                    for r in &merged_rects {
+                        let row_bytes = r.w as usize * 4;
+                        if row_bytes == 0 || r.h == 0 {
+                            continue;
+                        }
+                        let max_rows = (max_rect_raw_bytes / row_bytes)
+                            .max(1)
+                            .min(u16::MAX as usize) as u16;
+                        let mut y_off = 0u16;
+                        while y_off < r.h {
+                            let strip_h = (r.h - y_off).min(max_rows);
+                            raw_scratch.resize(row_bytes * strip_h as usize, 0);
+                            {
+                                let mut guard = view.lock();
+                                for dy in 0..strip_h {
+                                    let dst = &mut raw_scratch
+                                        [dy as usize * row_bytes..(dy as usize + 1) * row_bytes];
+                                    guard.0.read_rect_row(r.x, r.y + y_off + dy, r.w, dst);
+                                }
+                            }
+                            let (encoding, data) = encode_bgra_rect(&raw_scratch);
+                            push_rect(
+                                EncodedRect {
+                                    x: r.x,
+                                    y: r.y + y_off,
+                                    w: r.w,
+                                    h: strip_h,
+                                    encoding,
+                                    data,
+                                },
+                                &mut out_buf,
+                            )?;
+                            y_off += strip_h;
+                        }
+                    }
+                }
+
+                if !batch_rects.is_empty() {
                     frame_seq += 1;
                     encode_server_msg(
                         &ServerMsg::FrameBatch {
                             frame_seq,
                             host_time_us,
-                            rects: std::mem::take(&mut batch_rects),
-                        },
-                        out_buf,
-                    )?;
-                    batch_payload_bytes = FRAME_BATCH_HEADER_BYTES;
-                }
-                batch_payload_bytes += rect_wire_bytes;
-                batch_rects.push(rect);
-                Ok(())
-            };
-
-            if use_shm {
-                for r in &merged_rects {
-                    push_rect(
-                        EncodedRect {
-                            x: r.x,
-                            y: r.y,
-                            w: r.w,
-                            h: r.h,
-                            encoding: RectEncoding::ShmDirtyOnly,
-                            data: Vec::new(),
+                            rects: batch_rects,
                         },
                         &mut out_buf,
                     )?;
                 }
-            } else {
-                let max_rect_raw_bytes = fastdesk_proto::MAX_FRAME_PAYLOAD_BYTES
-                    - FRAME_BATCH_HEADER_BYTES
-                    - ENCODED_RECT_HEADER_BYTES;
-                for r in &merged_rects {
-                    let row_bytes = r.w as usize * 4;
-                    if row_bytes == 0 || r.h == 0 {
-                        continue;
-                    }
-                    let max_rows = (max_rect_raw_bytes / row_bytes)
-                        .max(1)
-                        .min(u16::MAX as usize) as u16;
-                    let mut y_off = 0u16;
-                    while y_off < r.h {
-                        let strip_h = (r.h - y_off).min(max_rows);
-                        raw_scratch.resize(row_bytes * strip_h as usize, 0);
-                        {
-                            let mut guard = ctx.view.lock();
-                            for dy in 0..strip_h {
-                                let dst = &mut raw_scratch
-                                    [dy as usize * row_bytes..(dy as usize + 1) * row_bytes];
-                                guard.0.read_rect_row(r.x, r.y + y_off + dy, r.w, dst);
-                            }
-                        }
-                        let (encoding, data) = encode_bgra_rect(&raw_scratch);
-                        push_rect(
-                            EncodedRect {
-                                x: r.x,
-                                y: r.y + y_off,
-                                w: r.w,
-                                h: strip_h,
-                                encoding,
-                                data,
-                            },
-                            &mut out_buf,
-                        )?;
-                        y_off += strip_h;
-                    }
-                }
             }
 
-            if !batch_rects.is_empty() {
-                frame_seq += 1;
+            for client_time_us in pending_pongs {
                 encode_server_msg(
-                    &ServerMsg::FrameBatch {
-                        frame_seq,
-                        host_time_us,
-                        rects: batch_rects,
+                    &ServerMsg::Pong {
+                        client_time_us,
+                        host_time_us: start_time.elapsed().as_micros() as u64,
                     },
                     &mut out_buf,
                 )?;
             }
-        }
 
-        if let Some(client_time_us) = pending_pong {
-            encode_server_msg(
-                &ServerMsg::Pong {
-                    client_time_us,
-                    host_time_us: ctx.start_time.elapsed().as_micros() as u64,
-                },
-                &mut out_buf,
-            )?;
+            if !out_buf.is_empty() {
+                write_half.write_all(&out_buf).await?;
+                yield_now().await;
+            }
         }
+    };
 
-        if !out_buf.is_empty() {
-            ctx.socket.write_all(&out_buf).await?;
-        }
+    let mut reader_fut = std::pin::pin!(reader_fut.fuse());
+    let mut writer_fut = std::pin::pin!(writer_fut.fuse());
+    futures::select! {
+        r = reader_fut => r,
+        r = writer_fut => r,
     }
 }
 
@@ -2534,6 +2699,334 @@ mod tests {
         assert!(matches!(
             recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
             Some(InputData::Mouse(MouseData { button_mask: 0, .. }))
+        ));
+
+        server.stop();
+    }
+
+    #[test]
+    fn queued_dirty_before_format_reset_preserves_fallback_polling() {
+        let server = start_test_server(64, 64, None);
+        let (mut stream, _) = connect_client(server.addr, false);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+
+        // Drain initial full frame.
+        assert!(matches!(
+            read_server_msg(&mut stream).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        // Repeat across several rounds so both select! ready orderings are exercised.
+        for round in 1..=10u8 {
+            // Re-enable device_dirty_seen with a dirty rect first.
+            let px_init = [0x10, round, 0x20, 0xff];
+            server.vram.write_at((8 * 64 + 8) * 4, &px_init).unwrap();
+            server.dirty_send.send(vec![DirtyRect {
+                left: 0,
+                top: 0,
+                right: 16,
+                bottom: 16,
+            }]);
+            assert!(matches!(
+                read_server_msg(&mut stream).unwrap(),
+                ServerMsg::FrameBatch { .. }
+            ));
+
+            // Queue a dirty rect followed immediately by a same-dimension format reset.
+            let px_pre = [0x01, round, 0x02, 0xff];
+            server.vram.write_at((16 * 64 + 16) * 4, &px_pre).unwrap();
+            server.dirty_send.send(vec![DirtyRect {
+                left: 16,
+                top: 16,
+                right: 32,
+                bottom: 32,
+            }]);
+            server.format_send.send(FramebufferFormat {
+                width: 64,
+                height: 64,
+                bytes_per_line: 64 * 4,
+                offset: 0,
+            });
+
+            // Wait for the reset to settle and drain all queued frames via Ping/Pong.
+            thread::sleep(Duration::from_millis(25));
+            let ping_id = 1000 + round as u64;
+            write_client_msg(
+                &mut stream,
+                &ClientMsg::Ping {
+                    client_time_us: ping_id,
+                },
+            )
+            .unwrap();
+            loop {
+                match read_server_msg(&mut stream).unwrap() {
+                    ServerMsg::Pong { client_time_us, .. } if client_time_us == ping_id => break,
+                    ServerMsg::FrameBatch { .. } | ServerMsg::Resolution { .. } => {}
+                    other => panic!("unexpected msg during format reset barrier: {other:?}"),
+                }
+            }
+
+            // Write a sentinel pixel without sending any DirtyRect; fallback polling must deliver it.
+            let px_fallback = [0xaa, round, 0x55, 0xff];
+            server
+                .vram
+                .write_at((40 * 64 + 40) * 4, &px_fallback)
+                .unwrap();
+            let mut found = false;
+            for _ in 0..8 {
+                match read_server_msg(&mut stream).unwrap() {
+                    ServerMsg::FrameBatch { rects, .. } => {
+                        for r in &rects {
+                            if r.x <= 40 && 40 < r.x + r.w && r.y <= 40 && 40 < r.y + r.h {
+                                let decoded = decode_bgra_rect(
+                                    r.encoding,
+                                    &r.data,
+                                    r.w as usize * r.h as usize * 4,
+                                )
+                                .unwrap();
+                                let off =
+                                    ((40 - r.y as usize) * r.w as usize + (40 - r.x as usize)) * 4;
+                                if decoded[off..off + 4] == px_fallback {
+                                    found = true;
+                                }
+                            }
+                        }
+                        if found {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected msg waiting for fallback FrameBatch: {other:?}"),
+                }
+            }
+            assert!(
+                found,
+                "round {round}: fallback polling stopped after queued dirty + format reset"
+            );
+        }
+
+        // Also verify in-band empty Vec<DirtyRect> reset barrier preserves fallback polling.
+        server.dirty_send.send(vec![DirtyRect {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 16,
+        }]);
+        assert!(matches!(
+            read_server_msg(&mut stream).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+        server.dirty_send.send(vec![DirtyRect {
+            left: 16,
+            top: 16,
+            right: 32,
+            bottom: 32,
+        }]);
+        server.dirty_send.send(Vec::new());
+        thread::sleep(Duration::from_millis(25));
+        write_client_msg(
+            &mut stream,
+            &ClientMsg::Ping {
+                client_time_us: 2000,
+            },
+        )
+        .unwrap();
+        loop {
+            match read_server_msg(&mut stream).unwrap() {
+                ServerMsg::Pong {
+                    client_time_us: 2000,
+                    ..
+                } => break,
+                ServerMsg::FrameBatch { .. } => {}
+                other => panic!("unexpected msg during in-band reset barrier: {other:?}"),
+            }
+        }
+
+        let px_inband = [0xfe, 0xca, 0xef, 0xff];
+        server.vram.write_at((48 * 64 + 48) * 4, &px_inband).unwrap();
+        let mut found_inband = false;
+        for _ in 0..8 {
+            match read_server_msg(&mut stream).unwrap() {
+                ServerMsg::FrameBatch { rects, .. } => {
+                    for r in &rects {
+                        if r.x <= 48 && 48 < r.x + r.w && r.y <= 48 && 48 < r.y + r.h {
+                            let decoded = decode_bgra_rect(
+                                r.encoding,
+                                &r.data,
+                                r.w as usize * r.h as usize * 4,
+                            )
+                            .unwrap();
+                            let off =
+                                ((48 - r.y as usize) * r.w as usize + (48 - r.x as usize)) * 4;
+                            if decoded[off..off + 4] == px_inband {
+                                found_inband = true;
+                            }
+                        }
+                    }
+                    if found_inband {
+                        break;
+                    }
+                }
+                other => panic!("unexpected msg waiting for in-band fallback FrameBatch: {other:?}"),
+            }
+        }
+        assert!(found_inband, "in-band dirty reset did not re-enable fallback polling");
+
+        drop(stream);
+        server.stop();
+    }
+
+    #[test]
+    fn input_releases_not_blocked_by_backpressured_frame_writes() {
+        let mut server = start_test_server(1280, 720, None);
+
+        // Shrink client SO_RCVBUF so server write_all() saturates TCP buffers quickly when client
+        // stops reading frames.
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            None,
+        )
+        .unwrap();
+        sock.set_recv_buffer_size(16 * 1024).unwrap();
+        sock.connect(&server.addr.into()).unwrap();
+        let mut stream: TcpStream = sock.into();
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let _hello = read_server_msg(&mut stream).unwrap();
+        write_client_msg(
+            &mut stream,
+            &ClientMsg::ClientHello {
+                capabilities: CAP_ALL,
+                prefer_shm: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_server_msg(&mut stream).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        // Press Ctrl and Left mouse button while reader is idle.
+        write_client_msg(
+            &mut stream,
+            &ClientMsg::KeyEvent {
+                scancode: 0x1d,
+                make: true,
+            },
+        )
+        .unwrap();
+        write_client_msg(
+            &mut stream,
+            &ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT,
+                x: 100,
+                y: 100,
+                wheel_delta: 0,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x1d,
+                make: true
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_secs(1)),
+            Some(InputData::Mouse(MouseData {
+                button_mask: BTN_LEFT,
+                ..
+            }))
+        ));
+
+        // Fill VRAM with high-entropy incompressible data and trigger multiple full-screen dirty
+        // bursts without reading from `stream`, backpressuring `write_half.write_all()`.
+        let frame_bytes = 1280usize * 720 * 4;
+        let mut noise = vec![0u8; frame_bytes];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for chunk in noise.chunks_exact_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes());
+        }
+        for round in 0..6u8 {
+            noise[0] = round;
+            server.vram.write_at(0, &noise).unwrap();
+            server.dirty_send.send(vec![DirtyRect {
+                left: 0,
+                top: 0,
+                right: 1280,
+                bottom: 720,
+            }]);
+            thread::sleep(Duration::from_millis(8));
+        }
+
+        // Send key-up and button release while the outbound frame pipe is stalled; input must
+        // arrive promptly without waiting for frame reads to resume.
+        write_client_msg(
+            &mut stream,
+            &ClientMsg::KeyEvent {
+                scancode: 0x1d,
+                make: false,
+            },
+        )
+        .unwrap();
+        write_client_msg(
+            &mut stream,
+            &ClientMsg::PointerEvent {
+                button_mask: 0,
+                x: 100,
+                y: 100,
+                wheel_delta: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_millis(200)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x1d,
+                make: false
+            }))
+        ));
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_millis(200)),
+            Some(InputData::Mouse(MouseData { button_mask: 0, .. }))
+        ));
+
+        // Even while frame transmission remains stalled, disconnecting releases any held keys.
+        write_client_msg(
+            &mut stream,
+            &ClientMsg::KeyEvent {
+                scancode: 0x2a,
+                make: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_millis(200)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x2a,
+                make: true
+            }))
+        ));
+        drop(stream);
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_millis(200)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x2a,
+                make: false
+            }))
         ));
 
         server.stop();

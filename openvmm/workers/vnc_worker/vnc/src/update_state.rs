@@ -99,11 +99,18 @@ impl UpdateState {
             loop {
                 match recv.try_recv() {
                     Ok(rects) => {
-                        for r in rects.iter() {
-                            self.pending_dirty
-                                .mark_rect(r.left, r.top, r.right, r.bottom);
+                        if rects.is_empty() {
+                            self.device_dirty_seen = false;
+                            self.pending_dirty.clear();
+                            got_device_dirty = false;
+                            full_update = true;
+                        } else {
+                            for r in rects.iter() {
+                                self.pending_dirty
+                                    .mark_rect(r.left, r.top, r.right, r.bottom);
+                            }
+                            got_device_dirty = true;
                         }
-                        got_device_dirty = true;
                     }
                     Err(async_channel::TryRecvError::Empty) => break,
                     Err(async_channel::TryRecvError::Closed) => {

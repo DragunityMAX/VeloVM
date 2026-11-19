@@ -108,7 +108,17 @@ function Resolve-ListenEndpoint {
         }
     }
 
+    if ($null -ne $listenIp) {
+        if ($listenIp.Equals([System.Net.IPAddress]::Any) -or
+            ($listenIp.IsIPv4MappedToIPv6 -and $listenIp.MapToIPv4().Equals([System.Net.IPAddress]::Any))) {
+            $viewerAddr = "127.0.0.1:$listenPort"
+        } elseif ($listenIp.Equals([System.Net.IPAddress]::IPv6Any)) {
+            $viewerAddr = "[::1]:$listenPort"
+        }
+    }
+
     return [PSCustomObject]@{
+        ListenAddr = $trimmed
         ViewerAddr = $viewerAddr
         Port       = $listenPort
         IpAddress  = $listenIp
@@ -127,7 +137,8 @@ function Test-FastDeskTcpListening {
         }
         if ($null -eq $IpAddress -or
             $IpAddress.Equals([System.Net.IPAddress]::Any) -or
-            $IpAddress.Equals([System.Net.IPAddress]::IPv6Any)) {
+            $IpAddress.Equals([System.Net.IPAddress]::IPv6Any) -or
+            ($IpAddress.IsIPv4MappedToIPv6 -and $IpAddress.MapToIPv4().Equals([System.Net.IPAddress]::Any))) {
             return $true
         }
         if ($ep.Address.Equals($IpAddress) -or
@@ -278,7 +289,7 @@ try {
 
     $deadline = (Get-Date).AddMilliseconds($StartupTimeoutMs)
     if (-not $UseHvSock) {
-        Write-Host "Waiting for OpenVMM FastDesk listener on $($tcpEndpoint.ViewerAddr)..." -ForegroundColor Cyan
+        Write-Host "Waiting for OpenVMM FastDesk listener on $($tcpEndpoint.ListenAddr)..." -ForegroundColor Cyan
         while ($true) {
             $vmmProc.Refresh()
             if ($vmmProc.HasExited) {
@@ -292,7 +303,7 @@ try {
                 if ($vmmProc.HasExited) {
                     throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
                 }
-                throw "Timed out waiting for OpenVMM FastDesk listener on $($tcpEndpoint.ViewerAddr)."
+                throw "Timed out waiting for OpenVMM FastDesk listener on $($tcpEndpoint.ListenAddr)."
             }
             Start-Sleep -Milliseconds 50
         }
