@@ -578,6 +578,9 @@ impl SimpleVmbusDevice for Video {
     }
 
     async fn close(&mut self) {
+        if let Some(send) = &self.dirt_send {
+            send.send(Vec::new());
+        }
         self.control.notify_lifecycle_reset().await;
         if let Some(send) = &self.cursor_send {
             send.send(CursorUpdate::Position(CursorPosition {
@@ -716,6 +719,9 @@ async fn process_channel(
                     cursor_assembler.reset();
                     if *feature_sent {
                         *feature_sent = false;
+                        if let Some(send) = dirt_send {
+                            send.send(Vec::new());
+                        }
                         framebuffer.notify_lifecycle_reset().await;
                         if let Some(send) = cursor_send {
                             send.send(CursorUpdate::Position(CursorPosition {
@@ -828,17 +834,19 @@ async fn process_channel(
                                 }
                             }
                             Request::Dirt(rects) => {
-                                if let Some(send) = dirt_send {
-                                    let dirty: Vec<DirtyRect> = rects
-                                        .iter()
-                                        .map(|r| DirtyRect {
-                                            left: r.left.into(),
-                                            top: r.top.into(),
-                                            right: r.right.into(),
-                                            bottom: r.bottom.into(),
-                                        })
-                                        .collect();
-                                    send.send(dirty);
+                                if !rects.is_empty() {
+                                    if let Some(send) = dirt_send {
+                                        let dirty: Vec<DirtyRect> = rects
+                                            .iter()
+                                            .map(|r| DirtyRect {
+                                                left: r.left.into(),
+                                                top: r.top.into(),
+                                                right: r.right.into(),
+                                                bottom: r.bottom.into(),
+                                            })
+                                            .collect();
+                                        send.send(dirty);
+                                    }
                                 }
                             }
                             Request::BiosInfo => {
@@ -1685,7 +1693,7 @@ mod tests {
         let (host, mut guest) = connected_message_pipes(32768);
         let (device, control, mut view) = framebuffer_fixture();
         let mut format_recv = view.take_format_recv().unwrap();
-        let (dirt_send, _dirt_recv) = mesh::channel();
+        let (dirt_send, mut dirt_recv) = mesh::channel();
         let (cursor_send, mut cursor_recv) = mesh::channel();
         let worker = start_worker_full(
             &driver,
@@ -1752,6 +1760,19 @@ mod tests {
             })
         );
 
+        send_dirt_packet(
+            &mut guest,
+            &[protocol::Rectangle {
+                left: 10.into(),
+                top: 20.into(),
+                right: 30.into(),
+                bottom: 40.into(),
+            }],
+        )
+        .await;
+        // Empty guest Dirt packets must not spoof a lifecycle reset barrier.
+        send_dirt_packet(&mut guest, &[]).await;
+
         // Re-negotiate SynthVid on the open channel (guest driver reload/reinit).
         send_packet(
             &mut guest,
@@ -1764,6 +1785,14 @@ mod tests {
             parse_header(&ver_resp).0.typ.to_ne(),
             protocol::MESSAGE_VERSION_RESPONSE
         );
+        let pre_reset_dirt = with_timeout(&driver, dirt_recv.recv()).await.unwrap();
+        assert_eq!(pre_reset_dirt.len(), 1);
+        assert_eq!(pre_reset_dirt[0].left, 10);
+        assert_eq!(pre_reset_dirt[0].top, 20);
+        assert_eq!(pre_reset_dirt[0].right, 30);
+        assert_eq!(pre_reset_dirt[0].bottom, 40);
+        let reset_barrier = with_timeout(&driver, dirt_recv.recv()).await.unwrap();
+        assert!(reset_barrier.is_empty());
         let reset_fmt = with_timeout(&driver, format_recv.recv()).await.unwrap();
         assert_eq!(reset_fmt.width, 1280);
         assert_eq!(
@@ -1804,10 +1833,23 @@ mod tests {
         drop(guest);
         worker.await.unwrap();
 
-        // Closing the SimpleVmbusDevice emits a lifecycle reset notification and hides cursor.
-        let mut video =
-            Video::new(Box::new(device.control()), None, Some(cursor_send), None).unwrap();
+        // Closing the SimpleVmbusDevice emits an in-band dirty reset barrier,
+        // a lifecycle reset notification, and hides the cursor.
+        let (close_dirt_send, mut close_dirt_recv) = mesh::channel();
+        let mut video = Video::new(
+            Box::new(device.control()),
+            Some(close_dirt_send),
+            Some(cursor_send),
+            None,
+        )
+        .unwrap();
         video.close().await;
+        assert!(
+            with_timeout(&driver, close_dirt_recv.recv())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let close_fmt = with_timeout(&driver, format_recv.recv()).await.unwrap();
         assert_eq!(close_fmt.width, 1280);
         assert_eq!(

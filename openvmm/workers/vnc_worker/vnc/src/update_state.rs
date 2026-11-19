@@ -84,6 +84,7 @@ impl UpdateState {
         dirty_recv: &mut Option<DirtyRectReceiver>,
         force_full: bool,
         missed_dirty: &Option<Arc<AtomicBool>>,
+        shared_device_dirty_seen: &Option<Arc<AtomicBool>>,
     ) -> DirtyResult {
         let (width, height) = (self.width, self.height);
         let fb_size = width as usize * height as usize;
@@ -95,15 +96,23 @@ impl UpdateState {
 
         // Drain any device-reported dirty rects into our pending bitmap.
         let mut got_device_dirty = false;
+        let mut channel_closed = false;
         if let Some(recv) = dirty_recv {
             loop {
                 match recv.try_recv() {
                     Ok(rects) => {
-                        for r in rects.iter() {
-                            self.pending_dirty
-                                .mark_rect(r.left, r.top, r.right, r.bottom);
+                        if rects.is_empty() {
+                            self.device_dirty_seen = false;
+                            self.pending_dirty.clear();
+                            got_device_dirty = false;
+                            full_update = true;
+                        } else {
+                            for r in rects.iter() {
+                                self.pending_dirty
+                                    .mark_rect(r.left, r.top, r.right, r.bottom);
+                            }
+                            got_device_dirty = true;
                         }
-                        got_device_dirty = true;
                     }
                     Err(async_channel::TryRecvError::Empty) => break,
                     Err(async_channel::TryRecvError::Closed) => {
@@ -115,20 +124,25 @@ impl UpdateState {
                             self.device_dirty_seen = false;
                         }
                         *dirty_recv = None;
+                        channel_closed = true;
                         break;
                     }
                 }
             }
         }
-        if got_device_dirty {
+        if got_device_dirty && !channel_closed {
             self.device_dirty_seen = true;
         }
+        let device_dirty_active = match shared_device_dirty_seen {
+            Some(shared) if !channel_closed => shared.load(Ordering::Acquire),
+            _ => self.device_dirty_seen,
+        };
 
-        // If the coordinator flagged that it dropped a dirty broadcast
-        // because our channel was full, force a full refresh to prevent
-        // permanently stale regions.
+        // If the coordinator flagged that it dropped a dirty broadcast or
+        // observed a device reset while our channel was full, force a full
+        // refresh to prevent permanently stale regions.
         if let Some(missed) = missed_dirty {
-            if missed.swap(false, Ordering::Relaxed) {
+            if missed.swap(false, Ordering::AcqRel) {
                 full_update = true;
                 tracing::debug!("missed dirty broadcast, forcing full refresh");
             }
@@ -139,7 +153,7 @@ impl UpdateState {
             self.read_full_framebuffer(fb);
             self.pending_dirty.merge_into(&mut self.merged_rects);
             DirtySource::Full
-        } else if got_device_dirty {
+        } else if got_device_dirty && device_dirty_active {
             // Merge once: reuse for both partial VRAM reads and final output.
             self.pending_dirty.merge_into(&mut self.merged_rects);
             // Swap prev_fb into cur_fb (O(1) pointer swap) so non-dirty
@@ -155,7 +169,7 @@ impl UpdateState {
                 }
             }
             DirtySource::Device
-        } else if self.device_dirty_seen {
+        } else if device_dirty_active {
             // Device supports dirty rects but sent nothing this cycle --
             // nothing changed. Skip the 8MB VRAM read entirely.
             self.merged_rects.clear();
@@ -278,7 +292,7 @@ mod tests {
         state.set_resolution(32, 32);
 
         // First call with force_full=true: every tile dirty.
-        let result = state.collect_dirty(&mut fb, &mut None, true, &None);
+        let result = state.collect_dirty(&mut fb, &mut None, true, &None, &None);
         assert_eq!(result.source, DirtySource::Full);
         // 32/16 = 2 tiles per axis = 4 tiles, merged into 1 rect.
         assert!(!result.rects.is_empty());
@@ -294,11 +308,11 @@ mod tests {
         state.set_resolution(32, 32);
 
         // First frame: full.
-        let _ = state.collect_dirty(&mut fb, &mut None, true, &None);
+        let _ = state.collect_dirty(&mut fb, &mut None, true, &None, &None);
         state.commit();
 
         // Second frame: nothing changed, should produce no dirty rects.
-        let result = state.collect_dirty(&mut fb, &mut None, false, &None);
+        let result = state.collect_dirty(&mut fb, &mut None, false, &None, &None);
         assert_eq!(result.source, DirtySource::Diff);
         assert!(result.rects.is_empty());
         state.commit();
@@ -311,13 +325,13 @@ mod tests {
         state.set_resolution(32, 32);
 
         // First frame.
-        let _ = state.collect_dirty(&mut fb, &mut None, true, &None);
+        let _ = state.collect_dirty(&mut fb, &mut None, true, &None, &None);
         state.commit();
 
         // Change one pixel in tile (1,1).
         fb.set(20, 20, 0xFFFFFFFF);
 
-        let result = state.collect_dirty(&mut fb, &mut None, false, &None);
+        let result = state.collect_dirty(&mut fb, &mut None, false, &None, &None);
         assert_eq!(result.source, DirtySource::Diff);
         assert_eq!(result.rects.len(), 1);
         // The dirty rect should cover the tile containing pixel (20,20).
@@ -334,7 +348,7 @@ mod tests {
         state.set_resolution(32, 32);
 
         // First frame.
-        let _ = state.collect_dirty(&mut fb, &mut None, true, &None);
+        let _ = state.collect_dirty(&mut fb, &mut None, true, &None, &None);
         state.commit();
 
         // Simulate device dirty rect via async-channel.
@@ -350,7 +364,7 @@ mod tests {
         // Change the pixel so there's actually something different in VRAM.
         fb.set(5, 5, 0x12345678);
 
-        let result = state.collect_dirty(&mut fb, &mut dirty_recv, false, &None);
+        let result = state.collect_dirty(&mut fb, &mut dirty_recv, false, &None, &None);
         assert_eq!(result.source, DirtySource::Device);
         assert!(!result.rects.is_empty());
         state.commit();
@@ -365,7 +379,7 @@ mod tests {
         state.set_resolution(32, 32);
 
         // First frame: full.
-        let _ = state.collect_dirty(&mut fb, &mut None, true, &None);
+        let _ = state.collect_dirty(&mut fb, &mut None, true, &None, &None);
         state.commit();
 
         // Device-dirty cycle: only tile (0,0) reported dirty.
@@ -377,17 +391,78 @@ mod tests {
             bottom: 16,
         }]));
         let mut dirty_recv: Option<DirtyRectReceiver> = Some(rx);
-        let _ = state.collect_dirty(&mut fb, &mut dirty_recv, false, &None);
+        let _ = state.collect_dirty(&mut fb, &mut dirty_recv, false, &None, &None);
         state.commit();
 
         // Third cycle: device dirty was seen, so empty channel means
         // "nothing changed" — skips the 8MB VRAM read entirely.
-        let result = state.collect_dirty(&mut fb, &mut dirty_recv, false, &None);
+        let result = state.collect_dirty(&mut fb, &mut dirty_recv, false, &None, &None);
         assert_eq!(result.source, DirtySource::Device);
         assert!(
             result.rects.is_empty(),
             "idle cycle should produce no dirty rects"
         );
+        state.commit();
+    }
+
+    #[test]
+    fn update_state_shared_reset_overrides_full_dirty_queue() {
+        let mut fb = MockFramebuffer::new(32, 32, 0x10203040);
+        let mut state = UpdateState::new();
+        state.set_resolution(32, 32);
+
+        let shared_dirty_seen = Some(Arc::new(AtomicBool::new(true)));
+        let missed_dirty = Some(Arc::new(AtomicBool::new(false)));
+
+        // First frame: full.
+        let _ = state.collect_dirty(&mut fb, &mut None, true, &missed_dirty, &shared_dirty_seen);
+        state.commit();
+
+        // Fill the client dirty queue to capacity with pre-reset non-empty batches.
+        let (tx, rx) = async_channel::bounded(4);
+        for _ in 0..4 {
+            tx.try_send(Arc::new(vec![video_core::DirtyRect {
+                left: 0,
+                top: 0,
+                right: 16,
+                bottom: 16,
+            }]))
+            .unwrap();
+        }
+        let mut dirty_recv: Option<DirtyRectReceiver> = Some(rx);
+
+        // Simulate a guest reset overflowing the full queue: coordinator clears shared
+        // dirty-reporting state and flags missed_dirty without being able to enqueue Vec::new().
+        shared_dirty_seen
+            .as_ref()
+            .unwrap()
+            .store(false, Ordering::Release);
+        missed_dirty.as_ref().unwrap().store(true, Ordering::Release);
+
+        let reset_result = state.collect_dirty(
+            &mut fb,
+            &mut dirty_recv,
+            false,
+            &missed_dirty,
+            &shared_dirty_seen,
+        );
+        assert_eq!(reset_result.source, DirtySource::Full);
+        state.commit();
+
+        // Mutate a pixel without any new DirtyRect; tile diff must remain active.
+        fb.set(20, 20, 0xDEADBEEF);
+        let diff_result = state.collect_dirty(
+            &mut fb,
+            &mut dirty_recv,
+            false,
+            &missed_dirty,
+            &shared_dirty_seen,
+        );
+        assert_eq!(diff_result.source, DirtySource::Diff);
+        assert_eq!(diff_result.rects.len(), 1);
+        let r = &diff_result.rects[0];
+        assert!(r.x <= 20 && r.x + r.w > 20);
+        assert!(r.y <= 20 && r.y + r.h > 20);
         state.commit();
     }
 }

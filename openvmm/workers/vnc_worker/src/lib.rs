@@ -112,6 +112,7 @@ impl<T: 'static + Listener + MeshField + Send> VncWorker<T> {
                 view: Arc::new(Mutex::new(self.view)),
                 input_send: self.input_send,
                 dirty_recv: self.dirty_recv,
+                device_dirty_seen: Arc::new(AtomicBool::new(false)),
                 dirty_senders: Vec::new(),
                 clients: unicycle::FuturesUnordered::new(),
                 abort_senders: Vec::new(),
@@ -176,6 +177,10 @@ struct MultiClientServer<T: Listener> {
     /// Dirty rectangles from the synthetic video device. None if no video
     /// device is configured.
     dirty_recv: Option<mesh::Receiver<Vec<video_core::DirtyRect>>>,
+    /// Shared flag tracking whether the guest video device is actively sending
+    /// dirty notifications. Updated out-of-band on reset so slow clients with
+    /// full per-client channels still fall back reliably to tile diff.
+    device_dirty_seen: Arc<AtomicBool>,
     /// Per-client dirty rect senders. The coordinator broadcasts device rects
     /// to all clients via these channels. Each client accumulates rects in
     /// its own pending bitmap -- no shared state, no clearing issues.
@@ -204,8 +209,6 @@ impl<T: Listener> MultiClientServer<T> {
             ClientDone(u64),
             DirtyRects(Vec<video_core::DirtyRect>),
         }
-
-        let mut device_dirty_seen = false;
 
         loop {
             let listener = &mut self.listener;
@@ -244,6 +247,7 @@ impl<T: Listener> MultiClientServer<T> {
                         // diff instead of freezing with device_dirty_seen.
                         tracing::warn!("device dirty channel closed, falling back to tile diff");
                         self.dirty_recv = None;
+                        self.device_dirty_seen.store(false, Ordering::Release);
                         // Close all per-client dirty senders so clients
                         // detect the closure and reset device_dirty_seen.
                         self.dirty_senders.clear();
@@ -305,27 +309,37 @@ impl<T: Listener> MultiClientServer<T> {
                     tracing::info!(id, count = self.clients.len(), "VNC client disconnected");
                 }
                 Event::DirtyRects(rects) => {
-                    if !device_dirty_seen {
-                        device_dirty_seen = true;
-                        tracing::info!("device dirty rects active, preferring over tile diff");
-                    }
-                    // Broadcast to all connected clients. Arc avoids cloning
-                    // the rect Vec for each client (only ref-count bump).
-                    let rects = Arc::new(rects);
-                    for s in &mut self.dirty_senders {
-                        if s.sender.try_send(Arc::clone(&rects)).is_err() {
-                            s.missed_dirty.store(true, Ordering::Relaxed);
-                            tracing::debug!(
-                                id = s.id,
-                                "client dirty channel full, flagged for full refresh"
+                    if rects.is_empty() {
+                        if self.device_dirty_seen.swap(false, Ordering::AcqRel) {
+                            tracing::info!(
+                                "device dirty reset received, falling back to tile diff"
                             );
                         }
+                        for s in &mut self.dirty_senders {
+                            s.missed_dirty.store(true, Ordering::Release);
+                        }
+                    } else {
+                        if !self.device_dirty_seen.swap(true, Ordering::AcqRel) {
+                            tracing::info!("device dirty rects active, preferring over tile diff");
+                        }
+                        // Broadcast to all connected clients. Arc avoids cloning
+                        // the rect Vec for each client (only ref-count bump).
+                        let rects = Arc::new(rects);
+                        for s in &mut self.dirty_senders {
+                            if s.sender.try_send(Arc::clone(&rects)).is_err() {
+                                s.missed_dirty.store(true, Ordering::Release);
+                                tracing::debug!(
+                                    id = s.id,
+                                    "client dirty channel full, flagged for full refresh"
+                                );
+                            }
+                        }
+                        tracing::trace!(
+                            rect_count = rects.len(),
+                            clients = self.dirty_senders.len(),
+                            "broadcast device dirty rects"
+                        );
                     }
-                    tracing::trace!(
-                        rect_count = rects.len(),
-                        clients = self.dirty_senders.len(),
-                        "broadcast device dirty rects"
-                    );
                 }
             }
         }
@@ -370,6 +384,7 @@ impl<T: Listener> MultiClientServer<T> {
         // input channel. The first frame is always a full screen refresh
         // (force_full_update=true in run_internal), so new clients don't
         // need to receive prior device dirty rects.
+        let device_dirty_seen = self.device_dirty_seen.clone();
         let driver = driver.clone();
         let client_future = Box::pin(async move {
             let fb = SharedView(view);
@@ -381,6 +396,7 @@ impl<T: Listener> MultiClientServer<T> {
                 input,
                 Some(dirty_recv),
                 Some(missed_dirty),
+                Some(device_dirty_seen),
             );
             let mut updater = vncserver.updater();
 
@@ -427,6 +443,10 @@ impl<T: Listener> inspect::Inspect for MultiClientServer<T> {
         resp.display_debug("local_addr", &self.listener.get().local_addr().unwrap());
         resp.field("client_count", self.clients.len());
         resp.field("has_dirty_recv", self.dirty_recv.is_some());
+        resp.field(
+            "device_dirty_seen",
+            self.device_dirty_seen.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -720,6 +740,7 @@ mod tests {
                     view: Arc::new(Mutex::new(ViewWrapper(access.view().unwrap()))),
                     input_send,
                     dirty_recv,
+                    device_dirty_seen: Arc::new(AtomicBool::new(false)),
                     dirty_senders: Vec::new(),
                     clients: unicycle::FuturesUnordered::new(),
                     abort_senders: Vec::new(),
@@ -1122,6 +1143,124 @@ mod tests {
         assert_eq!(refresh[0].encoding, ENCODING_TYPE_RAW);
         assert_eq!(refresh[0].width, 6);
         assert_eq!(refresh[0].height, 3);
+
+        drop(client);
+        server.stop();
+    }
+
+    #[test]
+    fn e2e_dirty_reset_overflow_falls_back_to_tile_diff() {
+        let server = start_server(32, 32, true);
+        let mut client = Client::connect(server.addr);
+
+        client.send_update_request(false);
+        let initial = client.read_update();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].width, 32);
+        assert_eq!(initial[0].height, 32);
+
+        // Enter device-dirty mode.
+        let first_offset = (2usize * 32 + 2) * 4;
+        server
+            .vram
+            .write_at(first_offset, &pixel(0xaa, 0xbb, 0xcc))
+            .unwrap();
+        server.dirty_send.as_ref().unwrap().send(vec![DirtyRect {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 16,
+        }]);
+        client.send_update_request(true);
+        let dirty_update = client.read_update();
+        assert_eq!(dirty_update.len(), 1);
+        assert_eq!(dirty_update[0].x, 0);
+        assert_eq!(dirty_update[0].y, 0);
+
+        // Overflow the client's bounded(4) dirty queue before sending an in-band
+        // empty reset marker so the empty Vec cannot be enqueued.
+        let dirty_tx = server.dirty_send.as_ref().unwrap();
+        for _ in 0..8 {
+            dirty_tx.send(vec![DirtyRect {
+                left: 0,
+                top: 0,
+                right: 16,
+                bottom: 16,
+            }]);
+        }
+        dirty_tx.send(Vec::new());
+        thread::sleep(Duration::from_millis(30));
+
+        // Client catches up with a full refresh, and fallback tile diff must stay
+        // active (not revert to device-dirty idle skipping).
+        client.send_update_request(true);
+        let post_reset = client.read_update();
+        assert_eq!(post_reset.len(), 1);
+        assert_eq!(post_reset[0].width, 32);
+        assert_eq!(post_reset[0].height, 32);
+
+        let second_offset = (20usize * 32 + 20) * 4;
+        server
+            .vram
+            .write_at(second_offset, &pixel(0x11, 0x22, 0x33))
+            .unwrap();
+        let mut fallback_update = None;
+        for _ in 0..20 {
+            client.send_update_request(true);
+            if let Some(update) = client.try_read_update(Duration::from_millis(50)) {
+                if update.len() == 1
+                    && update[0].encoding == ENCODING_TYPE_RAW
+                    && update[0].x == 16
+                    && update[0].y == 16
+                    && update[0].width == 16
+                    && update[0].height == 16
+                {
+                    fallback_update = Some(update);
+                    break;
+                }
+            }
+        }
+        let fallback_update =
+            fallback_update.expect("tile-diff fallback update not observed after reset overflow");
+        let px_in_tile = ((20 - 16) * 16 + (20 - 16)) * 4;
+        assert_eq!(
+            &fallback_update[0].payload[px_in_tile..px_in_tile + 4],
+            &pixel(0x11, 0x22, 0x33)
+        );
+
+        // Sending a new post-reset DirtyRect cleanly resumes device-dirty mode.
+        let third_offset = (3usize * 32 + 3) * 4;
+        server
+            .vram
+            .write_at(third_offset, &pixel(0x44, 0x55, 0x66))
+            .unwrap();
+        dirty_tx.send(vec![DirtyRect {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 16,
+        }]);
+        let mut resumed = None;
+        for _ in 0..20 {
+            client.send_update_request(true);
+            if let Some(update) = client.try_read_update(Duration::from_millis(50)) {
+                if update.len() == 1
+                    && update[0].x == 0
+                    && update[0].y == 0
+                    && update[0].width == 16
+                    && update[0].height == 16
+                {
+                    resumed = Some(update);
+                    break;
+                }
+            }
+        }
+        let resumed = resumed.expect("post-reset device dirty update not observed");
+        let px_tile0 = (3 * 16 + 3) * 4;
+        assert_eq!(
+            &resumed[0].payload[px_tile0..px_tile0 + 4],
+            &pixel(0x44, 0x55, 0x66)
+        );
 
         drop(client);
         server.stop();
