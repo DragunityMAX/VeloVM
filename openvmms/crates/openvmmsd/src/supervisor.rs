@@ -45,6 +45,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
@@ -72,6 +73,7 @@ pub struct Supervisor {
     vms: RwLock<HashMap<Uuid, ManagedVm>>,
     events_tx: broadcast::Sender<DaemonEvent>,
     shutdown_notify: Notify,
+    shutdown_watch: watch::Sender<bool>,
 }
 
 impl Supervisor {
@@ -98,6 +100,7 @@ impl Supervisor {
         }
 
         let (events_tx, _) = broadcast::channel(256);
+        let (shutdown_watch, _) = watch::channel(false);
         Ok(Arc::new(Self {
             store,
             auth_token,
@@ -105,6 +108,7 @@ impl Supervisor {
             vms: RwLock::new(vm_map),
             events_tx,
             shutdown_notify: Notify::new(),
+            shutdown_watch,
         }))
     }
 
@@ -129,8 +133,17 @@ impl Supervisor {
         self.events_tx.subscribe()
     }
 
-    pub fn request_shutdown(&self) {
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_watch.subscribe()
+    }
+
+    pub fn mark_shutting_down(&self) {
         let _ = self.events_tx.send(DaemonEvent::DaemonStopping);
+        let _ = self.shutdown_watch.send(true);
+    }
+
+    pub fn request_shutdown(&self) {
+        self.mark_shutting_down();
         self.shutdown_notify.notify_waiters();
     }
 
@@ -348,7 +361,12 @@ impl Supervisor {
                     DiskFormat::Vhdx => "vhdx",
                     _ => "img",
                 };
-                disk_req.path = vm_dir.join(format!("disk0.{ext}"));
+                let stem = sanitize_disk_stem(&cfg.name);
+                let short_id = &cfg.id.to_string()[..8];
+                disk_req.path = self
+                    .store
+                    .disks_dir()
+                    .join(format!("{stem}-{short_id}-disk0.{ext}"));
             }
             let info = disk::create_disk(&disk_req, paths.openvmm_img_bin.as_deref())?;
             let lun = cfg.next_free_lun();
@@ -1099,7 +1117,16 @@ impl Supervisor {
             let guard = self.vms.read().unwrap();
             let vm = guard.get(&id).context("VM not found")?;
             match req.lun {
-                Some(l) => vm.config.disks.iter().find(|d| d.lun == l).map(|d| d.lun),
+                Some(l) => match vm.config.disks.iter().find(|d| d.lun == l) {
+                    Some(d) if d.kind != DiskKind::Dvd => {
+                        bail!(
+                            "SCSI LUN {l} is occupied by a non-DVD disk ({}); specify a different LUN or omit --lun",
+                            d.path.display()
+                        );
+                    }
+                    Some(d) => Some(d.lun),
+                    None => None,
+                },
                 None => vm
                     .config
                     .disks
@@ -1348,6 +1375,25 @@ impl Supervisor {
         if let Some(vm) = guard.get(&id) {
             self.emit(DaemonEvent::VmUpdated { vm: vm.summary() });
         }
+    }
+}
+
+fn sanitize_disk_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "vm".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 

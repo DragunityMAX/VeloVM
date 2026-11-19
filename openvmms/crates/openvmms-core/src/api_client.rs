@@ -54,7 +54,7 @@ impl ApiClient {
         daemon_url_override: Option<&str>,
     ) -> anyhow::Result<Self> {
         let dir = data_dir
-            .map(Path::to_path_buf)
+            .map(resolve_client_path)
             .unwrap_or_else(default_data_dir);
         let store = RegistryStore::new(&dir)?;
         let cfg = store.load_or_init_host_config()?;
@@ -95,7 +95,24 @@ impl ApiClient {
     }
 
     pub fn update_host_config(&self, cfg: &HostConfig) -> anyhow::Result<HostConfig> {
-        self.put("/api/v1/host/config", cfg)
+        let mut resolved = cfg.clone();
+        if !resolved.data_dir.as_os_str().is_empty() {
+            resolved.data_dir = resolve_client_path(&resolved.data_dir);
+        }
+        if !resolved.runtime_dir.as_os_str().is_empty() {
+            resolved.runtime_dir = resolve_client_path(&resolved.runtime_dir);
+        }
+        resolved.openvmm_bin = resolved.openvmm_bin.as_deref().map(resolve_client_path);
+        resolved.fastdesk_viewer_bin = resolved
+            .fastdesk_viewer_bin
+            .as_deref()
+            .map(resolve_client_path);
+        resolved.openvmm_img_bin = resolved.openvmm_img_bin.as_deref().map(resolve_client_path);
+        resolved.uefi_firmware_path = resolved
+            .uefi_firmware_path
+            .as_deref()
+            .map(resolve_client_path);
+        self.put("/api/v1/host/config", &resolved)
     }
 
     pub fn list_switches(&self) -> anyhow::Result<Vec<VirtualSwitchInfo>> {
@@ -111,11 +128,31 @@ impl ApiClient {
     }
 
     pub fn create_vm(&self, req: &CreateVmPayload) -> anyhow::Result<VmSummary> {
-        self.post("/api/v1/vms", req)
+        let mut resolved = req.clone();
+        resolved.uefi_firmware = resolved.uefi_firmware.as_deref().map(resolve_client_path);
+        resolved.iso_path = resolved.iso_path.as_deref().map(resolve_client_path);
+        for d in &mut resolved.disks {
+            d.path = resolve_client_path(&d.path);
+        }
+        if let Some(cd) = &mut resolved.create_disk
+            && !cd.path.as_os_str().is_empty()
+        {
+            cd.path = resolve_client_path(&cd.path);
+        }
+        self.post("/api/v1/vms", &resolved)
     }
 
     pub fn update_vm(&self, id_or_name: &str, req: &UpdateVmPayload) -> anyhow::Result<VmSummary> {
-        self.put(&format!("/api/v1/vms/{}", url_segment(id_or_name)), req)
+        let mut resolved = req.clone();
+        if let Some(Some(fw)) = &resolved.uefi_firmware {
+            resolved.uefi_firmware = Some(Some(resolve_client_path(fw)));
+        }
+        if let Some(disks) = &mut resolved.disks {
+            for d in disks {
+                d.path = resolve_client_path(&d.path);
+            }
+        }
+        self.put(&format!("/api/v1/vms/{}", url_segment(id_or_name)), &resolved)
     }
 
     pub fn delete_vm(&self, id_or_name: &str, delete_disks: bool) -> anyhow::Result<()> {
@@ -170,9 +207,11 @@ impl ApiClient {
         id_or_name: &str,
         req: &AttachDiskPayload,
     ) -> anyhow::Result<VmSummary> {
+        let mut resolved = req.clone();
+        resolved.path = resolve_client_path(&resolved.path);
         self.post(
             &format!("/api/v1/vms/{}/disks", url_segment(id_or_name)),
-            req,
+            &resolved,
         )
     }
 
@@ -185,9 +224,11 @@ impl ApiClient {
     }
 
     pub fn mount_iso(&self, id_or_name: &str, req: &MountIsoPayload) -> anyhow::Result<VmSummary> {
+        let mut resolved = req.clone();
+        resolved.path = resolve_client_path(&resolved.path);
         self.post(
             &format!("/api/v1/vms/{}/iso", url_segment(id_or_name)),
-            req,
+            &resolved,
         )
     }
 
@@ -248,14 +289,16 @@ impl ApiClient {
     }
 
     pub fn create_disk(&self, req: &CreateDiskPayload) -> anyhow::Result<DiskInfo> {
-        self.post("/api/v1/disks/create", req)
+        let mut resolved = req.clone();
+        resolved.path = resolve_client_path(&resolved.path);
+        self.post("/api/v1/disks/create", &resolved)
     }
 
     pub fn inspect_disk(&self, path: &Path) -> anyhow::Result<DiskInfo> {
         self.post(
             "/api/v1/disks/inspect",
             &InspectDiskPayload {
-                path: path.to_path_buf(),
+                path: resolve_client_path(path),
             },
         )
     }
@@ -321,6 +364,43 @@ impl ApiClient {
             .send()
             .with_context(|| format!("DELETE {path}"))?;
         decode_json_response(resp)
+    }
+}
+
+pub fn resolve_client_path(path: &Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    normalize_lexical(&joined)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => out.push(comp.as_os_str()),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        out
     }
 }
 
@@ -424,7 +504,7 @@ pub fn ensure_daemon_running(
 
     let daemon_bin = find_openvmmsd_binary()?;
     let dir = data_dir
-        .map(Path::to_path_buf)
+        .map(resolve_client_path)
         .unwrap_or_else(default_data_dir);
     let store = RegistryStore::new(&dir)?;
     let cfg = store.load_or_init_host_config()?;
@@ -509,4 +589,18 @@ pub fn launch_fastdesk_viewer(
     }
     cmd.spawn()
         .with_context(|| format!("launching fastdesk-viewer {}", viewer_bin.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_client_path_resolves_relative_and_preserves_empty() {
+        assert_eq!(resolve_client_path(Path::new("")), PathBuf::new());
+        let cwd = std::env::current_dir().unwrap();
+        let resolved = resolve_client_path(Path::new("./sub/../disk.img"));
+        assert_eq!(resolved, normalize_lexical(&cwd.join("disk.img")));
+        assert!(resolved.is_absolute());
+    }
 }

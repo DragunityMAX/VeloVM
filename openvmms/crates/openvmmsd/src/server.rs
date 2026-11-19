@@ -23,6 +23,7 @@ use openvmms_core::models::ApiErrorBody;
 use openvmms_core::models::AttachDiskPayload;
 use openvmms_core::models::CreateDiskPayload;
 use openvmms_core::models::CreateVmPayload;
+use openvmms_core::models::DaemonEvent;
 use openvmms_core::models::DiskInfo;
 use openvmms_core::models::HostConfig;
 use openvmms_core::models::HostInfo;
@@ -38,8 +39,6 @@ use serde::Serialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -186,12 +185,52 @@ async fn events_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.supervisor.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|item| match item {
-        Ok(event) => serde_json::to_string(&event)
-            .ok()
-            .map(|json| Ok(Event::default().data(json))),
-        Err(_) => None,
-    });
+    let shutdown_rx = state.supervisor.subscribe_shutdown();
+    let stream = futures_util::stream::unfold(
+        (rx, shutdown_rx, false),
+        |(mut rx, mut shutdown_rx, done)| async move {
+            if done || *shutdown_rx.borrow() {
+                return None;
+            }
+            loop {
+                tokio::select! {
+                    item = rx.recv() => {
+                        match item {
+                            Ok(event) => {
+                                let is_stopping = matches!(event, DaemonEvent::DaemonStopping);
+                                if let Ok(json) = serde_json::to_string(&event) {
+                                    return Some((
+                                        Ok::<Event, Infallible>(Event::default().data(json)),
+                                        (rx, shutdown_rx, is_stopping),
+                                    ));
+                                }
+                                if is_stopping {
+                                    return None;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            while let Ok(event) = rx.try_recv() {
+                                if matches!(event, DaemonEvent::DaemonStopping)
+                                    && let Ok(json) = serde_json::to_string(&event)
+                                {
+                                    return Some((
+                                        Ok::<Event, Infallible>(Event::default().data(json)),
+                                        (rx, shutdown_rx, true),
+                                    ));
+                                }
+                            }
+                            return None;
+                        }
+                    }
+                }
+            }
+        },
+    );
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -744,8 +783,231 @@ mod tests {
         let caps = client.capabilities_vm().await.unwrap();
         assert!(!caps.supported_resources.is_empty());
 
-        client.quit().await.unwrap();
+        let _ = client.quit().await;
         let status = child.wait().unwrap();
         assert!(status.success(), "openvmm --rpc exited with {status}");
+    }
+
+    #[tokio::test]
+    async fn delete_vm_without_delete_disks_preserves_default_and_vm_dir_disks() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        // Create VM with a default created disk (empty path -> <data_dir>/disks/...).
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Preserve-Disks-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: Some(CreateDiskPayload {
+                    path: std::path::PathBuf::new(),
+                    size_bytes: 4 * 1024 * 1024,
+                    format: DiskFormat::Raw,
+                    fixed: false,
+                }),
+                iso_path: None,
+                nics: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+        let vm: VmSummary = create_resp.json().await.unwrap();
+        let default_disk = vm.config.disks[0].path.clone();
+        assert!(default_disk.exists());
+        assert!(default_disk.starts_with(dir.path().join("disks")));
+
+        // Also place a disk explicitly inside vms/<id>/ and attach it.
+        let inside_vm_dir_disk = dir
+            .path()
+            .join("vms")
+            .join(vm.config.id.to_string())
+            .join("extra.img");
+        fs::write(&inside_vm_dir_disk, b"EXTRA_DISK").unwrap();
+        let attach_resp = client
+            .post(format!(
+                "{}/api/v1/vms/{}/disks",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::AttachDiskPayload {
+                path: inside_vm_dir_disk.clone(),
+                lun: Some(1),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(attach_resp.status(), 200);
+
+        // Delete WITHOUT delete_disks -> both disks must remain intact.
+        let del = client
+            .delete(format!("{}/api/v1/vms/{}", daemon.base_url, vm.config.id))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(del.status(), 204);
+        assert!(
+            default_disk.exists(),
+            "default disk {} should be preserved when delete_disks=false",
+            default_disk.display()
+        );
+        assert!(
+            inside_vm_dir_disk.exists(),
+            "disk inside vm dir {} should be preserved when delete_disks=false",
+            inside_vm_dir_disk.display()
+        );
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mount_iso_rejects_non_dvd_lun_without_detaching_os_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let os_disk = dir.path().join("os.img");
+        fs::write(&os_disk, b"OS_DISK").unwrap();
+        let iso_path = dir.path().join("install.iso");
+        fs::write(&iso_path, b"ISO_DATA").unwrap();
+
+        let create_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Lun-Guard-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                fastdesk: None,
+                disks: vec![openvmms_core::models::DiskAttachment {
+                    lun: 0,
+                    kind: DiskKind::HardDisk,
+                    path: os_disk.clone(),
+                    read_only: false,
+                    format: DiskFormat::Raw,
+                }],
+                create_disk: None,
+                iso_path: None,
+                nics: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 201);
+
+        // Attempt to mount ISO onto LUN 0 (occupied by HardDisk) -> must fail!
+        let bad_mount = client
+            .post(format!("{}/api/v1/vms/Lun-Guard-VM/iso", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&MountIsoPayload {
+                path: iso_path.clone(),
+                lun: Some(0),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_mount.status(), 409);
+
+        // Verify LUN 0 is still the OS HardDisk.
+        let vm: VmSummary = client
+            .get(format!("{}/api/v1/vms/Lun-Guard-VM", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(vm.config.disks.len(), 1);
+        assert_eq!(vm.config.disks[0].lun, 0);
+        assert_eq!(vm.config.disks[0].kind, DiskKind::HardDisk);
+        assert_eq!(vm.config.disks[0].path, os_disk);
+
+        // Mounting ISO with lun: None succeeds onto free LUN 1.
+        let ok_mount = client
+            .post(format!("{}/api/v1/vms/Lun-Guard-VM/iso", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&MountIsoPayload {
+                path: iso_path,
+                lun: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_mount.status(), 200);
+        let vm: VmSummary = ok_mount.json().await.unwrap();
+        assert_eq!(vm.config.disks.len(), 2);
+        assert_eq!(vm.config.disks[1].lun, 1);
+        assert_eq!(vm.config.disks[1].kind, DiskKind::Dvd);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sse_events_stream_closes_promptly_on_daemon_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        // Open a persistent SSE stream like openvmms-gui does.
+        let mut sse_resp = client
+            .get(format!(
+                "{}/api/v1/events?token={}",
+                daemon.base_url, daemon.token
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), 200);
+
+        // Request daemon shutdown via API while the SSE stream is open.
+        let shutdown_resp = client
+            .post(format!("{}/api/v1/daemon/shutdown", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(shutdown_resp.status(), 202);
+
+        // Both the SSE stream and the server task must exit within 2 seconds.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut saw_stopping = false;
+            while let Some(chunk) = sse_resp.chunk().await.unwrap() {
+                let text = String::from_utf8_lossy(&chunk);
+                if text.contains("daemon_stopping") {
+                    saw_stopping = true;
+                }
+            }
+            assert!(saw_stopping, "expected daemon_stopping SSE event before EOF");
+            daemon.shutdown().await;
+        })
+        .await
+        .expect("SSE stream and daemon did not shut down within 2s");
     }
 }

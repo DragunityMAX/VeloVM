@@ -8,6 +8,7 @@ use openvmms_core::api_client::ApiClient;
 use openvmms_core::api_client::ensure_daemon_running;
 use openvmms_core::api_client::find_openvmmsd_binary;
 use openvmms_core::api_client::launch_fastdesk_viewer;
+use openvmms_core::api_client::resolve_client_path;
 use openvmms_core::models::AttachDiskPayload;
 use openvmms_core::models::CreateDiskPayload;
 use openvmms_core::models::CreateVmPayload;
@@ -402,7 +403,11 @@ fn handle_daemon(cli: &Cli, action: &DaemonCmd) -> anyhow::Result<()> {
         DaemonCmd::Start { foreground } => {
             if *foreground {
                 let bin = find_openvmmsd_binary()?;
-                let dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
+                let dir = cli
+                    .data_dir
+                    .as_deref()
+                    .map(resolve_client_path)
+                    .unwrap_or_else(default_data_dir);
                 let mut cmd = Command::new(bin);
                 cmd.arg("--data-dir").arg(&dir);
                 let status = cmd.status().context("running openvmmsd in foreground")?;
@@ -476,19 +481,19 @@ fn handle_host(cli: &Cli, action: &HostCmd) -> anyhow::Result<()> {
             let mut cfg = client.host_config()?;
             let mut changed = false;
             if let Some(p) = openvmm_bin {
-                cfg.openvmm_bin = Some(p.clone());
+                cfg.openvmm_bin = Some(resolve_client_path(p));
                 changed = true;
             }
             if let Some(p) = viewer_bin {
-                cfg.fastdesk_viewer_bin = Some(p.clone());
+                cfg.fastdesk_viewer_bin = Some(resolve_client_path(p));
                 changed = true;
             }
             if let Some(p) = img_bin {
-                cfg.openvmm_img_bin = Some(p.clone());
+                cfg.openvmm_img_bin = Some(resolve_client_path(p));
                 changed = true;
             }
             if let Some(p) = uefi_firmware {
-                cfg.uefi_firmware_path = Some(p.clone());
+                cfg.uefi_firmware_path = Some(resolve_client_path(p));
                 changed = true;
             }
             if let Some(addr) = listen_addr {
@@ -540,12 +545,13 @@ fn handle_disk(cli: &Cli, action: &DiskCmd) -> anyhow::Result<()> {
             format,
             fixed,
         } => {
+            let resolved_path = resolve_client_path(path);
             let size_bytes = parse_byte_size(size)?;
             let fmt = format
                 .map(DiskFormat::from)
-                .unwrap_or_else(|| DiskFormat::from_path(path));
+                .unwrap_or_else(|| DiskFormat::from_path(&resolved_path));
             let info = client.create_disk(&CreateDiskPayload {
-                path: path.clone(),
+                path: resolved_path,
                 size_bytes,
                 format: fmt,
                 fixed: *fixed,
@@ -553,7 +559,7 @@ fn handle_disk(cli: &Cli, action: &DiskCmd) -> anyhow::Result<()> {
             print_disk_info(&info, cli.json)
         }
         DiskCmd::Info { path } => {
-            let info = client.inspect_disk(path)?;
+            let info = client.inspect_disk(&resolve_client_path(path))?;
             print_disk_info(&info, cli.json)
         }
     }
@@ -610,17 +616,21 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
 
             let create_disk = if let Some(size_str) = &args.create_disk {
                 let size_bytes = parse_byte_size(size_str)?;
+                let resolved_disk_path = args
+                    .create_disk_path
+                    .as_deref()
+                    .map(resolve_client_path)
+                    .unwrap_or_default();
                 let format = args
                     .disk_format
                     .map(DiskFormat::from)
                     .or_else(|| {
-                        args.create_disk_path
-                            .as_deref()
-                            .map(DiskFormat::from_path)
+                        (!resolved_disk_path.as_os_str().is_empty())
+                            .then(|| DiskFormat::from_path(&resolved_disk_path))
                     })
                     .unwrap_or(DiskFormat::Vhdx);
                 Some(CreateDiskPayload {
-                    path: args.create_disk_path.clone().unwrap_or_default(),
+                    path: resolved_disk_path,
                     size_bytes,
                     format,
                     fixed: args.fixed_disk,
@@ -631,12 +641,13 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
 
             let mut disks = Vec::new();
             for (idx, p) in args.disk.iter().enumerate() {
+                let resolved = resolve_client_path(p);
                 disks.push(DiskAttachment {
                     lun: idx as u32,
                     kind: DiskKind::HardDisk,
-                    path: p.clone(),
+                    format: DiskFormat::from_path(&resolved),
+                    path: resolved,
                     read_only: false,
-                    format: DiskFormat::from_path(p),
                 });
             }
 
@@ -672,7 +683,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                 fastdesk,
                 disks,
                 create_disk,
-                iso_path: args.iso.clone(),
+                iso_path: args.iso.as_deref().map(resolve_client_path),
                 nics,
             };
             let summary = client.create_vm(&payload)?;
@@ -765,7 +776,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                 let summary = client.attach_disk(
                     vm,
                     &AttachDiskPayload {
-                        path: path.clone(),
+                        path: resolve_client_path(path),
                         lun: *lun,
                         read_only: *ro,
                         format: None,
@@ -782,7 +793,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                 let summary = client.mount_iso(
                     vm,
                     &MountIsoPayload {
-                        path: path.clone(),
+                        path: resolve_client_path(path),
                         lun: *lun,
                     },
                 )?;
@@ -1006,5 +1017,13 @@ mod tests {
         assert_eq!(parse_net_spec("consomme").unwrap().len(), 1);
         assert!(parse_net_spec("tap:tap0").is_ok());
         assert!(parse_net_spec("invalid").is_err());
+    }
+
+    #[test]
+    fn cli_resolves_relative_paths_against_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let resolved = resolve_client_path(Path::new("relative.img"));
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, cwd.join("relative.img"));
     }
 }

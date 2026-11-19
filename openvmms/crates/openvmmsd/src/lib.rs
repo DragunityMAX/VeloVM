@@ -56,6 +56,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
                     info!("received API shutdown request");
                 }
             }
+            shutdown_supervisor.mark_shutting_down();
             shutdown_supervisor.shutdown_all_vms().await;
         })
         .await
@@ -88,6 +89,7 @@ impl TestDaemonHandle {
             let _ = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     shutdown_sup.wait_for_shutdown_signal().await;
+                    shutdown_sup.mark_shutting_down();
                     shutdown_sup.shutdown_all_vms().await;
                 })
                 .await;

@@ -179,7 +179,11 @@ impl NewVmWizard {
             transport: FastDeskTransport::Tcp,
             selected_switch_id: "consomme".to_string(),
             disk_mode: DiskMode::CreateNew,
-            new_disk_path: default_dir.join("Windows-11-VM.vhdx").to_string_lossy().into_owned(),
+            new_disk_path: default_dir
+                .join("disks")
+                .join("Windows-11-VM.vhdx")
+                .to_string_lossy()
+                .into_owned(),
             new_disk_size_gb: 64,
             new_disk_format: DiskFormat::Vhdx,
             new_disk_fixed: false,

@@ -22,6 +22,9 @@ use openvmms_core::models::VmStatus;
 use openvmms_core::models::VmSummary;
 use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -93,7 +96,7 @@ impl BackendHandle {
 
         thread::spawn(move || {
             let mut client: Option<ApiClient> = None;
-            let mut sse_started = false;
+            let sse_active = Arc::new(AtomicBool::new(false));
 
             let emit = |msg: GuiUpdate| {
                 let _ = upd_tx.send(msg);
@@ -105,13 +108,21 @@ impl BackendHandle {
                     GuiRequest::ConnectOrStartDaemon => {
                         match ensure_daemon_running(data_dir.as_deref(), daemon_url.as_deref()) {
                             Ok(c) => {
-                                if !sse_started {
-                                    sse_started = true;
+                                if sse_active
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                                {
                                     spawn_sse_listener(
                                         c.base_url().to_string(),
                                         c.token().to_string(),
                                         upd_tx.clone(),
                                         repaint_ctx.clone(),
+                                        Arc::clone(&sse_active),
                                     );
                                 }
                                 match fetch_full_snapshot(&c) {
@@ -366,14 +377,19 @@ fn spawn_sse_listener(
     token: String,
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
+    sse_active: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let http = match reqwest::blocking::Client::builder().timeout(None).build() {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => {
+                sse_active.store(false, Ordering::SeqCst);
+                return;
+            }
         };
         let url = format!("{base_url}/api/v1/events?token={token}");
-        loop {
+        let mut stopping = false;
+        while !stopping {
             match http.get(&url).send() {
                 Ok(resp) if resp.status().is_success() => {
                     let reader = std::io::BufReader::new(resp);
@@ -410,17 +426,22 @@ fn spawn_sse_listener(
                                         "Daemon stopped".to_string(),
                                     ));
                                     repaint_ctx.request_repaint();
+                                    stopping = true;
+                                    break;
                                 }
                             }
                         }
+                    }
+                    if !stopping {
+                        thread::sleep(Duration::from_secs(1));
                     }
                 }
                 _ => {
                     thread::sleep(Duration::from_secs(2));
                 }
             }
-            thread::sleep(Duration::from_secs(1));
         }
+        sse_active.store(false, Ordering::SeqCst);
     });
 }
 

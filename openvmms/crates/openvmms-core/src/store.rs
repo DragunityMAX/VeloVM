@@ -19,11 +19,14 @@ impl RegistryStore {
         let data_dir = data_dir.into();
         fs::create_dir_all(data_dir.join("vms"))
             .with_context(|| format!("creating VM store dir under {}", data_dir.display()))?;
+        fs::create_dir_all(data_dir.join("disks"))
+            .with_context(|| format!("creating disks dir under {}", data_dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700));
             let _ = fs::set_permissions(data_dir.join("vms"), fs::Permissions::from_mode(0o700));
+            let _ = fs::set_permissions(data_dir.join("disks"), fs::Permissions::from_mode(0o700));
         }
         Ok(Self { data_dir })
     }
@@ -42,6 +45,10 @@ impl RegistryStore {
 
     pub fn vms_dir(&self) -> PathBuf {
         self.data_dir.join("vms")
+    }
+
+    pub fn disks_dir(&self) -> PathBuf {
+        self.data_dir.join("disks")
     }
 
     pub fn vm_dir(&self, id: Uuid) -> PathBuf {
@@ -154,10 +161,26 @@ impl RegistryStore {
 
     pub fn delete_vm_dir(&self, id: Uuid) -> anyhow::Result<()> {
         let vm_dir = self.vm_dir(id);
-        if vm_dir.exists() {
-            fs::remove_dir_all(&vm_dir)
-                .with_context(|| format!("deleting VM directory {}", vm_dir.display()))?;
+        if !vm_dir.exists() {
+            return Ok(());
         }
+        // Only remove OpenVMMS's own metadata, state, and log files so any
+        // user disk images residing inside vm_dir are preserved unless
+        // explicitly deleted by the caller.
+        for file_name in ["vm.toml", "state.vmgs"] {
+            let p = vm_dir.join(file_name);
+            if p.is_file() {
+                fs::remove_file(&p)
+                    .with_context(|| format!("removing {}", p.display()))?;
+            }
+        }
+        let logs_dir = vm_dir.join("logs");
+        if logs_dir.is_dir() {
+            fs::remove_dir_all(&logs_dir)
+                .with_context(|| format!("removing {}", logs_dir.display()))?;
+        }
+        // Remove the VM directory only if it is now empty.
+        let _ = fs::remove_dir(&vm_dir);
         Ok(())
     }
 }
@@ -212,6 +235,11 @@ mod tests {
         let vm = VmConfig::from_preset("Win11-Test", VmPreset::Windows11, &vm_dir);
         store.save_vm(&vm).unwrap();
 
+        // Even if a user disk file happens to reside inside vm_dir, deleting
+        // VM metadata with delete_vm_dir must preserve that disk file.
+        let disk_in_vm_dir = store.vm_dir(vm.id).join("disk0.img");
+        fs::write(&disk_in_vm_dir, b"PRESERVE_ME").unwrap();
+
         let loaded = store.load_all_vms().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, vm.id);
@@ -219,5 +247,7 @@ mod tests {
 
         store.delete_vm_dir(vm.id).unwrap();
         assert!(store.load_all_vms().unwrap().is_empty());
+        assert!(disk_in_vm_dir.exists());
+        assert!(!store.vm_config_path(vm.id).exists());
     }
 }
