@@ -52,6 +52,9 @@ impl ApiClient {
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(10))
+            // Disable reqwest's 30 s default client timeout so `post_no_timeout` (fixed disk
+            // creation) can wait arbitrarily long; every other call sets its own timeout.
+            .timeout(None)
             .build()
             .context("building HTTP client")?;
         Ok(Self {
@@ -1172,6 +1175,152 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "child proxy bypass probe failed: {status}");
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn disk_creating_requests_do_not_hit_reqwest_30s_default_timeout() {
+        use crate::models::{DiskFormat, DiskInfo, VmConfig, VmPreset, VmRuntimeState};
+        use std::io::{Read, Write};
+
+        fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+            let mut buf = Vec::with_capacity(4096);
+            let mut tmp = [0u8; 1024];
+            let header_end = loop {
+                let n = stream.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    return String::from_utf8_lossy(&buf).into_owned();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_str = String::from_utf8_lossy(&buf[..header_end]);
+            let content_len = header_str
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + content_len {
+                let n = stream.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            String::from_utf8_lossy(&buf[..header_end]).into_owned()
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "slow-disk-test-token";
+
+        let srv = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                workers.push(std::thread::spawn(move || {
+                    let req = read_http_request(&mut stream);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let (status_line, body) = if first_line.starts_with("GET /api/v1/health?") {
+                        let query = first_line
+                            .split_whitespace()
+                            .nth(1)
+                            .and_then(|p| p.split_once('?'))
+                            .map(|(_, q)| q)
+                            .unwrap_or("");
+                        let challenge = query
+                            .split('&')
+                            .filter_map(|kv| kv.split_once('='))
+                            .find(|(k, _)| *k == "challenge")
+                            .map(|(_, v)| v)
+                            .unwrap_or("");
+                        let proof = crate::models::compute_health_auth_proof(token, addr, challenge);
+                        (
+                            "HTTP/1.1 200 OK",
+                            format!(
+                                r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#
+                            ),
+                        )
+                    } else if first_line.starts_with("POST /api/v1/disks/create ") {
+                        std::thread::sleep(Duration::from_secs(31));
+                        let disk_info = DiskInfo {
+                            path: PathBuf::from("/tmp/slow-fixed.img"),
+                            format: "raw".into(),
+                            disk_type: "fixed".into(),
+                            virtual_size_bytes: 16 * 1024 * 1024,
+                            file_size_bytes: 16 * 1024 * 1024,
+                            block_size_bytes: None,
+                            sector_size_bytes: Some(512),
+                            parent_path: None,
+                            read_only: false,
+                        };
+                        ("HTTP/1.1 200 OK", serde_json::to_string(&disk_info).unwrap())
+                    } else if first_line.starts_with("POST /api/v1/vms ") {
+                        std::thread::sleep(Duration::from_secs(31));
+                        let summary = VmSummary {
+                            config: VmConfig::from_preset(
+                                "Slow-Disk-VM",
+                                VmPreset::Custom,
+                                Path::new("/tmp/slow-vm"),
+                            ),
+                            runtime: VmRuntimeState::default(),
+                        };
+                        (
+                            "HTTP/1.1 201 Created",
+                            serde_json::to_string(&summary).unwrap(),
+                        )
+                    } else {
+                        panic!("unexpected HTTP request in mock server: {first_line}");
+                    };
+
+                    let resp = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                }));
+            }
+            for w in workers {
+                w.join().unwrap();
+            }
+        });
+
+        let client = ApiClient::new(format!("http://{addr}"), token).unwrap();
+        let disk_client = client.clone();
+        let disk_thread = std::thread::spawn(move || {
+            disk_client.create_disk(&CreateDiskPayload {
+                path: PathBuf::from("/tmp/slow-fixed.img"),
+                size_bytes: 16 * 1024 * 1024,
+                format: DiskFormat::Raw,
+                fixed: true,
+            })
+        });
+        let vm_thread = std::thread::spawn(move || {
+            client.create_vm(&CreateVmPayload {
+                name: "Slow-Disk-VM".into(),
+                create_disk: Some(CreateDiskPayload {
+                    path: PathBuf::from("/tmp/slow-vm-disk.img"),
+                    size_bytes: 16 * 1024 * 1024,
+                    format: DiskFormat::Raw,
+                    fixed: true,
+                }),
+                ..Default::default()
+            })
+        });
+
+        let disk_info = disk_thread.join().unwrap().expect("create_disk timed out");
+        assert_eq!(disk_info.disk_type, "fixed");
+        let vm_summary = vm_thread.join().unwrap().expect("create_vm timed out");
+        assert_eq!(vm_summary.config.name, "Slow-Disk-VM");
         srv.join().unwrap();
     }
 }

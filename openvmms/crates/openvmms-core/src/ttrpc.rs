@@ -24,6 +24,14 @@ const MESSAGE_TYPE_RESPONSE: u8 = 2;
 const MAX_MESSAGE_SIZE: usize = 0x00ff_ffff;
 const SERVICE_VM: &str = "vmservice.VM";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+// socket2 truncates timeouts to whole milliseconds on Windows (microseconds on Unix),
+// and a 0 socket timeout means "block indefinitely".
+const MIN_SOCKET_TIMEOUT: Duration = Duration::from_millis(1);
+const POLL_SLICE: Duration = Duration::from_millis(200);
+
+fn clamp_read_slice(remaining: Duration) -> Duration {
+    remaining.clamp(MIN_SOCKET_TIMEOUT, POLL_SLICE)
+}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct WireRequest {
@@ -365,7 +373,6 @@ fn read_exact_cancellable(
     cancelled: &AtomicBool,
     deadline: Option<Instant>,
 ) -> anyhow::Result<()> {
-    const POLL_SLICE: Duration = Duration::from_millis(200);
     let mut offset = 0usize;
     while offset < buf.len() {
         if cancelled.load(Ordering::Acquire) {
@@ -376,7 +383,7 @@ fn read_exact_cancellable(
             if now >= dl {
                 bail!("ttrpc call timed out");
             }
-            (dl - now).min(POLL_SLICE)
+            clamp_read_slice(dl - now)
         } else {
             POLL_SLICE
         };
@@ -481,7 +488,8 @@ fn call_blocking_cancellable(
         .with_context(|| format!("invalid AF_UNIX path {}", socket_path.display()))?;
     sock.connect(&addr)
         .with_context(|| format!("connecting to OpenVMM RPC socket {}", socket_path.display()))?;
-    let _ = sock.set_write_timeout(timeout.or(Some(DEFAULT_TIMEOUT)));
+    let write_timeout = timeout.unwrap_or(DEFAULT_TIMEOUT).max(MIN_SOCKET_TIMEOUT);
+    let _ = sock.set_write_timeout(Some(write_timeout));
 
     let sock = Arc::new(sock);
     {
@@ -661,6 +669,61 @@ mod tests {
             .await
             .expect("server did not observe socket close after wait_vm future drop")
             .unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn clamp_read_slice_never_truncates_to_zero_ms() {
+        assert_eq!(clamp_read_slice(Duration::ZERO), Duration::from_millis(1));
+        assert_eq!(clamp_read_slice(Duration::from_nanos(1)), Duration::from_millis(1));
+        assert_eq!(clamp_read_slice(Duration::from_micros(500)), Duration::from_millis(1));
+        assert_eq!(clamp_read_slice(Duration::from_micros(999)), Duration::from_millis(1));
+        assert_eq!(clamp_read_slice(Duration::from_millis(1)), Duration::from_millis(1));
+        assert_eq!(clamp_read_slice(Duration::from_millis(50)), Duration::from_millis(50));
+        assert_eq!(clamp_read_slice(Duration::from_secs(5)), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn sub_millisecond_timeout_still_times_out_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("silent.sock");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&sock_path).unwrap()).unwrap();
+        listener.listen(8).unwrap();
+
+        let timeouts = [
+            Duration::from_micros(900),
+            Duration::from_micros(200),
+            Duration::from_nanos(500),
+        ];
+        let count = timeouts.len();
+        let server = thread::spawn(move || {
+            for _ in 0..count {
+                let (mut conn, _) = listener.accept().unwrap();
+                let _ = read_frame(&mut conn);
+                // Hold the socket open without replying until the client times out and closes it.
+                let mut buf = [0u8; 16];
+                let _ = conn.read(&mut buf);
+            }
+        });
+
+        for timeout in timeouts {
+            let sock = sock_path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let res = call_blocking(&sock, SERVICE_VM, "PropertiesVM", &[], Some(timeout));
+                let _ = tx.send(res);
+            });
+            let res = rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("call_blocking with {timeout:?} blocked instead of timing out"));
+            let err = res.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("ttrpc call timed out"),
+                "expected timeout error for {timeout:?}, got: {err:#}"
+            );
+        }
 
         server.join().unwrap();
     }

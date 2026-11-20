@@ -1,0 +1,210 @@
+From: OpenVMMS Maintainers <fastdesk@localhost>
+Subject: [PATCH 1/1] mesh_rpc: cancel pending RPCs and drop responses on client disconnect
+Upstream-Base: microsoft/openvmm@c4419be15ab702194f0a25c294bd2f6187804824
+
+In `mesh_rpc::Server::serve_connection`, closing the ttrpc client socket
+previously did not cancel the connection's `CancelContext`, and `send_task`
+attempted to write responses back to the closed stream.
+
+This patch wires `CancelContext::new().with_cancel()` and a `peer_closed`
+flag into `serve_connection`: when `read_message` reaches EOF or errors,
+`cancel.cancel()` cancels all pending RPCs on that connection and `send_task`
+drops their responses rather than writing to the dead socket.
+
+Behavioral impact across every ttrpc service:
+- Any ttrpc client that closes its socket before receiving a response now
+  cancels all pending RPCs on that connection (via `CancelContext`) and their
+  responses are dropped.
+
+Rationale in this repository:
+- OpenVMM's `VmService::WaitVm` stores a single `(CancelContext, response)`
+  waiter per VM. Cancelling `WaitVm`'s `CancelContext` when `openvmmsd` closes
+  the socket during `daemon stop` / `SIGTERM` lets a restarted daemon cleanly
+  re-adopt the running VM and re-attach `WaitVm` without hitting
+  `"wait VM already in flight"`.
+
+Carry forward or upstream when syncing `openvmm/` past `c4419be15ab702194f0a25c294bd2f6187804824`.
+---
+diff --git a/openvmm/support/mesh/mesh_rpc/src/server.rs b/openvmm/support/mesh/mesh_rpc/src/server.rs
+index 24acaf8..0cb9745 100644
+--- a/openvmm/support/mesh/mesh_rpc/src/server.rs
++++ b/openvmm/support/mesh/mesh_rpc/src/server.rs
+@@ -168,45 +168,52 @@ pub async fn serve_connection(
+     ) -> anyhow::Result<()> {
+         let (mut reader, mut writer) = stream.split();
+         let (stream_send, mut stream_recv) = mesh::channel();
+-        let ctx = CancelContext::new();
++        let (ctx, mut cancel) = CancelContext::new().with_cancel();
++        let peer_closed = std::sync::atomic::AtomicBool::new(false);
+         let recv_task = async {
+             let stream_send = stream_send; // move into this task
+-            while let Some(message) = read_message(&mut reader).await? {
+-                let (send, recv) = mesh::oneshot::<Result<Vec<u8>, Status>>();
+-                stream_send.send((message.stream_id, recv));
+-
+-                let handle = handle_message(message).and_then(|request| {
+-                    let service = self.services.get(request.service.as_str()).ok_or_else(|| {
+-                        status_from_err(
+-                            Code::Unimplemented,
+-                            anyhow::anyhow!("unknown service {}", request.service),
+-                        )
+-                    })?;
+-
+-                    let ctx = if request.timeout_nano == 0 {
+-                        ctx.clone()
+-                    } else {
+-                        ctx.with_timeout(std::time::Duration::from_nanos(request.timeout_nano))
+-                    };
+-
+-                    Ok(move |port| {
+-                        service.send((
+-                            ctx,
+-                            GenericRpc {
+-                                method: request.method,
+-                                data: request.payload,
+-                                port,
+-                            },
+-                        ));
+-                    })
+-                });
++            let res: anyhow::Result<()> = async {
++                while let Some(message) = read_message(&mut reader).await? {
++                    let (send, recv) = mesh::oneshot::<Result<Vec<u8>, Status>>();
++                    stream_send.send((message.stream_id, recv));
++
++                    let handle = handle_message(message).and_then(|request| {
++                        let service = self.services.get(request.service.as_str()).ok_or_else(|| {
++                            status_from_err(
++                                Code::Unimplemented,
++                                anyhow::anyhow!("unknown service {}", request.service),
++                            )
++                        })?;
++
++                        let ctx = if request.timeout_nano == 0 {
++                            ctx.clone()
++                        } else {
++                            ctx.with_timeout(std::time::Duration::from_nanos(request.timeout_nano))
++                        };
++
++                        Ok(move |port| {
++                            service.send((
++                                ctx,
++                                GenericRpc {
++                                    method: request.method,
++                                    data: request.payload,
++                                    port,
++                                },
++                            ));
++                        })
++                    });
+ 
+-                match handle {
+-                    Ok(handle) => handle(send.into()),
+-                    Err(err) => send.send(Err(err)),
++                    match handle {
++                        Ok(handle) => handle(send.into()),
++                        Err(err) => send.send(Err(err)),
++                    }
+                 }
++                Ok(())
+             }
+-            Ok(())
++            .await;
++            peer_closed.store(true, std::sync::atomic::Ordering::Release);
++            cancel.cancel();
++            res
+         };
+         let send_task = async {
+             let mut responses = FuturesUnordered::new();
+@@ -239,13 +246,15 @@ enum Event<T> {
+                         responses.push(recv);
+                     }
+                     Event::Response((stream_id, payload)) => {
+-                        write_message(
+-                            &mut writer,
+-                            stream_id,
+-                            MESSAGE_TYPE_RESPONSE,
+-                            &mesh::payload::encode(payload),
+-                        )
+-                        .await?;
++                        if !peer_closed.load(std::sync::atomic::Ordering::Acquire) {
++                            write_message(
++                                &mut writer,
++                                stream_id,
++                                MESSAGE_TYPE_RESPONSE,
++                                &mesh::payload::encode(payload),
++                            )
++                            .await?;
++                        }
+                     }
+                 }
+             }
+@@ -626,6 +635,9 @@ mod tests {
+     use crate::Client;
+     use crate::Server;
+     use crate::client::ExistingConnection;
++    use crate::message::MESSAGE_TYPE_REQUEST;
++    use crate::message::write_message;
++    use crate::rpc::status_from_err;
+     use crate::service::Code;
+     use crate::service::ServiceRpc;
+     use futures::StreamExt;
+@@ -702,4 +714,58 @@ fn client_server() {
+         client_thread.join().unwrap();
+         server_thread.join().unwrap().unwrap();
+     }
++
++    #[test]
++    fn client_disconnect_cancels_pending_rpc_context() {
++        let (c, s) = unix_socket::UnixStream::pair().unwrap();
++        let mut server = Server::new();
++        let mut recv = server.add_service::<items::Example>();
++        let server_thread = std::thread::spawn(move || {
++            block_with_io(async |driver| server.run_single(&driver, s).await)
++        });
++
++        let client_thread = std::thread::spawn(move || {
++            DefaultPool::run_with(async |driver| {
++                let mut sock = PolledSocket::new(&driver, c).unwrap();
++                let req = crate::message::Request {
++                    service: items::Example::NAME.to_string(),
++                    method: "Method1".to_string(),
++                    payload: mesh::payload::encode(items::Method1Request {
++                        foo: "a".to_string(),
++                        bar: "b".to_string(),
++                    }),
++                    timeout_nano: 0,
++                    metadata: Vec::new(),
++                };
++                write_message(
++                    &mut sock,
++                    1,
++                    MESSAGE_TYPE_REQUEST,
++                    &mesh::payload::encode(req),
++                )
++                .await
++                .unwrap();
++                // Disconnect before the server responds so the pending RPC must observe cancellation.
++                drop(sock);
++            })
++        });
++
++        block_on(async {
++            let (mut ctx, req) = recv.next().await.unwrap();
++            match req {
++                items::Example::Method1(_, resp) => {
++                    ctx.cancelled().await;
++                    resp.send(Err(status_from_err(
++                        Code::Cancelled,
++                        anyhow::anyhow!("client disconnected"),
++                    )));
++                }
++                _ => panic!("{:?}", req),
++            }
++            assert!(recv.next().await.is_none());
++        });
++
++        client_thread.join().unwrap();
++        server_thread.join().unwrap().unwrap();
++    }
+ }

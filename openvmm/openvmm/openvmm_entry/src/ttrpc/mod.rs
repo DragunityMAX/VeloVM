@@ -4682,6 +4682,118 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "ttrpc")]
+    #[test]
+    fn wait_vm_disconnect_releases_slot_for_next_client() {
+        DefaultPool::run_with(async |driver| {
+            let dir = tempfile::tempdir().unwrap();
+            let sock_path = dir.path().join("rpc.sock");
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            let (event_send, event_recv) = mesh::channel();
+            let (_worker_send, worker_recv) = mesh::channel();
+            let mut svc = service(driver.clone(), None);
+            svc.vm_controller_events = Some(event_recv);
+            svc.transport = ResolvedTransport::Ttrpc;
+
+            let server_task =
+                driver.spawn("vm-service-wait-vm", async move { svc.run(listener, worker_recv).await });
+
+            let connect = |sock: &Path| {
+                let stream = unix_socket::UnixStream::connect(sock).unwrap();
+                mesh_rpc::Client::new(
+                    &driver,
+                    mesh_rpc::client::ExistingConnection::new(
+                        pal_async::socket::PolledSocket::new(&driver, stream).unwrap(),
+                    ),
+                )
+            };
+
+            // Client 1 acquires the single WaitVM slot and confirms it is registered.
+            let client1 = connect(&sock_path);
+            let _wait1 = client1.call().start(vmservice::Vm::WaitVm, ());
+            let props1 = client1
+                .call()
+                .start(
+                    vmservice::Vm::PropertiesVm,
+                    vmservice::PropertiesVmRequest { types: vec![] },
+                )
+                .await
+                .unwrap();
+            assert_eq!(props1.state, vmservice::VmState::Running as i32);
+
+            let probe1 = connect(&sock_path);
+            let err1 = probe1
+                .call()
+                .start(vmservice::Vm::WaitVm, ())
+                .await
+                .unwrap_err();
+            assert!(
+                err1.message.contains("wait VM already in flight"),
+                "unexpected error while WaitVM active: {err1:?}"
+            );
+            probe1.shutdown().await;
+
+            // Disconnecting Client 1 must cancel its WaitVM so Client 2 can re-attach.
+            drop(_wait1);
+            client1.shutdown().await;
+
+            let mut timer = pal_async::timer::PolledTimer::new(&driver);
+            let mut acquired = None;
+            for _ in 0..40 {
+                let c = connect(&sock_path);
+                let mut w = Box::pin(c.call().start(vmservice::Vm::WaitVm, ()));
+                let props2 = c
+                    .call()
+                    .start(
+                        vmservice::Vm::PropertiesVm,
+                        vmservice::PropertiesVmRequest { types: vec![] },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(props2.state, vmservice::VmState::Running as i32);
+                timer.sleep(Duration::from_millis(10)).await;
+                match (&mut w).now_or_never() {
+                    Some(Err(err)) => {
+                        assert!(
+                            err.message.contains("wait VM already in flight"),
+                            "unexpected WaitVM error during re-attach: {err:?}"
+                        );
+                        c.shutdown().await;
+                        timer.sleep(Duration::from_millis(25)).await;
+                    }
+                    Some(Ok(())) => panic!("WaitVm resolved unexpectedly before GuestHalt"),
+                    None => {
+                        acquired = Some((c, w));
+                        break;
+                    }
+                }
+            }
+            let (client2, wait2) =
+                acquired.expect("Client 2 could not re-attach WaitVM after Client 1 disconnected");
+
+            // Confirm Client 2 now owns the single WaitVM slot.
+            let probe2 = connect(&sock_path);
+            let err2 = probe2
+                .call()
+                .start(vmservice::Vm::WaitVm, ())
+                .await
+                .unwrap_err();
+            assert!(
+                err2.message.contains("wait VM already in flight"),
+                "expected probe2 to see Client 2's WaitVM in flight, got: {err2:?}"
+            );
+            probe2.shutdown().await;
+
+            // Halting the guest resolves Client 2's WaitVM cleanly.
+            event_send.send(VmControllerEvent::GuestHalt("power off".into()));
+            wait2.await.unwrap();
+
+            event_send.send(VmControllerEvent::ExitRequested { code: 0 });
+            client2.shutdown().await;
+            assert_eq!(server_task.await.unwrap(), 0);
+        });
+    }
+
     #[test]
     fn uefi_initial_variables_defaults() {
         for arch in [

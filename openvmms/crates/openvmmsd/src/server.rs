@@ -857,6 +857,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_openvmm_wait_vm_cancels_on_disconnect_and_reattaches() {
+        use openvmms_core::ttrpc::{TtrpcClient, WaitVmOutcome};
+        use openvmms_core::vmservice;
+
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir.join("../../..");
+        let bin_name = if cfg!(windows) { "openvmm.exe" } else { "openvmm" };
+        let openvmm_bin = [
+            repo_root.join("openvmm/target/release").join(bin_name),
+            repo_root.join("openvmm/target/debug").join(bin_name),
+        ]
+        .into_iter()
+        .find(|p| p.is_file());
+        let msvm_fd = repo_root.join(
+            "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
+        );
+        #[cfg(target_os = "linux")]
+        let kvm_ready = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok();
+        #[cfg(not(target_os = "linux"))]
+        let kvm_ready = false;
+
+        let missing_reason = if openvmm_bin.is_none() {
+            Some(format!(
+                "real openvmm binary not found under {}",
+                repo_root.display()
+            ))
+        } else if !msvm_fd.is_file() {
+            Some(format!("UEFI firmware not found at {}", msvm_fd.display()))
+        } else if !kvm_ready {
+            Some("/dev/kvm is not accessible read/write".into())
+        } else {
+            None
+        };
+        if let Some(reason) = missing_reason {
+            if std::env::var_os("OPENVMM_REQUIRE_REAL_KVM_TEST").is_some() {
+                panic!(
+                    "OPENVMM_REQUIRE_REAL_KVM_TEST is set, cannot run real WaitVM test: {reason}"
+                );
+            }
+            eprintln!("skipping real_openvmm_wait_vm_cancels_on_disconnect_and_reattaches: {reason}");
+            return;
+        }
+        let openvmm_bin = openvmm_bin.unwrap();
+
+        struct ChildKillGuard(Option<std::process::Child>);
+        impl Drop for ChildKillGuard {
+            fn drop(&mut self) {
+                if let Some(mut c) = self.0.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("openvmm-wait.sock");
+        let disk_path = dir.path().join("boot.img");
+        fs::write(&disk_path, vec![0u8; 1024 * 1024]).unwrap();
+        let vmgs_path = dir.path().join("state.vmgs");
+
+        let child = std::process::Command::new(&openvmm_bin)
+            .arg("--rpc")
+            .arg(format!("path={},transport=ttrpc", sock.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child_guard = ChildKillGuard(Some(child));
+
+        let client = TtrpcClient::new(&sock);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if sock.exists() && client.ping().await.is_ok() {
+                break;
+            }
+            if let Some(status) = child_guard.0.as_mut().unwrap().try_wait().unwrap() {
+                panic!("openvmm --rpc exited prematurely with {status}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for openvmm --rpc socket"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let create_req = vmservice::CreateVmRequest {
+            config: Some(vmservice::VmConfig {
+                memory_config: Some(vmservice::MemoryConfig {
+                    memory_mb: 512,
+                    ..Default::default()
+                }),
+                processor_config: Some(vmservice::ProcessorConfig {
+                    processor_count: 1,
+                    ..Default::default()
+                }),
+                boot_config: Some(vmservice::vm_config::BootConfig::Uefi(vmservice::Uefi {
+                    firmware_path: msvm_fd.to_string_lossy().into_owned(),
+                    initial_variables: Some(vmservice::uefi::InitialVariables {
+                        secure_boot_template:
+                            vmservice::uefi::initial_variables::SecureBootTemplate::None as i32,
+                        custom_uefi_json_path: None,
+                    }),
+                    secure_boot_enabled: false,
+                })),
+                devices_config: Some(vmservice::DevicesConfig {
+                    scsi_disks: vec![vmservice::ScsiDisk {
+                        controller: 0,
+                        lun: 0,
+                        host_path: disk_path.to_string_lossy().into_owned(),
+                        r#type: vmservice::DiskType::ScsiDiskTypePhysical as i32,
+                        read_only: false,
+                        is_dvd: false,
+                    }],
+                    enable_scsi_controller: true,
+                    ..Default::default()
+                }),
+                vmgs: Some(vmservice::VmgsConfig {
+                    backend: Some(vmservice::DiskBackend {
+                        kind: Some(vmservice::disk_backend::Kind::File(vmservice::FileDisk {
+                            path: vmgs_path.to_string_lossy().into_owned(),
+                            direct: false,
+                            create_size_bytes: Some(4 * 1024 * 1024),
+                        })),
+                    }),
+                    provision_condition: vmservice::vmgs_config::ProvisionCondition::OnEmpty as i32,
+                }),
+                tpm_enabled: false,
+                ..Default::default()
+            }),
+            log_id: "real-wait-vm-test".into(),
+        };
+        client.create_vm(create_req).await.unwrap();
+        client.resume_vm().await.unwrap();
+
+        let props = client
+            .properties_vm(vmservice::PropertiesVmRequest { types: vec![] })
+            .await
+            .unwrap();
+        assert_eq!(props.state, vmservice::VmState::Running as i32);
+
+        // 1. Task 1 holds the single WaitVM slot on the real openvmm process.
+        let (cancel_tx1, cancel_rx1) = tokio::sync::watch::channel(false);
+        let task1 = tokio::spawn({
+            let c = client.clone();
+            async move { c.wait_vm_cancellable(cancel_rx1).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!task1.is_finished(), "Task 1 exited before probe1");
+
+        let (probe1_cancel_tx, probe1_cancel_rx) = tokio::sync::watch::channel(false);
+        let probe1_err = tokio::select! {
+            r = client.wait_vm_cancellable(probe1_cancel_rx) => r.unwrap_err(),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                let _ = probe1_cancel_tx.send(true);
+                panic!("probe1 did not fail with 'wait VM already in flight'");
+            }
+        };
+        assert!(
+            format!("{probe1_err:#}").contains("wait VM already in flight"),
+            "unexpected probe1 error: {probe1_err:#}"
+        );
+
+        // 2. Cancelling Task 1 shuts down its socket, cancelling WaitVM in real openvmm.
+        let _ = cancel_tx1.send(true);
+        let outcome1 = tokio::time::timeout(std::time::Duration::from_secs(2), task1)
+            .await
+            .expect("Task 1 did not unblock on cancel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome1, WaitVmOutcome::Cancelled);
+
+        // 3. Re-attaching Task 2 succeeds directly without hitting "wait VM already in flight".
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let (_cancel_tx2, cancel_rx2) = tokio::sync::watch::channel(false);
+        let task2 = tokio::spawn({
+            let c = client.clone();
+            async move { c.wait_vm_cancellable(cancel_rx2).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !task2.is_finished(),
+            "Task 2 exited prematurely instead of holding WaitVM"
+        );
+
+        let (probe2_cancel_tx, probe2_cancel_rx) = tokio::sync::watch::channel(false);
+        let probe2_err = tokio::select! {
+            r = client.wait_vm_cancellable(probe2_cancel_rx) => r.unwrap_err(),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                let _ = probe2_cancel_tx.send(true);
+                panic!("probe2 did not fail with 'wait VM already in flight'");
+            }
+        };
+        assert!(
+            format!("{probe2_err:#}").contains("wait VM already in flight"),
+            "unexpected probe2 error: {probe2_err:#}"
+        );
+
+        // 4. Tearing down the VM resolves Task 2's WaitVM cleanly.
+        client.teardown_vm().await.unwrap();
+        let wait2_err = tokio::time::timeout(std::time::Duration::from_secs(5), task2)
+            .await
+            .expect("Task 2 did not finish after teardown_vm")
+            .unwrap()
+            .unwrap_err();
+        let wait2_msg = format!("{wait2_err:#}");
+        assert!(
+            wait2_msg.contains("VM torn down"),
+            "expected 'VM torn down' from Task 2, got: {wait2_msg}"
+        );
+        assert!(
+            !wait2_msg.contains("wait VM already in flight"),
+            "Task 2 failed with stale WaitVM conflict: {wait2_msg}"
+        );
+
+        let _ = client.quit().await;
+        let status = child_guard.0.take().unwrap().wait().unwrap();
+        assert!(status.success(), "openvmm --rpc exited with {status}");
+    }
+
+    #[tokio::test]
     async fn delete_vm_without_delete_disks_preserves_default_and_vm_dir_disks() {
         let dir = tempfile::tempdir().unwrap();
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())

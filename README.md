@@ -1,6 +1,6 @@
 # OpenVMM FastDesk (`hyperv-fast-desktop`)
 
-A high-speed, low-latency 2D desktop display and input pipeline built on a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) (upstream base commit `c4419be15ab702194f0a25c294bd2f6187804824`), paired with a standalone native desktop viewer (`fastdesk-viewer`) and turnkey Windows/Linux launcher scripts.
+A high-speed, low-latency 2D desktop display and input pipeline built on a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) (upstream base commit `c4419be15ab702194f0a25c294bd2f6187804824`; carried vendored patches are tracked in [`patches/README.md`](patches/README.md)), paired with a standalone native desktop viewer (`fastdesk-viewer`) and turnkey Windows/Linux launcher scripts.
 
 ## Prebuilt GitHub Actions Artifacts & Quickstart
 
