@@ -343,7 +343,7 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
 #[cfg(windows)]
 fn current_user_sid_bytes() -> anyhow::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE};
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     struct HandleGuard(HANDLE);

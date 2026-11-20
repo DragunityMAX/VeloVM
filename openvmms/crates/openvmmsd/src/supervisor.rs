@@ -2980,7 +2980,43 @@ fn read_log_tail(path: &Path, tail: usize) -> anyhow::Result<String> {
 }
 
 #[cfg(windows)]
+fn windows_hyperv_module_available() -> bool {
+    let mut roots: Vec<PathBuf> = std::env::var_os("PSModulePath")
+        .map(|val| std::env::split_paths(&val).collect())
+        .unwrap_or_default();
+    if let Some(sys_root) = std::env::var_os("SystemRoot") {
+        roots.push(
+            PathBuf::from(sys_root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("Modules"),
+        );
+    }
+    roots.into_iter().any(|dir| dir.join("Hyper-V").is_dir())
+}
+
+#[cfg(windows)]
 fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    const CACHE_TTL: Duration = Duration::from_secs(10);
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    static CACHE: OnceLock<std::sync::Mutex<Option<(Instant, Vec<VirtualSwitchInfo>)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache.lock().unwrap();
+    if let Some((captured_at, cached)) = guard.as_ref()
+        && captured_at.elapsed() < CACHE_TTL
+    {
+        return cached.clone();
+    }
+
     let mut out = vec![VirtualSwitchInfo {
         id: "c08cb7b8-9b3c-408e-8e30-5e16a3aeb444".to_string(),
         name: "Default Switch".to_string(),
@@ -2988,39 +3024,76 @@ fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
         description: "Windows Hyper-V Default Switch (HCN)".to_string(),
     }];
 
-    if let Ok(output) = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-VMSwitch | Select-Object @{n='Id';e={$_.Id.ToString()}},Name,SwitchType | ConvertTo-Json -Compress",
-        ])
-        .output()
-        && output.status.success()
-        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+    if windows_hyperv_module_available()
+        && let Ok(mut child) = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-VMSwitch | Select-Object @{n='Id';e={$_.Id.ToString()}},Name,SwitchType | ConvertTo-Json -Compress",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
     {
-        let arr = match val {
-            serde_json::Value::Array(items) => items,
-            obj @ serde_json::Value::Object(_) => vec![obj],
-            _ => Vec::new(),
-        };
-        for item in arr {
-            if let (Some(id), Some(name)) = (item["Id"].as_str(), item["Name"].as_str()) {
-                let id_lower = id.to_ascii_lowercase();
-                if !out.iter().any(|s| s.id.eq_ignore_ascii_case(&id_lower)) {
-                    out.push(VirtualSwitchInfo {
-                        id: id_lower,
-                        name: name.to_string(),
-                        kind: "vmswitch".to_string(),
-                        description: format!(
-                            "Hyper-V Virtual Switch ({})",
-                            item["SwitchType"].as_str().unwrap_or("Unknown")
-                        ),
-                    });
+        let reader_handle = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stdout.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let deadline = Instant::now() + QUERY_TIMEOUT;
+        let mut status = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    status = Some(st);
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+        let stdout_bytes = reader_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        if status.is_some_and(|st| st.success())
+            && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout_bytes)
+        {
+            let arr = match val {
+                serde_json::Value::Array(items) => items,
+                obj @ serde_json::Value::Object(_) => vec![obj],
+                _ => Vec::new(),
+            };
+            for item in arr {
+                if let (Some(id), Some(name)) = (item["Id"].as_str(), item["Name"].as_str()) {
+                    let id_lower = id.to_ascii_lowercase();
+                    if !out.iter().any(|s| s.id.eq_ignore_ascii_case(&id_lower)) {
+                        out.push(VirtualSwitchInfo {
+                            id: id_lower,
+                            name: name.to_string(),
+                            kind: "vmswitch".to_string(),
+                            description: format!(
+                                "Hyper-V Virtual Switch ({})",
+                                item["SwitchType"].as_str().unwrap_or("Unknown")
+                            ),
+                        });
+                    }
                 }
             }
         }
     }
+
+    *guard = Some((Instant::now(), out.clone()));
     out
 }
 

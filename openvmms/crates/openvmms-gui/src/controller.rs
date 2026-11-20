@@ -954,6 +954,7 @@ mod tests {
         F: FnMut(&GuiUpdate) -> bool,
     {
         let deadline = std::time::Instant::now() + timeout;
+        let mut seen = Vec::new();
         loop {
             while let Some(upd) = handle.try_recv() {
                 if let GuiUpdate::ErrorMessage(err) = &upd {
@@ -962,10 +963,11 @@ mod tests {
                 if pred(&upd) {
                     return upd;
                 }
+                seen.push(format!("{upd:?}"));
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for expected GuiUpdate"
+                "timed out waiting for expected GuiUpdate after {timeout:?} (seen: {seen:?})"
             );
             thread::sleep(Duration::from_millis(20));
         }
