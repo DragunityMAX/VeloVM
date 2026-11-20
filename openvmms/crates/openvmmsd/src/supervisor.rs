@@ -3063,10 +3063,8 @@ fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
                 }
             }
         }
-        let stdout_bytes = reader_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
         if status.is_some_and(|st| st.success())
+            && let Some(stdout_bytes) = reader_handle.and_then(|h| h.join().ok())
             && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout_bytes)
         {
             let arr = match val {
