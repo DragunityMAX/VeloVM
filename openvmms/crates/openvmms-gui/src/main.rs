@@ -3,15 +3,19 @@ mod dialogs;
 
 use clap::Parser;
 use controller::BackendHandle;
+use controller::DialogKind;
 use controller::GuiRequest;
 use controller::GuiUpdate;
+use dialogs::ConfirmActionDialog;
 use dialogs::DeleteVmDialog;
 use dialogs::DiskManagerDialog;
 use dialogs::FilePickerModal;
 use dialogs::FilePickerTarget;
 use dialogs::HostSettingsDialog;
 use dialogs::NewVmWizard;
+use dialogs::PendingConfirmAction;
 use dialogs::VmSettingsDialog;
+use dialogs::render_confirm_action_dialog;
 use dialogs::render_delete_vm_dialog;
 use dialogs::render_disk_manager_dialog;
 use dialogs::render_file_picker;
@@ -75,6 +79,7 @@ struct OpenVmmsApp {
     data_dir: PathBuf,
     backend: BackendHandle,
     connected: bool,
+    host_config_loaded: bool,
     connection_status: String,
     host_info: Option<HostInfo>,
     host_config: HostConfig,
@@ -102,6 +107,7 @@ struct OpenVmmsApp {
     disk_mgr_dlg: Option<DiskManagerDialog>,
     host_settings_dlg: Option<HostSettingsDialog>,
     delete_vm_dlg: Option<DeleteVmDialog>,
+    confirm_action_dlg: Option<ConfirmActionDialog>,
     file_picker: Option<FilePickerModal>,
 }
 
@@ -115,6 +121,7 @@ impl OpenVmmsApp {
             data_dir,
             backend,
             connected: false,
+            host_config_loaded: false,
             connection_status: "Connecting to openvmmsd…".to_string(),
             host_info: None,
             host_config: HostConfig::default(),
@@ -138,6 +145,7 @@ impl OpenVmmsApp {
             disk_mgr_dlg: None,
             host_settings_dlg: None,
             delete_vm_dlg: None,
+            confirm_action_dlg: None,
             file_picker: None,
         }
     }
@@ -153,6 +161,7 @@ impl OpenVmmsApp {
                     vms,
                 } => {
                     self.connected = true;
+                    self.host_config_loaded = true;
                     self.connection_status = format!("Connected ({base_url})");
                     self.host_info = Some(host_info);
                     self.host_config = host_config;
@@ -174,6 +183,7 @@ impl OpenVmmsApp {
                     if let Some(dlg) = self.vm_settings_dlg.as_mut()
                         && dlg.vm_id == id
                     {
+                        dlg.base_fastdesk = vm.config.fastdesk.clone();
                         dlg.nics = vm.config.nics.clone();
                         dlg.is_offline = matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error);
                     }
@@ -211,10 +221,53 @@ impl OpenVmmsApp {
                     let base_url =
                         openvmms_core::api_client::normalize_base_url(&host_config.listen_addr);
                     self.connected = true;
+                    self.host_config_loaded = true;
                     self.connection_status = format!("Connected ({base_url})");
                     self.host_info = Some(host_info);
                     self.host_config = host_config;
                 }
+                GuiUpdate::DialogFinished { kind, error } => match (kind, error) {
+                    (DialogKind::NewVmWizard, None) => self.new_vm_wizard = None,
+                    (DialogKind::NewVmWizard, Some(err)) => {
+                        if let Some(w) = self.new_vm_wizard.as_mut() {
+                            w.submitting = false;
+                            w.error = Some(err);
+                        }
+                    }
+                    (DialogKind::VmSettings(id), None) => {
+                        if self.vm_settings_dlg.as_ref().is_some_and(|d| d.vm_id == id) {
+                            self.vm_settings_dlg = None;
+                        }
+                    }
+                    (DialogKind::VmSettings(id), Some(err)) => {
+                        if let Some(d) = self.vm_settings_dlg.as_mut()
+                            && d.vm_id == id
+                        {
+                            d.submitting = false;
+                            d.error = Some(err);
+                        }
+                    }
+                    (DialogKind::HostSettings, None) => self.host_settings_dlg = None,
+                    (DialogKind::HostSettings, Some(err)) => {
+                        if let Some(d) = self.host_settings_dlg.as_mut() {
+                            d.submitting = false;
+                            d.error = Some(err);
+                        }
+                    }
+                    (DialogKind::DeleteVm(id), None) => {
+                        if self.delete_vm_dlg.as_ref().is_some_and(|d| d.vm_id == id) {
+                            self.delete_vm_dlg = None;
+                        }
+                    }
+                    (DialogKind::DeleteVm(id), Some(err)) => {
+                        if let Some(d) = self.delete_vm_dlg.as_mut()
+                            && d.vm_id == id
+                        {
+                            d.submitting = false;
+                            d.error = Some(err);
+                        }
+                    }
+                },
                 GuiUpdate::StatusMessage(msg) => {
                     self.status_line = msg;
                     self.error_banner = None;
@@ -338,7 +391,12 @@ impl eframe::App for OpenVmmsApp {
                 if ui.button("💾 Virtual Disk Manager…").clicked() {
                     self.disk_mgr_dlg = Some(DiskManagerDialog::new(&self.data_dir));
                 }
-                if ui.button("⚙ Host Settings…").clicked() {
+                let can_edit_host = self.connected && self.host_config_loaded;
+                if ui
+                    .add_enabled(can_edit_host, egui::Button::new("⚙ Host Settings…"))
+                    .on_disabled_hover_text("Connect to openvmmsd before editing host settings")
+                    .clicked()
+                {
                     self.host_settings_dlg =
                         Some(HostSettingsDialog::from_config(&self.host_config));
                 }
@@ -439,7 +497,12 @@ impl eframe::App for OpenVmmsApp {
                 if ui.button("Virtual Hard Disk Manager…").clicked() {
                     self.disk_mgr_dlg = Some(DiskManagerDialog::new(&self.data_dir));
                 }
-                if ui.button("Host Settings…").clicked() {
+                let can_edit_host = self.connected && self.host_config_loaded;
+                if ui
+                    .add_enabled(can_edit_host, egui::Button::new("Host Settings…"))
+                    .on_disabled_hover_text("Connect to openvmmsd before editing host settings")
+                    .clicked()
+                {
                     self.host_settings_dlg =
                         Some(HostSettingsDialog::from_config(&self.host_config));
                 }
@@ -485,7 +548,12 @@ impl eframe::App for OpenVmmsApp {
                         .add_enabled(can_turn_off, egui::Button::new("⏹ Turn Off"))
                         .clicked()
                     {
-                        self.backend.send(GuiRequest::StopVm { id });
+                        self.confirm_action_dlg = Some(ConfirmActionDialog {
+                            action: PendingConfirmAction::TurnOff {
+                                id,
+                                vm_name: vm.config.name.clone(),
+                            },
+                        });
                     }
                     if is_paused {
                         if ui.button("▶ Resume").clicked() {
@@ -501,7 +569,12 @@ impl eframe::App for OpenVmmsApp {
                         .add_enabled(is_active, egui::Button::new("↻ Reset"))
                         .clicked()
                     {
-                        self.backend.send(GuiRequest::ResetVm { id });
+                        self.confirm_action_dlg = Some(ConfirmActionDialog {
+                            action: PendingConfirmAction::Reset {
+                                id,
+                                vm_name: vm.config.name.clone(),
+                            },
+                        });
                     }
                     ui.separator();
                     if ui.button("⚙ Settings…").clicked() {
@@ -519,6 +592,8 @@ impl eframe::App for OpenVmmsApp {
                             vm_id: id,
                             vm_name: vm.config.name.clone(),
                             delete_disks: false,
+                            submitting: false,
+                            error: None,
                         });
                     }
                 } else {
@@ -702,6 +777,7 @@ impl eframe::App for OpenVmmsApp {
             &mut self.file_picker,
         );
         render_delete_vm_dialog(ctx, &mut self.delete_vm_dlg, &self.backend);
+        render_confirm_action_dialog(ctx, &mut self.confirm_action_dlg, &self.backend);
         if let Some((target, path)) = render_file_picker(ctx, &mut self.file_picker) {
             self.apply_picked_file(target, path);
         }
@@ -803,7 +879,15 @@ impl OpenVmmsApp {
                             });
                         }
                     } else if ui.small_button("Detach").clicked() {
-                        self.backend.send(GuiRequest::DetachDisk { id, lun: d.lun });
+                        self.confirm_action_dlg = Some(ConfirmActionDialog {
+                            action: PendingConfirmAction::DetachDisk {
+                                id,
+                                vm_name: vm.config.name.clone(),
+                                lun: d.lun,
+                                path: d.path.clone(),
+                                vm_active: !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error),
+                            },
+                        });
                     }
                     ui.end_row();
                 }

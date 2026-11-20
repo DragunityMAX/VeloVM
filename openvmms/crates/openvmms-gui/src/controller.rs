@@ -63,6 +63,14 @@ pub enum GuiRequest {
     SaveHostConfig(HostConfig),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKind {
+    NewVmWizard,
+    VmSettings(Uuid),
+    HostSettings,
+    DeleteVm(Uuid),
+}
+
 #[derive(Debug)]
 pub enum GuiUpdate {
     DaemonConnected {
@@ -82,6 +90,10 @@ pub enum GuiUpdate {
         host_info: HostInfo,
         host_config: HostConfig,
     },
+    DialogFinished {
+        kind: DialogKind,
+        error: Option<String>,
+    },
     StatusMessage(String),
     ErrorMessage(String),
 }
@@ -89,6 +101,23 @@ pub enum GuiUpdate {
 pub struct BackendHandle {
     req_tx: mpsc::Sender<GuiRequest>,
     upd_rx: mpsc::Receiver<GuiUpdate>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for BackendHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+fn request_dialog_kind(req: &GuiRequest) -> Option<DialogKind> {
+    match req {
+        GuiRequest::CreateVm(_) => Some(DialogKind::NewVmWizard),
+        GuiRequest::UpdateVm { id, .. } => Some(DialogKind::VmSettings(*id)),
+        GuiRequest::SaveHostConfig(_) => Some(DialogKind::HostSettings),
+        GuiRequest::DeleteVm { id, .. } => Some(DialogKind::DeleteVm(*id)),
+        _ => None,
+    }
 }
 
 impl BackendHandle {
@@ -99,6 +128,8 @@ impl BackendHandle {
     ) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<GuiRequest>();
         let (upd_tx, upd_rx) = mpsc::channel::<GuiUpdate>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_worker = Arc::clone(&shutdown);
 
         thread::spawn(move || {
             let mut client: Option<ApiClient> = None;
@@ -110,30 +141,33 @@ impl BackendHandle {
                 repaint_ctx.request_repaint();
             };
 
+            let ensure_sse = |shared: &SharedEndpoint| {
+                if sse_active
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    spawn_sse_listener(
+                        data_dir.clone(),
+                        daemon_url.clone(),
+                        Arc::clone(shared),
+                        upd_tx.clone(),
+                        repaint_ctx.clone(),
+                        Arc::clone(&sse_active),
+                        Arc::clone(&shutdown_worker),
+                    );
+                }
+            };
+
             while let Ok(req) = req_rx.recv() {
+                if shutdown_worker.load(Ordering::Acquire) {
+                    break;
+                }
                 match req {
                     GuiRequest::ConnectOrStartDaemon => {
                         match ensure_daemon_running(data_dir.as_deref(), daemon_url.as_deref()) {
                             Ok(c) => {
                                 set_shared_endpoint(&shared_endpoint, &c);
-                                if sse_active
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        Ordering::SeqCst,
-                                        Ordering::SeqCst,
-                                    )
-                                    .is_ok()
-                                {
-                                    spawn_sse_listener(
-                                        data_dir.clone(),
-                                        daemon_url.clone(),
-                                        Arc::clone(&shared_endpoint),
-                                        upd_tx.clone(),
-                                        repaint_ctx.clone(),
-                                        Arc::clone(&sse_active),
-                                    );
-                                }
+                                ensure_sse(&shared_endpoint);
                                 match fetch_full_snapshot(&c) {
                                     Ok((host_info, host_config, switches, vms)) => {
                                         let base_url = c.base_url().to_string();
@@ -157,50 +191,119 @@ impl BackendHandle {
                         }
                     }
                     other => {
+                        let dialog_kind = request_dialog_kind(&other);
+                        if client.is_none()
+                            && let Some(reloaded) = reload_client_from_data_dir(
+                                data_dir.as_deref(),
+                                daemon_url.as_deref(),
+                                &shared_endpoint,
+                            )
+                        {
+                            set_shared_endpoint(&shared_endpoint, &reloaded);
+                            ensure_sse(&shared_endpoint);
+                            if !matches!(other, GuiRequest::RefreshAll)
+                                && let Ok((host_info, host_config, switches, vms)) =
+                                    fetch_full_snapshot(&reloaded)
+                            {
+                                emit(GuiUpdate::DaemonConnected {
+                                    base_url: reloaded.base_url().to_string(),
+                                    host_info,
+                                    host_config,
+                                    switches,
+                                    vms,
+                                });
+                            }
+                            client = Some(reloaded);
+                        }
+
                         let Some(c) = client.as_mut() else {
-                            emit(GuiUpdate::ErrorMessage(
-                                "Not connected to openvmmsd".to_string(),
-                            ));
+                            let err_msg = "Not connected to openvmmsd".to_string();
+                            emit(GuiUpdate::ErrorMessage(err_msg.clone()));
+                            if let Some(kind) = dialog_kind {
+                                emit(GuiUpdate::DialogFinished {
+                                    kind,
+                                    error: Some(err_msg),
+                                });
+                            }
                             continue;
                         };
+                        ensure_sse(&shared_endpoint);
                         sync_client_before_request(
                             c,
                             data_dir.as_deref(),
                             daemon_url.as_deref(),
                             &shared_endpoint,
                         );
-                        if let Err(err) = handle_client_request(
+                        match handle_client_request(
                             c,
                             data_dir.as_deref(),
                             other.clone(),
                             &shared_endpoint,
                             &emit,
-                        )
-                        {
-                            if let Some(reloaded) = reload_client_from_data_dir(
-                                data_dir.as_deref(),
-                                daemon_url.as_deref(),
-                                &shared_endpoint,
-                            ) && (reloaded.base_url() != c.base_url()
-                                || reloaded.token() != c.token())
-                            {
-                                *c = reloaded;
-                                if let Err(retry_err) = handle_client_request(
-                                    c,
-                                    data_dir.as_deref(),
-                                    other,
-                                    &shared_endpoint,
-                                    &emit,
-                                ) {
-                                    emit(GuiUpdate::ErrorMessage(format!("{retry_err:#}")));
+                        ) {
+                            Ok(()) => {
+                                if let Some(kind) = dialog_kind {
+                                    emit(GuiUpdate::DialogFinished { kind, error: None });
                                 }
-                            } else if c.health().is_err() {
-                                client = None;
-                                emit(GuiUpdate::DaemonDisconnected(format!(
-                                    "Lost connection to openvmmsd: {err:#}"
-                                )));
-                            } else {
-                                emit(GuiUpdate::ErrorMessage(format!("{err:#}")));
+                            }
+                            Err(err) => {
+                                let reloaded = reload_client_from_data_dir(
+                                    data_dir.as_deref(),
+                                    daemon_url.as_deref(),
+                                    &shared_endpoint,
+                                );
+                                if let Some(reloaded) = reloaded
+                                    && (reloaded.base_url() != c.base_url()
+                                        || reloaded.token() != c.token())
+                                {
+                                    *c = reloaded;
+                                    ensure_sse(&shared_endpoint);
+                                    match handle_client_request(
+                                        c,
+                                        data_dir.as_deref(),
+                                        other,
+                                        &shared_endpoint,
+                                        &emit,
+                                    ) {
+                                        Ok(()) => {
+                                            if let Some(kind) = dialog_kind {
+                                                emit(GuiUpdate::DialogFinished {
+                                                    kind,
+                                                    error: None,
+                                                });
+                                            }
+                                        }
+                                        Err(retry_err) => {
+                                            let err_msg = format!("{retry_err:#}");
+                                            emit(GuiUpdate::ErrorMessage(err_msg.clone()));
+                                            if let Some(kind) = dialog_kind {
+                                                emit(GuiUpdate::DialogFinished {
+                                                    kind,
+                                                    error: Some(err_msg),
+                                                });
+                                            }
+                                        }
+                                    }
+                                } else if c.health().is_err() {
+                                    client = None;
+                                    let err_msg = format!("Lost connection to openvmmsd: {err:#}");
+                                    emit(GuiUpdate::DaemonDisconnected(err_msg.clone()));
+                                    if let Some(kind) = dialog_kind {
+                                        emit(GuiUpdate::DialogFinished {
+                                            kind,
+                                            error: Some(err_msg),
+                                        });
+                                    }
+                                } else {
+                                    let err_msg = format!("{err:#}");
+                                    emit(GuiUpdate::ErrorMessage(err_msg.clone()));
+                                    if let Some(kind) = dialog_kind {
+                                        emit(GuiUpdate::DialogFinished {
+                                            kind,
+                                            error: Some(err_msg),
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -208,7 +311,11 @@ impl BackendHandle {
             }
         });
 
-        Self { req_tx, upd_rx }
+        Self {
+            req_tx,
+            upd_rx,
+            shutdown,
+        }
     }
 
     pub fn send(&self, req: GuiRequest) {
@@ -540,6 +647,7 @@ fn spawn_sse_listener(
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
     sse_active: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let http = match reqwest::blocking::Client::builder().timeout(None).build() {
@@ -549,9 +657,8 @@ fn spawn_sse_listener(
                 return;
             }
         };
-        let mut stopping = false;
         let mut was_connected = true;
-        while !stopping {
+        while !shutdown.load(Ordering::Acquire) {
             let endpoint = shared_endpoint.read().unwrap().clone().or_else(|| {
                 reload_client_from_data_dir(
                     data_dir.as_deref(),
@@ -560,25 +667,40 @@ fn spawn_sse_listener(
                 )
                 .map(|c| (c.base_url().to_string(), c.token().to_string()))
             });
-            let Some((base_url, token)) = endpoint else {
-                thread::sleep(Duration::from_secs(1));
+            let Some((mut base_url, mut token)) = endpoint else {
+                thread::sleep(Duration::from_millis(500));
                 continue;
             };
-            // Verify health authentication challenge before transmitting token on the SSE URL.
+            // Verify health authentication challenge before transmitting token on the SSE request.
             if !ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok()) {
-                if was_connected {
-                    was_connected = false;
-                    let _ = upd_tx.send(GuiUpdate::DaemonDisconnected(
-                        "Lost connection or failed daemon verification".to_string(),
-                    ));
-                    repaint_ctx.request_repaint();
+                if let Some(reloaded) = reload_client_from_data_dir(
+                    data_dir.as_deref(),
+                    daemon_url.as_deref(),
+                    &shared_endpoint,
+                ) {
+                    base_url = reloaded.base_url().to_string();
+                    token = reloaded.token().to_string();
+                } else {
+                    if was_connected {
+                        was_connected = false;
+                        if upd_tx
+                            .send(GuiUpdate::DaemonDisconnected(
+                                "Lost connection or failed daemon verification".to_string(),
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        repaint_ctx.request_repaint();
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
                 }
-                thread::sleep(Duration::from_secs(2));
-                continue;
             }
-            let url = format!("{base_url}/api/v1/events?token={token}");
+            let url = format!("{base_url}/api/v1/events");
             let mut switched_endpoint = false;
-            match http.get(&url).send() {
+            let mut saw_daemon_stopping = false;
+            match http.get(&url).bearer_auth(&token).send() {
                 Ok(resp) if resp.status().is_success() => {
                     if !was_connected {
                         was_connected = true;
@@ -586,28 +708,40 @@ fn spawn_sse_listener(
                             && let Ok((host_info, host_config, switches, vms)) =
                                 fetch_full_snapshot(&c)
                         {
-                            let _ = upd_tx.send(GuiUpdate::DaemonConnected {
-                                base_url: base_url.clone(),
-                                host_info,
-                                host_config,
-                                switches,
-                                vms,
-                            });
+                            if upd_tx
+                                .send(GuiUpdate::DaemonConnected {
+                                    base_url: base_url.clone(),
+                                    host_info,
+                                    host_config,
+                                    switches,
+                                    vms,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
                             repaint_ctx.request_repaint();
                         }
                     }
                     let reader = std::io::BufReader::new(resp);
                     for line in reader.lines().map_while(Result::ok) {
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
                         if let Some(json_str) = line.strip_prefix("data: ")
                             && let Ok(event) = serde_json::from_str::<DaemonEvent>(json_str)
                         {
                             match event {
                                 DaemonEvent::VmUpdated { vm } => {
-                                    let _ = upd_tx.send(GuiUpdate::VmUpdated(vm));
+                                    if upd_tx.send(GuiUpdate::VmUpdated(vm)).is_err() {
+                                        break;
+                                    }
                                     repaint_ctx.request_repaint();
                                 }
                                 DaemonEvent::VmDeleted { id } => {
-                                    let _ = upd_tx.send(GuiUpdate::VmDeleted(id));
+                                    if upd_tx.send(GuiUpdate::VmDeleted(id)).is_err() {
+                                        break;
+                                    }
                                     repaint_ctx.request_repaint();
                                 }
                                 DaemonEvent::HostConfigUpdated => {
@@ -621,13 +755,18 @@ fn spawn_sse_listener(
                                         fetch_full_snapshot(&c)
                                     {
                                         let new_base = c.base_url().to_string();
-                                        let _ = upd_tx.send(GuiUpdate::DaemonConnected {
-                                            base_url: new_base.clone(),
-                                            host_info,
-                                            host_config,
-                                            switches,
-                                            vms,
-                                        });
+                                        if upd_tx
+                                            .send(GuiUpdate::DaemonConnected {
+                                                base_url: new_base.clone(),
+                                                host_info,
+                                                host_config,
+                                                switches,
+                                                vms,
+                                            })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                         repaint_ctx.request_repaint();
                                         if new_base != base_url {
                                             switched_endpoint = true;
@@ -636,17 +775,27 @@ fn spawn_sse_listener(
                                     }
                                 }
                                 DaemonEvent::DaemonStopping => {
-                                    let _ = upd_tx.send(GuiUpdate::DaemonDisconnected(
-                                        "Daemon stopped".to_string(),
-                                    ));
+                                    was_connected = false;
+                                    saw_daemon_stopping = true;
+                                    if upd_tx
+                                        .send(GuiUpdate::DaemonDisconnected(
+                                            "Daemon stopped".to_string(),
+                                        ))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                     repaint_ctx.request_repaint();
-                                    stopping = true;
                                     break;
                                 }
                             }
                         }
                     }
-                    if !stopping && !switched_endpoint {
+                    if !shutdown.load(Ordering::Acquire) && !switched_endpoint {
+                        if saw_daemon_stopping {
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
                         if maybe_switch_endpoint_on_disconnect(
                             &base_url,
                             data_dir.as_deref(),
@@ -655,18 +804,24 @@ fn spawn_sse_listener(
                             &upd_tx,
                             &repaint_ctx,
                         ) {
+                            was_connected = true;
                             continue;
                         }
                         let healthy =
                             ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
                         if !healthy && was_connected {
                             was_connected = false;
-                            let _ = upd_tx.send(GuiUpdate::DaemonDisconnected(
-                                "Lost connection to openvmmsd".to_string(),
-                            ));
+                            if upd_tx
+                                .send(GuiUpdate::DaemonDisconnected(
+                                    "Lost connection to openvmmsd".to_string(),
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                             repaint_ctx.request_repaint();
                         }
-                        thread::sleep(Duration::from_secs(1));
+                        thread::sleep(Duration::from_millis(500));
                     }
                 }
                 _ => {
@@ -678,18 +833,24 @@ fn spawn_sse_listener(
                         &upd_tx,
                         &repaint_ctx,
                     ) {
+                        was_connected = true;
                         continue;
                     }
                     let healthy =
                         ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
                     if !healthy && was_connected {
                         was_connected = false;
-                        let _ = upd_tx.send(GuiUpdate::DaemonDisconnected(
-                            "Lost connection to openvmmsd".to_string(),
-                        ));
+                        if upd_tx
+                            .send(GuiUpdate::DaemonDisconnected(
+                                "Lost connection to openvmmsd".to_string(),
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
                         repaint_ctx.request_repaint();
                     }
-                    thread::sleep(Duration::from_secs(2));
+                    thread::sleep(Duration::from_millis(500));
                 }
             }
         }
@@ -954,6 +1115,143 @@ mod tests {
             }
             _ => unreachable!(),
         }
+
+        rt.block_on(daemon.shutdown());
+    }
+
+    #[test]
+    fn backend_handle_recovers_requests_and_sse_after_external_daemon_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let daemon1 = rt
+            .block_on(openvmmsd::TestDaemonHandle::spawn(dir.path().to_path_buf()))
+            .unwrap();
+        let url1 = daemon1.base_url.clone();
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        }) {
+            GuiUpdate::DaemonConnected { base_url, .. } => assert_eq!(base_url, url1),
+            _ => unreachable!(),
+        }
+
+        // Daemon stops; GUI must report DaemonDisconnected and wait for restart.
+        rt.block_on(daemon1.shutdown());
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonDisconnected(_))
+        }) {
+            GuiUpdate::DaemonDisconnected(_) => {}
+            _ => unreachable!(),
+        }
+
+        // External daemon starts on the same data_dir with a fresh ephemeral port.
+        let daemon2 = rt
+            .block_on(openvmmsd::TestDaemonHandle::spawn(dir.path().to_path_buf()))
+            .unwrap();
+        let url2 = daemon2.base_url.clone();
+        assert_ne!(url2, url1);
+
+        match recv_until(&backend, Duration::from_secs(6), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { base_url, .. } if base_url == &url2
+            )
+        }) {
+            GuiUpdate::DaemonConnected { base_url, .. } => assert_eq!(base_url, url2),
+            _ => unreachable!(),
+        }
+
+        // Requests sent through BackendHandle after external restart must succeed (never "Not connected").
+        backend.send(GuiRequest::CreateVm(CreateVmPayload {
+            name: "Gui-After-Restart".into(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(512),
+            ..Default::default()
+        }));
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DialogFinished {
+                    kind: DialogKind::NewVmWizard,
+                    error: None
+                }
+            )
+        }) {
+            GuiUpdate::DialogFinished { error, .. } => assert!(error.is_none()),
+            _ => unreachable!(),
+        }
+
+        // External mutations on daemon2 must also stream over the revived SSE connection.
+        let ext2 = ApiClient::new(&url2, &daemon2.token).unwrap();
+        let ext_vm = ext2
+            .create_vm(&CreateVmPayload {
+                name: "External-After-Restart".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            })
+            .unwrap();
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::VmUpdated(vm) if vm.config.id == ext_vm.config.id)
+        }) {
+            GuiUpdate::VmUpdated(vm) => assert_eq!(vm.config.name, "External-After-Restart"),
+            _ => unreachable!(),
+        }
+
+        rt.block_on(daemon2.shutdown());
+    }
+
+    #[test]
+    fn rejected_create_vm_emits_dialog_finished_with_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let daemon = rt
+            .block_on(openvmmsd::TestDaemonHandle::spawn(dir.path().to_path_buf()))
+            .unwrap();
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        });
+
+        backend.send(GuiRequest::CreateVm(CreateVmPayload {
+            name: "Invalid-Vcpu-VM".into(),
+            preset: VmPreset::Custom,
+            vcpus: Some(0),
+            memory_mb: Some(512),
+            ..Default::default()
+        }));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_dialog_err = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(upd) = backend.try_recv()
+                && let GuiUpdate::DialogFinished {
+                    kind: DialogKind::NewVmWizard,
+                    error: Some(err),
+                } = upd
+            {
+                assert!(err.contains("vcpus"), "{err}");
+                saw_dialog_err = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_dialog_err, "expected DialogFinished with error");
 
         rt.block_on(daemon.shutdown());
     }

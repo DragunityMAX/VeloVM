@@ -33,8 +33,11 @@ use openvmms_core::store::RegistryStore;
 use openvmms_core::ttrpc::TtrpcClient;
 use openvmms_core::vmservice;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
-use std::io::BufRead;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
@@ -43,12 +46,43 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiErrorKind {
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("{0}")]
+    Internal(String),
+}
+
+pub(crate) fn err_not_found(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ApiErrorKind::NotFound(msg.into()))
+}
+
+pub(crate) fn err_conflict(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ApiErrorKind::Conflict(msg.into()))
+}
+
+pub(crate) fn err_bad_request(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ApiErrorKind::BadRequest(msg.into()))
+}
+
+#[allow(dead_code)]
+pub(crate) fn err_internal(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ApiErrorKind::Internal(msg.into()))
+}
 
 struct ManagedVm {
     config: VmConfig,
@@ -91,16 +125,15 @@ impl ManagedVm {
 
     fn active_rpc_socket(&self, action: &str) -> anyhow::Result<Option<PathBuf>> {
         match self.runtime.status {
-            VmStatus::Starting | VmStatus::Stopping => bail!(
+            VmStatus::Starting | VmStatus::Stopping => Err(err_conflict(format!(
                 "cannot {action} while VM '{}' is {}",
-                self.config.name,
-                self.runtime.status
-            ),
+                self.config.name, self.runtime.status
+            ))),
             VmStatus::Running | VmStatus::Paused => Ok(Some(
                 self.runtime
                     .rpc_socket_path
                     .clone()
-                    .context("VM is active but has no RPC socket")?,
+                    .ok_or_else(|| err_internal("VM is active but has no RPC socket"))?,
             )),
             VmStatus::Off | VmStatus::Error => Ok(None),
         }
@@ -111,6 +144,7 @@ pub struct Supervisor {
     store: RegistryStore,
     _daemon_lock: fs::File,
     auth_token: String,
+    initial_listen_addr: String,
     host_config: RwLock<HostConfig>,
     host_config_lock: tokio::sync::Mutex<()>,
     active_listener: std::sync::Mutex<Option<ActiveListener>>,
@@ -118,16 +152,17 @@ pub struct Supervisor {
     vms: RwLock<HashMap<Uuid, ManagedVm>>,
     events_tx: broadcast::Sender<DaemonEvent>,
     shutdown_watch: watch::Sender<bool>,
+    stop_vms_on_shutdown: AtomicBool,
 }
 
 impl Supervisor {
     pub fn new(data_dir: &Path, listen_override: Option<&str>) -> anyhow::Result<Arc<Self>> {
         let store = RegistryStore::new(data_dir)?;
         let daemon_lock = store.try_acquire_daemon_lock()?;
-        let mut host_config = store.load_or_init_host_config()?;
-        if let Some(listen) = listen_override {
-            host_config.listen_addr = listen.to_string();
-        }
+        let host_config = store.load_or_init_host_config()?;
+        let initial_listen_addr = listen_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| host_config.listen_addr.clone());
         let auth_token = store.load_or_create_token()?;
         let loaded_vms = store.load_all_vms()?;
 
@@ -190,11 +225,17 @@ impl Supervisor {
                         } else {
                             runtime.status = VmStatus::Running;
                             runtime.pid = saved_pid;
-                            runtime.rpc_socket_path = Some(sock_path);
+                            runtime.rpc_socket_path = Some(sock_path.clone());
                             runtime.shm_path = shm_candidate
                                 .exists()
                                 .then(|| shm_candidate.to_string_lossy().into_owned());
                             generation = 1;
+                            adopted_vms.push((cfg.id, sock_path));
+                            warn!(
+                                vm_id = %cfg.id,
+                                name = %cfg.name,
+                                "re-adopted running OpenVMM VM (properties probe failed; monitor will refresh)"
+                            );
                         }
                     }
                 }
@@ -220,6 +261,7 @@ impl Supervisor {
             store,
             _daemon_lock: daemon_lock,
             auth_token,
+            initial_listen_addr,
             host_config: RwLock::new(host_config),
             host_config_lock: tokio::sync::Mutex::new(()),
             active_listener: std::sync::Mutex::new(None),
@@ -227,6 +269,7 @@ impl Supervisor {
             vms: RwLock::new(vm_map),
             events_tx,
             shutdown_watch,
+            stop_vms_on_shutdown: AtomicBool::new(false),
         });
 
         if !adopted_vms.is_empty()
@@ -253,7 +296,10 @@ impl Supervisor {
     }
 
     pub fn listen_addr(&self) -> String {
-        self.host_config.read().unwrap().listen_addr.clone()
+        if let Some(active) = self.active_listener.lock().unwrap().as_ref() {
+            return active.addr.to_string();
+        }
+        self.initial_listen_addr.clone()
     }
 
     pub fn host_config(&self) -> HostConfig {
@@ -279,7 +325,22 @@ impl Supervisor {
     }
 
     pub fn request_shutdown(&self) {
+        self.request_shutdown_with_options(false);
+    }
+
+    pub fn request_shutdown_with_options(&self, stop_vms: bool) {
+        if stop_vms {
+            self.stop_vms_on_shutdown.store(true, Ordering::SeqCst);
+        }
         self.mark_shutting_down();
+    }
+
+    pub fn should_stop_vms_on_shutdown(&self) -> bool {
+        self.stop_vms_on_shutdown.load(Ordering::SeqCst)
+    }
+
+    pub fn clear_runtime_listen_addr(&self) {
+        self.store.clear_runtime_listen_addr();
     }
 
     pub async fn wait_for_shutdown_signal(&self) {
@@ -311,7 +372,7 @@ impl Supervisor {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             data_dir: cfg.data_dir,
             runtime_dir: cfg.runtime_dir,
-            listen_addr: cfg.listen_addr,
+            listen_addr: self.listen_addr(),
             resolved_paths,
         }
     }
@@ -347,6 +408,7 @@ impl Supervisor {
             stop_tx,
             handle,
         });
+        let _ = self.store.write_runtime_listen_addr(&bound_addr.to_string());
         if let Some(mut old) = previous {
             let _ = old.stop_tx.send(true);
             let drain = tokio::spawn(async move {
@@ -384,11 +446,30 @@ impl Supervisor {
         mut new_cfg: HostConfig,
     ) -> anyhow::Result<HostConfig> {
         let _lock = self.host_config_lock.lock().await;
+        let current_cfg = self.host_config();
         if new_cfg.data_dir.as_os_str().is_empty() {
             new_cfg.data_dir = self.store.data_dir().to_path_buf();
         }
         if new_cfg.runtime_dir.as_os_str().is_empty() {
             new_cfg.runtime_dir = openvmms_core::models::default_runtime_dir(&new_cfg.data_dir);
+        }
+        if new_cfg.data_dir != current_cfg.data_dir {
+            return Err(err_bad_request(
+                "cannot change data_dir over the API; restart openvmmsd with --data-dir instead",
+            ));
+        }
+        if new_cfg.runtime_dir != current_cfg.runtime_dir {
+            let has_active_vms = self
+                .vms
+                .read()
+                .unwrap()
+                .values()
+                .any(|vm| !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error));
+            if has_active_vms {
+                return Err(err_conflict(
+                    "cannot change runtime_dir while VMs are active; stop all running VMs first",
+                ));
+            }
         }
 
         let trimmed_addr = new_cfg
@@ -399,24 +480,30 @@ impl Supervisor {
             .trim_end_matches('/');
         let target_addr: SocketAddr = trimmed_addr
             .parse()
-            .with_context(|| format!("invalid listen address '{}'", new_cfg.listen_addr))?;
+            .map_err(|e| err_bad_request(format!("invalid listen address '{}': {e}", new_cfg.listen_addr)))?;
+        if !target_addr.ip().is_loopback() {
+            return Err(err_bad_request(format!(
+                "listen_addr '{}' must be a loopback address (e.g. 127.0.0.1:47620 or [::1]:47620)",
+                new_cfg.listen_addr
+            )));
+        }
 
-        let current_addr = self
+        let configured_addr = target_addr.to_string();
+        let listen_changed = configured_addr != current_cfg.listen_addr || target_addr.port() == 0;
+        let active_addr = self
             .active_listener
             .lock()
             .unwrap()
             .as_ref()
             .map(|l| l.addr);
-        if let Some(prev_addr) = current_addr
-            && prev_addr != target_addr
-        {
+        if listen_changed && active_addr.is_some() && active_addr != Some(target_addr) {
             let listener = tokio::net::TcpListener::bind(target_addr)
                 .await
                 .with_context(|| format!("binding openvmmsd HTTP server on {target_addr}"))?;
             let bound_addr = self.serve_on_listener(listener)?;
             new_cfg.listen_addr = bound_addr.to_string();
         } else {
-            new_cfg.listen_addr = target_addr.to_string();
+            new_cfg.listen_addr = configured_addr;
         }
 
         self.store.save_host_config(&new_cfg)?;
@@ -458,11 +545,13 @@ impl Supervisor {
             .map(|m| m.config.id);
         if let Some(first) = matches.next() {
             if matches.next().is_some() {
-                bail!("multiple VMs share name '{id_or_name}'; specify UUID");
+                return Err(err_conflict(format!(
+                    "multiple VMs share name '{id_or_name}'; specify UUID"
+                )));
             }
             return Ok(first);
         }
-        bail!("VM not found: {id_or_name}");
+        Err(err_not_found(format!("VM not found: {id_or_name}")))
     }
 
     pub fn list_vms(&self) -> Vec<VmSummary> {
@@ -537,7 +626,7 @@ impl Supervisor {
     pub fn create_vm(&self, payload: CreateVmPayload) -> anyhow::Result<VmSummary> {
         let trimmed_name = payload.name.trim().to_string();
         if trimmed_name.is_empty() {
-            bail!("VM name cannot be empty");
+            return Err(err_bad_request("VM name cannot be empty"));
         }
 
         {
@@ -546,7 +635,9 @@ impl Supervisor {
                 .values()
                 .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
             {
-                bail!("a VM named '{trimmed_name}' already exists");
+                return Err(err_conflict(format!(
+                    "a VM named '{trimmed_name}' already exists"
+                )));
             }
         }
 
@@ -588,13 +679,20 @@ impl Supervisor {
         if let Some(iso_path) = &payload.iso_path
             && !iso_path.is_file()
         {
-            bail!("ISO image not found: {}", iso_path.display());
+            return Err(err_bad_request(format!(
+                "ISO image not found: {}",
+                iso_path.display()
+            )));
         }
 
         let paths = self.resolved_paths();
 
         for mut disk_att in payload.disks {
-            if disk_att.kind == DiskKind::Dvd {
+            if disk_att.kind == DiskKind::Dvd
+                || disk_att.format == DiskFormat::Iso
+                || DiskFormat::from_path(&disk_att.path) == DiskFormat::Iso
+            {
+                disk_att.kind = DiskKind::Dvd;
                 disk_att.read_only = true;
                 disk_att.format = DiskFormat::Iso;
             }
@@ -640,10 +738,11 @@ impl Supervisor {
             });
         }
 
-        cfg.validate()?;
+        cfg.validate().map_err(|e| err_bad_request(format!("{e:#}")))?;
 
         let created_disk_path = if let Some(disk_req) = pending_disk_req {
-            let info = disk::create_disk(&disk_req, paths.openvmm_img_bin.as_deref())?;
+            let info = disk::create_disk(&disk_req, paths.openvmm_img_bin.as_deref())
+                .map_err(|e| err_bad_request(format!("{e:#}")))?;
             Some(info.path)
         } else {
             None
@@ -655,7 +754,9 @@ impl Supervisor {
                 .values()
                 .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
             {
-                bail!("a VM named '{trimmed_name}' already exists");
+                return Err(err_conflict(format!(
+                    "a VM named '{trimmed_name}' already exists"
+                )));
             }
             self.store.save_vm(&cfg)?;
 
@@ -708,23 +809,26 @@ impl Supervisor {
         if let Some(new_name) = &payload.name {
             let trimmed = new_name.trim();
             if trimmed.is_empty() {
-                bail!("VM name cannot be empty");
+                return Err(err_bad_request("VM name cannot be empty"));
             }
             if guard
                 .values()
                 .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(trimmed))
             {
-                bail!("another VM is already named '{trimmed}'");
+                return Err(err_conflict(format!(
+                    "another VM is already named '{trimmed}'"
+                )));
             }
         }
 
-        let vm = guard.get_mut(&id).context("VM not found")?;
+        let vm = guard
+            .get_mut(&id)
+            .ok_or_else(|| err_not_found("VM not found"))?;
         if hardware_change && !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
-            bail!(
+            return Err(err_conflict(format!(
                 "cannot edit hardware configuration while VM '{}' is {}",
-                vm.config.name,
-                vm.runtime.status
-            );
+                vm.config.name, vm.runtime.status
+            )));
         }
 
         let mut updated = vm.config.clone();
@@ -766,7 +870,9 @@ impl Supervisor {
         }
         updated.updated_at = Utc::now();
 
-        updated.validate()?;
+        updated
+            .validate()
+            .map_err(|e| err_bad_request(format!("{e:#}")))?;
         self.store.save_vm(&updated)?;
         vm.config = updated;
         let summary = vm.summary();
@@ -782,22 +888,39 @@ impl Supervisor {
         let id = self.resolve_vm_id(id_or_name)?;
         let disks_to_delete = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get(&id).context("VM not found")?;
+            let vm = guard
+                .get(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             if !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
-                bail!(
+                return Err(err_conflict(format!(
                     "cannot delete VM '{}' while status is {}; stop it first",
-                    vm.config.name,
-                    vm.runtime.status
-                );
+                    vm.config.name, vm.runtime.status
+                )));
             }
             let vm = guard.remove(&id).unwrap();
             if delete_disks {
-                vm.config
-                    .disks
-                    .iter()
-                    .filter(|d| d.kind == DiskKind::HardDisk && !d.read_only)
-                    .map(|d| d.path.clone())
-                    .collect::<Vec<_>>()
+                let referenced_by_others: HashSet<PathBuf> = guard
+                    .values()
+                    .flat_map(|other| other.config.disks.iter())
+                    .map(|d| normalize_path_key(&d.path))
+                    .collect();
+                let mut seen = HashSet::new();
+                let mut candidates = Vec::new();
+                for d in &vm.config.disks {
+                    if d.kind == DiskKind::HardDisk && !d.read_only {
+                        let key = normalize_path_key(&d.path);
+                        if referenced_by_others.contains(&key) {
+                            warn!(
+                                vm_id = %id,
+                                path = %d.path.display(),
+                                "refusing to delete disk referenced by another VM"
+                            );
+                        } else if seen.insert(key) {
+                            candidates.push(d.path.clone());
+                        }
+                    }
+                }
+                candidates
             } else {
                 Vec::new()
             }
@@ -827,13 +950,14 @@ impl Supervisor {
         let id = self.resolve_vm_id(id_or_name)?;
         let (cfg, host_cfg, paths, start_gen, mut cancel_rx) = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
+            let vm = guard
+                .get_mut(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             if !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
-                bail!(
+                return Err(err_conflict(format!(
                     "VM '{}' is already {}",
-                    vm.config.name,
-                    vm.runtime.status
-                );
+                    vm.config.name, vm.runtime.status
+                )));
             }
             vm.generation += 1;
             let start_gen = vm.generation;
@@ -920,23 +1044,33 @@ impl Supervisor {
         host_cfg: HostConfig,
         paths: ResolvedHostPaths,
     ) -> anyhow::Result<VmSummary> {
-        let openvmm_bin = paths.openvmm_bin.context(
-            "openvmm binary not found; configure openvmm_bin in Host Settings or place openvmm next to openvmmsd",
-        )?;
+        let openvmm_bin = paths.openvmm_bin.ok_or_else(|| {
+            err_bad_request(
+                "openvmm binary not found; configure openvmm_bin in Host Settings or place openvmm next to openvmmsd",
+            )
+        })?;
         let uefi_path = cfg
             .uefi_firmware
             .clone()
             .or(paths.uefi_firmware_path)
-            .context(
-                "UEFI firmware (MSVM.fd) not found; configure uefi_firmware_path in Host Settings",
-            )?;
+            .ok_or_else(|| {
+                err_bad_request(
+                    "UEFI firmware (MSVM.fd) not found; configure uefi_firmware_path in Host Settings",
+                )
+            })?;
         if !uefi_path.is_file() {
-            bail!("UEFI firmware not found at {}", uefi_path.display());
+            return Err(err_bad_request(format!(
+                "UEFI firmware not found at {}",
+                uefi_path.display()
+            )));
         }
 
         for d in &cfg.disks {
             if !d.path.is_file() {
-                bail!("attached disk/ISO not found: {}", d.path.display());
+                return Err(err_bad_request(format!(
+                    "attached disk/ISO not found: {}",
+                    d.path.display()
+                )));
             }
         }
 
@@ -1004,11 +1138,18 @@ impl Supervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
 
         let mut child = cmd
@@ -1159,12 +1300,190 @@ impl Supervisor {
         }
     }
 
+    fn is_monitor_generation_active(&self, id: Uuid, run_gen: u64) -> bool {
+        if *self.shutdown_watch.borrow() && !self.should_stop_vms_on_shutdown() {
+            return false;
+        }
+        self.vms.read().unwrap().get(&id).is_some_and(|vm| {
+            vm.generation == run_gen
+                && !matches!(
+                    vm.runtime.status,
+                    VmStatus::Stopping | VmStatus::Off | VmStatus::Error
+                )
+        })
+    }
+
+    async fn is_vm_process_alive(&self, id: Uuid, run_gen: u64) -> bool {
+        let adopted_pid = {
+            let mut guard = self.vms.write().unwrap();
+            let Some(vm) = guard.get_mut(&id) else {
+                return false;
+            };
+            if vm.generation != run_gen {
+                return false;
+            }
+            if let Some(child) = vm.child.as_mut() {
+                return matches!(child.try_wait(), Ok(None));
+            }
+            vm.runtime.pid
+        };
+        if let Some(pid) = adopted_pid {
+            return tokio::task::spawn_blocking(move || is_pid_alive(pid))
+                .await
+                .unwrap_or(false);
+        }
+        false
+    }
+
+    fn sync_status_from_properties(
+        &self,
+        id: Uuid,
+        run_gen: u64,
+        props: &vmservice::PropertiesVmResponse,
+    ) {
+        let next_status = if props.state == vmservice::VmState::Paused as i32 {
+            VmStatus::Paused
+        } else if props.state == vmservice::VmState::Running as i32 {
+            VmStatus::Running
+        } else {
+            return;
+        };
+        let next_endpoint = props
+            .fastdesk_listen_addr
+            .as_deref()
+            .map(normalize_fastdesk_endpoint);
+
+        let updated_summary = {
+            let mut guard = self.vms.write().unwrap();
+            let Some(vm) = guard.get_mut(&id) else {
+                return;
+            };
+            if vm.generation != run_gen
+                || matches!(vm.runtime.status, VmStatus::Stopping | VmStatus::Off | VmStatus::Error)
+            {
+                return;
+            }
+            let mut changed = false;
+            if vm.runtime.status != next_status {
+                vm.runtime.status = next_status;
+                changed = true;
+            }
+            if vm.runtime.fastdesk_endpoint.is_none() && next_endpoint.is_some() {
+                vm.runtime.fastdesk_endpoint = next_endpoint;
+                changed = true;
+            }
+            if vm.runtime.shm_path.is_none()
+                && let Some(shm) = &props.fastdesk_shm_path
+            {
+                vm.runtime.shm_path = Some(shm.clone());
+                changed = true;
+            }
+            changed.then(|| vm.summary())
+        };
+        if let Some(summary) = updated_summary {
+            self.emit(DaemonEvent::VmUpdated { vm: summary });
+        }
+    }
+
     async fn monitor_vm(self: Arc<Self>, id: Uuid, run_gen: u64, sock_path: PathBuf) {
         let client = TtrpcClient::new(&sock_path);
-        let wait_res = client.wait_vm().await;
+        let (wait_res, mut props) = loop {
+            if !self.is_monitor_generation_active(id, run_gen) {
+                return;
+            }
+            let needs_endpoint = self
+                .vms
+                .read()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|vm| vm.generation == run_gen && vm.runtime.fastdesk_endpoint.is_none());
+            if needs_endpoint
+                && let Ok(Ok(props)) = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    client.properties_vm(vmservice::PropertiesVmRequest { types: vec![] }),
+                )
+                .await
+            {
+                if props.state == vmservice::VmState::Halted as i32 {
+                    break (Ok(()), Some(props));
+                }
+                self.sync_status_from_properties(id, run_gen, &props);
+            }
+
+            let res = client.wait_vm().await;
+            if !self.is_monitor_generation_active(id, run_gen) {
+                return;
+            }
+            match res {
+                Ok(()) => {
+                    let props = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        client.properties_vm(vmservice::PropertiesVmRequest { types: vec![] }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                    break (Ok(()), props);
+                }
+                Err(err) => {
+                    // Distinguish transient RPC/EOF glitches on a live VM from actual VM exit.
+                    let mut confirmed_alive = false;
+                    let mut last_props = None;
+                    for attempt in 0..3 {
+                        if !self.is_monitor_generation_active(id, run_gen) {
+                            return;
+                        }
+                        if let Ok(Ok(p)) = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            client.properties_vm(vmservice::PropertiesVmRequest { types: vec![] }),
+                        )
+                        .await
+                        {
+                            let is_live_state = p.state == vmservice::VmState::Running as i32
+                                || p.state == vmservice::VmState::Paused as i32;
+                            if is_live_state {
+                                self.sync_status_from_properties(id, run_gen, &p);
+                                confirmed_alive = true;
+                                break;
+                            }
+                            last_props = Some(p);
+                            break;
+                        }
+                        let proc_alive = self.is_vm_process_alive(id, run_gen).await;
+                        let sock_client = client.clone();
+                        let sock_alive = tokio::task::spawn_blocking(move || {
+                            sock_client.is_socket_accepting()
+                        })
+                        .await
+                        .unwrap_or(false);
+                        if !proc_alive && !sock_alive {
+                            break;
+                        }
+                        if attempt == 2 && proc_alive && sock_alive {
+                            confirmed_alive = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    if confirmed_alive {
+                        warn!(
+                            vm_id = %id,
+                            error = %err,
+                            "WaitVM returned error while VM is still alive; re-attaching monitor"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    break (Err(err), last_props);
+                }
+            }
+        };
 
         let stop_done_tx = {
             let mut guard = self.vms.write().unwrap();
+            if *self.shutdown_watch.borrow() && !self.should_stop_vms_on_shutdown() {
+                return;
+            }
             let Some(vm) = guard.get_mut(&id) else {
                 return;
             };
@@ -1178,10 +1497,15 @@ impl Supervisor {
             stop_done_tx
         };
 
-        let props = client
-            .properties_vm(vmservice::PropertiesVmRequest { types: vec![] })
+        if props.is_none() {
+            props = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.properties_vm(vmservice::PropertiesVmRequest { types: vec![] }),
+            )
             .await
-            .ok();
+            .ok()
+            .and_then(Result::ok);
+        }
 
         let _ = tokio::time::timeout(Duration::from_secs(3), client.teardown_vm()).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), client.quit()).await;
@@ -1265,7 +1589,9 @@ impl Supervisor {
         let id = self.resolve_vm_id(id_or_name)?;
         let (wait_rx, stop_task_args) = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
+            let vm = guard
+                .get_mut(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
                 vm.runtime.status = VmStatus::Off;
                 vm.runtime.last_error = None;
@@ -1275,10 +1601,10 @@ impl Supervisor {
                 if let Some(rx) = vm.stop_wait.clone() {
                     (Some(rx), None)
                 } else {
-                    bail!(
+                    return Err(err_conflict(format!(
                         "cannot stop VM '{}' while it is already Stopping",
                         vm.config.name
-                    );
+                    )));
                 }
             } else {
                 vm.generation += 1;
@@ -1478,15 +1804,16 @@ impl Supervisor {
     ) -> anyhow::Result<VmSummary> {
         let summary = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
+            let vm = guard
+                .get_mut(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             if vm.generation != rpc_gen
                 || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
             {
-                bail!(
+                return Err(err_conflict(format!(
                     "cannot complete {action} because VM '{}' changed state to {}",
-                    vm.config.name,
-                    vm.runtime.status
-                );
+                    vm.config.name, vm.runtime.status
+                )));
             }
             vm.runtime.status = new_status;
             vm.summary()
@@ -1510,7 +1837,10 @@ impl Supervisor {
         req: AttachDiskPayload,
     ) -> anyhow::Result<VmSummary> {
         if !req.path.is_file() {
-            bail!("disk file not found: {}", req.path.display());
+            return Err(err_bad_request(format!(
+                "disk file not found: {}",
+                req.path.display()
+            )));
         }
         let id = self.resolve_vm_id(id_or_name)?;
         let format = req
@@ -1524,11 +1854,13 @@ impl Supervisor {
 
         let pending = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
+            let vm = guard
+                .get_mut(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             let active_sock = vm.active_rpc_socket("attach disk")?;
             let lun = req.lun.unwrap_or_else(|| vm.config.next_free_lun());
             if vm.config.disks.iter().any(|d| d.lun == lun) {
-                bail!("SCSI LUN {lun} is already occupied");
+                return Err(err_conflict(format!("SCSI LUN {lun} is already occupied")));
             }
             let attachment = DiskAttachment {
                 lun,
@@ -1565,18 +1897,22 @@ impl Supervisor {
                     .context("hot-adding SCSI disk to running VM")?;
 
                 let mut guard = self.vms.write().unwrap();
-                let vm = guard.get_mut(&id).context("VM not found")?;
+                let vm = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| err_not_found("VM not found"))?;
                 if vm.generation != rpc_gen
                     || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
                 {
-                    bail!(
+                    return Err(err_conflict(format!(
                         "cannot complete disk attach because VM '{}' changed state to {}",
-                        vm.config.name,
-                        vm.runtime.status
-                    );
+                        vm.config.name, vm.runtime.status
+                    )));
                 }
                 if vm.config.disks.iter().any(|d| d.lun == attachment.lun) {
-                    bail!("SCSI LUN {} is already occupied", attachment.lun);
+                    return Err(err_conflict(format!(
+                        "SCSI LUN {} is already occupied",
+                        attachment.lun
+                    )));
                 }
                 let mut updated = vm.config.clone();
                 updated.disks.push(attachment);
@@ -1598,7 +1934,9 @@ impl Supervisor {
         let id = self.resolve_vm_id(id_or_name)?;
         let pending = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
+            let vm = guard
+                .get_mut(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             let active_sock = vm.active_rpc_socket("detach disk")?;
             let disk = vm
                 .config
@@ -1606,7 +1944,7 @@ impl Supervisor {
                 .iter()
                 .find(|d| d.lun == lun)
                 .cloned()
-                .with_context(|| format!("no disk attached at SCSI LUN {lun}"))?;
+                .ok_or_else(|| err_not_found(format!("no disk attached at SCSI LUN {lun}")))?;
             match active_sock {
                 Some(sock) => Ok((disk, sock, vm.generation)),
                 None => {
@@ -1638,15 +1976,16 @@ impl Supervisor {
                     .context("hot-removing SCSI disk from running VM")?;
 
                 let mut guard = self.vms.write().unwrap();
-                let vm = guard.get_mut(&id).context("VM not found")?;
+                let vm = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| err_not_found("VM not found"))?;
                 if vm.generation != rpc_gen
                     || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
                 {
-                    bail!(
+                    return Err(err_conflict(format!(
                         "cannot complete disk detach because VM '{}' changed state to {}",
-                        vm.config.name,
-                        vm.runtime.status
-                    );
+                        vm.config.name, vm.runtime.status
+                    )));
                 }
                 let mut updated = vm.config.clone();
                 updated.disks.retain(|d| d.lun != lun);
@@ -1669,20 +2008,25 @@ impl Supervisor {
         req: MountIsoPayload,
     ) -> anyhow::Result<VmSummary> {
         if !req.path.is_file() {
-            bail!("ISO image not found: {}", req.path.display());
+            return Err(err_bad_request(format!(
+                "ISO image not found: {}",
+                req.path.display()
+            )));
         }
         let id = self.resolve_vm_id(id_or_name)?;
         let existing_dvd_lun = {
             let guard = self.vms.read().unwrap();
-            let vm = guard.get(&id).context("VM not found")?;
+            let vm = guard
+                .get(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             let _ = vm.active_rpc_socket("mount ISO")?;
             match req.lun {
                 Some(l) => match vm.config.disks.iter().find(|d| d.lun == l) {
                     Some(d) if d.kind != DiskKind::Dvd => {
-                        bail!(
+                        return Err(err_conflict(format!(
                             "SCSI LUN {l} is occupied by a non-DVD disk ({}); specify a different LUN or omit --lun",
                             d.path.display()
-                        );
+                        )));
                     }
                     Some(d) => Some(d.lun),
                     None => None,
@@ -1726,7 +2070,9 @@ impl Supervisor {
         let id = self.resolve_vm_id(id_or_name)?;
         let target_lun = {
             let guard = self.vms.read().unwrap();
-            let vm = guard.get(&id).context("VM not found")?;
+            let vm = guard
+                .get(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             let _ = vm.active_rpc_socket("eject ISO")?;
             match lun {
                 Some(l) => vm
@@ -1735,14 +2081,14 @@ impl Supervisor {
                     .iter()
                     .find(|d| d.lun == l && d.kind == DiskKind::Dvd)
                     .map(|d| d.lun)
-                    .with_context(|| format!("no ISO/DVD attached at LUN {l}"))?,
+                    .ok_or_else(|| err_not_found(format!("no ISO/DVD attached at LUN {l}")))?,
                 None => vm
                     .config
                     .disks
                     .iter()
                     .find(|d| d.kind == DiskKind::Dvd)
                     .map(|d| d.lun)
-                    .context("no ISO/DVD drive attached to VM")?,
+                    .ok_or_else(|| err_not_found("no ISO/DVD drive attached to VM"))?,
             }
         };
         self.detach_disk(id_or_name, target_lun).await
@@ -1778,7 +2124,9 @@ impl Supervisor {
         let id = self.resolve_vm_id(id_or_name)?;
         let active_sock = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
+            let vm = guard
+                .get_mut(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             let sock_opt = vm.active_rpc_socket("modify port forwarding")?;
             {
                 let nic = vm
@@ -1786,15 +2134,17 @@ impl Supervisor {
                     .nics
                     .iter()
                     .find(|n| n.id == nic_id)
-                    .with_context(|| format!("NIC {nic_id} not found"))?;
+                    .ok_or_else(|| err_not_found(format!("NIC {nic_id} not found")))?;
                 let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend else {
-                    bail!("port forwarding is only supported on Consomme NAT NICs");
+                    return Err(err_bad_request(
+                        "port forwarding is only supported on Consomme NAT NICs",
+                    ));
                 };
                 if add && port_forwards.contains(&port) {
-                    bail!("port forward {port} already exists");
+                    return Err(err_conflict(format!("port forward {port} already exists")));
                 }
                 if !add && !port_forwards.contains(&port) {
-                    bail!("port forward {port} not found");
+                    return Err(err_not_found(format!("port forward {port} not found")));
                 }
             }
             match sock_opt {
@@ -1805,7 +2155,7 @@ impl Supervisor {
                         .nics
                         .iter_mut()
                         .find(|n| n.id == nic_id)
-                        .context("NIC vanished")?;
+                        .ok_or_else(|| err_not_found("NIC vanished"))?;
                     if let NicBackendConfig::Consomme { port_forwards, .. } = &mut nic.backend {
                         if add {
                             port_forwards.push(port.clone());
@@ -1849,22 +2199,23 @@ impl Supervisor {
                     .context("updating Consomme port forward on running VM")?;
 
                 let mut guard = self.vms.write().unwrap();
-                let vm = guard.get_mut(&id).context("VM not found")?;
+                let vm = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| err_not_found("VM not found"))?;
                 if vm.generation != rpc_gen
                     || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
                 {
-                    bail!(
+                    return Err(err_conflict(format!(
                         "cannot complete port forward update because VM '{}' changed state to {}",
-                        vm.config.name,
-                        vm.runtime.status
-                    );
+                        vm.config.name, vm.runtime.status
+                    )));
                 }
                 let mut updated = vm.config.clone();
                 let nic = updated
                     .nics
                     .iter_mut()
                     .find(|n| n.id == nic_id)
-                    .context("NIC vanished")?;
+                    .ok_or_else(|| err_not_found("NIC vanished"))?;
                 if let NicBackendConfig::Consomme { port_forwards, .. } = &mut nic.backend {
                     if add {
                         if !port_forwards.contains(&port) {
@@ -1911,11 +2262,13 @@ impl Supervisor {
     pub fn create_disk(&self, req: CreateDiskPayload) -> anyhow::Result<DiskInfo> {
         let paths = self.resolved_paths();
         disk::create_disk(&req, paths.openvmm_img_bin.as_deref())
+            .map_err(|e| err_bad_request(format!("{e:#}")))
     }
 
     pub fn inspect_disk(&self, path: &Path) -> anyhow::Result<DiskInfo> {
         let paths = self.resolved_paths();
         disk::inspect_disk(path, paths.openvmm_img_bin.as_deref())
+            .map_err(|e| err_bad_request(format!("{e:#}")))
     }
 
     pub fn vm_logs(&self, id_or_name: &str, tail: usize) -> anyhow::Result<String> {
@@ -1936,6 +2289,53 @@ impl Supervisor {
             }
         }
         Ok(out)
+    }
+
+    pub async fn detach_all_vms(self: &Arc<Self>) {
+        let (starting_ids, stopping_waits) = {
+            let mut guard = self.vms.write().unwrap();
+            let mut starting_ids = Vec::new();
+            let mut stopping_waits = Vec::new();
+            for vm in guard.values_mut() {
+                match vm.runtime.status {
+                    VmStatus::Starting => {
+                        starting_ids.push(vm.config.id);
+                    }
+                    VmStatus::Stopping => {
+                        if let Some(rx) = vm.stop_wait.clone() {
+                            stopping_waits.push(rx);
+                        }
+                    }
+                    VmStatus::Running | VmStatus::Paused => {
+                        if let Some(abort) = vm.monitor_handle.take() {
+                            abort.abort();
+                        }
+                        // Drop Child without killing/waiting and preserve runtime files so the next daemon re-adopts it.
+                        let _ = vm.child.take();
+                        vm.runtime.rpc_socket_path = None;
+                        vm.runtime.shm_path = None;
+                    }
+                    VmStatus::Off | VmStatus::Error => {}
+                }
+            }
+            (starting_ids, stopping_waits)
+        };
+
+        for id in starting_ids {
+            if let Err(err) = self.stop_vm(&id.to_string()).await {
+                warn!(vm_id = %id, error = %err, "failed to cancel starting VM during daemon detach");
+            }
+        }
+        for mut rx in stopping_waits {
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
     }
 
     pub async fn shutdown_all_vms(self: &Arc<Self>) {
@@ -1965,21 +2365,23 @@ impl Supervisor {
         allowed: &[VmStatus],
     ) -> anyhow::Result<(PathBuf, u64)> {
         let guard = self.vms.read().unwrap();
-        let vm = guard.get(&id).context("VM not found")?;
+        let vm = guard
+            .get(&id)
+            .ok_or_else(|| err_not_found("VM not found"))?;
         if !allowed.contains(&vm.runtime.status) {
             let names: Vec<String> = allowed.iter().map(ToString::to_string).collect();
-            bail!(
+            return Err(err_conflict(format!(
                 "VM '{}' is {} (must be {})",
                 vm.config.name,
                 vm.runtime.status,
                 names.join(" or ")
-            );
+            )));
         }
         let sock = vm
             .runtime
             .rpc_socket_path
             .clone()
-            .context("VM has no active RPC socket")?;
+            .ok_or_else(|| err_internal("VM has no active RPC socket"))?;
         Ok((sock, vm.generation))
     }
 
@@ -1993,6 +2395,18 @@ impl Supervisor {
         if let Some(vm) = guard.get(&id) {
             self.emit(DaemonEvent::VmUpdated { vm: vm.summary() });
         }
+    }
+}
+
+fn normalize_path_key(path: &Path) -> PathBuf {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        PathBuf::from(resolved.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        resolved
     }
 }
 
@@ -2067,8 +2481,15 @@ fn is_pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let _ = pid;
-        false
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+            })
     }
 }
 
@@ -2280,6 +2701,7 @@ fn to_proto_scsi_disk(d: &DiskAttachment) -> vmservice::ScsiDisk {
     } else {
         match d.format {
             DiskFormat::Vhdx => vmservice::DiskType::ScsiDiskTypeVhdx as i32,
+            DiskFormat::Vhd => vmservice::DiskType::ScsiDiskTypeVhd1 as i32,
             DiskFormat::Raw | DiskFormat::Iso => vmservice::DiskType::ScsiDiskTypePhysical as i32,
         }
     };
@@ -2342,18 +2764,44 @@ fn to_proto_nic_config(nic: &NicAttachment) -> vmservice::NicConfig {
 }
 
 fn read_log_tail(path: &Path, tail: usize) -> anyhow::Result<String> {
+    const CHUNK_SIZE: u64 = 64 * 1024;
+    const MAX_TAIL_BYTES: usize = 4 * 1024 * 1024;
+
     let tail = tail.clamp(1, 10_000);
-    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
-    let mut ring = std::collections::VecDeque::with_capacity(tail.min(1024));
-    for line in reader.lines() {
-        let line = line?;
-        if ring.len() == tail {
-            ring.pop_front();
-        }
-        ring.push_back(line);
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(String::new());
     }
-    Ok(ring.into_iter().collect::<Vec<_>>().join("\n"))
+
+    let mut pos = file_len;
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut newline_count = 0usize;
+
+    while pos > 0 && total_bytes < MAX_TAIL_BYTES {
+        let to_read = pos.min(CHUNK_SIZE).min((MAX_TAIL_BYTES - total_bytes) as u64);
+        pos -= to_read;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut buf = vec![0u8; to_read as usize];
+        file.read_exact(&mut buf)?;
+        newline_count += buf.iter().filter(|&&b| b == b'\n').count();
+        total_bytes += buf.len();
+        chunks.push(buf);
+        if newline_count > tail {
+            break;
+        }
+    }
+
+    let mut combined = Vec::with_capacity(total_bytes);
+    for chunk in chunks.into_iter().rev() {
+        combined.extend_from_slice(&chunk);
+    }
+
+    let text = String::from_utf8_lossy(&combined);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    Ok(lines[start..].join("\n"))
 }
 
 #[cfg(windows)]
@@ -2493,57 +2941,25 @@ mod tests {
         assert!(switches[0].description.contains("br0"));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_start_vm_future_does_not_leave_vm_stuck_in_starting() {
-        use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn read_log_tail_reads_exact_last_lines_from_large_file() {
+        use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
-        let store = RegistryStore::new(dir.path()).unwrap();
-        let fake_bin = dir.path().join("fake-openvmm.sh");
-        fs::write(&fake_bin, "#!/bin/sh\nsleep 0.1\nexit 1\n").unwrap();
-        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let fake_uefi = dir.path().join("MSVM.fd");
-        fs::write(&fake_uefi, b"dummy").unwrap();
-
-        let mut host = store.load_or_init_host_config().unwrap();
-        host.openvmm_bin = Some(fake_bin);
-        host.uefi_firmware_path = Some(fake_uefi);
-        store.save_host_config(&host).unwrap();
-
-        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
-        let created = sup
-            .create_vm(CreateVmPayload {
-                name: "DropStartTest".to_string(),
-                vcpus: Some(2),
-                memory_mb: Some(1024),
-                tpm_enabled: None,
-                ..Default::default()
-            })
-            .unwrap();
-        let vm_id = created.config.id;
-
-        // Drop the start_vm future before startup completes (simulating client HTTP disconnect).
-        tokio::select! {
-            res = sup.start_vm("DropStartTest") => {
-                panic!("expected start_vm to outlive 20ms cancel window, got {res:?}");
+        let log_path = dir.path().join("large.log");
+        {
+            let mut f = fs::File::create(&log_path).unwrap();
+            let filler = "x".repeat(120);
+            for i in 0..25_000 {
+                writeln!(f, "line-{i:05}:{filler}").unwrap();
             }
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
+        assert!(fs::metadata(&log_path).unwrap().len() > 3 * 1024 * 1024);
 
-        // Wait for the detached startup task to notice process exit and run cleanup_failed_start.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let status = sup.get_vm(&vm_id.to_string()).unwrap().runtime.status;
-            if status == VmStatus::Error {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "VM stayed in {status:?} after start_vm future was dropped"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        let tail = read_log_tail(&log_path, 5).unwrap();
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].starts_with("line-24995:"));
+        assert!(lines[4].starts_with("line-24999:"));
     }
 }

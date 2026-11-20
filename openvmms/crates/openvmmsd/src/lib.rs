@@ -32,14 +32,15 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
     let addr: SocketAddr = listen_addr
         .parse()
         .with_context(|| format!("invalid listen address '{listen_addr}'"))?;
+    anyhow::ensure!(
+        addr.ip().is_loopback(),
+        "openvmmsd listen address '{listen_addr}' must be a loopback address"
+    );
 
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding openvmmsd HTTP server on {addr}"))?;
     let bound_addr = supervisor.serve_on_listener(listener)?;
-    let mut cfg = supervisor.host_config();
-    cfg.listen_addr = bound_addr.to_string();
-    let _ = supervisor.update_host_config(cfg).await?;
     info!(address = %bound_addr, data_dir = %opts.data_dir.display(), "openvmmsd listening");
 
     tokio::select! {
@@ -51,8 +52,13 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
         }
     }
     supervisor.mark_shutting_down();
-    supervisor.shutdown_all_vms().await;
+    if supervisor.should_stop_vms_on_shutdown() {
+        supervisor.shutdown_all_vms().await;
+    } else {
+        supervisor.detach_all_vms().await;
+    }
     supervisor.join_all_listeners().await;
+    supervisor.clear_runtime_listen_addr();
 
     Ok(())
 }
@@ -151,17 +157,18 @@ impl TestDaemonHandle {
         let token = supervisor.auth_token().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let bound_addr = supervisor.serve_on_listener(listener)?;
-        // Persist actual bound port in host config so ApiClient::from_data_dir works seamlessly.
-        let mut cfg = supervisor.host_config();
-        cfg.listen_addr = bound_addr.to_string();
-        let _ = supervisor.update_host_config(cfg).await?;
 
         let shutdown_sup = supervisor.clone();
         let task = tokio::spawn(async move {
             shutdown_sup.wait_for_shutdown_signal().await;
             shutdown_sup.mark_shutting_down();
-            shutdown_sup.shutdown_all_vms().await;
+            if shutdown_sup.should_stop_vms_on_shutdown() {
+                shutdown_sup.shutdown_all_vms().await;
+            } else {
+                shutdown_sup.detach_all_vms().await;
+            }
             shutdown_sup.join_all_listeners().await;
+            shutdown_sup.clear_runtime_listen_addr();
         });
 
         Ok(Self {
@@ -173,7 +180,12 @@ impl TestDaemonHandle {
     }
 
     pub async fn shutdown(self) {
-        self.supervisor.request_shutdown();
+        self.supervisor.request_shutdown_with_options(true);
+        let _ = self.task.await;
+    }
+
+    pub async fn shutdown_preserving_vms(self) {
+        self.supervisor.request_shutdown_with_options(false);
         let _ = self.task.await;
     }
 }

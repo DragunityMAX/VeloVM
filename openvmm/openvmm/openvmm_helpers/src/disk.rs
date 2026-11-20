@@ -50,16 +50,6 @@ fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Resu
     Ok(())
 }
 
-/// Checks whether `path` starts with the 8-byte VHDX file signature (`b"vhdxfile"`).
-pub fn has_vhdx_signature(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic).is_ok() && &magic == b"vhdxfile"
-}
-
 /// Opens `path` as a VHDX disk regardless of its file extension.
 pub async fn open_vhdx_disk(
     path: &Path,
@@ -92,15 +82,22 @@ pub async fn open_vhdx_disk(
     }
 }
 
+/// Opens `path` strictly as a raw file or block device without format sniffing.
+pub fn open_raw_disk_file(
+    path: &Path,
+    options: OpenDiskOptions,
+) -> anyhow::Result<Resource<DiskHandleKind>> {
+    open_raw_disk(path, options, None)
+}
+
 /// Opens the resources needed for using a disk from a file at `path`.
 ///
 /// If the file ends with .vhd and is a fixed VHD1, it will be opened using
 /// the user-mode VHD parser. Otherwise, if the file ends with .vhd, the
 /// file will be opened using the kernel-mode VHD parser (Windows only).
 ///
-/// If the file ends with .vhdx (case-insensitively) or carries a VHDX header
-/// signature, the VHDX backend is used (kernel-mode VHD parser for `.vhdx` on
-/// Windows, or the pure-Rust VHDX parser on Linux and non-`.vhdx` paths).
+/// If the file ends with .vhdx (case-insensitively), the VHDX backend is used
+/// (kernel-mode VHD parser on Windows, or the pure-Rust VHDX parser on Linux).
 ///
 /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
 pub async fn open_disk_type(
@@ -181,7 +178,6 @@ pub async fn open_disk_type(
 
             Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
         }
-        _ if !options.direct && has_vhdx_signature(path) => open_vhdx_disk(path, options).await?,
         _ => open_raw_disk(path, options, None)?,
     })
 }
@@ -399,7 +395,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn uppercase_vhdx_and_vhdx_signature_dispatch_to_vhdx_backend() {
+    async fn uppercase_vhdx_dispatches_to_vhdx_and_raw_never_sniffs_vhdx_signature() {
         let dir = tempfile::tempdir().unwrap();
 
         // A file ending in .VHDX must not fall back to raw disk open.
@@ -415,13 +411,29 @@ mod tests {
         .await
         .unwrap_err();
         // Raw open would have succeeded on arbitrary bytes; VHDX backend fails parsing.
-        assert!(err.to_string().contains("vhdx") || err.chain().any(|c| c.to_string().contains("vhdx")), "{err:#}");
+        assert!(
+            err.chain()
+                .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
+            "{err:#}"
+        );
 
-        // A .img file starting with the VHDX header signature must also dispatch to VHDX, not raw.
+        // A .img file starting with the VHDX header signature must open as raw (never sniffed as VHDX).
         let sig_img = dir.path().join("data.img");
-        std::fs::write(&sig_img, b"vhdxfile\x00\x00\x00\x00").unwrap();
-        assert!(has_vhdx_signature(&sig_img));
-        let err = open_disk_type(
+        let mut raw_payload = vec![0u8; 512];
+        raw_payload[..8].copy_from_slice(b"vhdxfile");
+        std::fs::write(&sig_img, &raw_payload).unwrap();
+        let _raw_disk = open_disk_type(
+            &sig_img,
+            OpenDiskOptions {
+                read_only: true,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Explicit open_vhdx_disk still parses the file as VHDX and rejects the invalid payload.
+        let err = open_vhdx_disk(
             &sig_img,
             OpenDiskOptions {
                 read_only: true,
@@ -432,7 +444,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.chain()
-                .any(|c| c.to_string().to_ascii_lowercase().contains("vhdx")),
+                .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
             "{err:#}"
         );
     }

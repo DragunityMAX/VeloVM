@@ -101,8 +101,12 @@ enum DaemonCmd {
         #[arg(long)]
         foreground: bool,
     },
-    /// Stop openvmmsd and power off all managed VMs
-    Stop,
+    /// Stop openvmmsd (leaves running VMs alive for re-adoption unless --stop-vms is passed)
+    Stop {
+        /// Also stop all running VMs managed by openvmmsd before exiting
+        #[arg(long)]
+        stop_vms: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -205,6 +209,9 @@ enum VmCmd {
         vm: String,
         #[arg(long)]
         delete_disks: bool,
+        /// Skip interactive confirmation when --delete-disks is set
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Start a virtual machine
     Start { vm: String },
@@ -280,11 +287,11 @@ struct CreateVmArgs {
     #[arg(long)]
     create_disk: Option<String>,
     /// Optional explicit path for --create-disk (defaults to <vm_dir>/disk0.<ext>)
-    #[arg(long)]
+    #[arg(long, requires = "create_disk")]
     create_disk_path: Option<PathBuf>,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, requires = "create_disk")]
     disk_format: Option<DiskFormatArg>,
-    #[arg(long)]
+    #[arg(long, requires = "create_disk")]
     fixed_disk: bool,
     /// Optional installer ISO image
     #[arg(long)]
@@ -439,13 +446,21 @@ fn handle_daemon(cli: &Cli, action: &DaemonCmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        DaemonCmd::Stop => {
+        DaemonCmd::Stop { stop_vms } => {
             let client = ApiClient::from_data_dir(cli.data_dir.as_deref(), cli.daemon_url.as_deref())?;
-            client.shutdown_daemon()?;
+            client.shutdown_daemon_with_options(*stop_vms)?;
             if cli.json {
-                println!("{{\"status\":\"stopping\"}}");
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "status": "stopping",
+                        "stop_vms": stop_vms
+                    }))?
+                );
+            } else if *stop_vms {
+                println!("Shutdown signal sent to openvmmsd (stopping all VMs).");
             } else {
-                println!("Shutdown signal sent to openvmmsd.");
+                println!("Shutdown signal sent to openvmmsd (leaving running VMs active).");
             }
             Ok(())
         }
@@ -655,14 +670,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
 
             let mut disks = Vec::new();
             for (idx, p) in args.disk.iter().enumerate() {
-                let resolved = resolve_client_path(p);
-                disks.push(DiskAttachment {
-                    lun: idx as u32,
-                    kind: DiskKind::HardDisk,
-                    format: DiskFormat::from_path(&resolved),
-                    path: resolved,
-                    read_only: false,
-                });
+                disks.push(disk_attachment_from_cli_path(idx as u32, p));
             }
 
             let fastdesk = if args.vram_mb.is_some() || args.no_shm || args.hvsock {
@@ -743,7 +751,35 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
             let summary = client.update_vm(&args.vm, &payload)?;
             print_vm_summary(&summary, cli.json)
         }
-        VmCmd::Delete { vm, delete_disks } => {
+        VmCmd::Delete {
+            vm,
+            delete_disks,
+            yes,
+        } => {
+            if *delete_disks && !*yes {
+                let summary = client.get_vm(vm)?;
+                let writable_disks: Vec<PathBuf> = summary
+                    .config
+                    .disks
+                    .iter()
+                    .filter(|d| d.kind == DiskKind::HardDisk && !d.read_only)
+                    .map(|d| d.path.clone())
+                    .collect();
+                if !writable_disks.is_empty() {
+                    use std::io::IsTerminal;
+                    if cli.json || !std::io::stdin().is_terminal() {
+                        bail!(
+                            "refusing to delete disk files without confirmation in non-interactive mode; pass --yes to confirm"
+                        );
+                    }
+                    confirm_disk_deletion(
+                        &summary.config.name,
+                        &writable_disks,
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stderr(),
+                    )?;
+                }
+            }
             client.delete_vm(vm, *delete_disks)?;
             if cli.json {
                 println!("{}", serde_json::to_string(&serde_json::json!({ "deleted": vm }))?);
@@ -789,7 +825,10 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                     summary.config.name
                 );
             }
-            let _ = child.wait();
+            let status = child.wait().context("waiting for fastdesk-viewer")?;
+            if !status.success() {
+                bail!("fastdesk-viewer exited with {status}");
+            }
             Ok(())
         }
         VmCmd::Logs { vm, tail } => {
@@ -843,6 +882,48 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
             let nic_id = resolve_consomme_nic_id(&client, vm, *nic)?;
             print_vm_summary(&client.remove_port_forward(vm, nic_id, pf)?, cli.json)
         }
+    }
+}
+
+fn disk_attachment_from_cli_path(lun: u32, path: &Path) -> DiskAttachment {
+    let resolved = resolve_client_path(path);
+    let format = DiskFormat::from_path(&resolved);
+    let (kind, read_only) = if format == DiskFormat::Iso {
+        (DiskKind::Dvd, true)
+    } else {
+        (DiskKind::HardDisk, false)
+    };
+    DiskAttachment {
+        lun,
+        kind,
+        path: resolved,
+        read_only,
+        format,
+    }
+}
+
+fn confirm_disk_deletion(
+    vm_name: &str,
+    disk_paths: &[PathBuf],
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    writeln!(
+        output,
+        "Deleting VM '{vm_name}' will permanently delete the following disk file(s):"
+    )?;
+    for path in disk_paths {
+        writeln!(output, "  - {}", path.display())?;
+    }
+    write!(output, "Permanently delete these disk file(s)? [y/N]: ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    let trimmed = answer.trim();
+    if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+        Ok(())
+    } else {
+        bail!("aborted: VM '{vm_name}' and its disk file(s) were not deleted");
     }
 }
 
@@ -1088,5 +1169,116 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn cli_requires_create_disk_for_disk_creation_options() {
+        for flag_args in [
+            vec!["openvmms", "vm", "create", "VM1", "--create-disk-path", "os.vhdx"],
+            vec!["openvmms", "vm", "create", "VM1", "--disk-format", "raw"],
+            vec!["openvmms", "vm", "create", "VM1", "--fixed-disk"],
+        ] {
+            assert!(
+                Cli::try_parse_from(flag_args.clone()).is_err(),
+                "expected {flag_args:?} to require --create-disk"
+            );
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "openvmms",
+                "vm",
+                "create",
+                "VM1",
+                "--create-disk",
+                "64G",
+                "--create-disk-path",
+                "os.img",
+                "--disk-format",
+                "raw",
+                "--fixed-disk",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cli_disk_helper_attaches_iso_as_readonly_dvd_and_vhd_as_vhd() {
+        let iso = disk_attachment_from_cli_path(0, Path::new("installer.iso"));
+        assert_eq!(iso.kind, DiskKind::Dvd);
+        assert!(iso.read_only);
+        assert_eq!(iso.format, DiskFormat::Iso);
+
+        let vhd = disk_attachment_from_cli_path(1, Path::new("legacy.vhd"));
+        assert_eq!(vhd.kind, DiskKind::HardDisk);
+        assert!(!vhd.read_only);
+        assert_eq!(vhd.format, DiskFormat::Vhd);
+    }
+
+    #[test]
+    fn cli_parses_delete_yes_and_daemon_stop_flags_and_confirm_prompt() {
+        let parsed_del = Cli::try_parse_from([
+            "openvmms",
+            "vm",
+            "delete",
+            "VM1",
+            "--delete-disks",
+            "-y",
+        ])
+        .unwrap();
+        match parsed_del.command {
+            TopCommand::Vm {
+                action:
+                    VmCmd::Delete {
+                        vm,
+                        delete_disks,
+                        yes,
+                    },
+            } => {
+                assert_eq!(vm, "VM1");
+                assert!(delete_disks);
+                assert!(yes);
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        match Cli::try_parse_from(["openvmms", "daemon", "stop"])
+            .unwrap()
+            .command
+        {
+            TopCommand::Daemon {
+                action: DaemonCmd::Stop { stop_vms },
+            } => assert!(!stop_vms),
+            _ => panic!("unexpected command"),
+        }
+
+        match Cli::try_parse_from(["openvmms", "daemon", "stop", "--stop-vms"])
+            .unwrap()
+            .command
+        {
+            TopCommand::Daemon {
+                action: DaemonCmd::Stop { stop_vms },
+            } => assert!(stop_vms),
+            _ => panic!("unexpected command"),
+        }
+
+        let paths = vec![PathBuf::from("/tmp/os.vhdx")];
+        let mut out = Vec::new();
+        assert!(
+            confirm_disk_deletion("VM1", &paths, &mut std::io::Cursor::new(b"y\n"), &mut out)
+                .is_ok()
+        );
+        assert!(
+            confirm_disk_deletion("VM1", &paths, &mut std::io::Cursor::new(b"YES\n"), &mut out)
+                .is_ok()
+        );
+        assert!(
+            confirm_disk_deletion("VM1", &paths, &mut std::io::Cursor::new(b"\n"), &mut out)
+                .is_err()
+        );
+        assert!(
+            confirm_disk_deletion("VM1", &paths, &mut std::io::Cursor::new(b"n\n"), &mut out)
+                .is_err()
+        );
     }
 }

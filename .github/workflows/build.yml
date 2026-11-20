@@ -90,7 +90,7 @@ jobs:
 
       - name: Run OpenVMM display and FastDesk worker tests
         working-directory: openvmm
-        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry -p tpm_device --lib
+        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
 
       - name: Run fastdesk-viewer tests
         working-directory: fastdesk-viewer
@@ -166,6 +166,13 @@ jobs:
             if ($LASTEXITCODE -ne 0 -or $listJson -notmatch "Smoke-VM") {
               throw "openvmms vm list failed:`n$listJson"
             }
+            $whpEnabled = $false
+            try {
+              $whpFeature = Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction SilentlyContinue
+              if ($null -ne $whpFeature -and $whpFeature.State -eq "Enabled") {
+                $whpEnabled = $true
+              }
+            } catch {}
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm start "Smoke-VM" | Out-Null
             if ($LASTEXITCODE -eq 0) {
@@ -174,18 +181,33 @@ jobs:
               if ($show.runtime.status -ne "running") {
                 throw "Expected Smoke-VM status running, got $($show.runtime.status)"
               }
+              if ([string]::IsNullOrWhiteSpace($show.runtime.fastdesk_endpoint)) {
+                throw "Expected Smoke-VM fastdesk_endpoint to be populated"
+              }
+              & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+                vm pause "Smoke-VM" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "openvmms vm pause failed" }
+              & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+                vm resume "Smoke-VM" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "openvmms vm resume failed" }
             } else {
+              if ($whpEnabled) {
+                throw "openvmms vm start failed even though HypervisorPlatform is enabled"
+              }
               $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
                 vm show "Smoke-VM" | Out-String | ConvertFrom-Json
               if ($show.runtime.status -ne "error") {
                 throw "Expected Smoke-VM to recover cleanly to error when runner lacks WHP, got $($show.runtime.status)"
+              }
+              if ($show.runtime.last_error -notmatch "no hypervisor available|WHP") {
+                throw "Expected Smoke-VM failure to be missing hypervisor/WHP, got: $($show.runtime.last_error)"
               }
             }
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm stop "Smoke-VM" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "openvmms vm stop failed" }
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
-              daemon stop | Out-Null
+              daemon stop --stop-vms | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop failed" }
             if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
               throw "openvmmsd smoke daemon did not exit cleanly (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
@@ -342,7 +364,7 @@ jobs:
 
       - name: Run OpenVMM display and FastDesk worker tests
         working-directory: openvmm
-        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry -p tpm_device --lib
+        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
 
       - name: Run fastdesk-viewer tests
         working-directory: fastdesk-viewer
@@ -400,27 +422,36 @@ jobs:
             fi
             sleep 0.1
           done
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm || true
+          if [ ! -e /dev/kvm ]; then
+            echo "Expected /dev/kvm on Linux runner to verify real VM startup" >&2
+            exit 1
           fi
+          sudo chmod 666 /dev/kvm
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.img" --size 16M --format raw >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm list | grep -q "Smoke-VM"
-          if ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
-            vm start "Smoke-VM" >/dev/null 2>&1; then
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-              vm show "Smoke-VM" | grep -q '"status": "running"'
-          else
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-              vm show "Smoke-VM" | grep -q '"status": "error"'
-          fi
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm start "Smoke-VM" >/dev/null
+          SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
+          echo "$SHOW_JSON" | grep -q '"status": "running"'
+          echo "$SHOW_JSON" | grep -q '"fastdesk_endpoint": "tcp://'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm pause "Smoke-VM" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-VM" | grep -q '"status": "paused"'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm resume "Smoke-VM" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-VM" | grep -q '"status": "running"'
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm stop "Smoke-VM" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-VM" | grep -q '"status": "off"'
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
-            daemon stop >/dev/null
+            daemon stop --stop-vms >/dev/null
           wait "$SMOKE_PID"
           trap - EXIT
           rm -rf "$SMOKE_DIR"

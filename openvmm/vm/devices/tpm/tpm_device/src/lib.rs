@@ -8,6 +8,7 @@
 //! buffers, as well as the IO Port interface for performing PPI requests and
 //! configuring MMIO request/response regions.
 
+#![cfg(feature = "tpm")]
 #![expect(missing_docs)]
 #![forbid(unsafe_code)]
 
@@ -41,9 +42,7 @@ use guestmem::GuestMemory;
 use guid::Guid;
 use inspect::Inspect;
 use inspect::InspectMut;
-#[cfg(feature = "tpm")]
 use ms_tcg_tpm_sys::MsTpm185Platform;
-#[cfg(feature = "tpm")]
 use ms_tpm_20_ref::MsTpm20RefPlatform;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -108,12 +107,10 @@ const REPORT_TIMER_PERIOD: std::time::Duration = std::time::Duration::new(2, 0);
 const LEGACY_VTPM_SIZE: usize = 16 * 1024;
 const STANDARD_VTPM_SIZE: usize = 32 * 1024;
 
-#[cfg(feature = "tpm")]
 static_assertions::const_assert_eq!(
     ms_tpm_20_ref::NV_MEMORY_SIZE,
     default_vtpm_size(TpmVersion::V138)
 );
-#[cfg(feature = "tpm")]
 static_assertions::const_assert_eq!(
     ms_tcg_tpm_sys::NV_MEMORY_SIZE,
     default_vtpm_size(TpmVersion::V185)
@@ -338,7 +335,6 @@ struct AkCertRequest {
 /// Callback used to implement the monotonic timer for a TPM library.
 pub type MonotonicTimer = Box<dyn Send + FnMut() -> std::time::Duration>;
 
-#[cfg(feature = "tpm")]
 #[derive(Debug, Error)]
 pub enum TpmLibraryError {
     #[error(transparent)]
@@ -347,7 +343,6 @@ pub enum TpmLibraryError {
     V185(#[from] ms_tcg_tpm_sys::Error),
 }
 
-#[cfg(feature = "tpm")]
 impl TpmLibraryError {
     fn is_mismatched_blob_size(&self) -> bool {
         matches!(
@@ -362,13 +357,11 @@ impl TpmLibraryError {
 }
 
 /// Wrapper around TPM libraries that implements [`TpmEngine`].
-#[cfg(feature = "tpm")]
 enum TpmRefLib {
     V138(MsTpm20RefPlatform),
     V185(MsTpm185Platform),
 }
 
-#[cfg(feature = "tpm")]
 impl TpmRefLib {
     fn new(
         version: TpmVersion,
@@ -427,7 +420,6 @@ impl TpmRefLib {
     }
 }
 
-#[cfg(feature = "tpm")]
 impl TpmEngine for TpmRefLib {
     fn execute_command(
         &mut self,
@@ -450,639 +442,6 @@ impl TpmEngine for TpmRefLib {
             TpmRefLib::V185(_) => tpm_lib::TPM_V185_MAX_NV_INDEX_SIZE,
         }
     }
-}
-
-#[cfg(not(feature = "tpm"))]
-#[derive(Debug, Error)]
-pub enum TpmLibraryError {
-    #[error("invalid pure-Rust vTPM state blob")]
-    InvalidStateBlob,
-}
-
-#[cfg(not(feature = "tpm"))]
-impl TpmLibraryError {
-    fn is_mismatched_blob_size(&self) -> bool {
-        false
-    }
-}
-
-#[cfg(not(feature = "tpm"))]
-use tpm20proto::AlgIdEnum;
-#[cfg(not(feature = "tpm"))]
-use tpm20proto::protocol::PcrSelection;
-
-/// Pure-Rust TPM 2.0 command engine used when the optional C reference library
-/// feature (`tpm`) is not compiled in (for instance on Windows MSVC).
-#[cfg(not(feature = "tpm"))]
-struct TpmRefLib {
-    version: TpmVersion,
-    callbacks: TpmPlatformCallbacks,
-    nvram_size: usize,
-    initialized: bool,
-    clear_disabled: bool,
-    cancel_flag: bool,
-    active_sha256: bool,
-    pcr_update_counter: u32,
-    pcr_sha256: [[u8; SHA_256_OUTPUT_SIZE_BYTES]; 24],
-}
-
-#[cfg(not(feature = "tpm"))]
-impl TpmRefLib {
-    const STATE_MAGIC: &'static [u8; 8] = b"OVMMTPM1";
-
-    fn new(
-        version: TpmVersion,
-        callbacks: TpmPlatformCallbacks,
-        nvram_size: usize,
-    ) -> Result<Self, TpmLibraryError> {
-        Ok(Self {
-            version,
-            callbacks,
-            nvram_size,
-            initialized: false,
-            clear_disabled: false,
-            cancel_flag: false,
-            active_sha256: true,
-            pcr_update_counter: 1,
-            pcr_sha256: [[0u8; SHA_256_OUTPUT_SIZE_BYTES]; 24],
-        })
-    }
-
-    fn reset(&mut self, nvram: Option<&[u8]>) -> Result<(), TpmLibraryError> {
-        self.initialized = false;
-        self.clear_disabled = false;
-        self.pcr_sha256 = [[0u8; SHA_256_OUTPUT_SIZE_BYTES]; 24];
-        self.pcr_update_counter = 1;
-        if let Some(blob) = nvram
-            && blob.starts_with(Self::STATE_MAGIC)
-        {
-            self.restore_state(blob.to_vec())?;
-        }
-        Ok(())
-    }
-
-    fn save_state(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16 + self.pcr_sha256.len() * SHA_256_OUTPUT_SIZE_BYTES);
-        out.extend_from_slice(Self::STATE_MAGIC);
-        out.push(self.initialized as u8);
-        out.push(self.clear_disabled as u8);
-        out.push(self.active_sha256 as u8);
-        out.extend_from_slice(&self.pcr_update_counter.to_be_bytes());
-        for pcr in &self.pcr_sha256 {
-            out.extend_from_slice(pcr);
-        }
-        out
-    }
-
-    fn restore_state(&mut self, state: Vec<u8>) -> Result<(), TpmLibraryError> {
-        let expected_len = 8 + 3 + 4 + 24 * SHA_256_OUTPUT_SIZE_BYTES;
-        if state.len() < expected_len || &state[..8] != Self::STATE_MAGIC {
-            return Err(TpmLibraryError::InvalidStateBlob);
-        }
-        self.initialized = state[8] != 0;
-        self.clear_disabled = state[9] != 0;
-        self.active_sha256 = state[10] != 0;
-        self.pcr_update_counter = u32::from_be_bytes(state[11..15].try_into().unwrap());
-        let mut offset = 15;
-        for pcr in &mut self.pcr_sha256 {
-            pcr.copy_from_slice(&state[offset..offset + SHA_256_OUTPUT_SIZE_BYTES]);
-            offset += SHA_256_OUTPUT_SIZE_BYTES;
-        }
-        Ok(())
-    }
-
-    fn set_cancel_flag(&mut self, enabled: bool) {
-        self.cancel_flag = enabled;
-    }
-
-    fn version(&self) -> TpmVersion {
-        self.version
-    }
-
-    fn commit_nv_snapshot(&self) {
-        let mut state = self.save_state();
-        if state.len() < self.nvram_size {
-            state.resize(self.nvram_size, 0);
-        }
-        *self.callbacks.pending_nvram.lock() = state;
-    }
-
-    fn write_reply(
-        response: &mut [u8],
-        session_tag: u16,
-        rc: u32,
-        params: &[u8],
-        auth_acks: usize,
-    ) -> Result<(), TpmEngineError> {
-        const TPM_ST_NO_SESSIONS: u16 = 0x8001;
-        const TPM_ST_SESSIONS: u16 = 0x8002;
-        const TPM_RC_SUCCESS: u32 = 0;
-
-        let mut buf = Vec::with_capacity(16 + params.len() + auth_acks * 5);
-        if rc == TPM_RC_SUCCESS && session_tag == TPM_ST_SESSIONS {
-            let acks = auth_acks.max(1);
-            let total_size = (10 + 4 + params.len() + acks * 5) as u32;
-            buf.extend_from_slice(&TPM_ST_SESSIONS.to_be_bytes());
-            buf.extend_from_slice(&total_size.to_be_bytes());
-            buf.extend_from_slice(&rc.to_be_bytes());
-            buf.extend_from_slice(&(params.len() as u32).to_be_bytes());
-            buf.extend_from_slice(params);
-            for _ in 0..acks {
-                buf.extend_from_slice(&[0u8; 5]);
-            }
-        } else {
-            let body = if rc == TPM_RC_SUCCESS { params } else { &[] };
-            let total_size = (10 + body.len()) as u32;
-            buf.extend_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
-            buf.extend_from_slice(&total_size.to_be_bytes());
-            buf.extend_from_slice(&rc.to_be_bytes());
-            buf.extend_from_slice(body);
-        }
-
-        if response.len() < buf.len() {
-            return Err(TpmEngineError::new(TpmLibraryError::InvalidStateBlob));
-        }
-        response[..buf.len()].copy_from_slice(&buf);
-        Ok(())
-    }
-
-    fn skip_session_area(bytes: &[u8]) -> Option<(&[u8], usize)> {
-        if bytes.len() < 4 {
-            return None;
-        }
-        let auth_size = u32::from_be_bytes(bytes[..4].try_into().ok()?) as usize;
-        let auth_end = 4usize.checked_add(auth_size)?;
-        let auth_area = bytes.get(4..auth_end)?;
-        let mut pos = 0usize;
-        let mut sessions = 0usize;
-        while pos < auth_area.len() {
-            // sessionHandle (4) + nonceSize (2)
-            let nonce_len = u16::from_be_bytes(
-                auth_area.get(pos + 4..pos + 6)?.try_into().ok()?,
-            ) as usize;
-            let attr_off = pos + 6 + nonce_len;
-            // sessionAttributes (1) + hmacSize (2)
-            let hmac_len = u16::from_be_bytes(
-                auth_area.get(attr_off + 1..attr_off + 3)?.try_into().ok()?,
-            ) as usize;
-            pos = attr_off + 3 + hmac_len;
-            sessions += 1;
-        }
-        Some((bytes.get(auth_end..)?, sessions))
-    }
-
-    fn execute_get_capability(&self, params: &[u8]) -> (u32, Vec<u8>) {
-        const TPM_RC_SUCCESS: u32 = 0;
-        const TPM_RC_SIZE: u32 = 0x00000195;
-        const TPM_CAP_ALGS: u32 = 0;
-        const TPM_CAP_COMMANDS: u32 = 2;
-        const TPM_CAP_PCRS: u32 = 5;
-        const TPM_CAP_TPM_PROPERTIES: u32 = 6;
-        const TPM_CAP_HANDLES: u32 = 1;
-
-        if params.len() < 12 {
-            return (TPM_RC_SIZE, Vec::new());
-        }
-        let capability = u32::from_be_bytes(params[0..4].try_into().unwrap());
-        let property = u32::from_be_bytes(params[4..8].try_into().unwrap());
-        let prop_count = u32::from_be_bytes(params[8..12].try_into().unwrap()) as usize;
-
-        let mut out = Vec::new();
-        match capability {
-            TPM_CAP_TPM_PROPERTIES => {
-                let revision: u32 = match self.version {
-                    TpmVersion::V138 => 138,
-                    TpmVersion::V185 => 185,
-                };
-                let startup_clear: u32 = 0x8000_000F; // phEnable | shEnable | ehEnable | phEnableNV | orderly
-                let props: [(u32, u32); 20] = [
-                    (0x0000_0100, 0x322E_3000), // TPM_PT_FAMILY_INDICATOR ("2.0\0")
-                    (0x0000_0101, 0),           // TPM_PT_LEVEL
-                    (0x0000_0102, revision),    // TPM_PT_REVISION
-                    (0x0000_0103, 1),           // TPM_PT_DAY_OF_YEAR
-                    (0x0000_0104, 2025),        // TPM_PT_YEAR
-                    (0x0000_0105, 0x4D53_4654), // TPM_PT_MANUFACTURER ("MSFT")
-                    (0x0000_0106, 0x4F70_656E), // TPM_PT_VENDOR_STRING_1 ("Open")
-                    (0x0000_0107, 0x564D_4D20), // TPM_PT_VENDOR_STRING_2 ("VMM ")
-                    (0x0000_0108, 0x7654_504D), // TPM_PT_VENDOR_STRING_3 ("vTPM")
-                    (0x0000_0109, 0x322E_3000), // TPM_PT_VENDOR_STRING_4 ("2.0\0")
-                    (0x0000_010A, 1),           // TPM_PT_VENDOR_TPM_TYPE
-                    (0x0000_010B, 0x0002_0000), // TPM_PT_FIRMWARE_VERSION_1
-                    (0x0000_010C, 0),           // TPM_PT_FIRMWARE_VERSION_2
-                    (0x0000_010D, TPM_PAGE_SIZE as u32), // TPM_PT_INPUT_BUFFER
-                    (0x0000_0111, TPM_PAGE_SIZE as u32), // TPM_PT_MAX_COMMAND_SIZE
-                    (0x0000_0112, TPM_PAGE_SIZE as u32), // TPM_PT_MAX_RESPONSE_SIZE
-                    (0x0000_0113, SHA_256_OUTPUT_SIZE_BYTES as u32), // TPM_PT_MAX_DIGEST
-                    (0x0000_0120, 24),          // TPM_PT_PCR_COUNT
-                    (0x0000_0121, 3),           // TPM_PT_PCR_SELECT_MIN
-                    (0x0000_0202, startup_clear), // TPM_PT_STARTUP_CLEAR
-                ];
-                let matching: Vec<(u32, u32)> =
-                    props.iter().copied().filter(|(k, _)| *k >= property).collect();
-                let take = matching.len().min(prop_count);
-                let more_data = u8::from(take < matching.len());
-                out.push(more_data);
-                out.extend_from_slice(&capability.to_be_bytes());
-                out.extend_from_slice(&(take as u32).to_be_bytes());
-                for (k, v) in &matching[..take] {
-                    out.extend_from_slice(&k.to_be_bytes());
-                    out.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            TPM_CAP_ALGS => {
-                // (algId, TPMA_ALGORITHM properties)
-                let algs: [(u16, u32); 4] = [
-                    (AlgIdEnum::RSA as u16, 0x0000_0009),
-                    (AlgIdEnum::AES as u16, 0x0000_000A),
-                    (0x0008, 0x0000_000C), // TPM_ALG_KEYEDHASH
-                    (AlgIdEnum::SHA256 as u16, 0x0000_0004),
-                ];
-                let matching: Vec<(u16, u32)> = algs
-                    .iter()
-                    .copied()
-                    .filter(|(id, _)| u32::from(*id) >= property)
-                    .collect();
-                let take = matching.len().min(prop_count);
-                out.push(u8::from(take < matching.len()));
-                out.extend_from_slice(&capability.to_be_bytes());
-                out.extend_from_slice(&(take as u32).to_be_bytes());
-                for (id, attrs) in &matching[..take] {
-                    out.extend_from_slice(&id.to_be_bytes());
-                    out.extend_from_slice(&attrs.to_be_bytes());
-                }
-            }
-            TPM_CAP_COMMANDS => {
-                let cmds: [(u32, u8); 14] = [
-                    (CommandCodeEnum::Clear as u32, 1),
-                    (CommandCodeEnum::ClearControl as u32, 1),
-                    (CommandCodeEnum::PCR_Allocate as u32, 1),
-                    (CommandCodeEnum::PCR_Event as u32, 1),
-                    (CommandCodeEnum::SelfTest as u32, 0),
-                    (CommandCodeEnum::Startup as u32, 0),
-                    (CommandCodeEnum::Shutdown as u32, 0),
-                    (CommandCodeEnum::StirRandom as u32, 0),
-                    (CommandCodeEnum::NV_ReadPublic as u32, 1),
-                    (CommandCodeEnum::FlushContext as u32, 0),
-                    (CommandCodeEnum::GetCapability as u32, 0),
-                    (CommandCodeEnum::GetRandom as u32, 0),
-                    (CommandCodeEnum::GetTestResult as u32, 0),
-                    (CommandCodeEnum::PCR_Read as u32, 0),
-                ];
-                let min_cc = property & 0xFFFF;
-                let matching: Vec<u32> = cmds
-                    .iter()
-                    .filter(|(cc, _)| *cc >= min_cc)
-                    .map(|(cc, c_handles)| (cc & 0xFFFF) | ((u32::from(*c_handles)) << 25))
-                    .collect();
-                let take = matching.len().min(prop_count);
-                out.push(u8::from(take < matching.len()));
-                out.extend_from_slice(&capability.to_be_bytes());
-                out.extend_from_slice(&(take as u32).to_be_bytes());
-                for val in &matching[..take] {
-                    out.extend_from_slice(&val.to_be_bytes());
-                }
-            }
-            TPM_CAP_PCRS => {
-                out.push(0); // moreData = NO
-                out.extend_from_slice(&capability.to_be_bytes());
-                if self.active_sha256 {
-                    out.extend_from_slice(&1u32.to_be_bytes()); // count = 1
-                    out.extend_from_slice(&(AlgIdEnum::SHA256 as u16).to_be_bytes());
-                    out.push(3);
-                    out.extend_from_slice(&[0xff, 0xff, 0xff]);
-                } else {
-                    out.extend_from_slice(&0u32.to_be_bytes());
-                }
-            }
-            TPM_CAP_HANDLES => {
-                out.push(0); // moreData = NO
-                out.extend_from_slice(&capability.to_be_bytes());
-                out.extend_from_slice(&0u32.to_be_bytes());
-            }
-            _ => {
-                out.push(0);
-                out.extend_from_slice(&capability.to_be_bytes());
-                out.extend_from_slice(&0u32.to_be_bytes());
-            }
-        }
-        (TPM_RC_SUCCESS, out)
-    }
-
-    fn execute_pcr_read(&self, params: &[u8]) -> (u32, Vec<u8>) {
-        const TPM_RC_SUCCESS: u32 = 0;
-        const TPM_RC_SIZE: u32 = 0x00000195;
-
-        if params.len() < 4 {
-            return (TPM_RC_SIZE, Vec::new());
-        }
-        let req_count = u32::from_be_bytes(params[0..4].try_into().unwrap()) as usize;
-        let mut offset = 4usize;
-        let mut resp_selections = Vec::new();
-        let mut resp_digests = Vec::new();
-        let mut sel_count = 0u32;
-        let mut digest_count = 0u32;
-
-        for _ in 0..req_count.min(8) {
-            let Some(sel) = PcrSelection::deserialize(&params[offset..]) else {
-                return (TPM_RC_SIZE, Vec::new());
-            };
-            offset += sel.payload_size();
-            let mut out_bitmap = [0u8; 3];
-            if sel.hash.0.get() == AlgIdEnum::SHA256 as u16 && self.active_sha256 {
-                for pcr in 0..24usize {
-                    let byte_idx = pcr / 8;
-                    let bit = 1u8 << (pcr % 8);
-                    if byte_idx < sel.size_of_select as usize && (sel.bitmap[byte_idx] & bit) != 0 {
-                        if digest_count >= 8 {
-                            break;
-                        }
-                        out_bitmap[byte_idx] |= bit;
-                        digest_count += 1;
-                        resp_digests.extend_from_slice(&(SHA_256_OUTPUT_SIZE_BYTES as u16).to_be_bytes());
-                        resp_digests.extend_from_slice(&self.pcr_sha256[pcr]);
-                    }
-                }
-            }
-            sel_count += 1;
-            resp_selections.extend_from_slice(&sel.hash.0.get().to_be_bytes());
-            resp_selections.push(3);
-            resp_selections.extend_from_slice(&out_bitmap);
-        }
-
-        let mut out = Vec::new();
-        out.extend_from_slice(&self.pcr_update_counter.to_be_bytes());
-        out.extend_from_slice(&sel_count.to_be_bytes());
-        out.extend_from_slice(&resp_selections);
-        out.extend_from_slice(&digest_count.to_be_bytes());
-        out.extend_from_slice(&resp_digests);
-        (TPM_RC_SUCCESS, out)
-    }
-
-    fn execute_pcr_extend(&mut self, pcr_handle: u32, payload: &[u8]) -> u32 {
-        const TPM_RC_SUCCESS: u32 = 0;
-        const TPM_RC_SIZE: u32 = 0x00000195;
-
-        if payload.len() < 4 {
-            return TPM_RC_SIZE;
-        }
-        let count = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let mut pos = 4usize;
-        for _ in 0..count {
-            if payload.len() < pos + 2 {
-                return TPM_RC_SIZE;
-            }
-            let alg = u16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap());
-            pos += 2;
-            let digest_len = match alg {
-                0x0004 => 20, // SHA1
-                0x000B => 32, // SHA256
-                0x000C => 48, // SHA384
-                0x000D => 64, // SHA512
-                0x0012 => 32, // SM3_256
-                _ => return 0x0000_0126, // TPM_RC_HASH
-            };
-            let Some(digest) = payload.get(pos..pos + digest_len) else {
-                return TPM_RC_SIZE;
-            };
-            pos += digest_len;
-            if alg == AlgIdEnum::SHA256 as u16 && (pcr_handle as usize) < self.pcr_sha256.len() {
-                let mut combined = [0u8; SHA_256_OUTPUT_SIZE_BYTES * 2];
-                combined[..SHA_256_OUTPUT_SIZE_BYTES]
-                    .copy_from_slice(&self.pcr_sha256[pcr_handle as usize]);
-                combined[SHA_256_OUTPUT_SIZE_BYTES..].copy_from_slice(digest);
-                self.pcr_sha256[pcr_handle as usize] = pure_rust_sha256(&combined);
-                self.pcr_update_counter = self.pcr_update_counter.wrapping_add(1);
-            }
-        }
-        TPM_RC_SUCCESS
-    }
-}
-
-#[cfg(not(feature = "tpm"))]
-impl TpmEngine for TpmRefLib {
-    fn execute_command(
-        &mut self,
-        command: &mut [u8],
-        response: &mut [u8],
-    ) -> Result<(), TpmEngineError> {
-        const TPM_RC_SUCCESS: u32 = 0;
-        const TPM_RC_CANCELED: u32 = 0x0000_0909;
-        const TPM_RC_COMMAND_CODE: u32 = 0x0000_0143;
-        const TPM_RC_COMMAND_SIZE: u32 = 0x0000_0142;
-        const TPM_RC_DISABLED: u32 = 0x0000_0120;
-        const TPM_RC_HANDLE: u32 = 0x0000_018B;
-
-        if self.cancel_flag {
-            self.cancel_flag = false;
-            return Self::write_reply(response, 0x8001, TPM_RC_CANCELED, &[], 0);
-        }
-
-        if command.len() < 10 {
-            return Self::write_reply(response, 0x8001, TPM_RC_COMMAND_SIZE, &[], 0);
-        }
-        let session_tag = u16::from_be_bytes([command[0], command[1]]);
-        let cmd_size = u32::from_be_bytes([command[2], command[3], command[4], command[5]]) as usize;
-        let cmd_code = u32::from_be_bytes([command[6], command[7], command[8], command[9]]);
-        if cmd_size < 10 || cmd_size > command.len() {
-            return Self::write_reply(response, 0x8001, TPM_RC_COMMAND_SIZE, &[], 0);
-        }
-        let body = &command[10..cmd_size];
-
-        match CommandCodeEnum::from_u32(cmd_code) {
-            Some(CommandCodeEnum::Startup) => {
-                self.initialized = true;
-                self.commit_nv_snapshot();
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &[], 0)
-            }
-            Some(CommandCodeEnum::SelfTest) | Some(CommandCodeEnum::Shutdown) | Some(CommandCodeEnum::StirRandom) | Some(CommandCodeEnum::FlushContext) => {
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &[], 0)
-            }
-            Some(CommandCodeEnum::GetTestResult) => {
-                let mut params = Vec::with_capacity(6);
-                params.extend_from_slice(&0u16.to_be_bytes());
-                params.extend_from_slice(&TPM_RC_SUCCESS.to_be_bytes());
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &params, 0)
-            }
-            Some(CommandCodeEnum::GetRandom) => {
-                if body.len() < 2 {
-                    return Self::write_reply(response, session_tag, TPM_RC_COMMAND_SIZE, &[], 0);
-                }
-                let requested = u16::from_be_bytes([body[0], body[1]]) as usize;
-                let count = requested.min(32);
-                let mut out = vec![0u8; 2 + count];
-                out[..2].copy_from_slice(&(count as u16).to_be_bytes());
-                if count > 0 && getrandom::fill(&mut out[2..]).is_err() {
-                    return Err(TpmEngineError::new(TpmLibraryError::InvalidStateBlob));
-                }
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &out, 0)
-            }
-            Some(CommandCodeEnum::ReadClock) => {
-                let dur = (self.callbacks.monotonic_timer)();
-                let time_ms = dur.as_millis() as u64;
-                let mut out = Vec::with_capacity(21);
-                out.extend_from_slice(&time_ms.to_be_bytes());
-                out.extend_from_slice(&time_ms.to_be_bytes());
-                out.extend_from_slice(&0u32.to_be_bytes());
-                out.extend_from_slice(&0u32.to_be_bytes());
-                out.push(1);
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &out, 0)
-            }
-            Some(CommandCodeEnum::GetCapability) => {
-                let (rc, params) = self.execute_get_capability(body);
-                Self::write_reply(response, session_tag, rc, &params, 0)
-            }
-            Some(CommandCodeEnum::PCR_Read) => {
-                let (rc, params) = self.execute_pcr_read(body);
-                Self::write_reply(response, session_tag, rc, &params, 0)
-            }
-            Some(CommandCodeEnum::NV_ReadPublic) => {
-                Self::write_reply(response, session_tag, TPM_RC_HANDLE, &[], 0)
-            }
-            Some(CommandCodeEnum::ClearControl) => {
-                let Some((params, acks)) = body.get(4..).and_then(Self::skip_session_area) else {
-                    return Self::write_reply(response, session_tag, TPM_RC_COMMAND_SIZE, &[], 0);
-                };
-                if let Some(&disable) = params.first() {
-                    self.clear_disabled = disable != 0;
-                    self.commit_nv_snapshot();
-                }
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &[], acks)
-            }
-            Some(CommandCodeEnum::Clear) => {
-                let Some((_params, acks)) = body.get(4..).and_then(Self::skip_session_area) else {
-                    return Self::write_reply(response, session_tag, TPM_RC_COMMAND_SIZE, &[], 0);
-                };
-                if self.clear_disabled {
-                    return Self::write_reply(response, session_tag, TPM_RC_DISABLED, &[], acks);
-                }
-                self.pcr_sha256 = [[0u8; SHA_256_OUTPUT_SIZE_BYTES]; 24];
-                self.pcr_update_counter = self.pcr_update_counter.wrapping_add(1);
-                self.commit_nv_snapshot();
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &[], acks)
-            }
-            Some(CommandCodeEnum::ChangeEPS) | Some(CommandCodeEnum::ChangePPS) | Some(CommandCodeEnum::HierarchyControl) => {
-                let Some((_params, acks)) = body.get(4..).and_then(Self::skip_session_area) else {
-                    return Self::write_reply(response, session_tag, TPM_RC_COMMAND_SIZE, &[], 0);
-                };
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &[], acks)
-            }
-            Some(CommandCodeEnum::PCR_Allocate) => {
-                let Some((params, acks)) = body.get(4..).and_then(Self::skip_session_area) else {
-                    return Self::write_reply(response, session_tag, TPM_RC_COMMAND_SIZE, &[], 0);
-                };
-                if params.len() >= 4 {
-                    let count = u32::from_be_bytes(params[0..4].try_into().unwrap()) as usize;
-                    let mut off = 4usize;
-                    for _ in 0..count {
-                        let Some(sel) = PcrSelection::deserialize(&params[off..]) else {
-                            break;
-                        };
-                        off += sel.payload_size();
-                        if sel.hash.0.get() == AlgIdEnum::SHA256 as u16 {
-                            self.active_sha256 = sel.bitmap.iter().any(|b| *b != 0);
-                        }
-                    }
-                    self.commit_nv_snapshot();
-                }
-                let mut reply_params = Vec::with_capacity(13);
-                reply_params.push(1); // allocationSuccess = YES
-                reply_params.extend_from_slice(&24u32.to_be_bytes());
-                reply_params.extend_from_slice(&0u32.to_be_bytes());
-                reply_params.extend_from_slice(&1024u32.to_be_bytes());
-                Self::write_reply(response, session_tag, TPM_RC_SUCCESS, &reply_params, acks)
-            }
-            Some(CommandCodeEnum::PCR_Extend) => {
-                if body.len() < 4 {
-                    return Self::write_reply(response, session_tag, TPM_RC_COMMAND_SIZE, &[], 0);
-                }
-                let pcr_handle = u32::from_be_bytes(body[0..4].try_into().unwrap());
-                let Some((params, acks)) = Self::skip_session_area(&body[4..]) else {
-                    return Self::write_reply(response, session_tag, TPM_RC_COMMAND_SIZE, &[], 0);
-                };
-                let rc = self.execute_pcr_extend(pcr_handle, params);
-                Self::write_reply(response, session_tag, rc, &[], acks)
-            }
-            _ => Self::write_reply(response, session_tag, TPM_RC_COMMAND_CODE, &[], 0),
-        }
-    }
-
-    fn max_nv_index_size(&self) -> u16 {
-        match self.version {
-            TpmVersion::V138 => tpm_lib::TPM_V138_MAX_NV_INDEX_SIZE,
-            TpmVersion::V185 => tpm_lib::TPM_V185_MAX_NV_INDEX_SIZE,
-        }
-    }
-}
-
-#[cfg(not(feature = "tpm"))]
-fn pure_rust_sha256(input: &[u8]) -> [u8; SHA_256_OUTPUT_SIZE_BYTES] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut padded = Vec::with_capacity((input.len() + 9).div_ceil(64) * 64);
-    padded.extend_from_slice(input);
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (slot, delta) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *slot = slot.wrapping_add(delta);
-        }
-    }
-    let mut digest = [0u8; SHA_256_OUTPUT_SIZE_BYTES];
-    for (i, word) in h.iter().enumerate() {
-        digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    digest
 }
 
 #[derive(InspectMut)]
@@ -1188,7 +547,6 @@ struct TpmPlatformCallbacks {
     monotonic_timer: MonotonicTimer,
 }
 
-#[cfg(feature = "tpm")]
 impl ms_tpm_20_ref::PlatformCallbacks for TpmPlatformCallbacks {
     fn commit_nv_state(&mut self, state: &[u8]) -> ms_tpm_20_ref::DynResult<()> {
         *self.pending_nvram.lock() = state.to_vec();
@@ -1209,7 +567,6 @@ impl ms_tpm_20_ref::PlatformCallbacks for TpmPlatformCallbacks {
     }
 }
 
-#[cfg(feature = "tpm")]
 impl ms_tcg_tpm_sys::PlatformCallbacks for TpmPlatformCallbacks {
     fn commit_nv_state(&mut self, state: &[u8]) -> ms_tcg_tpm_sys::DynResult<()> {
         *self.pending_nvram.lock() = state.to_vec();
@@ -3027,7 +2384,7 @@ mod save_restore {
     }
 }
 
-#[cfg(all(test, feature = "tpm"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ak_cert::TpmAkCertType;
@@ -3880,59 +3237,5 @@ mod tests {
             writes.lock().as_slice(),
             [(StoreKind::Nvram, _), (StoreKind::Ppi, _)]
         ));
-    }
-}
-
-#[cfg(all(test, not(feature = "tpm")))]
-mod fallback_tests {
-    use super::*;
-    use guestmem::GuestMemory;
-    use pal_async::async_test;
-    use vmcore::non_volatile_store::EphemeralNonVolatileStore;
-
-    #[async_test]
-    async fn pure_rust_tpm_initializes_and_reports_tpm20_capability() {
-        let mem = GuestMemory::allocate(TPM_PAGE_SIZE * 2);
-        let mut tpm = Tpm::new(
-            TpmVersion::V185,
-            TpmRegisterLayout::IoPort,
-            mem,
-            EphemeralNonVolatileStore::new_boxed(),
-            EphemeralNonVolatileStore::new_boxed(),
-            None,
-            Box::new(|| std::time::Duration::from_millis(1)),
-            false,
-            false,
-            TpmAkCertType::None,
-            None,
-            None,
-            false,
-            Guid::new_random(),
-        )
-        .await
-        .unwrap();
-
-        // Query GetCapability(TPM_CAP_TPM_PROPERTIES, TPM_PT_FAMILY_INDICATOR = 0x100, count = 1).
-        let mut cmd = Vec::new();
-        cmd.extend_from_slice(&0x8001u16.to_be_bytes());
-        cmd.extend_from_slice(&22u32.to_be_bytes());
-        cmd.extend_from_slice(&(CommandCodeEnum::GetCapability as u32).to_be_bytes());
-        cmd.extend_from_slice(&6u32.to_be_bytes()); // TPM_CAP_TPM_PROPERTIES
-        cmd.extend_from_slice(&0x100u32.to_be_bytes()); // TPM_PT_FAMILY_INDICATOR
-        cmd.extend_from_slice(&1u32.to_be_bytes());
-
-        let mut resp = [0u8; TPM_PAGE_SIZE];
-        tpm.tpm_engine_helper
-            .tpm_engine
-            .execute_command(&mut cmd, &mut resp)
-            .unwrap();
-
-        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0x8001);
-        assert_eq!(u32::from_be_bytes(resp[6..10].try_into().unwrap()), 0);
-        // cap(4) + count(4) after moreData(1) -> offset 19 holds property(4) and value(4).
-        let prop_tag = u32::from_be_bytes(resp[19..23].try_into().unwrap());
-        let prop_val = u32::from_be_bytes(resp[23..27].try_into().unwrap());
-        assert_eq!(prop_tag, 0x0000_0100);
-        assert_eq!(prop_val, 0x322E_3000); // "2.0\0"
     }
 }

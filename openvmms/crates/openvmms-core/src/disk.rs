@@ -20,12 +20,12 @@ pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow:
         .map(|e| e.to_ascii_lowercase());
     match format {
         DiskFormat::Iso => bail!("cannot create an ISO file; specify Raw or Vhdx format"),
+        DiskFormat::Vhd => bail!("creating VHD1 disks is not supported; specify Raw or Vhdx format"),
         DiskFormat::Vhdx => {
-            if matches!(lower.as_deref(), Some("iso" | "vmdk" | "vmgs" | "vhd")) {
+            if lower.as_deref() != Some("vhdx") {
                 bail!(
-                    "disk path {} is incompatible with vhdx format: extension .{} is reserved for another disk format (use .vhdx)",
+                    "disk path {} is incompatible with vhdx format: VHDX disks must use the .vhdx extension",
                     path.display(),
-                    lower.as_deref().unwrap_or_default()
                 );
             }
         }
@@ -58,6 +58,7 @@ pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
     match format {
         DiskFormat::Raw if validate_disk_path_for_format(path, format).is_ok() => return,
         DiskFormat::Vhdx if raw_ext == Some("vhdx") => return,
+        DiskFormat::Vhd if raw_ext == Some("vhd") => return,
         _ => {}
     }
     match (format, ext.as_deref()) {
@@ -73,6 +74,9 @@ pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
         (DiskFormat::Vhdx, Some(_)) => {
             // Preserve unrelated dotted name segments (e.g. `win.v2`) and append.
             path.as_mut_os_string().push(".vhdx");
+        }
+        (DiskFormat::Vhd, _) => {
+            path.set_extension("vhd");
         }
         (DiskFormat::Iso, _) => {}
     }
@@ -193,7 +197,7 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
-    let is_vhdx = ext.as_deref() == Some("vhdx") || crate::models::has_vhdx_magic(path);
+    let is_vhdx = ext.as_deref() == Some("vhdx");
     if is_vhdx
         && let Some(img_bin) = openvmm_img_bin
     {
@@ -283,6 +287,7 @@ mod tests {
             ("disk.vmdk", DiskFormat::Raw),
             ("disk.vmgs", DiskFormat::Raw),
             ("disk.iso", DiskFormat::Raw),
+            ("data.img", DiskFormat::Vhdx),
             ("disk.vhd", DiskFormat::Vhdx),
             ("disk.vmdk", DiskFormat::Vhdx),
             ("disk.vmgs", DiskFormat::Vhdx),
@@ -305,6 +310,21 @@ mod tests {
             );
             assert!(!path.exists(), "{name} must not be created");
         }
+
+        let vhd_err = create_disk(
+            &CreateDiskPayload {
+                path: dir.path().join("legacy.vhd"),
+                size_bytes: 16 * 1024 * 1024,
+                format: DiskFormat::Vhd,
+                fixed: false,
+            },
+            Some(Path::new("/nonexistent/openvmm-img")),
+        )
+        .unwrap_err();
+        assert!(
+            vhd_err.to_string().contains("VHD1"),
+            "{vhd_err:#}"
+        );
 
         let empty_err = create_disk(
             &CreateDiskPayload {
@@ -478,32 +498,38 @@ mod tests {
             assert_eq!(vhdx_err, 7);
             assert_eq!(fs::read(&vhdx_path).unwrap(), b"VHDX_WINNER_PAYLOAD");
 
-            // Case-insensitive .VHDX and explicit --format vhdx on .img both succeed
-            // and inspect/infer as VHDX via magic bytes.
-            let magic_stub = dir.path().join("magic-stub-openvmm-img.sh");
+            // Case-insensitive .VHDX succeeds as VHDX, .vhd classifies as Vhd, and .img
+            // starting with `vhdxfile` bytes stays Raw (never format-sniffed).
+            let vhdx_stub = dir.path().join("vhdx-stub-openvmm-img.sh");
             fs::write(
-                &magic_stub,
+                &vhdx_stub,
                 "#!/bin/sh\nset -eu\ncmd=\"$1\"\npath=\"$2\"\nif [ \"$cmd\" = \"create\" ]; then\n  printf \"vhdxfileDUMMY\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
             )
             .unwrap();
-            fs::set_permissions(&magic_stub, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&vhdx_stub, fs::Permissions::from_mode(0o755)).unwrap();
 
-            for custom_name in ["data.img", "Disk.VHDX"] {
-                let p = dir.path().join(custom_name);
-                let created = create_disk(
-                    &CreateDiskPayload {
-                        path: p.clone(),
-                        size_bytes,
-                        format: DiskFormat::Vhdx,
-                        fixed: false,
-                    },
-                    Some(&magic_stub),
-                )
-                .unwrap();
-                assert_eq!(created.format, "vhdx", "{custom_name}");
-                assert_eq!(created.virtual_size_bytes, size_bytes, "{custom_name}");
-                assert_eq!(DiskFormat::from_path(&p), DiskFormat::Vhdx, "{custom_name}");
-            }
+            let upper_vhdx = dir.path().join("Disk.VHDX");
+            let created = create_disk(
+                &CreateDiskPayload {
+                    path: upper_vhdx.clone(),
+                    size_bytes,
+                    format: DiskFormat::Vhdx,
+                    fixed: false,
+                },
+                Some(&vhdx_stub),
+            )
+            .unwrap();
+            assert_eq!(created.format, "vhdx");
+            assert_eq!(created.virtual_size_bytes, size_bytes);
+            assert_eq!(DiskFormat::from_path(&upper_vhdx), DiskFormat::Vhdx);
+
+            assert_eq!(DiskFormat::from_path(Path::new("legacy.vhd")), DiskFormat::Vhd);
+
+            let raw_with_magic = dir.path().join("raw-with-magic.img");
+            fs::write(&raw_with_magic, b"vhdxfileDUMMY").unwrap();
+            assert_eq!(DiskFormat::from_path(&raw_with_magic), DiskFormat::Raw);
+            let inspected = inspect_disk(&raw_with_magic, Some(&vhdx_stub)).unwrap();
+            assert_eq!(inspected.format, "raw");
         }
     }
 }

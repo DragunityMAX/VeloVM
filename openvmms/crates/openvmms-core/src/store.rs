@@ -47,6 +47,24 @@ impl RegistryStore {
         self.data_dir.join("daemon.lock")
     }
 
+    pub fn runtime_addr_path(&self) -> PathBuf {
+        self.data_dir.join("daemon.addr")
+    }
+
+    pub fn write_runtime_listen_addr(&self, addr: &str) -> anyhow::Result<()> {
+        atomic_write(&self.runtime_addr_path(), addr.as_bytes(), true)
+    }
+
+    pub fn read_runtime_listen_addr(&self) -> Option<String> {
+        let raw = fs::read_to_string(self.runtime_addr_path()).ok()?;
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    pub fn clear_runtime_listen_addr(&self) {
+        let _ = fs::remove_file(self.runtime_addr_path());
+    }
+
     /// Acquires an exclusive non-blocking lock on `<data_dir>/daemon.lock` for the
     /// lifetime of the returned `File`, preventing two `openvmmsd` instances from
     /// managing the same registry simultaneously.

@@ -25,9 +25,6 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -36,7 +33,6 @@ pub struct ApiClient {
     base_url: String,
     token: String,
     client: reqwest::blocking::Client,
-    verified: Arc<AtomicBool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -59,7 +55,6 @@ impl ApiClient {
             base_url,
             token: token.into(),
             client,
-            verified: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -73,9 +68,15 @@ impl ApiClient {
         let store = RegistryStore::new(&dir)?;
         let cfg = store.load_or_init_host_config()?;
         let token = store.read_token()?;
-        let base_url = daemon_url_override
-            .map(|u| normalize_base_url(u))
-            .unwrap_or_else(|| normalize_base_url(&cfg.listen_addr));
+        let base_url = if let Some(u) = daemon_url_override {
+            normalize_base_url(u)
+        } else if store.is_daemon_locked()
+            && let Some(runtime_addr) = store.read_runtime_listen_addr()
+        {
+            normalize_base_url(&runtime_addr)
+        } else {
+            normalize_base_url(&cfg.listen_addr)
+        };
         Self::new(base_url, token)
     }
 
@@ -119,12 +120,11 @@ impl ApiClient {
                 );
             }
         }
-        self.verified.store(true, Ordering::Release);
         Ok(())
     }
 
     fn ensure_verified(&self) -> anyhow::Result<()> {
-        if !self.verified.load(Ordering::Acquire) {
+        if !self.token.is_empty() {
             self.health()?;
         }
         Ok(())
@@ -353,8 +353,16 @@ impl ApiClient {
     }
 
     pub fn shutdown_daemon(&self) -> anyhow::Result<()> {
+        self.shutdown_daemon_with_options(false)
+    }
+
+    pub fn shutdown_daemon_with_options(&self, stop_vms: bool) -> anyhow::Result<()> {
         self.ensure_verified()?;
-        let url = format!("{}/api/v1/daemon/shutdown", self.base_url);
+        let url = if stop_vms {
+            format!("{}/api/v1/daemon/shutdown?stop_vms=true", self.base_url)
+        } else {
+            format!("{}/api/v1/daemon/shutdown", self.base_url)
+        };
         let resp = self
             .client
             .post(url)
@@ -840,5 +848,95 @@ mod tests {
             "bearer token must never be transmitted to an impostor health listener"
         );
         drop(srv);
+    }
+
+    #[test]
+    fn client_rechallenges_and_refuses_token_to_port_squatter_after_daemon_stops() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "secret-bearer-token";
+
+        // Genuine daemon handles one health challenge and one authenticated GET /api/v1/vms, then exits.
+        let genuine_srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let body = if first_line.starts_with("GET /api/v1/health?") {
+                    let query = first_line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.split_once('?'))
+                        .map(|(_, q)| q)
+                        .unwrap_or("");
+                    let challenge = query
+                        .split('&')
+                        .filter_map(|kv| kv.split_once('='))
+                        .find(|(k, _)| *k == "challenge")
+                        .map(|(_, v)| v)
+                        .unwrap_or("");
+                    let proof = crate::models::compute_health_auth_proof(token, challenge);
+                    format!(
+                        r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#
+                    )
+                } else {
+                    "[]".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = ApiClient::new(format!("http://{addr}"), token).unwrap();
+        assert!(client.list_vms().unwrap().is_empty());
+        genuine_srv.join().unwrap();
+
+        // Port squatter binds the freed port on the same address.
+        let squatter = std::net::TcpListener::bind(addr).unwrap();
+        let saw_auth = Arc::new(AtomicBool::new(false));
+        let saw_auth_srv = Arc::clone(&saw_auth);
+        let squatter_srv = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = squatter.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.to_ascii_lowercase().contains("authorization:") {
+                    saw_auth_srv.store(true, Ordering::SeqCst);
+                }
+                let body = r#"{"status":"ok","service":"openvmmsd"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        // The long-lived client must re-challenge before sending the bearer token again.
+        let err = client.list_vms().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed health authentication challenge"),
+            "{err:#}"
+        );
+        assert!(
+            !saw_auth.load(Ordering::SeqCst),
+            "long-lived client leaked bearer token to port squatter"
+        );
+        squatter_srv.join().unwrap();
     }
 }

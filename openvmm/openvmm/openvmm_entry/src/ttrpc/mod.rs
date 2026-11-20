@@ -2778,14 +2778,13 @@ async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDevic
             None
         } else {
             Some(
-                open_disk_type(
+                openvmm_helpers::disk::open_raw_disk_file(
                     disk.host_path.as_ref(),
                     OpenDiskOptions {
                         read_only: true,
                         direct: false,
                     },
                 )
-                .await
                 .with_context(|| format!("failed to open {}", disk.host_path))?,
             )
         };
@@ -2795,10 +2794,16 @@ async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDevic
         }
         .into_resource()
     } else {
-        let disk_handle = if disk.r#type == vmservice::DiskType::ScsiDiskTypeVhdx as i32 {
-            openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await
-        } else {
-            open_disk_type(disk.host_path.as_ref(), options).await
+        let disk_handle = match vmservice::DiskType::from_i32(disk.r#type) {
+            Some(vmservice::DiskType::ScsiDiskTypeVhdx) => {
+                openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await
+            }
+            Some(vmservice::DiskType::ScsiDiskTypePhysical) => {
+                openvmm_helpers::disk::open_raw_disk_file(disk.host_path.as_ref(), options)
+            }
+            Some(vmservice::DiskType::ScsiDiskTypeVhd1) | None => {
+                open_disk_type(disk.host_path.as_ref(), options).await
+            }
         }
         .with_context(|| format!("failed to open {}", disk.host_path))?;
         SimpleScsiDiskHandle {
@@ -5271,5 +5276,88 @@ mod tests {
     fn fastdesk_max_clients_zero_uses_worker_default() {
         assert_eq!(resolve_fastdesk_max_clients(0), 16);
         assert_eq!(resolve_fastdesk_max_clients(4), 4);
+    }
+
+    #[test]
+    fn make_disk_config_honors_declared_raw_with_vhdx_magic() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let raw_path = dir.path().join("raw.img");
+            let mut payload = vec![0u8; 512];
+            payload[..8].copy_from_slice(b"vhdxfile");
+            std::fs::write(&raw_path, &payload).unwrap();
+
+            let disk = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 0,
+                host_path: raw_path.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypePhysical as i32,
+                read_only: true,
+                is_dvd: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(disk.path.lun, 0);
+            assert_eq!(disk.device.id(), "emulated_disk");
+        });
+    }
+
+    #[test]
+    fn make_disk_config_opens_vhd1_disk() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let vhd_path = dir.path().join("legacy.vhd");
+            let created = openvmm_helpers::disk::create_disk_type(
+                &vhd_path,
+                64 * 1024,
+                OpenDiskOptions {
+                    read_only: false,
+                    direct: false,
+                },
+            )
+            .unwrap();
+            drop(created);
+
+            let disk = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 1,
+                host_path: vhd_path.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypeVhd1 as i32,
+                read_only: false,
+                is_dvd: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(disk.path.lun, 1);
+            assert_eq!(disk.device.id(), "emulated_disk");
+        });
+    }
+
+    #[test]
+    fn make_disk_config_explicit_vhdx_uses_vhdx_backend() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let bad_vhdx = dir.path().join("bad.img");
+            std::fs::write(&bad_vhdx, [0u8; 512]).unwrap();
+
+            let err = match make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 0,
+                host_path: bad_vhdx.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypeVhdx as i32,
+                read_only: true,
+                is_dvd: false,
+            })
+            .await
+            {
+                Ok(_) => panic!("expected explicit VHDX open to fail on invalid payload"),
+                Err(err) => err,
+            };
+            assert!(
+                err.chain()
+                    .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
+                "{err:#}"
+            );
+        });
     }
 }

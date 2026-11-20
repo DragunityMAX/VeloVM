@@ -161,6 +161,7 @@ pub struct NewVmWizard {
     pub new_disk_fixed: bool,
     pub existing_disk_path: String,
     pub iso_path: String,
+    pub submitting: bool,
     pub error: Option<String>,
 }
 
@@ -175,7 +176,7 @@ impl NewVmWizard {
             memory_mb: 8192,
             secure_boot_enabled: true,
             secure_boot_template: SecureBootTemplateConfig::MicrosoftWindows,
-            tpm_enabled: true,
+            tpm_enabled: false,
             nested_virt: false,
             fastdesk_enabled: true,
             vram_mb: 32,
@@ -192,10 +193,21 @@ impl NewVmWizard {
             new_disk_fixed: false,
             existing_disk_path: String::new(),
             iso_path: String::new(),
+            submitting: false,
             error: None,
         };
         w.apply_preset(VmPreset::Windows11);
         w
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("VM name cannot be empty".to_string());
+        }
+        if self.disk_mode == DiskMode::UseExisting && self.existing_disk_path.trim().is_empty() {
+            return Err("Please specify an existing virtual hard disk path".to_string());
+        }
+        Ok(())
     }
 
     fn sanitized_disk_stem(&self) -> String {
@@ -264,13 +276,19 @@ impl NewVmWizard {
             }
             DiskMode::UseExisting => {
                 let p = PathBuf::from(self.existing_disk_path.trim());
+                let format = DiskFormat::from_path(&p);
+                let (kind, read_only) = if format == DiskFormat::Iso {
+                    (DiskKind::Dvd, true)
+                } else {
+                    (DiskKind::HardDisk, false)
+                };
                 (
                     vec![DiskAttachment {
                         lun: 0,
-                        kind: DiskKind::HardDisk,
-                        format: DiskFormat::from_path(&p),
+                        kind,
+                        format,
                         path: p,
-                        read_only: false,
+                        read_only,
                     }],
                     None,
                 )
@@ -312,7 +330,7 @@ impl NewVmWizard {
                 self.memory_mb = 8192;
                 self.secure_boot_enabled = true;
                 self.secure_boot_template = SecureBootTemplateConfig::MicrosoftWindows;
-                self.tpm_enabled = true;
+                self.tpm_enabled = false;
                 self.vram_mb = 32;
             }
             VmPreset::LinuxDesktop => {
@@ -337,6 +355,7 @@ impl NewVmWizard {
 pub struct VmSettingsDialog {
     pub vm_id: Uuid,
     pub is_offline: bool,
+    pub initial_config: VmConfig,
     pub name: String,
     pub description: String,
     pub vcpus: u32,
@@ -354,6 +373,8 @@ pub struct VmSettingsDialog {
     pub initial_switch_id: String,
     pub selected_switch_id: String,
     pub nics: Vec<NicAttachment>,
+    pub submitting: bool,
+    pub error: Option<String>,
 }
 
 impl VmSettingsDialog {
@@ -367,6 +388,7 @@ impl VmSettingsDialog {
         Self {
             vm_id: cfg.id,
             is_offline: matches!(status, VmStatus::Off | VmStatus::Error),
+            initial_config: cfg.clone(),
             name: cfg.name.clone(),
             description: cfg.description.clone(),
             vcpus: cfg.vcpus,
@@ -388,48 +410,66 @@ impl VmSettingsDialog {
             initial_switch_id: selected_switch_id.clone(),
             selected_switch_id,
             nics: cfg.nics.clone(),
+            submitting: false,
+            error: None,
         }
     }
 
     pub fn build_update_payload(&self, switches: &[VirtualSwitchInfo]) -> UpdateVmPayload {
+        let trimmed_name = self.name.trim();
+        let name = (trimmed_name != self.initial_config.name).then(|| trimmed_name.to_string());
+        let description =
+            (self.description != self.initial_config.description).then(|| self.description.clone());
+
         if self.is_offline {
-            // Only send `nics` when the user changed the switch dropdown so concurrent
-            // CLI/API NIC or port-forward changes are not clobbered on Save Changes.
-            let nics = if self.selected_switch_id == self.initial_switch_id {
-                None
-            } else {
-                Some(build_nics_from_switch_id(
-                    &self.selected_switch_id,
-                    switches,
-                    &self.nics,
-                ))
-            };
-            let mut fastdesk = self.base_fastdesk.clone();
-            fastdesk.enabled = self.fastdesk_enabled;
-            fastdesk.vram_mb = self.vram_mb;
-            fastdesk.use_shm = self.use_shm;
-            fastdesk.transport = self.transport;
-            if self.transport == FastDeskTransport::HvSock && fastdesk.vsock_port.is_none() {
-                fastdesk.vsock_port = Some(5901);
-            }
+            // Only emit fields that were actually changed so concurrent CLI/API edits
+            // to other fields are never overwritten by a stale dialog snapshot.
+            let nics = (self.selected_switch_id != self.initial_switch_id).then(|| {
+                build_nics_from_switch_id(&self.selected_switch_id, switches, &self.nics)
+            });
+            let fastdesk_changed = self.fastdesk_enabled != self.initial_config.fastdesk.enabled
+                || self.vram_mb != self.initial_config.fastdesk.vram_mb
+                || self.use_shm != self.initial_config.fastdesk.use_shm
+                || self.transport != self.initial_config.fastdesk.transport;
+            let fastdesk_diff = fastdesk_changed.then(|| {
+                let mut fastdesk = self.base_fastdesk.clone();
+                fastdesk.enabled = self.fastdesk_enabled;
+                fastdesk.vram_mb = self.vram_mb;
+                fastdesk.use_shm = self.use_shm;
+                fastdesk.transport = self.transport;
+                if self.transport == FastDeskTransport::HvSock && fastdesk.vsock_port.is_none() {
+                    fastdesk.vsock_port = Some(5901);
+                }
+                fastdesk
+            });
+            let cur_fw = string_to_opt(&self.uefi_firmware);
+            let uefi_firmware = (cur_fw != self.initial_config.uefi_firmware).then_some(cur_fw);
+
             UpdateVmPayload {
-                name: Some(self.name.trim().to_string()),
-                description: Some(self.description.clone()),
-                vcpus: Some(self.vcpus),
-                memory_mb: Some(self.memory_mb),
-                nested_virt: Some(self.nested_virt),
-                uefi_firmware: Some(string_to_opt(&self.uefi_firmware)),
-                secure_boot_enabled: Some(self.secure_boot_enabled),
-                secure_boot_template: Some(self.secure_boot_template),
-                tpm_enabled: Some(self.tpm_enabled),
-                fastdesk: Some(fastdesk),
+                name,
+                description,
+                vcpus: (self.vcpus != self.initial_config.vcpus).then_some(self.vcpus),
+                memory_mb: (self.memory_mb != self.initial_config.memory_mb)
+                    .then_some(self.memory_mb),
+                nested_virt: (self.nested_virt != self.initial_config.nested_virt)
+                    .then_some(self.nested_virt),
+                uefi_firmware,
+                secure_boot_enabled: (self.secure_boot_enabled
+                    != self.initial_config.secure_boot_enabled)
+                    .then_some(self.secure_boot_enabled),
+                secure_boot_template: (self.secure_boot_template
+                    != self.initial_config.secure_boot_template)
+                    .then_some(self.secure_boot_template),
+                tpm_enabled: (self.tpm_enabled != self.initial_config.tpm_enabled)
+                    .then_some(self.tpm_enabled),
+                fastdesk: fastdesk_diff,
                 nics,
                 ..Default::default()
             }
         } else {
             UpdateVmPayload {
-                name: Some(self.name.trim().to_string()),
-                description: Some(self.description.clone()),
+                name,
+                description,
                 ..Default::default()
             }
         }
@@ -467,6 +507,8 @@ pub struct HostSettingsDialog {
     pub openvmm_img_bin: String,
     pub uefi_firmware_path: String,
     pub base_config: HostConfig,
+    pub submitting: bool,
+    pub error: Option<String>,
 }
 
 impl HostSettingsDialog {
@@ -478,6 +520,8 @@ impl HostSettingsDialog {
             openvmm_img_bin: opt_to_string(cfg.openvmm_img_bin.as_deref()),
             uefi_firmware_path: opt_to_string(cfg.uefi_firmware_path.as_deref()),
             base_config: cfg.clone(),
+            submitting: false,
+            error: None,
         }
     }
 }
@@ -486,6 +530,31 @@ pub struct DeleteVmDialog {
     pub vm_id: Uuid,
     pub vm_name: String,
     pub delete_disks: bool,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingConfirmAction {
+    TurnOff {
+        id: Uuid,
+        vm_name: String,
+    },
+    Reset {
+        id: Uuid,
+        vm_name: String,
+    },
+    DetachDisk {
+        id: Uuid,
+        vm_name: String,
+        lun: u32,
+        path: PathBuf,
+        vm_active: bool,
+    },
+}
+
+pub struct ConfirmActionDialog {
+    pub action: PendingConfirmAction,
 }
 
 fn opt_to_string(p: Option<&std::path::Path>) -> String {
@@ -786,7 +855,8 @@ pub fn render_new_vm_wizard(
                                 ui.end_row();
 
                                 ui.label("vTPM 2.0:");
-                                ui.checkbox(&mut w.tpm_enabled, "Enable Trusted Platform Module 2.0");
+                                ui.checkbox(&mut w.tpm_enabled, "Enable Trusted Platform Module 2.0")
+                                    .on_hover_text("Requires openvmm built with --features tpm");
                                 ui.end_row();
                             },
                         );
@@ -941,19 +1011,31 @@ pub fn render_new_vm_wizard(
                 ui.add_space(12.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if ui.add_enabled(!w.submitting, egui::Button::new("Cancel")).clicked() {
                         close = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if w.step == 4 {
-                            if ui.button(RichText::new("Finish & Create VM").strong()).clicked() {
-                                if w.name.trim().is_empty() {
-                                    w.error = Some("VM name cannot be empty".to_string());
+                            let finish_label = if w.submitting {
+                                "Creating…"
+                            } else {
+                                "Finish & Create VM"
+                            };
+                            if ui
+                                .add_enabled(
+                                    !w.submitting,
+                                    egui::Button::new(RichText::new(finish_label).strong()),
+                                )
+                                .clicked()
+                            {
+                                if let Err(msg) = w.validate() {
+                                    w.error = Some(msg);
                                     return;
                                 }
+                                w.error = None;
+                                w.submitting = true;
                                 let payload = w.build_create_payload(switches);
                                 backend.send(GuiRequest::CreateVm(payload));
-                                close = true;
                             }
                         } else if ui.button("Next >").clicked() {
                             w.step += 1;
@@ -1104,17 +1186,32 @@ pub fn render_vm_settings_dialog(
                     );
                 });
 
+                if let Some(err) = &d.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
+
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Save Changes").clicked() {
+                    let save_label = if d.submitting { "Saving…" } else { "Save Changes" };
+                    if ui.add_enabled(!d.submitting, egui::Button::new(save_label)).clicked() {
+                        if d.name.trim().is_empty() {
+                            d.error = Some("VM name cannot be empty".to_string());
+                            return;
+                        }
                         let payload = d.build_update_payload(switches);
-                        backend.send(GuiRequest::UpdateVm {
-                            id: d.vm_id,
-                            payload,
-                        });
-                        close = true;
+                        if payload.is_empty() {
+                            close = true;
+                        } else {
+                            d.error = None;
+                            d.submitting = true;
+                            backend.send(GuiRequest::UpdateVm {
+                                id: d.vm_id,
+                                payload,
+                            });
+                        }
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.add_enabled(!d.submitting, egui::Button::new("Cancel")).clicked() {
                         close = true;
                     }
                 });
@@ -1319,19 +1416,30 @@ pub fn render_host_settings_dialog(
                     ));
                 }
 
+                if let Some(err) = &d.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
+
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Save Host Settings").clicked() {
+                    let save_label = if d.submitting {
+                        "Saving…"
+                    } else {
+                        "Save Host Settings"
+                    };
+                    if ui.add_enabled(!d.submitting, egui::Button::new(save_label)).clicked() {
                         let mut cfg = d.base_config.clone();
                         cfg.listen_addr = d.listen_addr.trim().to_string();
                         cfg.openvmm_bin = string_to_opt(&d.openvmm_bin);
                         cfg.fastdesk_viewer_bin = string_to_opt(&d.fastdesk_viewer_bin);
                         cfg.openvmm_img_bin = string_to_opt(&d.openvmm_img_bin);
                         cfg.uefi_firmware_path = string_to_opt(&d.uefi_firmware_path);
+                        d.error = None;
+                        d.submitting = true;
                         backend.send(GuiRequest::SaveHostConfig(cfg));
-                        close = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.add_enabled(!d.submitting, egui::Button::new("Cancel")).clicked() {
                         close = true;
                     }
                 });
@@ -1384,16 +1492,99 @@ pub fn render_delete_vm_dialog(
                     &mut d.delete_disks,
                     "Also delete writable virtual hard disk files attached to this VM",
                 );
+                if let Some(err) = &d.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
+                    let del_label = if d.submitting { "Deleting…" } else { "Delete" };
                     if ui
-                        .button(RichText::new("Delete").color(Color32::LIGHT_RED))
+                        .add_enabled(
+                            !d.submitting,
+                            egui::Button::new(RichText::new(del_label).color(Color32::LIGHT_RED)),
+                        )
                         .clicked()
                     {
+                        d.error = None;
+                        d.submitting = true;
                         backend.send(GuiRequest::DeleteVm {
                             id: d.vm_id,
                             delete_disks: d.delete_disks,
                         });
+                    }
+                    if ui.add_enabled(!d.submitting, egui::Button::new("Cancel")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+    }
+    if close {
+        *dlg_opt = None;
+    }
+}
+
+pub fn render_confirm_action_dialog(
+    ctx: &egui::Context,
+    dlg_opt: &mut Option<ConfirmActionDialog>,
+    backend: &BackendHandle,
+) {
+    let mut close = false;
+    if let Some(dlg) = dlg_opt.as_ref() {
+        let (title, body, confirm_label, req) = match &dlg.action {
+            PendingConfirmAction::TurnOff { id, vm_name } => (
+                "Turn Off Virtual Machine",
+                format!(
+                    "Force-turn off '{vm_name}' immediately?\n\nThis cuts power without a guest shutdown and may cause unsaved data loss."
+                ),
+                "Turn Off",
+                GuiRequest::StopVm { id: *id },
+            ),
+            PendingConfirmAction::Reset { id, vm_name } => (
+                "Reset Virtual Machine",
+                format!(
+                    "Force-reset '{vm_name}' immediately?\n\nThis performs a hard reboot without shutting down the guest OS cleanly."
+                ),
+                "Reset",
+                GuiRequest::ResetVm { id: *id },
+            ),
+            PendingConfirmAction::DetachDisk {
+                id,
+                vm_name,
+                lun,
+                path,
+                vm_active,
+            } => {
+                let live_note = if *vm_active {
+                    "\n\nThis will hot-unplug the disk while the VM is running."
+                } else {
+                    ""
+                };
+                (
+                    "Detach Virtual Hard Disk",
+                    format!(
+                        "Detach SCSI LUN {lun} ({}) from '{vm_name}'?{live_note}",
+                        path.display()
+                    ),
+                    "Detach",
+                    GuiRequest::DetachDisk { id: *id, lun: *lun },
+                )
+            }
+        };
+
+        egui::Window::new(title)
+            .id(egui::Id::new("confirm_destructive_action_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(body);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new(confirm_label).color(Color32::LIGHT_RED))
+                        .clicked()
+                    {
+                        backend.send(req);
                         close = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1500,12 +1691,27 @@ mod tests {
         }
 
         let mut dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Off);
-        let payload = dlg.build_update_payload(&[]);
-        let fd = payload.fastdesk.unwrap();
+        // Unmodified dialog must produce an empty diff payload so concurrent CLI edits are preserved.
+        assert!(dlg.build_update_payload(&[]).is_empty());
+
+        // Editing only description must leave all hardware/NIC fields as None.
+        dlg.description = "edited description".to_string();
+        let desc_only = dlg.build_update_payload(&[]);
+        assert_eq!(desc_only.description.as_deref(), Some("edited description"));
+        assert!(desc_only.vcpus.is_none());
+        assert!(desc_only.memory_mb.is_none());
+        assert!(desc_only.fastdesk.is_none());
+        assert!(desc_only.nics.is_none());
+
+        // Editing VRAM only must preserve custom FastDesk listen_addr/vsock_port while leaving other fields None.
+        dlg.vram_mb = 64;
+        let vram_payload = dlg.build_update_payload(&[]);
+        let fd = vram_payload.fastdesk.unwrap();
+        assert_eq!(fd.vram_mb, 64);
         assert_eq!(fd.listen_addr, "127.0.0.1:5999");
         assert_eq!(fd.vsock_port, Some(6000));
-        // Unchanged switch selection leaves NICs untouched on the daemon (`None`).
-        assert!(payload.nics.is_none());
+        assert!(vram_payload.vcpus.is_none());
+        assert!(vram_payload.nics.is_none());
 
         // Switching NIC backend still preserves extra NICs on the update payload.
         let switches = vec![VirtualSwitchInfo {
@@ -1551,15 +1757,18 @@ mod tests {
             render_vm_settings_dialog(ctx, &mut dlg_opt, &[], &backend, &mut file_picker);
         });
 
-        let dlg = dlg_opt.as_ref().unwrap();
+        let dlg = dlg_opt.as_mut().unwrap();
         assert_eq!(dlg.vcpus, 128);
         assert_eq!(dlg.memory_mb, 524_288);
         assert_eq!(dlg.vram_mb, 256);
 
+        // Unchanged dialog produces an empty diff; changing vram_mb emits only fastdesk with 256 preserved.
+        assert!(dlg.build_update_payload(&[]).is_empty());
+        dlg.memory_mb = 262_144;
         let payload = dlg.build_update_payload(&[]);
-        assert_eq!(payload.vcpus, Some(128));
-        assert_eq!(payload.memory_mb, Some(524_288));
-        assert_eq!(payload.fastdesk.unwrap().vram_mb, 256);
+        assert_eq!(payload.memory_mb, Some(262_144));
+        assert!(payload.vcpus.is_none());
+        assert!(payload.fastdesk.is_none());
 
         // Wizard controls must also preserve supported upper/lower limits across renders.
         let mut wiz = NewVmWizard::new(Path::new("/tmp/wiz"));
@@ -1579,5 +1788,65 @@ mod tests {
         assert_eq!(wiz.vcpus, 256);
         assert_eq!(wiz.memory_mb, 128);
         assert_eq!(wiz.vram_mb, 256);
+    }
+
+    #[test]
+    fn new_vm_wizard_rejects_blank_existing_disk_path() {
+        let mut wiz = NewVmWizard::new(Path::new("/tmp/wiz"));
+        wiz.disk_mode = DiskMode::UseExisting;
+        wiz.existing_disk_path = "   ".to_string();
+        assert!(wiz.validate().is_err());
+
+        wiz.existing_disk_path = "/tmp/existing.vhdx".to_string();
+        assert!(wiz.validate().is_ok());
+
+        wiz.existing_disk_path = "/tmp/installer.iso".to_string();
+        let payload = wiz.build_create_payload(&[]);
+        assert_eq!(payload.disks[0].kind, DiskKind::Dvd);
+        assert!(payload.disks[0].read_only);
+        assert_eq!(payload.disks[0].format, DiskFormat::Iso);
+    }
+
+    #[test]
+    fn vm_settings_dialog_concurrent_vm_updated_does_not_revert_cli_edits() {
+        let mut cfg = VmConfig::from_preset("Concurrent", VmPreset::Custom, Path::new("/tmp/vm"));
+        cfg.vcpus = 4;
+        cfg.fastdesk.listen_addr = "127.0.0.1:5900".to_string();
+
+        let mut dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Off);
+
+        // Simulate a concurrent CLI edit arriving via SSE/VmUpdated (mirroring GuiUpdate::VmUpdated):
+        // vcpus changes 4 -> 8, fastdesk.listen_addr changes 5900 -> 5955, and an extra TAP NIC is added.
+        let mut cli_cfg = cfg.clone();
+        cli_cfg.vcpus = 8;
+        cli_cfg.fastdesk.listen_addr = "127.0.0.1:5955".to_string();
+        cli_cfg.nics.push(NicAttachment {
+            id: Uuid::new_v4(),
+            name: "CLI TAP".to_string(),
+            mac_address: generate_hyperv_mac(),
+            backend: NicBackendConfig::Tap {
+                name: "tap0".to_string(),
+            },
+        });
+        dlg.base_fastdesk = cli_cfg.fastdesk.clone();
+        dlg.nics = cli_cfg.nics.clone();
+        dlg.is_offline = true;
+
+        // Editing only description must NOT revert the CLI's vcpus edit or emit fastdesk/nics.
+        dlg.description = "gui description".to_string();
+        let desc_only = dlg.build_update_payload(&[]);
+        assert_eq!(desc_only.description.as_deref(), Some("gui description"));
+        assert!(desc_only.vcpus.is_none());
+        assert!(desc_only.fastdesk.is_none());
+        assert!(desc_only.nics.is_none());
+
+        // Editing vram_mb must emit fastdesk with the new CLI listen_addr preserved while leaving vcpus/nics None.
+        dlg.vram_mb = 64;
+        let vram_payload = dlg.build_update_payload(&[]);
+        let fd = vram_payload.fastdesk.expect("expected fastdesk diff");
+        assert_eq!(fd.vram_mb, 64);
+        assert_eq!(fd.listen_addr, "127.0.0.1:5955");
+        assert!(vram_payload.vcpus.is_none());
+        assert!(vram_payload.nics.is_none());
     }
 }
