@@ -12,6 +12,7 @@ use openvmms_core::models::FastDeskSettings;
 use openvmms_core::models::FastDeskTransport;
 use openvmms_core::models::HostConfig;
 use openvmms_core::models::HostInfo;
+use openvmms_core::models::MAX_VM_MEMORY_MB;
 use openvmms_core::models::NicAttachment;
 use openvmms_core::models::NicBackendConfig;
 use openvmms_core::models::SecureBootTemplateConfig;
@@ -44,6 +45,7 @@ pub enum FilePickerTarget {
 pub struct FilePickerModal {
     pub target: FilePickerTarget,
     pub current_dir: PathBuf,
+    pub dir_input: String,
     pub filename_input: String,
     pub save_mode: bool,
     pub filter_exts: Vec<String>,
@@ -78,9 +80,11 @@ impl FilePickerModal {
             (home, String::new())
         };
 
+        let dir_input = start_dir.to_string_lossy().into_owned();
         let mut modal = Self {
             target,
             current_dir: start_dir,
+            dir_input,
             filename_input: fname,
             save_mode,
             filter_exts: filter_exts.into_iter().map(|s| s.to_ascii_lowercase()).collect(),
@@ -89,6 +93,16 @@ impl FilePickerModal {
         };
         modal.reload();
         modal
+    }
+
+    pub fn navigate_to(&mut self, dir: PathBuf) {
+        if dir.is_dir() {
+            self.current_dir = dir;
+            self.dir_input = self.current_dir.to_string_lossy().into_owned();
+            self.reload();
+        } else {
+            self.error = Some(format!("Directory not found: {}", dir.display()));
+        }
     }
 
     pub fn reload(&mut self) {
@@ -176,7 +190,7 @@ impl NewVmWizard {
             memory_mb: 8192,
             secure_boot_enabled: true,
             secure_boot_template: SecureBootTemplateConfig::MicrosoftWindows,
-            tpm_enabled: false,
+            tpm_enabled: true,
             nested_virt: false,
             fastdesk_enabled: true,
             vram_mb: 32,
@@ -268,7 +282,7 @@ impl NewVmWizard {
                     Vec::new(),
                     Some(CreateDiskPayload {
                         path: PathBuf::from(self.new_disk_path.trim()),
-                        size_bytes: self.new_disk_size_gb * 1024 * 1024 * 1024,
+                        size_bytes: self.new_disk_size_gb.saturating_mul(1024 * 1024 * 1024),
                         format: self.new_disk_format,
                         fixed: self.new_disk_fixed,
                     }),
@@ -330,7 +344,7 @@ impl NewVmWizard {
                 self.memory_mb = 8192;
                 self.secure_boot_enabled = true;
                 self.secure_boot_template = SecureBootTemplateConfig::MicrosoftWindows;
-                self.tpm_enabled = false;
+                self.tpm_enabled = true;
                 self.vram_mb = 32;
             }
             VmPreset::LinuxDesktop => {
@@ -589,10 +603,10 @@ pub fn build_nics_from_switch_id(
     switches: &[VirtualSwitchInfo],
     existing_nics: &[NicAttachment],
 ) -> Vec<NicAttachment> {
-    if switch_id == "none" {
-        return Vec::new();
-    }
     let trailing = existing_nics.iter().skip(1).cloned();
+    if switch_id == "none" {
+        return trailing.collect();
+    }
     if switch_id == "consomme" {
         let primary = match existing_nics.first() {
             Some(existing) if matches!(existing.backend, NicBackendConfig::Consomme { .. }) => {
@@ -658,21 +672,20 @@ pub fn render_file_picker(
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("⬆ Up").clicked()
-                    && let Some(parent) = picker.current_dir.parent()
+                    && let Some(parent) = picker.current_dir.parent().map(PathBuf::from)
                 {
-                    picker.current_dir = parent.to_path_buf();
-                    picker.reload();
+                    picker.navigate_to(parent);
                 }
-                let mut dir_str = picker.current_dir.to_string_lossy().into_owned();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut dir_str).desired_width(440.0))
-                    .lost_focus()
-                {
-                    let p = PathBuf::from(dir_str.trim());
-                    if p.is_dir() {
-                        picker.current_dir = p;
-                        picker.reload();
-                    }
+                let dir_resp =
+                    ui.add(egui::TextEdit::singleline(&mut picker.dir_input).desired_width(400.0));
+                let enter_pressed =
+                    dir_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let go_clicked = ui.button("Go").clicked();
+                let edited_away =
+                    dir_resp.lost_focus() && picker.dir_input.trim() != picker.current_dir.to_string_lossy();
+                if go_clicked || enter_pressed || edited_away {
+                    let p = PathBuf::from(picker.dir_input.trim());
+                    picker.navigate_to(p);
                 }
                 if ui.button("↻").clicked() {
                     picker.reload();
@@ -699,8 +712,7 @@ pub fn render_file_picker(
                         let resp = ui.selectable_label(selected, label);
                         if resp.clicked() {
                             if is_dir {
-                                picker.current_dir = path.clone();
-                                picker.reload();
+                                picker.navigate_to(path.clone());
                             } else {
                                 picker.filename_input = name;
                             }
@@ -818,7 +830,7 @@ pub fn render_new_vm_wizard(
 
                                 ui.label("Startup Memory (MiB):");
                                 ui.horizontal(|ui| {
-                                    let max_mem = w.memory_mb.max(262_144);
+                                    let max_mem = w.memory_mb.clamp(262_144, MAX_VM_MEMORY_MB);
                                     ui.add(egui::DragValue::new(&mut w.memory_mb).range(128..=max_mem).speed(256));
                                     for (label, mb) in [("4G", 4096), ("8G", 8192), ("16G", 16384), ("32G", 32768)] {
                                         if ui.button(label).clicked() {
@@ -960,9 +972,7 @@ pub fn render_new_vm_wizard(
                                             if w.new_disk_format != prev_format {
                                                 sync_disk_path_extension(&mut w.new_disk_path, w.new_disk_format);
                                             }
-                                            if w.new_disk_format == DiskFormat::Vhdx {
-                                                ui.checkbox(&mut w.new_disk_fixed, "Fixed size");
-                                            }
+                                            ui.checkbox(&mut w.new_disk_fixed, "Fixed size");
                                         });
                                         ui.end_row();
                                     },
@@ -1104,7 +1114,7 @@ pub fn render_vm_settings_dialog(
                             ui.end_row();
 
                             ui.label("Memory (MiB):");
-                            let max_mem = d.memory_mb.max(262_144);
+                            let max_mem = d.memory_mb.clamp(262_144, MAX_VM_MEMORY_MB);
                             ui.add(egui::DragValue::new(&mut d.memory_mb).range(128..=max_mem).speed(256));
                             ui.end_row();
 
@@ -1267,9 +1277,7 @@ pub fn render_disk_manager_dialog(
                                 if d.create_format != prev_format {
                                     sync_disk_path_extension(&mut d.create_path, d.create_format);
                                 }
-                                if d.create_format == DiskFormat::Vhdx {
-                                    ui.checkbox(&mut d.create_fixed, "Fixed allocation");
-                                }
+                                ui.checkbox(&mut d.create_fixed, "Fixed allocation");
                             });
                             ui.end_row();
 
@@ -1283,7 +1291,7 @@ pub fn render_disk_manager_dialog(
                         sync_disk_path_extension(&mut d.create_path, d.create_format);
                         backend.send(GuiRequest::CreateDisk(CreateDiskPayload {
                             path: PathBuf::from(d.create_path.trim()),
-                            size_bytes: d.create_size_gb * 1024 * 1024 * 1024,
+                            size_bytes: d.create_size_gb.saturating_mul(1024 * 1024 * 1024),
                             format: d.create_format,
                             fixed: d.create_fixed,
                         }));
@@ -1726,6 +1734,55 @@ mod tests {
         assert_eq!(nics.len(), 2);
         assert!(matches!(nics[0].backend, NicBackendConfig::Tap { ref name } if name == "tap1"));
         assert!(matches!(nics[1].backend, NicBackendConfig::Tap { ref name } if name == "tap0"));
+
+        // Selecting "Not Connected" removes only the primary NIC and preserves trailing NICs.
+        dlg.selected_switch_id = "none".to_string();
+        let none_payload = dlg.build_update_payload(&switches);
+        let remaining = none_payload.nics.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(remaining[0].backend, NicBackendConfig::Tap { ref name } if name == "tap0"));
+    }
+
+    #[test]
+    fn file_picker_dir_input_persists_while_typing_and_navigates_on_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("disk.img"), b"IMG").unwrap();
+
+        let mut picker_opt = Some(FilePickerModal::open(
+            FilePickerTarget::WizardExistingDisk,
+            &dir.path().to_string_lossy(),
+            false,
+            vec!["img"],
+        ));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = render_file_picker(ctx, &mut picker_opt);
+        });
+
+        // Simulate user editing dir_input across frames before committing navigation.
+        picker_opt.as_mut().unwrap().dir_input = sub.to_string_lossy().into_owned();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = render_file_picker(ctx, &mut picker_opt);
+        });
+        assert_eq!(
+            picker_opt.as_ref().unwrap().dir_input,
+            sub.to_string_lossy().as_ref(),
+            "dir_input must not be overwritten across frames while typing"
+        );
+
+        let target_dir = PathBuf::from(&picker_opt.as_ref().unwrap().dir_input);
+        picker_opt.as_mut().unwrap().navigate_to(target_dir);
+        assert_eq!(picker_opt.as_ref().unwrap().current_dir, sub);
+        assert!(
+            picker_opt
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|(name, _, is_dir)| name == "disk.img" && !*is_dir)
+        );
     }
 
     #[test]

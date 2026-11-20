@@ -7,7 +7,7 @@ A high-speed, low-latency 2D desktop display and input pipeline built on a fork 
 The GitHub Actions workflow ([`.github/workflows/build.yml`](.github/workflows/build.yml)) builds, tests, smoke-benchmarks, and packages self-contained bundles on every push, pull request, manual `workflow_dispatch`, and `v*` tag (publishing a GitHub Release on tags):
 
 - **Windows x64 bundle (`openvmm-fastdesk-windows-x64`)**:
-  - `openvmm.exe` (`x86_64-pc-windows-msvc` with WHP + FastDesk + RPC extensions enabled)
+  - `openvmm.exe` (`x86_64-pc-windows-msvc` with WHP + FastDesk + vTPM 2.0 + RPC extensions enabled)
   - `openvmm-img.exe` (VHDX creation, inspection, and verification tool)
   - `fastdesk-viewer.exe` (native Win32 GDI + zero-copy shared VRAM viewer)
   - `openvmmsd.exe`, `openvmms.exe`, `openvmms-gui.exe` (OpenVMMS daemon, CLI, and Hyper-V-style desktop manager)
@@ -117,8 +117,8 @@ cd openvmm
 cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
 cd workers/fastdesk_proto && cargo test
 cd ../..
-cargo build -p openvmm
-./target/debug/openvmm --help | grep -E "fastdesk|vram-mb"
+cargo build -p openvmm --features tpm
+./target/debug/openvmm --help | grep -E "fastdesk|vram-mb|tpm"
 ```
 
 ### 2. Standalone `fastdesk-viewer` (Linux Native + Windows `.exe`)

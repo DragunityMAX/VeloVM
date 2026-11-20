@@ -28,6 +28,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use uuid::Uuid;
 
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     base_url: String,
@@ -48,7 +50,8 @@ impl ApiClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> anyhow::Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(180))
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .context("building HTTP client")?;
         Ok(Self {
@@ -65,8 +68,8 @@ impl ApiClient {
         let dir = data_dir
             .map(resolve_client_path)
             .unwrap_or_else(default_data_dir);
-        let store = RegistryStore::new(&dir)?;
-        let cfg = store.load_or_init_host_config()?;
+        let store = RegistryStore::open(&dir);
+        let cfg = store.load_host_config_or_default()?;
         let token = store.read_token()?;
         let base_url = if let Some(u) = daemon_url_override {
             normalize_base_url(u)
@@ -78,6 +81,23 @@ impl ApiClient {
             normalize_base_url(&cfg.listen_addr)
         };
         Self::new(base_url, token)
+    }
+
+    /// Resolves a client strictly from the live daemon's `daemon.addr` while the daemon
+    /// holds `daemon.lock`, without falling back to `config.toml`'s configured `listen_addr`.
+    pub fn from_runtime_addr(data_dir: Option<&Path>) -> anyhow::Result<Option<Self>> {
+        let dir = data_dir
+            .map(resolve_client_path)
+            .unwrap_or_else(default_data_dir);
+        let store = RegistryStore::open(&dir);
+        if !store.is_daemon_locked() {
+            return Ok(None);
+        }
+        let Some(runtime_addr) = store.read_runtime_listen_addr() else {
+            return Ok(None);
+        };
+        let token = store.read_token()?;
+        Ok(Some(Self::new(normalize_base_url(&runtime_addr), token)?))
     }
 
     pub fn base_url(&self) -> &str {
@@ -100,6 +120,9 @@ impl ApiClient {
         if !resp.status().is_success() {
             bail!("openvmmsd health returned {}", resp.status());
         }
+        let remote_addr = resp
+            .remote_addr()
+            .context("cannot verify daemon health proof without remote socket address")?;
         let body: HealthCheckBody = resp
             .json()
             .context("decoding openvmmsd health response")?;
@@ -112,8 +135,13 @@ impl ApiClient {
             bail!("unexpected service '{service}' at {}", self.base_url);
         }
         if !self.token.is_empty() {
-            let expected = crate::models::compute_health_auth_proof(&self.token, &challenge);
-            if body.auth_proof.as_deref() != Some(expected.as_str()) {
+            let expected =
+                crate::models::compute_health_auth_proof(&self.token, remote_addr, &challenge);
+            let proof_ok = body
+                .auth_proof
+                .as_deref()
+                .is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()));
+            if !proof_ok {
                 bail!(
                     "daemon at {} failed health authentication challenge; refusing to send bearer token",
                     self.base_url
@@ -178,12 +206,17 @@ impl ApiClient {
         for d in &mut resolved.disks {
             d.path = resolve_client_path(&d.path);
         }
+        let has_create_disk = resolved.create_disk.is_some();
         if let Some(cd) = &mut resolved.create_disk
             && !cd.path.as_os_str().is_empty()
         {
             cd.path = resolve_client_path(&cd.path);
         }
-        self.post("/api/v1/vms", &resolved)
+        if has_create_disk {
+            self.post_no_timeout("/api/v1/vms", &resolved)
+        } else {
+            self.post("/api/v1/vms", &resolved)
+        }
     }
 
     pub fn update_vm(&self, id_or_name: &str, req: &UpdateVmPayload) -> anyhow::Result<VmSummary> {
@@ -214,6 +247,7 @@ impl ApiClient {
             .client
             .delete(url)
             .bearer_auth(&self.token)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .context("DELETE VM request failed")?;
         decode_empty_response(resp)
@@ -320,6 +354,7 @@ impl ApiClient {
             .delete(url)
             .bearer_auth(&self.token)
             .json(&PortForwardPayload { port })
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .context("DELETE port forward request failed")?;
         decode_json_response(resp)
@@ -340,7 +375,7 @@ impl ApiClient {
     pub fn create_disk(&self, req: &CreateDiskPayload) -> anyhow::Result<DiskInfo> {
         let mut resolved = req.clone();
         resolved.path = resolve_client_path(&resolved.path);
-        self.post("/api/v1/disks/create", &resolved)
+        self.post_no_timeout("/api/v1/disks/create", &resolved)
     }
 
     pub fn inspect_disk(&self, path: &Path) -> anyhow::Result<DiskInfo> {
@@ -367,6 +402,7 @@ impl ApiClient {
             .client
             .post(url)
             .bearer_auth(&self.token)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .context("sending daemon shutdown")?;
         decode_empty_response(resp)
@@ -378,12 +414,30 @@ impl ApiClient {
             .client
             .get(format!("{}{path}", self.base_url))
             .bearer_auth(&self.token)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .with_context(|| format!("GET {path}"))?;
         decode_json_response(resp)
     }
 
     fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> anyhow::Result<T> {
+        self.ensure_verified()?;
+        let resp = self
+            .client
+            .post(format!("{}{path}", self.base_url))
+            .bearer_auth(&self.token)
+            .json(body)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .send()
+            .with_context(|| format!("POST {path}"))?;
+        decode_json_response(resp)
+    }
+
+    fn post_no_timeout<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> anyhow::Result<T> {
         self.ensure_verified()?;
         let resp = self
             .client
@@ -401,6 +455,7 @@ impl ApiClient {
             .client
             .post(format!("{}{path}", self.base_url))
             .bearer_auth(&self.token)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .with_context(|| format!("POST {path}"))?;
         decode_json_response(resp)
@@ -413,6 +468,7 @@ impl ApiClient {
             .put(format!("{}{path}", self.base_url))
             .bearer_auth(&self.token)
             .json(body)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .with_context(|| format!("PUT {path}"))?;
         decode_json_response(resp)
@@ -424,6 +480,7 @@ impl ApiClient {
             .client
             .delete(format!("{}{path}", self.base_url))
             .bearer_auth(&self.token)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .with_context(|| format!("DELETE {path}"))?;
         decode_json_response(resp)
@@ -495,6 +552,17 @@ fn normalize_client_path(path: &Path) -> PathBuf {
     } else {
         out
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub fn normalize_base_url(listen_or_url: &str) -> String {
@@ -586,9 +654,8 @@ pub fn resolve_local_viewer_binary(data_dir: Option<&Path>) -> anyhow::Result<Pa
     let dir = data_dir
         .map(resolve_client_path)
         .unwrap_or_else(default_data_dir);
-    let configured = RegistryStore::new(&dir)
-        .ok()
-        .and_then(|store| store.load_or_init_host_config().ok())
+    let configured = RegistryStore::open(&dir)
+        .load_host_config_or_default()
         .unwrap_or_default();
     crate::models::resolve_host_paths(&configured)
         .fastdesk_viewer_bin
@@ -608,9 +675,8 @@ pub fn ensure_daemon_running(
     let dir = data_dir
         .map(resolve_client_path)
         .unwrap_or_else(default_data_dir);
-    let store = RegistryStore::new(&dir)?;
-    let cfg = store.load_or_init_host_config()?;
-    let _ = store.load_or_create_token()?;
+    let store = RegistryStore::open(&dir);
+    let cfg = store.load_host_config_or_default()?;
 
     if store.is_daemon_locked() {
         if let Some(url) = daemon_url_override {
@@ -628,7 +694,7 @@ pub fn ensure_daemon_running(
                 return Ok(client);
             }
             if std::time::Instant::now() >= wait_deadline {
-                let latest_cfg = store.load_or_init_host_config().unwrap_or(cfg);
+                let latest_cfg = store.load_host_config_or_default().unwrap_or(cfg);
                 bail!(
                     "another openvmmsd instance holds the lock for {} but is not healthy at {}",
                     dir.display(),
@@ -644,11 +710,7 @@ pub fn ensure_daemon_running(
     let mut cmd = Command::new(&daemon_bin);
     cmd.arg("--data-dir").arg(&dir);
     if let Some(url) = daemon_url_override {
-        let listen = url
-            .trim()
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .trim_end_matches('/');
+        let listen = crate::models::parse_loopback_listen_addr(url)?.to_string();
         cmd.arg("--listen").arg(listen);
     } else {
         let listen = match std::net::TcpListener::bind(&cfg.listen_addr) {
@@ -660,6 +722,15 @@ pub fn ensure_daemon_running(
             Err(_) => cfg.listen_addr.as_str(),
         };
         cmd.arg("--listen").arg(listen);
+    }
+    let dir_existed = dir.exists();
+    if !dir_existed {
+        let _ = std::fs::create_dir_all(&dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let log_file_path = dir.join("openvmmsd.log");
     if let Ok(log_file) = std::fs::OpenOptions::new()
@@ -883,7 +954,7 @@ mod tests {
                         .find(|(k, _)| *k == "challenge")
                         .map(|(_, v)| v)
                         .unwrap_or("");
-                    let proof = crate::models::compute_health_auth_proof(token, challenge);
+                    let proof = crate::models::compute_health_auth_proof(token, addr, challenge);
                     format!(
                         r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#
                     )
@@ -938,5 +1009,169 @@ mod tests {
             "long-lived client leaked bearer token to port squatter"
         );
         squatter_srv.join().unwrap();
+    }
+
+    #[test]
+    fn client_rejects_relayed_health_proof_from_different_address() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let real_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let real_addr = real_listener.local_addr().unwrap();
+        let token = "secret-bearer-token";
+
+        // Genuine daemon responds to one relayed health check with proof bound to `real_addr`.
+        let real_srv = std::thread::spawn(move || {
+            let (mut stream, _) = real_listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let query = first_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.split_once('?'))
+                .map(|(_, q)| q)
+                .unwrap_or("");
+            let challenge = query
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "challenge")
+                .map(|(_, v)| v)
+                .unwrap_or("");
+            let proof = crate::models::compute_health_auth_proof(token, real_addr, challenge);
+            let body = format!(r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        // Relay server on a different loopback port forwards `/api/v1/health?challenge=...`
+        // to the real daemon and returns the exact response body verbatim.
+        let relay_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let saw_auth = Arc::new(AtomicBool::new(false));
+        let saw_auth_relay = Arc::clone(&saw_auth);
+        let relay_srv = std::thread::spawn(move || {
+            let (mut stream, _) = relay_listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.to_ascii_lowercase().contains("authorization:") {
+                saw_auth_relay.store(true, Ordering::SeqCst);
+            }
+            let first_line = req.lines().next().unwrap_or("");
+            let path_and_query = first_line.split_whitespace().nth(1).unwrap_or("/api/v1/health");
+            let relayed = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{real_addr}{path_and_query}"))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                relayed.len(),
+                relayed
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = ApiClient::new(format!("http://{relay_addr}"), token).unwrap();
+        let err = client.list_vms().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed health authentication challenge"),
+            "{err:#}"
+        );
+        assert!(
+            !saw_auth.load(Ordering::SeqCst),
+            "client transmitted bearer token to health relay!"
+        );
+        real_srv.join().unwrap();
+        relay_srv.join().unwrap();
+    }
+
+    #[test]
+    fn client_bypasses_http_and_all_proxy_for_loopback_and_preserves_data_dir_mode() {
+        use std::io::{Read, Write};
+
+        // If invoked as child probe with proxy env vars set, verify ApiClient still reaches loopback.
+        if let Ok(target_url) = std::env::var("OPENVMMS_PROXY_TEST_URL") {
+            let token = std::env::var("OPENVMMS_PROXY_TEST_TOKEN").unwrap();
+            let client = ApiClient::new(target_url, token).unwrap();
+            client.health().unwrap();
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(ApiClient::from_data_dir(Some(dir.path()), None).is_err());
+            let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "ApiClient::from_data_dir must not chmod --data-dir");
+            assert!(!dir.path().join("vms").exists());
+            assert!(!dir.path().join("disks").exists());
+            assert!(!dir.path().join("config.toml").exists());
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "proxy-test-token";
+        let srv = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let query = first_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.split_once('?'))
+                .map(|(_, q)| q)
+                .unwrap_or("");
+            let challenge = query
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "challenge")
+                .map(|(_, v)| v)
+                .unwrap_or("");
+            let proof = crate::models::compute_health_auth_proof(token, addr, challenge);
+            let body = format!(r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("api_client::tests::client_bypasses_http_and_all_proxy_for_loopback_and_preserves_data_dir_mode")
+            .env("OPENVMMS_PROXY_TEST_URL", format!("http://{addr}"))
+            .env("OPENVMMS_PROXY_TEST_TOKEN", token)
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("http_proxy", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .env("all_proxy", "http://127.0.0.1:1")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child proxy bypass probe failed: {status}");
+        srv.join().unwrap();
     }
 }

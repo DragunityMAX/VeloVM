@@ -15,19 +15,40 @@ pub struct RegistryStore {
 }
 
 impl RegistryStore {
+    /// Returns a lightweight store handle without creating directories or altering permissions.
+    pub fn open(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+        }
+    }
+
     pub fn new(data_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let data_dir = data_dir.into();
-        fs::create_dir_all(data_dir.join("vms"))
+        let vms_dir = data_dir.join("vms");
+        let disks_dir = data_dir.join("disks");
+        let data_existed = data_dir.exists();
+        let vms_existed = vms_dir.exists();
+        let disks_existed = disks_dir.exists();
+
+        fs::create_dir_all(&vms_dir)
             .with_context(|| format!("creating VM store dir under {}", data_dir.display()))?;
-        fs::create_dir_all(data_dir.join("disks"))
+        fs::create_dir_all(&disks_dir)
             .with_context(|| format!("creating disks dir under {}", data_dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700));
-            let _ = fs::set_permissions(data_dir.join("vms"), fs::Permissions::from_mode(0o700));
-            let _ = fs::set_permissions(data_dir.join("disks"), fs::Permissions::from_mode(0o700));
+            if !data_existed {
+                let _ = fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700));
+            }
+            if !vms_existed {
+                let _ = fs::set_permissions(&vms_dir, fs::Permissions::from_mode(0o700));
+            }
+            if !disks_existed {
+                let _ = fs::set_permissions(&disks_dir, fs::Permissions::from_mode(0o700));
+            }
         }
+        #[cfg(not(unix))]
+        let _ = (data_existed, vms_existed, disks_existed);
         Ok(Self { data_dir })
     }
 
@@ -86,7 +107,13 @@ impl RegistryStore {
             let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
         }
         match file.try_lock() {
-            Ok(()) => Ok(file),
+            Ok(()) => {
+                #[cfg(windows)]
+                {
+                    set_path_owner_only_windows(&path)?;
+                }
+                Ok(file)
+            }
             Err(fs::TryLockError::WouldBlock) => {
                 bail!(
                     "another openvmmsd instance is already running for data directory {}",
@@ -135,7 +162,7 @@ impl RegistryStore {
         self.vm_dir(id).join("logs").join("openvmm.log")
     }
 
-    pub fn load_or_init_host_config(&self) -> anyhow::Result<HostConfig> {
+    pub fn load_host_config_or_default(&self) -> anyhow::Result<HostConfig> {
         let path = self.host_config_path();
         if path.exists() {
             let text = fs::read_to_string(&path)
@@ -149,6 +176,19 @@ impl RegistryStore {
                 cfg.runtime_dir = default_runtime_dir(&self.data_dir);
             }
             Ok(cfg)
+        } else {
+            Ok(HostConfig {
+                data_dir: self.data_dir.clone(),
+                runtime_dir: default_runtime_dir(&self.data_dir),
+                ..Default::default()
+            })
+        }
+    }
+
+    pub fn load_or_init_host_config(&self) -> anyhow::Result<HostConfig> {
+        let path = self.host_config_path();
+        if path.exists() {
+            self.load_host_config_or_default()
         } else {
             let cfg = HostConfig {
                 data_dir: self.data_dir.clone(),
@@ -282,7 +322,12 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
             .set_permissions(fs::Permissions::from_mode(0o600))
             .context("setting owner-only permissions")?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if owner_only {
+        set_path_owner_only_windows(tmp.path())
+            .context("setting owner-only Windows DACL")?;
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = owner_only;
     tmp.write_all(data)
         .with_context(|| format!("writing temp file for {}", path.display()))?;
@@ -292,6 +337,129 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("persisting {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_user_sid_bytes() -> anyhow::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut raw_token: HANDLE = std::ptr::null_mut();
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("OpenProcessToken failed");
+    }
+    let _token = HandleGuard(raw_token);
+
+    let mut needed = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            raw_token,
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if ok != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+        return Err(std::io::Error::last_os_error()).context("GetTokenInformation size query failed");
+    }
+    let mut buf = vec![0u8; needed as usize];
+    let ok = unsafe {
+        GetTokenInformation(
+            raw_token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("GetTokenInformation(TokenUser) failed");
+    }
+    Ok(buf)
+}
+
+#[cfg(windows)]
+fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_ALL, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
+        TOKEN_USER,
+    };
+
+    struct LocalFreeAcl(*mut ACL);
+    impl Drop for LocalFreeAcl {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0.cast());
+                }
+            }
+        }
+    }
+
+    let token_buf = current_user_sid_bytes()?;
+    let token_user = unsafe { &*(token_buf.as_ptr().cast::<TOKEN_USER>()) };
+    let user_sid = token_user.User.Sid;
+
+    let ea = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: GENERIC_ALL,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: user_sid.cast(),
+        },
+    };
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let err = unsafe { SetEntriesInAclW(1, &ea, std::ptr::null(), &mut new_dacl) };
+    if err != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(err as i32))
+            .context("SetEntriesInAclW failed");
+    }
+    let _acl_guard = LocalFreeAcl(new_dacl);
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl.cast_const(),
+            std::ptr::null(),
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(err as i32))
+            .with_context(|| format!("SetNamedSecurityInfoW failed for {}", path.display()));
+    }
     Ok(())
 }
 
@@ -366,5 +534,104 @@ mod tests {
         let loaded = store.load_all_vms().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, good.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_is_0600_and_existing_data_dir_permissions_are_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "pre-existing --data-dir permissions must not be overwritten");
+
+        let _ = store.load_or_create_token().unwrap();
+        let tok_mode = fs::metadata(store.token_path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(tok_mode, 0o600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn token_has_protected_owner_only_dacl_on_windows() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_USER,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let _ = store.load_or_create_token().unwrap();
+
+        let wide: Vec<u16> = store
+            .token_path()
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let err = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(err, ERROR_SUCCESS);
+        struct LocalFreeSd(PSECURITY_DESCRIPTOR);
+        impl Drop for LocalFreeSd {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        LocalFree(self.0);
+                    }
+                }
+            }
+        }
+        let _sd_guard = LocalFreeSd(sd);
+
+        let mut control = 0u16;
+        let mut rev = 0u32;
+        assert_ne!(unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut rev) }, 0);
+        assert_ne!(control & SE_DACL_PROTECTED, 0, "daemon.token DACL must be protected from inheritance");
+
+        let mut size_info = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut size_info as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        assert_eq!(size_info.AceCount, 1, "expected exactly 1 ACE on daemon.token");
+
+        let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        assert_ne!(unsafe { GetAce(dacl, 0, &mut ace_ptr) }, 0);
+        let ace = unsafe { &*(ace_ptr.cast::<ACCESS_ALLOWED_ACE>()) };
+        let ace_sid = (&raw const ace.SidStart).cast::<core::ffi::c_void>().cast_mut();
+
+        let token_buf = current_user_sid_bytes().unwrap();
+        let token_user = unsafe { &*(token_buf.as_ptr().cast::<TOKEN_USER>()) };
+        assert_ne!(unsafe { EqualSid(ace_sid, token_user.User.Sid) }, 0);
     }
 }

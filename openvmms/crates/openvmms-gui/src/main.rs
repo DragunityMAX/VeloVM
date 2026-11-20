@@ -25,6 +25,7 @@ use dialogs::render_vm_settings_dialog;
 use egui::Color32;
 use egui::RichText;
 use openvmms_core::models::AttachDiskPayload;
+use openvmms_core::models::DiskFormat;
 use openvmms_core::models::DiskKind;
 use openvmms_core::models::HostConfig;
 use openvmms_core::models::HostInfo;
@@ -33,11 +34,13 @@ use openvmms_core::models::MountIsoPayload;
 use openvmms_core::models::NicBackendConfig;
 use openvmms_core::models::PortForward;
 use openvmms_core::models::VirtualSwitchInfo;
+use openvmms_core::models::VmPreset;
 use openvmms_core::models::VmStatus;
 use openvmms_core::models::VmSummary;
 use openvmms_core::models::default_data_dir;
-use openvmms_core::models::format_bytes;
+use openvmms_core::models::format_memory_mb;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::Instant;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -53,7 +56,7 @@ struct Args {
     #[arg(long)]
     daemon_url: Option<String>,
 
-    /// Run headless end-to-end verification of the GUI controller against an ephemeral daemon
+    /// Run headless egui UI and controller verification against an ephemeral daemon
     #[arg(long)]
     self_test: bool,
 }
@@ -113,8 +116,12 @@ struct OpenVmmsApp {
 
 impl OpenVmmsApp {
     fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf, daemon_url: Option<String>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let backend = BackendHandle::spawn(Some(data_dir.clone()), daemon_url, cc.egui_ctx.clone());
+        Self::new_headless(&cc.egui_ctx, data_dir, daemon_url)
+    }
+
+    fn new_headless(ctx: &egui::Context, data_dir: PathBuf, daemon_url: Option<String>) -> Self {
+        ctx.set_visuals(egui::Visuals::dark());
+        let backend = BackendHandle::spawn(Some(data_dir.clone()), daemon_url, ctx.clone());
         backend.send(GuiRequest::ConnectOrStartDaemon);
 
         Self {
@@ -215,11 +222,10 @@ impl OpenVmmsApp {
                     }
                 }
                 GuiUpdate::HostConfigUpdated {
+                    base_url,
                     host_info,
                     host_config,
                 } => {
-                    let base_url =
-                        openvmms_core::api_client::normalize_base_url(&host_config.listen_addr);
                     self.connected = true;
                     self.host_config_loaded = true;
                     self.connection_status = format!("Connected ({base_url})");
@@ -357,14 +363,26 @@ impl OpenVmmsApp {
 
 impl eframe::App for OpenVmmsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui(ctx);
+    }
+}
+
+impl OpenVmmsApp {
+    fn render_ui(&mut self, ctx: &egui::Context) {
         self.process_updates();
 
         if self.detail_tab == DetailTab::ConsoleLogs
             && let Some(sel) = self.selected_vm
-            && self.last_log_fetch.elapsed().as_secs() >= 2
         {
-            self.last_log_fetch = Instant::now();
-            self.backend.send(GuiRequest::FetchVmLogs { id: sel });
+            const LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+            let elapsed = self.last_log_fetch.elapsed();
+            if elapsed >= LOG_REFRESH_INTERVAL {
+                self.last_log_fetch = Instant::now();
+                self.backend.send(GuiRequest::FetchVmLogs { id: sel });
+                ctx.request_repaint_after(LOG_REFRESH_INTERVAL);
+            } else {
+                ctx.request_repaint_after(LOG_REFRESH_INTERVAL - elapsed);
+            }
         }
 
         // Top toolbar
@@ -686,7 +704,7 @@ impl eframe::App for OpenVmmsApp {
                                     };
                                     ui.colored_label(state_color, state_text);
                                     ui.label(vm.config.vcpus.to_string());
-                                    ui.label(format_bytes(vm.config.memory_mb * 1024 * 1024));
+                                    ui.label(format_memory_mb(vm.config.memory_mb));
                                     ui.label(
                                         vm.runtime
                                             .fastdesk_endpoint
@@ -729,6 +747,7 @@ impl eframe::App for OpenVmmsApp {
                         )
                         .clicked()
                     {
+                        self.last_log_fetch = Instant::now();
                         self.backend
                             .send(GuiRequest::FetchVmLogs { id: vm.config.id });
                     }
@@ -800,7 +819,7 @@ impl OpenVmmsApp {
                 ui.label(format!(
                     "{} vCPU, {} RAM (Nested Virt: {})",
                     vm.config.vcpus,
-                    format_bytes(vm.config.memory_mb * 1024 * 1024),
+                    format_memory_mb(vm.config.memory_mb),
                     if vm.config.nested_virt { "On" } else { "Off" }
                 ));
                 ui.end_row();
@@ -1068,7 +1087,7 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     if args.self_test {
-        return controller::run_self_test();
+        return run_self_test();
     }
 
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
@@ -1086,4 +1105,291 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(OpenVmmsApp::new(cc, data_dir, daemon_url)))),
     )
     .map_err(|err| anyhow::anyhow!("eframe error: {err}"))
+}
+
+fn step_headless_ui(ctx: &egui::Context, app: &mut OpenVmmsApp, frames: usize) -> egui::FullOutput {
+    let raw_input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 820.0),
+        )),
+        ..Default::default()
+    };
+    let mut last_output = None;
+    for _ in 0..frames.max(1) {
+        last_output = Some(ctx.run(raw_input.clone(), |c| app.render_ui(c)));
+    }
+    last_output.unwrap()
+}
+
+fn wait_for_app<F>(
+    ctx: &egui::Context,
+    app: &mut OpenVmmsApp,
+    timeout: Duration,
+    what: &str,
+    mut pred: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&OpenVmmsApp) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let _ = step_headless_ui(ctx, app, 1);
+        if pred(app) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for {what} (status='{}', error={:?})",
+                app.status_line,
+                app.error_banner
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_self_test() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let data_dir = tmp.path().to_path_buf();
+    let rt = tokio::runtime::Runtime::new()?;
+    let daemon = rt.block_on(openvmmsd::TestDaemonHandle::spawn(data_dir.clone()))?;
+
+    let ctx = egui::Context::default();
+    let mut app = OpenVmmsApp::new_headless(&ctx, data_dir.clone(), Some(daemon.base_url.clone()));
+
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "daemon connection", |a| {
+        a.connected && a.host_config_loaded && a.host_info.is_some()
+    })?;
+
+    // Render DiskManagerDialog and verify Raw fixed/sparse creation + inspect through the backend.
+    let disk_path = tmp.path().join("selftest.img");
+    let mut disk_dlg = DiskManagerDialog::new(tmp.path());
+    disk_dlg.create_format = DiskFormat::Raw;
+    disk_dlg.create_fixed = true;
+    disk_dlg.create_path = disk_path.to_string_lossy().into_owned();
+    app.disk_mgr_dlg = Some(disk_dlg);
+    let _ = step_headless_ui(&ctx, &mut app, 2);
+    app.backend
+        .send(GuiRequest::CreateDisk(openvmms_core::models::CreateDiskPayload {
+            path: disk_path.clone(),
+            size_bytes: 4 * 1024 * 1024,
+            format: DiskFormat::Raw,
+            fixed: true,
+        }));
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "disk creation", |a| {
+        a.disk_mgr_dlg
+            .as_ref()
+            .and_then(|d| d.last_info.as_ref())
+            .is_some_and(|i| i.path == disk_path && i.virtual_size_bytes == 4 * 1024 * 1024)
+    })?;
+    if let Some(dlg) = app.disk_mgr_dlg.as_mut() {
+        dlg.tab = 1;
+        dlg.inspect_path = disk_path.to_string_lossy().into_owned();
+    }
+    let _ = step_headless_ui(&ctx, &mut app, 2);
+    app.backend.send(GuiRequest::InspectDisk(disk_path.clone()));
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "disk inspect", |a| {
+        a.disk_mgr_dlg
+            .as_ref()
+            .and_then(|d| d.last_info.as_ref())
+            .is_some_and(|i| i.path == disk_path)
+    })?;
+    app.disk_mgr_dlg = None;
+
+    // Render every step of NewVmWizard and submit VM creation.
+    let mut wiz = NewVmWizard::new(tmp.path());
+    assert!(wiz.tpm_enabled, "Win11 preset must default vTPM on");
+    wiz.name = "SelfTest-VM".to_string();
+    for step in 0..=4 {
+        wiz.step = step;
+        app.new_vm_wizard = Some(wiz);
+        let _ = step_headless_ui(&ctx, &mut app, 1);
+        wiz = app.new_vm_wizard.take().unwrap();
+    }
+    wiz.apply_preset(VmPreset::LinuxDesktop);
+    wiz.name = "SelfTest-VM".to_string();
+    wiz.disk_mode = dialogs::DiskMode::None;
+    let create_payload = wiz.build_create_payload(&app.switches);
+    app.new_vm_wizard = Some(wiz);
+    app.backend.send(GuiRequest::CreateVm(create_payload));
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "VM creation", |a| {
+        a.new_vm_wizard.is_none() && a.vms.iter().any(|v| v.config.name == "SelfTest-VM")
+    })?;
+
+    let vm = app
+        .vms
+        .iter()
+        .find(|v| v.config.name == "SelfTest-VM")
+        .cloned()
+        .expect("SelfTest-VM missing");
+    let vm_id = vm.config.id;
+    app.selected_vm = Some(vm_id);
+
+    // Render every inspector tab and verify idle ConsoleLogs schedules a 2s repaint.
+    for tab in [
+        DetailTab::Summary,
+        DetailTab::Storage,
+        DetailTab::Networking,
+        DetailTab::ConsoleLogs,
+    ] {
+        app.detail_tab = tab;
+        let out = step_headless_ui(&ctx, &mut app, 2);
+        if tab == DetailTab::ConsoleLogs {
+            let repaint_delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay)
+                .unwrap_or(Duration::MAX);
+            anyhow::ensure!(
+                repaint_delay <= Duration::from_secs(2),
+                "ConsoleLogs tab did not schedule idle auto-refresh repaint (delay={repaint_delay:?})"
+            );
+        }
+    }
+
+    // Exercise FilePickerModal navigation via typed dir_input and rendering.
+    let sub_dir = tmp.path().join("picker-subdir");
+    std::fs::create_dir_all(&sub_dir)?;
+    let mut picker = FilePickerModal::open(
+        FilePickerTarget::MountIsoPath,
+        &tmp.path().to_string_lossy(),
+        false,
+        vec!["iso"],
+    );
+    picker.dir_input = sub_dir.to_string_lossy().into_owned();
+    picker.navigate_to(sub_dir.clone());
+    anyhow::ensure!(picker.current_dir == sub_dir);
+    app.file_picker = Some(picker);
+    let _ = step_headless_ui(&ctx, &mut app, 2);
+    app.file_picker = None;
+
+    // Exercise VmSettingsDialog and UpdateVm.
+    let mut settings_dlg = VmSettingsDialog::from_config(&vm.config, vm.runtime.status);
+    settings_dlg.description = "Headless UI self-test".to_string();
+    settings_dlg.vcpus = 2;
+    let update_payload = settings_dlg.build_update_payload(&app.switches);
+    app.vm_settings_dlg = Some(settings_dlg);
+    let _ = step_headless_ui(&ctx, &mut app, 2);
+    app.backend.send(GuiRequest::UpdateVm {
+        id: vm_id,
+        payload: update_payload,
+    });
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "VM settings update", |a| {
+        a.vm_settings_dlg.is_none()
+            && a.vms
+                .iter()
+                .find(|v| v.config.id == vm_id)
+                .is_some_and(|v| v.config.description == "Headless UI self-test")
+    })?;
+
+    // Exercise ISO mount and eject.
+    let iso_path = tmp.path().join("selftest.iso");
+    std::fs::write(&iso_path, vec![0u8; 4096])?;
+    app.backend.send(GuiRequest::MountIso {
+        id: vm_id,
+        payload: MountIsoPayload {
+            path: iso_path.clone(),
+            lun: None,
+        },
+    });
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "ISO mount", |a| {
+        a.vms
+            .iter()
+            .find(|v| v.config.id == vm_id)
+            .is_some_and(|v| v.config.disks.iter().any(|d| d.kind == DiskKind::Dvd))
+    })?;
+    app.backend
+        .send(GuiRequest::EjectIso { id: vm_id, lun: None });
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "ISO eject", |a| {
+        a.vms
+            .iter()
+            .find(|v| v.config.id == vm_id)
+            .is_some_and(|v| v.config.disks.iter().all(|d| d.kind != DiskKind::Dvd))
+    })?;
+
+    // Exercise PortForward add/remove.
+    let nic_id = vm
+        .config
+        .nics
+        .first()
+        .map(|n| n.id)
+        .ok_or_else(|| anyhow::anyhow!("expected default Consomme NIC"))?;
+    let pf = PortForward {
+        protocol: IpProto::Udp,
+        host_addr: "127.0.0.1".to_string(),
+        host_port: 15353,
+        guest_port: 53,
+    };
+    app.backend.send(GuiRequest::AddPortForward {
+        id: vm_id,
+        nic_id,
+        port: pf.clone(),
+    });
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "port forward add", |a| {
+        a.vms.iter().find(|v| v.config.id == vm_id).is_some_and(|v| {
+            v.config.nics.iter().any(|n| {
+                matches!(&n.backend, NicBackendConfig::Consomme { port_forwards, .. } if port_forwards.contains(&pf))
+            })
+        })
+    })?;
+    app.backend.send(GuiRequest::RemovePortForward {
+        id: vm_id,
+        nic_id,
+        port: pf.clone(),
+    });
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "port forward remove", |a| {
+        a.vms.iter().find(|v| v.config.id == vm_id).is_some_and(|v| {
+            v.config.nics.iter().all(|n| {
+                !matches!(&n.backend, NicBackendConfig::Consomme { port_forwards, .. } if port_forwards.contains(&pf))
+            })
+        })
+    })?;
+
+    // Render HostSettingsDialog and verify saving config keeps client connected on daemon's actual URL.
+    let host_dlg = HostSettingsDialog::from_config(&app.host_config);
+    let host_cfg = host_dlg.base_config.clone();
+    app.host_settings_dlg = Some(host_dlg);
+    let _ = step_headless_ui(&ctx, &mut app, 2);
+    app.backend.send(GuiRequest::SaveHostConfig(host_cfg));
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "host settings save", |a| {
+        a.host_settings_dlg.is_none()
+    })?;
+    anyhow::ensure!(
+        app.connection_status.contains(&daemon.base_url),
+        "unexpected connection status '{}' (expected '{}')",
+        app.connection_status,
+        daemon.base_url
+    );
+
+    // Render ConfirmActionDialog and DeleteVmDialog, then delete the VM.
+    app.confirm_action_dlg = Some(ConfirmActionDialog {
+        action: PendingConfirmAction::Reset {
+            id: vm_id,
+            vm_name: "SelfTest-VM".to_string(),
+        },
+    });
+    let _ = step_headless_ui(&ctx, &mut app, 1);
+    app.confirm_action_dlg = None;
+
+    app.delete_vm_dlg = Some(DeleteVmDialog {
+        vm_id,
+        vm_name: "SelfTest-VM".to_string(),
+        delete_disks: false,
+        submitting: false,
+        error: None,
+    });
+    let _ = step_headless_ui(&ctx, &mut app, 2);
+    app.backend.send(GuiRequest::DeleteVm {
+        id: vm_id,
+        delete_disks: false,
+    });
+    wait_for_app(&ctx, &mut app, Duration::from_secs(15), "VM delete", |a| {
+        a.delete_vm_dlg.is_none() && !a.vms.iter().any(|v| v.config.id == vm_id)
+    })?;
+
+    drop(app);
+    rt.block_on(daemon.shutdown());
+    println!("SELF-TEST OK (headless egui UI + controller)");
+    Ok(())
 }

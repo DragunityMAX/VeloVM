@@ -10,6 +10,46 @@ use uuid::Uuid;
 
 pub const DEFAULT_DAEMON_PORT: u16 = 47620;
 pub const DEFAULT_DAEMON_LISTEN: &str = "127.0.0.1:47620";
+pub const MAX_VM_MEMORY_MB: u64 = 16 * 1024 * 1024;
+
+/// Parses and validates a loopback HTTP listen address (e.g. `127.0.0.1:47620`,
+/// `[::1]:47620`, or `http://localhost:47620`), rejecting arbitrary hostnames and
+/// non-loopback IP addresses.
+pub fn parse_loopback_listen_addr(raw: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let trimmed = raw.trim();
+    let without_scheme = if trimmed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        &trimmed[7..]
+    } else if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        &trimmed[8..]
+    } else {
+        trimmed
+    };
+    let host_port = without_scheme.trim_end_matches('/');
+    if let Some(port_str) = host_port
+        .get(..10)
+        .filter(|p| p.eq_ignore_ascii_case("localhost:"))
+        .map(|_| &host_port[10..])
+    {
+        let port: u16 = port_str
+            .parse()
+            .with_context(|| format!("invalid listen port in '{raw}'"))?;
+        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    let addr: std::net::SocketAddr = host_port
+        .parse()
+        .with_context(|| format!("invalid listen address '{raw}'"))?;
+    anyhow::ensure!(
+        addr.ip().is_loopback(),
+        "listen_addr '{raw}' must be a loopback address (e.g. 127.0.0.1:47620 or [::1]:47620)"
+    );
+    Ok(addr)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -348,6 +388,22 @@ impl std::fmt::Display for PortForward {
     }
 }
 
+impl PortForward {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.host_addr
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("invalid port forward host address '{}'", self.host_addr))?;
+        if self.host_port == 0 {
+            bail!("port forward host_port must be >= 1");
+        }
+        if self.guest_port == 0 {
+            bail!("port forward guest_port must be >= 1");
+        }
+        Ok(())
+    }
+}
+
 /// Parses specs like:
 /// - `tcp:127.0.0.1:3389->3389`
 /// - `tcp:8080->80`
@@ -366,10 +422,10 @@ pub fn parse_port_forward(spec: &str) -> anyhow::Result<PortForward> {
         .parse()
         .with_context(|| format!("invalid guest port in '{spec}'"))?;
 
-    let (protocol, addr_part) = if let Some(rest) = left.strip_prefix("tcp:") {
-        (IpProto::Tcp, rest)
-    } else if let Some(rest) = left.strip_prefix("udp:") {
-        (IpProto::Udp, rest)
+    let (protocol, addr_part) = if left.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("tcp:")) {
+        (IpProto::Tcp, &left[4..])
+    } else if left.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("udp:")) {
+        (IpProto::Udp, &left[4..])
     } else {
         (IpProto::Tcp, left)
     };
@@ -378,12 +434,12 @@ pub fn parse_port_forward(spec: &str) -> anyhow::Result<PortForward> {
         let (ip, rest) = bracketed
             .split_once("]:")
             .context("invalid IPv6 host address in port forward")?;
-        (ip.to_string(), rest)
+        (ip.trim().to_string(), rest)
     } else if let Some((addr, port)) = addr_part.rsplit_once(':') {
-        let h = if addr.is_empty() {
+        let h = if addr.trim().is_empty() {
             "127.0.0.1".to_string()
         } else {
-            addr.to_string()
+            addr.trim().to_string()
         };
         (h, port)
     } else {
@@ -395,12 +451,14 @@ pub fn parse_port_forward(spec: &str) -> anyhow::Result<PortForward> {
         .parse()
         .with_context(|| format!("invalid host port in '{spec}'"))?;
 
-    Ok(PortForward {
+    let pf = PortForward {
         protocol,
         host_addr,
         host_port,
         guest_port,
-    })
+    };
+    pf.validate()?;
+    Ok(pf)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,7 +599,7 @@ impl VmConfig {
                     8192,
                     true,
                     SecureBootTemplateConfig::MicrosoftWindows,
-                    false,
+                    true,
                 ),
                 VmPreset::LinuxDesktop => (
                     4,
@@ -580,8 +638,8 @@ impl VmConfig {
         if self.vcpus == 0 || self.vcpus > 256 {
             bail!("vcpus must be between 1 and 256");
         }
-        if self.memory_mb < 128 {
-            bail!("memory_mb must be at least 128 MiB");
+        if self.memory_mb < 128 || self.memory_mb > MAX_VM_MEMORY_MB {
+            bail!("memory_mb must be between 128 and {MAX_VM_MEMORY_MB} MiB");
         }
         if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
             bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
@@ -604,8 +662,13 @@ impl VmConfig {
                 bail!("duplicate SCSI LUN {}", disk.lun);
             }
         }
-        #[cfg(target_os = "linux")]
         for nic in &self.nics {
+            if let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend {
+                for pf in port_forwards {
+                    pf.validate()?;
+                }
+            }
+            #[cfg(target_os = "linux")]
             if let NicBackendConfig::Tap { name } = &nic.backend {
                 validate_tap_sysfs_dir(name, &Path::new("/sys/class/net").join(name))?;
             }
@@ -870,22 +933,64 @@ pub fn parse_byte_size(input: &str) -> anyhow::Result<u64> {
         .context("size overflows u64")
 }
 
-/// Computes the keyed challenge-response digest returned by `GET /api/v1/health?challenge=...`
-/// so clients can verify a local daemon knows the bearer token before sending it.
-pub fn compute_health_auth_proof(token: &str, challenge: &str) -> String {
+/// Computes RFC 2104 HMAC-SHA256.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"openvmmsd-health-v1:");
-    hasher.update(token.as_bytes());
-    hasher.update(b":");
-    hasher.update(challenge.as_bytes());
-    let digest = hasher.finalize();
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        let hashed = sha2::Sha256::digest(key);
+        key_block[..32].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut o_key_pad = [0x5cu8; BLOCK_SIZE];
+    let mut i_key_pad = [0x36u8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        o_key_pad[i] ^= key_block[i];
+        i_key_pad[i] ^= key_block[i];
+    }
+    let mut inner = sha2::Sha256::new();
+    inner.update(i_key_pad);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+
+    let mut outer = sha2::Sha256::new();
+    outer.update(o_key_pad);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+/// Computes the address-bound HMAC-SHA256 challenge-response digest returned by
+/// `GET /api/v1/health?challenge=...` so clients can verify a local daemon knows
+/// the bearer token and is bound to the exact dialed socket address.
+pub fn compute_health_auth_proof(
+    token: &str,
+    bound_addr: std::net::SocketAddr,
+    challenge: &str,
+) -> String {
+    let addr_str = bound_addr.to_string();
+    let mut msg = Vec::with_capacity(20 + addr_str.len() + 1 + challenge.len());
+    msg.extend_from_slice(b"openvmmsd-health-v2\0");
+    msg.extend_from_slice(addr_str.as_bytes());
+    msg.push(0);
+    msg.extend_from_slice(challenge.as_bytes());
+    let digest = hmac_sha256(token.as_bytes(), &msg);
     let mut out = String::with_capacity(64);
     for byte in digest {
         use std::fmt::Write;
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+pub fn format_memory_mb(memory_mb: u64) -> String {
+    let bytes_u128 = u128::from(memory_mb) * 1024 * 1024;
+    if let Ok(bytes) = u64::try_from(bytes_u128) {
+        format_bytes(bytes)
+    } else {
+        format!("{:.2} TiB", (memory_mb as f64) / (1024.0 * 1024.0))
+    }
 }
 
 pub fn parse_memory_mb(input: &str) -> anyhow::Result<u64> {
@@ -935,26 +1040,42 @@ mod tests {
         assert_eq!(parse_memory_mb("8G").unwrap(), 8192);
         assert_eq!(parse_memory_mb("4096").unwrap(), 4096);
 
-        // Known-answer SHA-256 vector checks for health auth proof and standard FIPS 180-4 vectors.
-        use sha2::Digest;
+        // Known-answer RFC 4231 HMAC-SHA256 vector checks (Cases 1, 2, 3, and key > block size)
+        // plus address-bound health auth proof verification.
         let to_hex = |bytes: &[u8]| -> String {
             bytes.iter().map(|b| format!("{b:02x}")).collect()
         };
         assert_eq!(
-            to_hex(&sha2::Sha256::digest(b"")),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            to_hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
         assert_eq!(
-            to_hex(&sha2::Sha256::digest(b"abc")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            to_hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
-        let p1 = compute_health_auth_proof("tok", "c1");
-        let p2 = compute_health_auth_proof("tok", "c2");
+        assert_eq!(
+            to_hex(&hmac_sha256(&[0xaa; 20], &[0xdd; 50])),
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
+        );
+        assert_eq!(
+            to_hex(&hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+
+        let addr1: std::net::SocketAddr = "127.0.0.1:47620".parse().unwrap();
+        let addr2: std::net::SocketAddr = "127.0.0.1:47621".parse().unwrap();
+        let p1 = compute_health_auth_proof("tok", addr1, "c1");
+        let p2 = compute_health_auth_proof("tok", addr1, "c2");
+        let p3 = compute_health_auth_proof("tok", addr2, "c1");
         assert_eq!(
             p1,
-            "1e9e179e3b1c4fd94a16d1ff0ee5067eb1d352b73fa24c0b46a292e054f1dc9d"
+            "efcdf6cac3bf581bae72a74c3ab8aa71fec615fc38be554f965d1c1c7bb77a35"
         );
         assert_ne!(p1, p2);
+        assert_ne!(p1, p3);
 
         let pf1 = parse_port_forward("tcp:127.0.0.1:3389->3389").unwrap();
         assert_eq!(pf1.protocol, IpProto::Tcp);
@@ -967,6 +1088,25 @@ mod tests {
         assert_eq!(pf2.host_addr, "127.0.0.1");
         assert_eq!(pf2.host_port, 5000);
         assert_eq!(pf2.guest_port, 5001);
+
+        let pf3 = parse_port_forward("UDP:53->53").unwrap();
+        assert_eq!(pf3.protocol, IpProto::Udp);
+        assert_eq!(pf3.host_addr, "127.0.0.1");
+        assert_eq!(pf3.host_port, 53);
+        assert_eq!(pf3.guest_port, 53);
+
+        let pf4 = parse_port_forward("TCP:8080->80").unwrap();
+        assert_eq!(pf4.protocol, IpProto::Tcp);
+        assert_eq!(pf4.host_addr, "127.0.0.1");
+        assert_eq!(pf4.host_port, 8080);
+        assert_eq!(pf4.guest_port, 80);
+
+        for bad in ["SCTP:53->53", "badhost:80->80", "0->80", "80->0"] {
+            assert!(
+                parse_port_forward(bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -977,8 +1117,38 @@ mod tests {
             cfg.validate().unwrap();
             assert_eq!(cfg.nics.len(), 1);
             assert!(cfg.nics[0].mac_address.starts_with("00-15-5D-"));
-            assert!(!cfg.tpm_enabled);
+            assert_eq!(cfg.tpm_enabled, matches!(preset, VmPreset::Windows11));
         }
+    }
+
+    #[test]
+    fn memory_bounds_and_loopback_listen_addr_validation() {
+        let dir = Path::new("/tmp/test-vm");
+        let mut cfg = VmConfig::from_preset("mem-test", VmPreset::Custom, dir);
+        cfg.memory_mb = MAX_VM_MEMORY_MB;
+        cfg.validate().unwrap();
+
+        cfg.memory_mb = MAX_VM_MEMORY_MB + 1;
+        assert!(cfg.validate().is_err());
+
+        cfg.memory_mb = u64::MAX;
+        assert!(cfg.validate().is_err());
+        assert!(!format_memory_mb(u64::MAX).is_empty());
+
+        assert_eq!(
+            parse_loopback_listen_addr("localhost:47620").unwrap(),
+            "127.0.0.1:47620".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_loopback_listen_addr("http://localhost:47620/").unwrap(),
+            "127.0.0.1:47620".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_loopback_listen_addr("[::1]:47620").unwrap(),
+            "[::1]:47620".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert!(parse_loopback_listen_addr("0.0.0.0:47620").is_err());
+        assert!(parse_loopback_listen_addr("example.com:47620").is_err());
     }
 
     #[test]

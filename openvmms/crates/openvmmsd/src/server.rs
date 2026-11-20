@@ -38,14 +38,26 @@ use openvmms_core::models::VmSummary;
 use serde::Deserialize;
 use serde::Serialize;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uuid::Uuid;
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub supervisor: Arc<Supervisor>,
     pub token: String,
+    pub bound_addr: SocketAddr,
 }
 
 struct ApiError {
@@ -90,8 +102,12 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub fn build_router(supervisor: Arc<Supervisor>, token: String) -> Router {
-    let state = AppState { supervisor, token };
+pub fn build_router(supervisor: Arc<Supervisor>, token: String, bound_addr: SocketAddr) -> Router {
+    let state = AppState {
+        supervisor,
+        token,
+        bound_addr,
+    };
 
     let protected = Router::new()
         .route("/api/v1/events", get(events_handler))
@@ -190,7 +206,7 @@ async fn health(
         .challenge
         .as_deref()
         .filter(|c| !c.is_empty())
-        .map(|c| openvmms_core::models::compute_health_auth_proof(&state.token, c));
+        .map(|c| openvmms_core::models::compute_health_auth_proof(&state.token, state.bound_addr, c));
     Json(HealthResponse {
         status: "ok",
         service: "openvmmsd",
@@ -307,7 +323,9 @@ async fn create_disk(
     State(state): State<AppState>,
     Json(req): Json<CreateDiskPayload>,
 ) -> Result<Json<DiskInfo>, ApiError> {
-    tokio::task::spawn_blocking(move || state.supervisor.create_disk(req))
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel_flag));
+    tokio::task::spawn_blocking(move || state.supervisor.create_disk_cancellable(req, &cancel_flag))
         .await
         .map_err(ApiError::internal)?
         .map(Json)
@@ -333,10 +351,13 @@ async fn create_vm(
     State(state): State<AppState>,
     Json(req): Json<CreateVmPayload>,
 ) -> Result<(StatusCode, Json<VmSummary>), ApiError> {
-    let summary = tokio::task::spawn_blocking(move || state.supervisor.create_vm(req))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::map_anyhow)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel_flag));
+    let summary =
+        tokio::task::spawn_blocking(move || state.supervisor.create_vm_cancellable(req, &cancel_flag))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::map_anyhow)?;
     Ok((StatusCode::CREATED, Json(summary)))
 }
 
@@ -589,6 +610,10 @@ mod tests {
     use openvmms_core::models::VmSummary;
     use std::fs;
 
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
     #[tokio::test]
     async fn daemon_rest_api_crud_disk_iso_port_forward_and_auth() {
         let dir = tempfile::tempdir().unwrap();
@@ -596,7 +621,7 @@ mod tests {
             .await
             .unwrap();
 
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         // Health is unauthenticated.
         let health = client
@@ -837,7 +862,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         // Create VM with a default created disk (empty path -> <data_dir>/disks/...).
         let create_resp = client
@@ -926,7 +951,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         let os_disk = dir.path().join("os.img");
         fs::write(&os_disk, b"OS_DISK").unwrap();
@@ -1018,7 +1043,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         // Open a persistent SSE stream like openvmms-gui does.
         let mut sse_resp = client
@@ -1062,7 +1087,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         // Create a VM on the original port so we can confirm state continuity on the new port.
         let create_resp = client
@@ -1172,7 +1197,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         let create_resp = client
             .post(format!("{}/api/v1/vms", daemon.base_url))
@@ -1310,7 +1335,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         let fw_path = dir.path().join("custom-msvm.fd");
         let create_resp = client
@@ -1374,7 +1399,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         let disk_path = dir.path().join("retry-os.img");
         for bad_vcpus in [0, 512] {
@@ -1467,7 +1492,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         for (name, format) in [
             ("disk.vhdx", DiskFormat::Raw),
@@ -1517,7 +1542,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         let shared_disk = dir.path().join("shared.img");
         let private_disk = dir.path().join("private.img");
@@ -1591,7 +1616,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         let base_cfg: openvmms_core::models::HostConfig = client
             .get(format!("{}/api/v1/host/config", daemon.base_url))
@@ -1749,7 +1774,7 @@ mod tests {
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
 
         let iso_path = dir.path().join("installer.iso");
         fs::write(&iso_path, b"ISO").unwrap();

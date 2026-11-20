@@ -4,7 +4,7 @@ pub mod supervisor;
 use anyhow::Context;
 use openvmms_core::models::DEFAULT_DAEMON_LISTEN;
 use openvmms_core::models::default_data_dir;
-use std::net::SocketAddr;
+use openvmms_core::models::parse_loopback_listen_addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use supervisor::Supervisor;
@@ -29,17 +29,14 @@ impl Default for DaemonOptions {
 pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
     let supervisor = Supervisor::new(&opts.data_dir, opts.listen_addr.as_deref())?;
     let listen_addr = supervisor.listen_addr();
-    let addr: SocketAddr = listen_addr
-        .parse()
-        .with_context(|| format!("invalid listen address '{listen_addr}'"))?;
-    anyhow::ensure!(
-        addr.ip().is_loopback(),
-        "openvmmsd listen address '{listen_addr}' must be a loopback address"
-    );
+    let addr = parse_loopback_listen_addr(&listen_addr)?;
 
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding openvmmsd HTTP server on {addr}"))?;
+    // Adopt running VMs only after listen validation and TCP bind have succeeded so a failed
+    // startup never alters or cleans up running VM runtime files.
+    supervisor.adopt_running_vms();
     let bound_addr = supervisor.serve_on_listener(listener)?;
     info!(address = %bound_addr, data_dir = %opts.data_dir.display(), "openvmmsd listening");
 
@@ -156,6 +153,7 @@ impl TestDaemonHandle {
         let supervisor = Supervisor::new(&data_dir, Some("127.0.0.1:0"))?;
         let token = supervisor.auth_token().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
+        supervisor.adopt_running_vms();
         let bound_addr = supervisor.serve_on_listener(listener)?;
 
         let shutdown_sup = supervisor.clone();

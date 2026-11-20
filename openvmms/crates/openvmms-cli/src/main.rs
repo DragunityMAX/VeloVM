@@ -28,6 +28,7 @@ use openvmms_core::models::VmPreset;
 use openvmms_core::models::VmSummary;
 use openvmms_core::models::default_data_dir;
 use openvmms_core::models::format_bytes;
+use openvmms_core::models::format_memory_mb;
 use openvmms_core::models::generate_hyperv_mac;
 use openvmms_core::models::parse_byte_size;
 use openvmms_core::models::parse_memory_mb;
@@ -609,7 +610,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                     "NAME", "STATE", "VCPU", "MEMORY", "FASTDESK", "ID"
                 );
                 for vm in vms {
-                    let mem = format_bytes(vm.config.memory_mb * 1024 * 1024);
+                    let mem = format_memory_mb(vm.config.memory_mb);
                     let fd = vm
                         .runtime
                         .fastdesk_endpoint
@@ -1017,7 +1018,7 @@ fn print_vm_summary(vm: &VmSummary, json: bool) -> anyhow::Result<()> {
         println!("Name:         {} ({})", vm.config.name, vm.config.id);
         println!("Preset:       {}", vm.config.preset);
         println!("State:        {}", vm.runtime.status);
-        println!("Compute:      {} vCPU, {}", vm.config.vcpus, format_bytes(vm.config.memory_mb * 1024 * 1024));
+        println!("Compute:      {} vCPU, {}", vm.config.vcpus, format_memory_mb(vm.config.memory_mb));
         println!(
             "Firmware:     UEFI (Secure Boot: {}, Template: {}, vTPM 2.0: {})",
             if vm.config.secure_boot_enabled {

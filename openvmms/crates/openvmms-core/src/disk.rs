@@ -4,9 +4,15 @@ use crate::models::DiskInfo;
 use anyhow::Context;
 use anyhow::bail;
 use std::fs;
+use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 /// Validates that `path` has a file name and does not collide with another disk format's
 /// reserved extension.
@@ -92,6 +98,17 @@ pub fn create_disk(
     req: &CreateDiskPayload,
     openvmm_img_bin: Option<&Path>,
 ) -> anyhow::Result<DiskInfo> {
+    create_disk_cancellable(req, openvmm_img_bin, &AtomicBool::new(false))
+}
+
+pub fn create_disk_cancellable(
+    req: &CreateDiskPayload,
+    openvmm_img_bin: Option<&Path>,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<DiskInfo> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("disk creation cancelled");
+    }
     if req.size_bytes < 512 || req.size_bytes % 512 != 0 {
         bail!("disk size must be at least 512 bytes and a multiple of 512 bytes");
     }
@@ -112,7 +129,7 @@ pub fn create_disk(
 
     // Atomically reserve the path. Exactly one concurrent creator can succeed here, and
     // from this point on the file belongs to this operation, so failure cleanup is safe.
-    let file = match fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -129,9 +146,13 @@ pub fn create_disk(
 
     match vhdx_img_bin {
         None => {
-            let sized = file
-                .set_len(req.size_bytes)
-                .with_context(|| format!("sizing raw disk {}", req.path.display()));
+            let sized = if req.fixed {
+                write_fixed_raw_zeros(&mut file, req.size_bytes, cancelled)
+                    .with_context(|| format!("allocating fixed raw disk {}", req.path.display()))
+            } else {
+                file.set_len(req.size_bytes)
+                    .with_context(|| format!("sizing raw disk {}", req.path.display()))
+            };
             drop(file);
             let res = sized.and_then(|()| inspect_disk(&req.path, openvmm_img_bin));
             if res.is_err() {
@@ -149,24 +170,77 @@ pub fn create_disk(
                 .arg("vhdx")
                 .arg("--size")
                 .arg(req.size_bytes.to_string())
-                .arg("--force");
+                .arg("--force")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             if req.fixed {
                 cmd.arg("--format-options").arg("allocation=fixed");
             }
-            let output = match cmd.output() {
-                Ok(output) => output,
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
                 Err(err) => {
                     remove_owned_disk(&req.path);
                     return Err(err).with_context(|| format!("running {}", img_bin.display()));
                 }
             };
-            if !output.status.success() {
+            let stdout_handle = child.stdout.take().map(|mut pipe| {
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = pipe.read_to_end(&mut buf);
+                    buf
+                })
+            });
+            let stderr_handle = child.stderr.take().map(|mut pipe| {
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = pipe.read_to_end(&mut buf);
+                    buf
+                })
+            });
+
+            let status = loop {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(h) = stdout_handle {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = stderr_handle {
+                        let _ = h.join();
+                    }
+                    remove_owned_disk(&req.path);
+                    bail!("disk creation cancelled");
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        if let Some(h) = stdout_handle {
+                            let _ = h.join();
+                        }
+                        if let Some(h) = stderr_handle {
+                            let _ = h.join();
+                        }
+                        remove_owned_disk(&req.path);
+                        return Err(err).with_context(|| format!("waiting for {}", img_bin.display()));
+                    }
+                }
+            };
+            let stdout_bytes = stdout_handle
+                .and_then(|h| h.join().ok())
+                .unwrap_or_default();
+            let stderr_bytes = stderr_handle
+                .and_then(|h| h.join().ok())
+                .unwrap_or_default();
+            if !status.success() {
                 remove_owned_disk(&req.path);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&stderr_bytes);
+                let stdout = String::from_utf8_lossy(&stdout_bytes);
                 bail!(
-                    "openvmm-img create failed ({}): {}{}",
-                    output.status,
+                    "openvmm-img create failed ({status}): {}{}",
                     stderr.trim(),
                     if stdout.trim().is_empty() {
                         String::new()
@@ -184,6 +258,25 @@ pub fn create_disk(
     }
 }
 
+fn write_fixed_raw_zeros(
+    file: &mut fs::File,
+    size_bytes: u64,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<()> {
+    let chunk = vec![0u8; 1024 * 1024];
+    let mut written = 0u64;
+    while written < size_bytes {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("disk creation cancelled");
+        }
+        let n = (size_bytes - written).min(chunk.len() as u64) as usize;
+        file.write_all(&chunk[..n])?;
+        written += n as u64;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
 pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Result<DiskInfo> {
     let meta = fs::metadata(path)
         .with_context(|| format!("reading disk metadata for {}", path.display()))?;
@@ -198,44 +291,61 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         .map(|e| e.to_ascii_lowercase());
 
     let is_vhdx = ext.as_deref() == Some("vhdx");
-    if is_vhdx
-        && let Some(img_bin) = openvmm_img_bin
-    {
+    if is_vhdx {
+        let img_bin = openvmm_img_bin.with_context(|| {
+            format!(
+                "cannot inspect VHDX metadata for {}: openvmm-img binary not found; configure openvmm_img_bin in host settings",
+                path.display()
+            )
+        })?;
         let output = Command::new(img_bin)
             .arg("info")
             .arg(path)
             .arg("--json")
             .output()
             .with_context(|| format!("running {}", img_bin.display()))?;
-        if output.status.success() {
-            let val: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .context("parsing openvmm-img info JSON output")?;
-            let virtual_size_bytes = val["disk_size"].as_u64().unwrap_or(file_size_bytes);
-            let disk_type = val["type"].as_str().unwrap_or("vhdx").to_string();
-            let block_size_bytes = val["block_size"].as_u64().and_then(|v| u32::try_from(v).ok());
-            let sector_size_bytes = val["logical_sector_size"]
-                .as_u64()
-                .and_then(|v| u32::try_from(v).ok());
-            let parent_path = val["relative_path"]
-                .as_str()
-                .or_else(|| val["absolute_win32_path"].as_str())
-                .map(ToOwned::to_owned);
-            return Ok(DiskInfo {
-                path: path.to_path_buf(),
-                format: "vhdx".to_string(),
-                disk_type,
-                virtual_size_bytes,
-                file_size_bytes,
-                block_size_bytes,
-                sector_size_bytes,
-                parent_path,
-                read_only,
-            });
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            bail!(
+                "openvmm-img info failed ({}): {}{}",
+                output.status,
+                stderr.trim(),
+                if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", stdout.trim())
+                }
+            );
         }
+        let val: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .context("parsing openvmm-img info JSON output")?;
+        let virtual_size_bytes = val["disk_size"]
+            .as_u64()
+            .context("missing disk_size in openvmm-img info JSON output")?;
+        let disk_type = val["type"].as_str().unwrap_or("vhdx").to_string();
+        let block_size_bytes = val["block_size"].as_u64().and_then(|v| u32::try_from(v).ok());
+        let sector_size_bytes = val["logical_sector_size"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok());
+        let parent_path = val["relative_path"]
+            .as_str()
+            .or_else(|| val["absolute_win32_path"].as_str())
+            .map(ToOwned::to_owned);
+        return Ok(DiskInfo {
+            path: path.to_path_buf(),
+            format: "vhdx".to_string(),
+            disk_type,
+            virtual_size_bytes,
+            file_size_bytes,
+            block_size_bytes,
+            sector_size_bytes,
+            parent_path,
+            read_only,
+        });
     }
 
     let (format, disk_type) = match ext.as_deref() {
-        _ if is_vhdx => ("vhdx".to_string(), "vhdx".to_string()),
         Some("iso") => ("iso".to_string(), "read-only image".to_string()),
         Some("vhd") => ("vhd".to_string(), "vhd".to_string()),
         _ => ("raw".to_string(), "sparse/flat".to_string()),
@@ -530,6 +640,142 @@ mod tests {
             assert_eq!(DiskFormat::from_path(&raw_with_magic), DiskFormat::Raw);
             let inspected = inspect_disk(&raw_with_magic, Some(&vhdx_stub)).unwrap();
             assert_eq!(inspected.format, "raw");
+        }
+    }
+
+    #[test]
+    fn inspect_disk_vhdx_returns_error_when_tool_missing_or_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let vhdx = dir.path().join("locked.vhdx");
+        fs::write(&vhdx, b"SMALL_HEADER").unwrap();
+
+        let no_bin_err = inspect_disk(&vhdx, None).unwrap_err();
+        assert!(
+            no_bin_err.to_string().contains("openvmm-img binary not found"),
+            "{no_bin_err:#}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let failing_stub = dir.path().join("fail-img.sh");
+            fs::write(
+                &failing_stub,
+                "#!/bin/sh\necho 'sharing violation' >&2\nexit 1\n",
+            )
+            .unwrap();
+            fs::set_permissions(&failing_stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let err = inspect_disk(&vhdx, Some(&failing_stub)).unwrap_err();
+            assert!(
+                err.to_string().contains("openvmm-img info failed"),
+                "{err:#}"
+            );
+            assert!(err.to_string().contains("sharing violation"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn fixed_raw_disk_allocates_blocks_and_cancellation_cleans_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed_path = dir.path().join("fixed.img");
+        let sparse_path = dir.path().join("sparse.img");
+        let size = 4 * 1024 * 1024;
+
+        let fixed_info = create_disk(
+            &CreateDiskPayload {
+                path: fixed_path.clone(),
+                size_bytes: size,
+                format: DiskFormat::Raw,
+                fixed: true,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(fixed_info.virtual_size_bytes, size);
+        assert_eq!(fs::metadata(&fixed_path).unwrap().len(), size);
+
+        let _sparse_info = create_disk(
+            &CreateDiskPayload {
+                path: sparse_path.clone(),
+                size_bytes: size,
+                format: DiskFormat::Raw,
+                fixed: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let fixed_blocks = fs::metadata(&fixed_path).unwrap().blocks();
+            let sparse_blocks = fs::metadata(&sparse_path).unwrap().blocks();
+            assert!(
+                fixed_blocks * 512 >= size,
+                "expected fixed raw disk to allocate >= {size} bytes, got {} bytes",
+                fixed_blocks * 512
+            );
+            assert_eq!(sparse_blocks, 0, "expected sparse raw disk to have 0 allocated blocks");
+        }
+
+        // Pre-cancelled raw creation must fail and leave no file behind.
+        let cancelled_raw = dir.path().join("cancelled.img");
+        let flag = AtomicBool::new(true);
+        let err = create_disk_cancellable(
+            &CreateDiskPayload {
+                path: cancelled_raw.clone(),
+                size_bytes: size,
+                format: DiskFormat::Raw,
+                fixed: true,
+            },
+            None,
+            &flag,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert!(!cancelled_raw.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::Arc;
+            let slow_stub = dir.path().join("slow-img.sh");
+            let started_flag = dir.path().join("slow_started");
+            fs::write(
+                &slow_stub,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\nsleep 5\n",
+                    started_flag.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&slow_stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let vhdx_cancel_path = dir.path().join("cancelled.vhdx");
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let cancel_flag_worker = Arc::clone(&cancel_flag);
+            let p = vhdx_cancel_path.clone();
+            let handle = std::thread::spawn(move || {
+                create_disk_cancellable(
+                    &CreateDiskPayload {
+                        path: p,
+                        size_bytes: size,
+                        format: DiskFormat::Vhdx,
+                        fixed: true,
+                    },
+                    Some(&slow_stub),
+                    &cancel_flag_worker,
+                )
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !started_flag.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            cancel_flag.store(true, Ordering::Release);
+            let res = handle.join().unwrap();
+            assert!(res.is_err());
+            assert!(!vhdx_cancel_path.exists());
         }
     }
 }

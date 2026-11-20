@@ -1,6 +1,7 @@
 use openvmms_core::api_client::ApiClient;
 use openvmms_core::models::{
-    CreateVmPayload, FastDeskSettings, HostConfig, VmPreset, VmStatus, VmSummary,
+    AttachDiskPayload, CreateVmPayload, DiskFormat, FastDeskSettings, HostConfig, IpProto,
+    NicAttachment, NicBackendConfig, PortForward, VmPreset, VmStatus, VmSummary,
 };
 use openvmms_core::store::RegistryStore;
 use openvmms_core::ttrpc::{TtrpcClient, TtrpcStatus, encode_frame, read_frame};
@@ -11,8 +12,9 @@ use prost::Message;
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -138,6 +140,15 @@ struct StubCtx {
     endpoint: Option<String>,
     stop_evt: Arc<AtomicBool>,
     wait_calls: Arc<AtomicUsize>,
+    wait_in_flight: Arc<AtomicBool>,
+}
+
+struct WaitInFlightGuard(Arc<AtomicBool>);
+
+impl Drop for WaitInFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
@@ -169,11 +180,30 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                     send_ttrpc_err(&mut stream, stream_id, 14, "transient WaitVM stream glitch");
                     return;
                 }
-                for _ in 0..300 {
+                if ctx.wait_in_flight.swap(true, Ordering::AcqRel) {
+                    touch(&ctx.state_dir.join("wait_already_in_flight"));
+                    send_ttrpc_err(&mut stream, stream_id, 9, "wait VM already in flight");
+                    return;
+                }
+                let _in_flight = WaitInFlightGuard(Arc::clone(&ctx.wait_in_flight));
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                for _ in 0..1200 {
                     if ctx.stop_evt.load(Ordering::Acquire) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    let mut buf = [0u8; 1];
+                    match stream.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(_) => {}
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(_) => return,
+                    }
                 }
                 send_ttrpc_ok(&mut stream, stream_id, Vec::new());
             }
@@ -243,6 +273,13 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                 ctx.stop_evt.store(true, Ordering::Release);
                 send_ttrpc_ok(&mut stream, stream_id, Vec::new());
             }
+            "ModifyResource" => {
+                if ctx.mode == "slow_modify_resource" {
+                    touch(&ctx.state_dir.join("modify_resource_entered"));
+                    std::thread::sleep(Duration::from_millis(350));
+                }
+                send_ttrpc_ok(&mut stream, stream_id, Vec::new());
+            }
             _ => send_ttrpc_ok(&mut stream, stream_id, Vec::new()),
         }
     }
@@ -278,6 +315,7 @@ fn run_fake_openvmm_server(args: &[String]) {
         endpoint: cfg.get("endpoint").cloned(),
         stop_evt: Arc::clone(&stop_evt),
         wait_calls: Arc::new(AtomicUsize::new(0)),
+        wait_in_flight: Arc::new(AtomicBool::new(false)),
     });
 
     while !stop_evt.load(Ordering::Acquire) {
@@ -360,6 +398,10 @@ async fn create_stub_vm(client: &reqwest::Client, daemon: &TestDaemonHandle, nam
     resp.json().await.unwrap()
 }
 
+fn test_http_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
 async fn wait_for_file(path: &Path) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !path.exists() {
@@ -424,7 +466,7 @@ async fn test_stopping_vm_during_startup_then_restarting_preserves_replacement_v
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
-    let client = reqwest::Client::new();
+    let client = test_http_client();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
     let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
@@ -435,7 +477,7 @@ async fn test_stopping_vm_during_startup_then_restarting_preserves_replacement_v
     let base_url = daemon.base_url.clone();
     let token = daemon.token.clone();
     let start1 = tokio::spawn(async move {
-        reqwest::Client::new()
+        test_http_client()
             .post(format!("{base_url}/api/v1/vms/Race-Restart-VM/start"))
             .bearer_auth(token)
             .send()
@@ -496,7 +538,7 @@ async fn test_concurrent_stop_requests_wait_for_cleanup_and_preserve_restarted_v
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
-    let client = reqwest::Client::new();
+    let client = test_http_client();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
     let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
@@ -517,7 +559,7 @@ async fn test_concurrent_stop_requests_wait_for_cleanup_and_preserve_restarted_v
     let base_url = daemon.base_url.clone();
     let token = daemon.token.clone();
     let stop1 = tokio::spawn(async move {
-        reqwest::Client::new()
+        test_http_client()
             .post(format!("{base_url}/api/v1/vms/ConcurrentStop-VM/stop"))
             .bearer_auth(token)
             .send()
@@ -596,7 +638,7 @@ async fn test_delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_res
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
-    let client = reqwest::Client::new();
+    let client = test_http_client();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
     let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
@@ -618,7 +660,7 @@ async fn test_delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_res
     let base_url = daemon.base_url.clone();
     let token = daemon.token.clone();
     let pause_task = tokio::spawn(async move {
-        reqwest::Client::new()
+        test_http_client()
             .post(format!("{base_url}/api/v1/vms/PauseStop-VM/pause"))
             .bearer_auth(token)
             .send()
@@ -630,7 +672,7 @@ async fn test_delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_res
     let base_url = daemon.base_url.clone();
     let token = daemon.token.clone();
     let stop1_task = tokio::spawn(async move {
-        reqwest::Client::new()
+        test_http_client()
             .post(format!("{base_url}/api/v1/vms/PauseStop-VM/stop"))
             .bearer_auth(token)
             .send()
@@ -666,7 +708,7 @@ async fn test_delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_res
     let base_url = daemon.base_url.clone();
     let token = daemon.token.clone();
     let resume_task = tokio::spawn(async move {
-        reqwest::Client::new()
+        test_http_client()
             .post(format!("{base_url}/api/v1/vms/PauseStop-VM/resume"))
             .bearer_auth(token)
             .send()
@@ -678,7 +720,7 @@ async fn test_delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_res
     let base_url = daemon.base_url.clone();
     let token = daemon.token.clone();
     let stop2_task = tokio::spawn(async move {
-        reqwest::Client::new()
+        test_http_client()
             .post(format!("{base_url}/api/v1/vms/PauseStop-VM/stop"))
             .bearer_auth(token)
             .send()
@@ -732,7 +774,7 @@ async fn test_wait_vm_transient_error_does_not_teardown_healthy_vm() {
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
-    let client = reqwest::Client::new();
+    let client = test_http_client();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
     let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
@@ -789,7 +831,7 @@ async fn test_readopted_vm_whose_initial_properties_failed_gets_monitored_and_tr
     let daemon1 = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
-    let client = reqwest::Client::new();
+    let client = test_http_client();
     let runtime_dir = configure_stub_host(&client, &daemon1, dir.path(), &fw_path).await;
     write_stub_mode(
         &runtime_dir,
@@ -863,7 +905,7 @@ async fn test_daemon_stop_without_stop_vms_preserves_running_vm_and_readopts_on_
     let daemon1 = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
-    let client = reqwest::Client::new();
+    let client = test_http_client();
     let runtime_dir = configure_stub_host(&client, &daemon1, dir.path(), &fw_path).await;
     write_stub_mode(
         &runtime_dir,
@@ -949,6 +991,457 @@ async fn test_daemon_stop_without_stop_vms_preserves_running_vm_and_readopts_on_
     assert!(!TtrpcClient::new(&sock_path).is_socket_accepting());
 }
 
+struct ChildKillGuard(Option<Child>);
+
+impl Drop for ChildKillGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_real_daemon(data_dir: &Path, listen: &str, log_path: &Path) -> ChildKillGuard {
+    let err_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_openvmmsd"))
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--listen")
+        .arg(listen)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err_file))
+        .spawn()
+        .expect("spawning real openvmmsd binary");
+    ChildKillGuard(Some(child))
+}
+
+async fn wait_for_real_daemon_health(data_dir: &Path, log_path: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let dir = data_dir.to_path_buf();
+        let ready = tokio::task::spawn_blocking(move || {
+            Ok::<bool, anyhow::Error>(
+                ApiClient::from_runtime_addr(Some(&dir))?
+                    .is_some_and(|c| c.health().is_ok()),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap_or(false);
+        if ready {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for real openvmmsd health; log:\n{}",
+            fs::read_to_string(log_path).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn run_real_api<R: Send + 'static>(
+    data_dir: &Path,
+    f: impl FnOnce(&ApiClient) -> anyhow::Result<R> + Send + 'static,
+) -> R {
+    let dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let client = ApiClient::from_runtime_addr(Some(&dir))?
+            .ok_or_else(|| anyhow::anyhow!("daemon runtime address unavailable"))?;
+        f(&client)
+    })
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+async fn wait_for_child_exit_zero(
+    guard: &mut ChildKillGuard,
+    timeout: Duration,
+    label: &str,
+    log_path: &Path,
+) {
+    let child = guard.0.as_mut().expect("daemon child missing");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(status) => {
+                let _ = guard.0.take();
+                assert!(
+                    status.success(),
+                    "{label} exited with non-zero status {status}; log:\n{}",
+                    fs::read_to_string(log_path).unwrap_or_default()
+                );
+                return;
+            }
+            None => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{label} did not exit within {timeout:?}; log:\n{}",
+                    fs::read_to_string(log_path).unwrap_or_default()
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
+fn configure_real_daemon_stub_host(
+    client: &ApiClient,
+    dir: &Path,
+    fw_path: &Path,
+) -> PathBuf {
+    let stub_bin = std::env::current_exe().unwrap();
+    let runtime_dir = dir.join("run");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let mut cfg = client.host_config().unwrap();
+    cfg.runtime_dir = runtime_dir.clone();
+    cfg.openvmm_bin = Some(stub_bin);
+    cfg.uefi_firmware_path = Some(fw_path.to_path_buf());
+    client.update_host_config(&cfg).unwrap();
+    runtime_dir
+}
+
+async fn test_real_daemon_process_exits_on_default_stop_and_sigterm_while_vm_running_and_readopts_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+    let log_path = dir.path().join("daemon.stderr.log");
+
+    let mut d1 = spawn_real_daemon(dir.path(), "127.0.0.1:0", &log_path);
+    wait_for_real_daemon_health(dir.path(), &log_path).await;
+    let dir_clone = dir.path().to_path_buf();
+    let fw_clone = fw_path.clone();
+    let runtime_dir = run_real_api(dir.path(), move |client1| {
+        Ok(configure_real_daemon_stub_host(client1, &dir_clone, &fw_clone))
+    })
+    .await;
+    write_stub_mode(
+        &runtime_dir,
+        "normal",
+        &[("endpoint", "tcp://127.0.0.1:45911")],
+    );
+
+    let created = run_real_api(dir.path(), |client1| {
+        client1.create_vm(&CreateVmPayload {
+            name: "RealDaemon-VM".into(),
+            description: String::new(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(1024),
+            fastdesk: Some(FastDeskSettings {
+                enabled: false,
+                ..Default::default()
+            }),
+            nics: Some(vec![]),
+            ..Default::default()
+        })
+    })
+    .await;
+    let created_id = created.config.id.to_string();
+    let started = run_real_api(dir.path(), move |client1| client1.start_vm(&created_id)).await;
+    assert_eq!(started.runtime.status, VmStatus::Running);
+    let sock_path = runtime_dir.join(format!("{}.sock", created.config.id));
+
+    // Default `daemon stop` (without `--stop-vms`) must exit promptly while VM continues running.
+    run_real_api(dir.path(), |client1| client1.shutdown_daemon()).await;
+    wait_for_child_exit_zero(&mut d1, Duration::from_secs(5), "daemon1 default stop", &log_path)
+        .await;
+    assert!(!RegistryStore::open(dir.path()).is_daemon_locked());
+    assert!(!runtime_dir.join("teardown_called").exists());
+    assert!(TtrpcClient::new(&sock_path).is_socket_accepting());
+
+    // Restart real daemon and verify clean WaitVM re-adoption with no duplicate waiter.
+    let mut d2 = spawn_real_daemon(dir.path(), "127.0.0.1:0", &log_path);
+    wait_for_real_daemon_health(dir.path(), &log_path).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let vm2 = run_real_api(dir.path(), |client2| client2.get_vm("RealDaemon-VM")).await;
+    assert_eq!(vm2.runtime.status, VmStatus::Running);
+    assert_eq!(
+        vm2.runtime.fastdesk_endpoint.as_deref(),
+        Some("tcp://127.0.0.1:45911")
+    );
+    assert!(
+        !runtime_dir.join("wait_already_in_flight").exists(),
+        "old daemon leaked WaitVM waiter across default daemon stop"
+    );
+
+    // Send SIGTERM directly to the running daemon process on Unix and ensure prompt clean detach.
+    #[cfg(unix)]
+    {
+        let pid2 = d2.0.as_ref().unwrap().id();
+        let kill_status = Command::new("kill")
+            .args(["-TERM", &pid2.to_string()])
+            .status()
+            .unwrap();
+        assert!(kill_status.success(), "kill -TERM failed");
+        wait_for_child_exit_zero(&mut d2, Duration::from_secs(5), "daemon2 SIGTERM", &log_path)
+            .await;
+        assert!(!RegistryStore::open(dir.path()).is_daemon_locked());
+        assert!(!runtime_dir.join("teardown_called").exists());
+        assert!(TtrpcClient::new(&sock_path).is_socket_accepting());
+    }
+    #[cfg(not(unix))]
+    {
+        run_real_api(dir.path(), |client2| client2.shutdown_daemon()).await;
+        wait_for_child_exit_zero(&mut d2, Duration::from_secs(5), "daemon2 stop", &log_path).await;
+    }
+
+    // Restart real daemon a third time and verify WaitVM re-adopts cleanly after SIGTERM too.
+    let mut d3 = spawn_real_daemon(dir.path(), "127.0.0.1:0", &log_path);
+    wait_for_real_daemon_health(dir.path(), &log_path).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let vm3 = run_real_api(dir.path(), |client3| client3.get_vm("RealDaemon-VM")).await;
+    assert_eq!(vm3.runtime.status, VmStatus::Running);
+    assert!(
+        !runtime_dir.join("wait_already_in_flight").exists(),
+        "old daemon leaked WaitVM waiter across SIGTERM"
+    );
+
+    run_real_api(dir.path(), |client3| client3.shutdown_daemon_with_options(true)).await;
+    wait_for_child_exit_zero(&mut d3, Duration::from_secs(5), "daemon3 stop-vms", &log_path).await;
+    assert!(runtime_dir.join("teardown_called").exists());
+    assert!(!TtrpcClient::new(&sock_path).is_socket_accepting());
+}
+
+async fn test_failed_daemon_start_preserves_running_vm_runtime_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+    let log_path = dir.path().join("daemon.stderr.log");
+
+    let mut d1 = spawn_real_daemon(dir.path(), "127.0.0.1:0", &log_path);
+    wait_for_real_daemon_health(dir.path(), &log_path).await;
+    let dir_clone = dir.path().to_path_buf();
+    let fw_clone = fw_path.clone();
+    let runtime_dir = run_real_api(dir.path(), move |client1| {
+        Ok(configure_real_daemon_stub_host(client1, &dir_clone, &fw_clone))
+    })
+    .await;
+    write_stub_mode(&runtime_dir, "normal", &[("endpoint", "tcp://127.0.0.1:45912")]);
+
+    let (created, started) = run_real_api(dir.path(), |client1| {
+        let created = client1.create_vm(&CreateVmPayload {
+            name: "PreserveFiles-VM".into(),
+            description: String::new(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(1024),
+            fastdesk: Some(FastDeskSettings {
+                enabled: true,
+                use_shm: true,
+                ..Default::default()
+            }),
+            nics: Some(vec![]),
+            ..Default::default()
+        })?;
+        let started = client1.start_vm(&created.config.id.to_string())?;
+        Ok((created, started))
+    })
+    .await;
+    assert_eq!(started.runtime.status, VmStatus::Running);
+
+    let id = created.config.id;
+    let sock_path = runtime_dir.join(format!("{id}.sock"));
+    let pid_path = runtime_dir.join(format!("{id}.pid"));
+    let shm_path = started
+        .runtime
+        .shm_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_dir.join(format!("{id}.shm")));
+    if !shm_path.exists() {
+        fs::write(&shm_path, b"FAKE_SHM_BACKING").unwrap();
+    }
+
+    run_real_api(dir.path(), |client1| client1.shutdown_daemon()).await;
+    wait_for_child_exit_zero(&mut d1, Duration::from_secs(5), "daemon1 detach", &log_path).await;
+    assert!(sock_path.exists());
+    assert!(pid_path.exists());
+    assert!(shm_path.exists());
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy_listen = occupied.local_addr().unwrap().to_string();
+
+    for bad_listen in ["badhost:47620", "0.0.0.0:47620", busy_listen.as_str()] {
+        let out = Command::new(env!("CARGO_BIN_EXE_openvmmsd"))
+            .arg("--data-dir")
+            .arg(dir.path())
+            .arg("--listen")
+            .arg(bad_listen)
+            .output()
+            .expect("invoking failing openvmmsd start");
+        assert!(
+            !out.status.success(),
+            "expected openvmmsd --listen {bad_listen} to fail"
+        );
+        assert!(
+            sock_path.exists(),
+            "failing start with --listen {bad_listen} removed .sock file"
+        );
+        assert!(
+            pid_path.exists(),
+            "failing start with --listen {bad_listen} removed .pid file"
+        );
+        assert!(
+            shm_path.exists(),
+            "failing start with --listen {bad_listen} removed .shm file"
+        );
+        assert!(
+            TtrpcClient::new(&sock_path).is_socket_accepting(),
+            "running VM socket died during failed start with --listen {bad_listen}"
+        );
+        assert!(!runtime_dir.join("teardown_called").exists());
+    }
+    drop(occupied);
+
+    // Valid restart re-adopts the untouched running VM cleanly.
+    let mut d2 = spawn_real_daemon(dir.path(), "127.0.0.1:0", &log_path);
+    wait_for_real_daemon_health(dir.path(), &log_path).await;
+    let vm2 = run_real_api(dir.path(), |client2| client2.get_vm("PreserveFiles-VM")).await;
+    assert_eq!(vm2.runtime.status, VmStatus::Running);
+    assert!(shm_path.exists());
+
+    run_real_api(dir.path(), |client2| client2.shutdown_daemon_with_options(true)).await;
+    wait_for_child_exit_zero(&mut d2, Duration::from_secs(5), "daemon2 stop-vms", &log_path).await;
+}
+
+async fn test_disconnecting_mid_disk_hotplug_and_port_forward_still_commits_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = RegistryStore::new(dir.path()).unwrap();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+    let runtime_dir = dir.path().join("run");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let mut host = store.load_or_init_host_config().unwrap();
+    host.runtime_dir = runtime_dir.clone();
+    host.openvmm_bin = Some(std::env::current_exe().unwrap());
+    host.uefi_firmware_path = Some(fw_path);
+    store.save_host_config(&host).unwrap();
+    write_stub_mode(&runtime_dir, "slow_modify_resource", &[]);
+
+    let sup = Arc::new(Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap());
+    let mut default_nic = NicAttachment::default_consomme();
+    let nic_id = default_nic.id;
+    default_nic.mac_address = "00:15:5d:00:01:02".into();
+    let created = sup
+        .create_vm(CreateVmPayload {
+            name: "DetachRpc-VM".into(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(1024),
+            fastdesk: Some(FastDeskSettings {
+                enabled: false,
+                ..Default::default()
+            }),
+            nics: Some(vec![default_nic]),
+            ..Default::default()
+        })
+        .unwrap();
+    let vm_id = created.config.id;
+    let started = sup.start_vm(&vm_id.to_string()).await.unwrap();
+    assert_eq!(started.runtime.status, VmStatus::Running);
+
+    let vm_id_str = vm_id.to_string();
+    let modify_sentinel = runtime_dir.join("modify_resource_entered");
+
+    // 1. Hot-plug a disk, drop the caller future mid-ModifyResource, verify detached task commits it.
+    let hotplug_disk = dir.path().join("hotplug.img");
+    fs::write(&hotplug_disk, vec![0u8; 65536]).unwrap();
+    {
+        let sup_attach = Arc::clone(&sup);
+        let disk_path = hotplug_disk.clone();
+        let attach_fut = sup_attach.attach_disk(
+            &vm_id_str,
+            AttachDiskPayload {
+                path: disk_path,
+                lun: Some(2),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        );
+        tokio::pin!(attach_fut);
+        tokio::select! {
+            res = &mut attach_fut => panic!("attach_disk finished before ModifyResource delay: {res:?}"),
+            _ = wait_for_file(&modify_sentinel) => {}
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let vm = sup.get_vm(&vm_id_str).unwrap();
+        if vm.config.disks.iter().any(|d| d.lun == 2 && d.path == hotplug_disk) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "detached attach_disk never committed");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let persisted_after_disk = RegistryStore::open(dir.path())
+        .load_all_vms()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.id == vm_id)
+        .unwrap();
+    assert!(
+        persisted_after_disk
+            .disks
+            .iter()
+            .any(|d| d.lun == 2 && d.path == hotplug_disk)
+    );
+
+    // 2. Add a port forward, drop the caller future mid-ModifyResource, verify detached task commits it.
+    let _ = fs::remove_file(&modify_sentinel);
+    let pf = PortForward {
+        protocol: IpProto::Udp,
+        host_addr: "127.0.0.1".into(),
+        host_port: 15353,
+        guest_port: 53,
+    };
+    {
+        let sup_pf = Arc::clone(&sup);
+        let pf_clone = pf.clone();
+        let pf_fut = sup_pf.add_port_forward(&vm_id_str, nic_id, pf_clone);
+        tokio::pin!(pf_fut);
+        tokio::select! {
+            res = &mut pf_fut => panic!("add_port_forward finished before ModifyResource delay: {res:?}"),
+            _ = wait_for_file(&modify_sentinel) => {}
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let vm = sup.get_vm(&vm_id.to_string()).unwrap();
+        let has_pf = vm.config.nics.iter().any(|n| {
+            matches!(&n.backend, NicBackendConfig::Consomme { port_forwards, .. } if port_forwards.contains(&pf))
+        });
+        if has_pf {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "detached add_port_forward never committed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let persisted_after_pf = RegistryStore::open(dir.path())
+        .load_all_vms()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.id == vm_id)
+        .unwrap();
+    assert!(persisted_after_pf.nics.iter().any(|n| {
+        matches!(&n.backend, NicBackendConfig::Consomme { port_forwards, .. } if port_forwards.contains(&pf))
+    }));
+
+    sup.shutdown_all_vms().await;
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--rpc") {
@@ -991,6 +1484,18 @@ fn main() {
         (
             "daemon_stop_without_stop_vms_preserves_running_vm_and_readopts_on_restart",
             Box::pin(test_daemon_stop_without_stop_vms_preserves_running_vm_and_readopts_on_restart()),
+        ),
+        (
+            "real_daemon_process_exits_on_default_stop_and_sigterm_while_vm_running_and_readopts_cleanly",
+            Box::pin(test_real_daemon_process_exits_on_default_stop_and_sigterm_while_vm_running_and_readopts_cleanly()),
+        ),
+        (
+            "failed_daemon_start_preserves_running_vm_runtime_files",
+            Box::pin(test_failed_daemon_start_preserves_running_vm_runtime_files()),
+        ),
+        (
+            "disconnecting_mid_disk_hotplug_and_port_forward_still_commits_config",
+            Box::pin(test_disconnecting_mid_disk_hotplug_and_port_forward_still_commits_config()),
         ),
     ];
 

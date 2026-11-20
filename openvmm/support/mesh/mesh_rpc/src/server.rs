@@ -168,45 +168,52 @@ impl Server {
     ) -> anyhow::Result<()> {
         let (mut reader, mut writer) = stream.split();
         let (stream_send, mut stream_recv) = mesh::channel();
-        let ctx = CancelContext::new();
+        let (ctx, mut cancel) = CancelContext::new().with_cancel();
+        let peer_closed = std::sync::atomic::AtomicBool::new(false);
         let recv_task = async {
             let stream_send = stream_send; // move into this task
-            while let Some(message) = read_message(&mut reader).await? {
-                let (send, recv) = mesh::oneshot::<Result<Vec<u8>, Status>>();
-                stream_send.send((message.stream_id, recv));
+            let res: anyhow::Result<()> = async {
+                while let Some(message) = read_message(&mut reader).await? {
+                    let (send, recv) = mesh::oneshot::<Result<Vec<u8>, Status>>();
+                    stream_send.send((message.stream_id, recv));
 
-                let handle = handle_message(message).and_then(|request| {
-                    let service = self.services.get(request.service.as_str()).ok_or_else(|| {
-                        status_from_err(
-                            Code::Unimplemented,
-                            anyhow::anyhow!("unknown service {}", request.service),
-                        )
-                    })?;
+                    let handle = handle_message(message).and_then(|request| {
+                        let service = self.services.get(request.service.as_str()).ok_or_else(|| {
+                            status_from_err(
+                                Code::Unimplemented,
+                                anyhow::anyhow!("unknown service {}", request.service),
+                            )
+                        })?;
 
-                    let ctx = if request.timeout_nano == 0 {
-                        ctx.clone()
-                    } else {
-                        ctx.with_timeout(std::time::Duration::from_nanos(request.timeout_nano))
-                    };
+                        let ctx = if request.timeout_nano == 0 {
+                            ctx.clone()
+                        } else {
+                            ctx.with_timeout(std::time::Duration::from_nanos(request.timeout_nano))
+                        };
 
-                    Ok(move |port| {
-                        service.send((
-                            ctx,
-                            GenericRpc {
-                                method: request.method,
-                                data: request.payload,
-                                port,
-                            },
-                        ));
-                    })
-                });
+                        Ok(move |port| {
+                            service.send((
+                                ctx,
+                                GenericRpc {
+                                    method: request.method,
+                                    data: request.payload,
+                                    port,
+                                },
+                            ));
+                        })
+                    });
 
-                match handle {
-                    Ok(handle) => handle(send.into()),
-                    Err(err) => send.send(Err(err)),
+                    match handle {
+                        Ok(handle) => handle(send.into()),
+                        Err(err) => send.send(Err(err)),
+                    }
                 }
+                Ok(())
             }
-            Ok(())
+            .await;
+            peer_closed.store(true, std::sync::atomic::Ordering::Release);
+            cancel.cancel();
+            res
         };
         let send_task = async {
             let mut responses = FuturesUnordered::new();
@@ -239,13 +246,15 @@ impl Server {
                         responses.push(recv);
                     }
                     Event::Response((stream_id, payload)) => {
-                        write_message(
-                            &mut writer,
-                            stream_id,
-                            MESSAGE_TYPE_RESPONSE,
-                            &mesh::payload::encode(payload),
-                        )
-                        .await?;
+                        if !peer_closed.load(std::sync::atomic::Ordering::Acquire) {
+                            write_message(
+                                &mut writer,
+                                stream_id,
+                                MESSAGE_TYPE_RESPONSE,
+                                &mesh::payload::encode(payload),
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -626,6 +635,9 @@ mod tests {
     use crate::Client;
     use crate::Server;
     use crate::client::ExistingConnection;
+    use crate::message::MESSAGE_TYPE_REQUEST;
+    use crate::message::write_message;
+    use crate::rpc::status_from_err;
     use crate::service::Code;
     use crate::service::ServiceRpc;
     use futures::StreamExt;
@@ -696,6 +708,60 @@ mod tests {
                 _ => panic!("{:?}", req),
             }
 
+            assert!(recv.next().await.is_none());
+        });
+
+        client_thread.join().unwrap();
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn client_disconnect_cancels_pending_rpc_context() {
+        let (c, s) = unix_socket::UnixStream::pair().unwrap();
+        let mut server = Server::new();
+        let mut recv = server.add_service::<items::Example>();
+        let server_thread = std::thread::spawn(move || {
+            block_with_io(async |driver| server.run_single(&driver, s).await)
+        });
+
+        let client_thread = std::thread::spawn(move || {
+            DefaultPool::run_with(async |driver| {
+                let mut sock = PolledSocket::new(&driver, c).unwrap();
+                let req = crate::message::Request {
+                    service: items::Example::NAME.to_string(),
+                    method: "Method1".to_string(),
+                    payload: mesh::payload::encode(items::Method1Request {
+                        foo: "a".to_string(),
+                        bar: "b".to_string(),
+                    }),
+                    timeout_nano: 0,
+                    metadata: Vec::new(),
+                };
+                write_message(
+                    &mut sock,
+                    1,
+                    MESSAGE_TYPE_REQUEST,
+                    &mesh::payload::encode(req),
+                )
+                .await
+                .unwrap();
+                // Disconnect before the server responds so the pending RPC must observe cancellation.
+                drop(sock);
+            })
+        });
+
+        block_on(async {
+            let (mut ctx, req) = recv.next().await.unwrap();
+            match req {
+                items::Example::Method1(_, resp) => {
+                    ctx.cancelled().await;
+                    resp.send(Err(status_from_err(
+                        Code::Cancelled,
+                        anyhow::anyhow!("client disconnected"),
+                    )));
+                }
+                _ => panic!("{:?}", req),
+            }
             assert!(recv.next().await.is_none());
         });
 
