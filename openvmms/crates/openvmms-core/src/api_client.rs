@@ -30,6 +30,19 @@ use uuid::Uuid;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PreRequestConnectError(pub String);
+
+pub fn is_pre_request_connect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.is::<PreRequestConnectError>()
+            || cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_connect)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     base_url: String,
@@ -48,7 +61,7 @@ struct HealthCheckBody {
 
 impl ApiClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> anyhow::Result<Self> {
-        let base_url = base_url.into().trim_end_matches('/').to_string();
+        let base_url = validate_daemon_base_url(&base_url.into())?;
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(10))
@@ -156,7 +169,13 @@ impl ApiClient {
 
     fn ensure_verified(&self) -> anyhow::Result<()> {
         if !self.token.is_empty() {
-            self.health()?;
+            self.health().map_err(|err| {
+                if err.chain().any(|cause| cause.is::<reqwest::Error>()) {
+                    anyhow::Error::new(PreRequestConnectError(format!("{err:#}")))
+                } else {
+                    err
+                }
+            })?;
         }
         Ok(())
     }
@@ -568,9 +587,49 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn validate_daemon_base_url(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        bail!(
+            "HTTPS daemon URLs are not supported; openvmmsd serves plain HTTP on loopback (use http://)"
+        );
+    }
+    if let Some(rest) = trimmed
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("http://"))
+        .map(|_| &trimmed[7..])
+    {
+        if rest.is_empty() {
+            bail!("invalid daemon URL '{raw}': missing host:port");
+        }
+        return Ok(format!("http://{rest}"));
+    }
+    if trimmed.contains("://") {
+        bail!("unsupported daemon URL scheme in '{raw}'; expected http://");
+    }
+    if trimmed.is_empty() {
+        bail!("daemon URL cannot be empty");
+    }
+    Ok(trimmed.to_string())
+}
+
 pub fn normalize_base_url(listen_or_url: &str) -> String {
     let trimmed = listen_or_url.trim().trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if let Some(rest) = trimmed
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("http://"))
+        .map(|_| &trimmed[7..])
+    {
+        return format!("http://{rest}");
+    }
+    if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        || trimmed.contains("://")
+    {
         return trimmed.to_string();
     }
     let addr = if trimmed.is_empty() {
@@ -669,6 +728,9 @@ pub fn ensure_daemon_running(
     data_dir: Option<&Path>,
     daemon_url_override: Option<&str>,
 ) -> anyhow::Result<ApiClient> {
+    if let Some(url) = daemon_url_override {
+        let _ = crate::models::parse_loopback_listen_addr(url)?;
+    }
     if let Ok(client) = ApiClient::from_data_dir(data_dir, daemon_url_override)
         && client.health().is_ok()
     {
@@ -1322,5 +1384,34 @@ mod tests {
         let vm_summary = vm_thread.join().unwrap().expect("create_vm timed out");
         assert_eq!(vm_summary.config.name, "Slow-Disk-VM");
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn https_and_unsupported_daemon_urls_are_rejected() {
+        for url in [
+            "https://127.0.0.1:47620",
+            "HTTPS://localhost:47620",
+            "ftp://127.0.0.1:47620",
+        ] {
+            let err = ApiClient::new(url, "tok").unwrap_err();
+            assert!(
+                err.to_string().contains("HTTPS") || err.to_string().contains("unsupported"),
+                "{url}: {err:#}"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let store = RegistryStore::new(dir.path()).unwrap();
+            let _ = store.load_or_create_token().unwrap();
+            assert!(
+                ApiClient::from_data_dir(Some(dir.path()), Some(url)).is_err(),
+                "from_data_dir accepted {url}"
+            );
+            assert!(
+                ensure_daemon_running(Some(dir.path()), Some(url)).is_err(),
+                "ensure_daemon_running accepted {url}"
+            );
+        }
+
+        let client = ApiClient::new("HTTP://127.0.0.1:47620/", "tok").unwrap();
+        assert_eq!(client.base_url(), "http://127.0.0.1:47620");
     }
 }

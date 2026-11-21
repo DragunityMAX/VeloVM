@@ -42,6 +42,56 @@ pub enum FilePickerTarget {
     HostUefiFirmware,
 }
 
+struct FilePickerLoadResult {
+    seq: u64,
+    resolved_dir: Option<(PathBuf, String, Option<String>)>,
+    entries: Vec<(String, PathBuf, bool)>,
+    error: Option<String>,
+}
+
+fn read_dir_entries(
+    dir: &std::path::Path,
+    filter_exts: &[String],
+) -> (Vec<(String, PathBuf, bool)>, Option<String>) {
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(err) => {
+            return (
+                Vec::new(),
+                Some(format!("Cannot read {}: {err}", dir.display())),
+            );
+        }
+    };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = path.is_dir();
+        if is_dir {
+            dirs.push((name, path, true));
+        } else {
+            if !filter_exts.is_empty() {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !filter_exts.contains(&ext) {
+                    continue;
+                }
+            }
+            files.push((name, path, false));
+        }
+    }
+    dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    let mut entries = Vec::with_capacity(dirs.len() + files.len());
+    entries.extend(dirs);
+    entries.extend(files);
+    (entries, None)
+}
+
 pub struct FilePickerModal {
     pub target: FilePickerTarget,
     pub current_dir: PathBuf,
@@ -51,6 +101,12 @@ pub struct FilePickerModal {
     pub filter_exts: Vec<String>,
     pub entries: Vec<(String, PathBuf, bool)>,
     pub error: Option<String>,
+    pub loading: bool,
+    dir_input_edited: bool,
+    dir_input_at_load_start: String,
+    load_seq: u64,
+    load_rx: Option<std::sync::mpsc::Receiver<FilePickerLoadResult>>,
+    repaint_ctx: Option<egui::Context>,
 }
 
 impl FilePickerModal {
@@ -60,87 +116,155 @@ impl FilePickerModal {
         save_mode: bool,
         filter_exts: Vec<&str>,
     ) -> Self {
-        let trimmed = initial_path.trim();
-        let initial = PathBuf::from(trimmed);
-        let (start_dir, fname) = if !trimmed.is_empty() && initial.is_dir() {
-            (initial, String::new())
-        } else if !trimmed.is_empty()
-            && let Some(parent) = initial.parent()
-            && parent.is_dir()
-        {
-            (
-                parent.to_path_buf(),
-                initial
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            )
+        let trimmed = initial_path.trim().to_string();
+        let initial_guess = if !trimmed.is_empty() {
+            PathBuf::from(&trimmed)
         } else {
-            let home = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            (home, String::new())
+            PathBuf::from(".")
         };
-
-        let dir_input = start_dir.to_string_lossy().into_owned();
         let mut modal = Self {
             target,
-            current_dir: start_dir,
-            dir_input,
-            filename_input: fname,
+            current_dir: initial_guess,
+            dir_input: trimmed.clone(),
+            filename_input: String::new(),
             save_mode,
             filter_exts: filter_exts.into_iter().map(|s| s.to_ascii_lowercase()).collect(),
             entries: Vec::new(),
             error: None,
+            loading: false,
+            dir_input_edited: false,
+            dir_input_at_load_start: trimmed.clone(),
+            load_seq: 0,
+            load_rx: None,
+            repaint_ctx: None,
         };
-        modal.reload();
+        let filter_exts_owned = modal.filter_exts.clone();
+        modal.start_load(trimmed.clone(), move |seq| {
+            let initial = PathBuf::from(&trimmed);
+            let (start_dir, fname) = if !trimmed.is_empty() && initial.is_dir() {
+                (initial, String::new())
+            } else if !trimmed.is_empty()
+                && let Some(parent) = initial.parent()
+                && parent.is_dir()
+            {
+                (
+                    parent.to_path_buf(),
+                    initial
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            } else {
+                let home = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                (home, String::new())
+            };
+            let dir_str = start_dir.to_string_lossy().into_owned();
+            let (entries, error) = read_dir_entries(&start_dir, &filter_exts_owned);
+            FilePickerLoadResult {
+                seq,
+                resolved_dir: Some((start_dir, dir_str, Some(fname))),
+                entries,
+                error,
+            }
+        });
         modal
     }
 
-    pub fn navigate_to(&mut self, dir: PathBuf) {
-        if dir.is_dir() {
-            self.current_dir = dir;
-            self.dir_input = self.current_dir.to_string_lossy().into_owned();
-            self.reload();
-        } else {
-            self.error = Some(format!("Directory not found: {}", dir.display()));
+    fn start_load<F>(&mut self, dir_input_snapshot: String, work: F)
+    where
+        F: FnOnce(u64) -> FilePickerLoadResult + Send + 'static,
+    {
+        self.load_seq = self.load_seq.wrapping_add(1).max(1);
+        let seq = self.load_seq;
+        self.loading = true;
+        self.error = None;
+        self.dir_input_at_load_start = dir_input_snapshot;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.load_rx = Some(rx);
+        let repaint_ctx = self.repaint_ctx.clone();
+        std::thread::spawn(move || {
+            let res = work(seq);
+            let _ = tx.send(res);
+            if let Some(ctx) = repaint_ctx {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    pub fn poll_load(&mut self) -> bool {
+        let Some(rx) = self.load_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.load_rx = None;
+                self.loading = false;
+                if res.seq != self.load_seq {
+                    return false;
+                }
+                if let Some((dir, dir_str, fname_opt)) = res.resolved_dir {
+                    self.current_dir = dir;
+                    if !self.dir_input_edited && self.dir_input == self.dir_input_at_load_start {
+                        self.dir_input = dir_str;
+                    }
+                    if let Some(fname) = fname_opt
+                        && self.filename_input.is_empty()
+                    {
+                        self.filename_input = fname;
+                    }
+                    self.entries = res.entries;
+                }
+                self.error = res.error;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.load_rx = None;
+                self.loading = false;
+                true
+            }
         }
     }
 
-    pub fn reload(&mut self) {
-        self.entries.clear();
-        self.error = None;
-        let read = match std::fs::read_dir(&self.current_dir) {
-            Ok(r) => r,
-            Err(err) => {
-                self.error = Some(format!("Cannot read {}: {err}", self.current_dir.display()));
-                return;
-            }
-        };
-        let mut dirs = Vec::new();
-        let mut files = Vec::new();
-        for entry in read.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = path.is_dir();
-            if is_dir {
-                dirs.push((name, path, true));
-            } else {
-                if !self.filter_exts.is_empty() {
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.to_ascii_lowercase())
-                        .unwrap_or_default();
-                    if !self.filter_exts.contains(&ext) {
-                        continue;
-                    }
+    pub fn navigate_to(&mut self, dir: PathBuf) {
+        let dir_str = dir.to_string_lossy().into_owned();
+        self.dir_input = dir_str.clone();
+        self.dir_input_edited = false;
+        let filter_exts = self.filter_exts.clone();
+        self.start_load(dir_str.clone(), move |seq| {
+            if dir.is_dir() {
+                let (entries, error) = read_dir_entries(&dir, &filter_exts);
+                FilePickerLoadResult {
+                    seq,
+                    resolved_dir: Some((dir, dir_str, None)),
+                    entries,
+                    error,
                 }
-                files.push((name, path, false));
+            } else {
+                FilePickerLoadResult {
+                    seq,
+                    resolved_dir: None,
+                    entries: Vec::new(),
+                    error: Some(format!("Directory not found: {}", dir.display())),
+                }
             }
-        }
-        dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-        files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-        self.entries.extend(dirs);
-        self.entries.extend(files);
+        });
+    }
+
+    pub fn reload(&mut self) {
+        let dir = self.current_dir.clone();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let filter_exts = self.filter_exts.clone();
+        let snapshot = self.dir_input.clone();
+        self.start_load(snapshot, move |seq| {
+            let (entries, error) = read_dir_entries(&dir, &filter_exts);
+            FilePickerLoadResult {
+                seq,
+                resolved_dir: Some((dir, dir_str, None)),
+                entries,
+                error,
+            }
+        });
     }
 }
 
@@ -327,7 +451,7 @@ impl NewVmWizard {
                 use_shm: self.use_shm,
                 transport: self.transport,
                 listen_addr: "127.0.0.1:0".to_string(),
-                vsock_port: (self.transport == FastDeskTransport::HvSock).then_some(5901),
+                vsock_port: None,
             }),
             disks,
             create_disk,
@@ -451,9 +575,6 @@ impl VmSettingsDialog {
                 fastdesk.vram_mb = self.vram_mb;
                 fastdesk.use_shm = self.use_shm;
                 fastdesk.transport = self.transport;
-                if self.transport == FastDeskTransport::HvSock && fastdesk.vsock_port.is_none() {
-                    fastdesk.vsock_port = Some(5901);
-                }
                 fastdesk
             });
             let cur_fw = string_to_opt(&self.uefi_firmware);
@@ -661,6 +782,11 @@ pub fn render_file_picker(
     let mut chosen: Option<(FilePickerTarget, PathBuf)> = None;
     let mut close = false;
     if let Some(picker) = picker_opt.as_mut() {
+        picker.repaint_ctx = Some(ctx.clone());
+        picker.poll_load();
+        if picker.loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         egui::Window::new(if picker.save_mode {
             "Choose Output File Path"
         } else {
@@ -678,17 +804,25 @@ pub fn render_file_picker(
                 }
                 let dir_resp =
                     ui.add(egui::TextEdit::singleline(&mut picker.dir_input).desired_width(400.0));
+                if dir_resp.changed() {
+                    picker.dir_input_edited = true;
+                }
                 let enter_pressed =
                     dir_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let go_clicked = ui.button("Go").clicked();
-                let edited_away =
-                    dir_resp.lost_focus() && picker.dir_input.trim() != picker.current_dir.to_string_lossy();
+                let edited_away = dir_resp.lost_focus()
+                    && picker.dir_input_edited
+                    && picker.dir_input.trim() != picker.current_dir.to_string_lossy();
                 if go_clicked || enter_pressed || edited_away {
                     let p = PathBuf::from(picker.dir_input.trim());
                     picker.navigate_to(p);
                 }
                 if ui.button("↻").clicked() {
                     picker.reload();
+                }
+                if picker.loading {
+                    ui.spinner();
+                    ui.label("Loading directory…");
                 }
             });
 
@@ -1743,6 +1877,17 @@ mod tests {
         assert!(matches!(remaining[0].backend, NicBackendConfig::Tap { ref name } if name == "tap0"));
     }
 
+    fn wait_file_picker_loaded(picker: &mut FilePickerModal) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while picker.loading && std::time::Instant::now() < deadline {
+            let _ = picker.poll_load();
+            if picker.loading {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert!(!picker.loading, "file picker load timed out");
+    }
+
     #[test]
     fn file_picker_dir_input_persists_while_typing_and_navigates_on_go() {
         let dir = tempfile::tempdir().unwrap();
@@ -1766,6 +1911,7 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let _ = render_file_picker(ctx, &mut picker_opt);
         });
+        wait_file_picker_loaded(picker_opt.as_mut().unwrap());
         assert_eq!(
             picker_opt.as_ref().unwrap().dir_input,
             sub.to_string_lossy().as_ref(),
@@ -1774,6 +1920,7 @@ mod tests {
 
         let target_dir = PathBuf::from(&picker_opt.as_ref().unwrap().dir_input);
         picker_opt.as_mut().unwrap().navigate_to(target_dir);
+        wait_file_picker_loaded(picker_opt.as_mut().unwrap());
         assert_eq!(picker_opt.as_ref().unwrap().current_dir, sub);
         assert!(
             picker_opt
@@ -1783,6 +1930,68 @@ mod tests {
                 .iter()
                 .any(|(name, _, is_dir)| name == "disk.img" && !*is_dir)
         );
+    }
+
+    #[test]
+    fn file_picker_open_and_navigate_are_nonblocking_and_drop_stale_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("fast-sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("ubuntu.iso"), b"ISO").unwrap();
+
+        let mut picker = FilePickerModal::open(
+            FilePickerTarget::MountIsoPath,
+            &dir.path().to_string_lossy(),
+            false,
+            vec!["iso"],
+        );
+        wait_file_picker_loaded(&mut picker);
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let stale_path = dir.path().join("stale-dir");
+        let start = std::time::Instant::now();
+        picker.start_load(dir.path().to_string_lossy().into_owned(), move |seq| {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            let dir_str = stale_path.to_string_lossy().into_owned();
+            let res = FilePickerLoadResult {
+                seq,
+                resolved_dir: Some((stale_path, dir_str, None)),
+                entries: vec![("stale.iso".to_string(), PathBuf::from("stale.iso"), false)],
+                error: Some("stale error".to_string()),
+            };
+            let _ = done_tx.send(());
+            res
+        });
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "start_load must return immediately without blocking UI thread"
+        );
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(picker.loading);
+
+        // Supersede the blocked load with a fast navigation.
+        picker.navigate_to(sub.clone());
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, sub);
+        assert!(
+            picker
+                .entries
+                .iter()
+                .any(|(name, _, is_dir)| name == "ubuntu.iso" && !*is_dir)
+        );
+        assert!(picker.error.is_none());
+
+        // Release the stale load and verify it is ignored when polled.
+        let _ = release_tx.send(());
+        done_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!picker.poll_load());
+        assert_eq!(picker.current_dir, sub);
+        assert!(!picker.entries.iter().any(|(name, _, _)| name == "stale.iso"));
+        assert!(picker.error.is_none());
     }
 
     #[test]

@@ -6,15 +6,25 @@ In `mesh_rpc::Server::serve_connection`, closing the ttrpc client socket
 previously did not cancel the connection's `CancelContext`, and `send_task`
 attempted to write responses back to the closed stream.
 
-This patch wires `CancelContext::new().with_cancel()` and a `peer_closed`
-flag into `serve_connection`: when `read_message` reaches EOF or errors,
-`cancel.cancel()` cancels all pending RPCs on that connection and `send_task`
-drops their responses rather than writing to the dead socket.
+This patch wires `CancelContext::new().with_cancel()`, `peer_closed`, and
+`send_done` into `serve_connection`:
+- On read/write errors, `cancel.cancel()` cancels all pending RPCs on that
+  connection and `send_task` drops their responses rather than writing to
+  the dead socket.
+- On Unix, a clean read EOF (which may be a client `shutdown(SHUT_WR)`
+  half-close still expecting replies) waits on `POLLHUP`/`POLLERR` vs
+  `send_task` finishing so half-closed clients still receive in-flight
+  replies while full socket closes cancel pending RPCs immediately.
+- On non-Unix platforms (`AF_UNIX` on Windows), read EOF continues to
+  cancel immediately because half-close cannot be distinguished from
+  socket close at read EOF without writing.
 
 Behavioral impact across every ttrpc service:
-- Any ttrpc client that closes its socket before receiving a response now
-  cancels all pending RPCs on that connection (via `CancelContext`) and their
-  responses are dropped.
+- Any ttrpc client that disconnects before receiving a response cancels all
+  pending RPCs on that connection (via `CancelContext`) and drops their
+  responses. In particular, if `openvmmsd` restarts or disconnects while
+  `SaveVm`, `RestoreVm`, or `ShutdownVm` is running, that operation is
+  cancelled instead of finishing.
 
 Rationale in this repository:
 - OpenVMM's `VmService::WaitVm` stores a single `(CancelContext, response)`
@@ -26,18 +36,31 @@ Rationale in this repository:
 Carry forward or upstream when syncing `openvmm/` past `c4419be15ab702194f0a25c294bd2f6187804824`.
 ---
 diff --git a/openvmm/support/mesh/mesh_rpc/src/server.rs b/openvmm/support/mesh/mesh_rpc/src/server.rs
-index 24acaf8..0cb9745 100644
+index 24acaf8..2726365 100644
 --- a/openvmm/support/mesh/mesh_rpc/src/server.rs
 +++ b/openvmm/support/mesh/mesh_rpc/src/server.rs
-@@ -168,45 +168,52 @@ pub async fn serve_connection(
+@@ -29,8 +29,10 @@
+ use mesh::MeshPayload;
+ use mesh::local_node::Port;
+ use pal_async::driver::Driver;
++use pal_async::interest::PollEvents;
+ use pal_async::socket::AsSockRef;
+ use pal_async::socket::Listener;
++use pal_async::socket::PollReadyExt;
+ use pal_async::socket::PolledSocket;
+ use std::collections::HashMap;
+ use std::io::Read;
+@@ -168,44 +170,80 @@ pub async fn serve_connection(
      ) -> anyhow::Result<()> {
          let (mut reader, mut writer) = stream.split();
          let (stream_send, mut stream_recv) = mesh::channel();
 -        let ctx = CancelContext::new();
-+        let (ctx, mut cancel) = CancelContext::new().with_cancel();
++        let (ctx, cancel) = CancelContext::new().with_cancel();
++        let cancel = parking_lot::Mutex::new(cancel);
 +        let peer_closed = std::sync::atomic::AtomicBool::new(false);
++        let (send_done_tx, send_done_rx) = mesh::oneshot::<()>();
          let recv_task = async {
-             let stream_send = stream_send; // move into this task
+-            let stream_send = stream_send; // move into this task
 -            while let Some(message) = read_message(&mut reader).await? {
 -                let (send, recv) = mesh::oneshot::<Result<Vec<u8>, Status>>();
 -                stream_send.send((message.stream_id, recv));
@@ -67,56 +90,82 @@ index 24acaf8..0cb9745 100644
 -                        ));
 -                    })
 -                });
-+            let res: anyhow::Result<()> = async {
-+                while let Some(message) = read_message(&mut reader).await? {
-+                    let (send, recv) = mesh::oneshot::<Result<Vec<u8>, Status>>();
-+                    stream_send.send((message.stream_id, recv));
++            let res: anyhow::Result<()> = {
++                let stream_send = stream_send; // drop on EOF/error so send_task can finish draining
++                async {
++                    while let Some(message) = read_message(&mut reader).await? {
++                        let (send, recv) = mesh::oneshot::<Result<Vec<u8>, Status>>();
++                        stream_send.send((message.stream_id, recv));
 +
-+                    let handle = handle_message(message).and_then(|request| {
-+                        let service = self.services.get(request.service.as_str()).ok_or_else(|| {
-+                            status_from_err(
-+                                Code::Unimplemented,
-+                                anyhow::anyhow!("unknown service {}", request.service),
-+                            )
-+                        })?;
++                        let handle = handle_message(message).and_then(|request| {
++                            let service = self.services.get(request.service.as_str()).ok_or_else(|| {
++                                status_from_err(
++                                    Code::Unimplemented,
++                                    anyhow::anyhow!("unknown service {}", request.service),
++                                )
++                            })?;
 +
-+                        let ctx = if request.timeout_nano == 0 {
-+                            ctx.clone()
-+                        } else {
-+                            ctx.with_timeout(std::time::Duration::from_nanos(request.timeout_nano))
-+                        };
++                            let ctx = if request.timeout_nano == 0 {
++                                ctx.clone()
++                            } else {
++                                ctx.with_timeout(std::time::Duration::from_nanos(request.timeout_nano))
++                            };
 +
-+                        Ok(move |port| {
-+                            service.send((
-+                                ctx,
-+                                GenericRpc {
-+                                    method: request.method,
-+                                    data: request.payload,
-+                                    port,
-+                                },
-+                            ));
-+                        })
-+                    });
++                            Ok(move |port| {
++                                service.send((
++                                    ctx,
++                                    GenericRpc {
++                                        method: request.method,
++                                        data: request.payload,
++                                        port,
++                                    },
++                                ));
++                            })
++                        });
  
 -                match handle {
 -                    Ok(handle) => handle(send.into()),
 -                    Err(err) => send.send(Err(err)),
-+                    match handle {
-+                        Ok(handle) => handle(send.into()),
-+                        Err(err) => send.send(Err(err)),
++                        match handle {
++                            Ok(handle) => handle(send.into()),
++                            Err(err) => send.send(Err(err)),
++                        }
 +                    }
++                    Ok(())
++                }
++                .await
++            };
++            if res.is_err() {
++                drop(send_done_rx);
++                peer_closed.store(true, std::sync::atomic::Ordering::Release);
++                cancel.lock().cancel();
++                return res;
++            }
++            // A clean read EOF can be either a half-close (`shutdown(SHUT_WR)`),
++            // where the peer still expects replies, or a full socket close.
++            // On Unix, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
++            // so half-closed clients still receive in-flight replies while
++            // full disconnects cancel pending RPCs immediately.
++            #[cfg(unix)]
++            {
++                futures::select! {
++                    _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
++                        peer_closed.store(true, std::sync::atomic::Ordering::Release);
++                        cancel.lock().cancel();
++                    }
++                    _ = send_done_rx.fuse() => {}
                  }
-+                Ok(())
              }
--            Ok(())
-+            .await;
-+            peer_closed.store(true, std::sync::atomic::Ordering::Release);
-+            cancel.cancel();
-+            res
++            #[cfg(not(unix))]
++            {
++                drop(send_done_rx);
++                peer_closed.store(true, std::sync::atomic::Ordering::Release);
++                cancel.lock().cancel();
++            }
+             Ok(())
          };
          let send_task = async {
-             let mut responses = FuturesUnordered::new();
-@@ -239,13 +246,15 @@ enum Event<T> {
+@@ -239,16 +277,24 @@ enum Event<T> {
                          responses.push(recv);
                      }
                      Event::Response((stream_id, payload)) => {
@@ -128,18 +177,27 @@ index 24acaf8..0cb9745 100644
 -                        )
 -                        .await?;
 +                        if !peer_closed.load(std::sync::atomic::Ordering::Acquire) {
-+                            write_message(
++                            if let Err(err) = write_message(
 +                                &mut writer,
 +                                stream_id,
 +                                MESSAGE_TYPE_RESPONSE,
 +                                &mesh::payload::encode(payload),
 +                            )
-+                            .await?;
++                            .await
++                            {
++                                peer_closed.store(true, std::sync::atomic::Ordering::Release);
++                                cancel.lock().cancel();
++                                return Err(err);
++                            }
 +                        }
                      }
                  }
              }
-@@ -626,6 +635,9 @@ mod tests {
++            send_done_tx.send(());
+             anyhow::Result::<_>::Ok(())
+         };
+         (recv_task, send_task).try_join().await?;
+@@ -626,6 +672,9 @@ mod tests {
      use crate::Client;
      use crate::Server;
      use crate::client::ExistingConnection;
@@ -149,7 +207,7 @@ index 24acaf8..0cb9745 100644
      use crate::service::Code;
      use crate::service::ServiceRpc;
      use futures::StreamExt;
-@@ -702,4 +714,58 @@ fn client_server() {
+@@ -702,4 +751,199 @@ fn client_server() {
          client_thread.join().unwrap();
          server_thread.join().unwrap().unwrap();
      }
@@ -197,6 +255,147 @@ index 24acaf8..0cb9745 100644
 +                    resp.send(Err(status_from_err(
 +                        Code::Cancelled,
 +                        anyhow::anyhow!("client disconnected"),
++                    )));
++                }
++                _ => panic!("{:?}", req),
++            }
++            assert!(recv.next().await.is_none());
++        });
++
++        client_thread.join().unwrap();
++        server_thread.join().unwrap().unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn client_half_close_receives_in_flight_reply() {
++        use crate::message::MESSAGE_TYPE_RESPONSE;
++        use crate::message::read_message;
++
++        let (c, s) = unix_socket::UnixStream::pair().unwrap();
++        let mut server = Server::new();
++        let mut recv = server.add_service::<items::Example>();
++        let server_thread = std::thread::spawn(move || {
++            block_with_io(async |driver| server.run_single(&driver, s).await)
++        });
++
++        let (req_seen_tx, req_seen_rx) = std::sync::mpsc::channel::<()>();
++        let client_thread = std::thread::spawn(move || {
++            DefaultPool::run_with(async |driver| {
++                let mut sock = PolledSocket::new(&driver, c).unwrap();
++                let req = crate::message::Request {
++                    service: items::Example::NAME.to_string(),
++                    method: "Method1".to_string(),
++                    payload: mesh::payload::encode(items::Method1Request {
++                        foo: "half".to_string(),
++                        bar: "close".to_string(),
++                    }),
++                    timeout_nano: 0,
++                    metadata: Vec::new(),
++                };
++                write_message(
++                    &mut sock,
++                    1,
++                    MESSAGE_TYPE_REQUEST,
++                    &mesh::payload::encode(req),
++                )
++                .await
++                .unwrap();
++                sock.get().shutdown(std::net::Shutdown::Write).unwrap();
++                // Wait until the server has observed the request and delayed slightly
++                // before sending the response back to the half-closed client.
++                req_seen_rx.recv().unwrap();
++                let msg = read_message(&mut sock).await.unwrap().unwrap();
++                assert_eq!(msg.stream_id, 1);
++                assert_eq!(msg.message_type, MESSAGE_TYPE_RESPONSE);
++                let resp =
++                    mesh::payload::decode::<crate::message::Response>(&msg.payload.unwrap())
++                        .unwrap();
++                match resp {
++                    crate::message::Response::Payload(bytes) => {
++                        let decoded = mesh::payload::decode::<items::Method1Response>(&bytes)
++                            .unwrap();
++                        assert_eq!(decoded.foo, "half-ok");
++                        assert_eq!(decoded.bar, "close-ok");
++                    }
++                    crate::message::Response::Status(s) => panic!("unexpected status {s:?}"),
++                }
++                drop(sock);
++            })
++        });
++
++        block_on(async {
++            let (mut ctx, req) = recv.next().await.unwrap();
++            match req {
++                items::Example::Method1(input, resp) => {
++                    req_seen_tx.send(()).unwrap();
++                    std::thread::sleep(std::time::Duration::from_millis(50));
++                    assert!(
++                        !ctx.is_cancelled(),
++                        "half-closed client must not cancel pending RPC"
++                    );
++                    resp.send(Ok(items::Method1Response {
++                        foo: input.foo + "-ok",
++                        bar: input.bar + "-ok",
++                    }));
++                }
++                _ => panic!("{:?}", req),
++            }
++            assert!(recv.next().await.is_none());
++        });
++
++        client_thread.join().unwrap();
++        server_thread.join().unwrap().unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn client_half_close_then_full_close_cancels_pending_rpc_context() {
++        let (c, s) = unix_socket::UnixStream::pair().unwrap();
++        let mut server = Server::new();
++        let mut recv = server.add_service::<items::Example>();
++        let server_thread = std::thread::spawn(move || {
++            block_with_io(async |driver| server.run_single(&driver, s).await)
++        });
++
++        let (req_seen_tx, req_seen_rx) = std::sync::mpsc::channel::<()>();
++        let client_thread = std::thread::spawn(move || {
++            DefaultPool::run_with(async |driver| {
++                let mut sock = PolledSocket::new(&driver, c).unwrap();
++                let req = crate::message::Request {
++                    service: items::Example::NAME.to_string(),
++                    method: "Method1".to_string(),
++                    payload: mesh::payload::encode(items::Method1Request {
++                        foo: "a".to_string(),
++                        bar: "b".to_string(),
++                    }),
++                    timeout_nano: 0,
++                    metadata: Vec::new(),
++                };
++                write_message(
++                    &mut sock,
++                    1,
++                    MESSAGE_TYPE_REQUEST,
++                    &mesh::payload::encode(req),
++                )
++                .await
++                .unwrap();
++                sock.get().shutdown(std::net::Shutdown::Write).unwrap();
++                req_seen_rx.recv().unwrap();
++                // Full close after half-close must raise POLLHUP and cancel the RPC.
++                drop(sock);
++            })
++        });
++
++        block_on(async {
++            let (mut ctx, req) = recv.next().await.unwrap();
++            match req {
++                items::Example::Method1(_, resp) => {
++                    req_seen_tx.send(()).unwrap();
++                    ctx.cancelled().await;
++                    resp.send(Err(status_from_err(
++                        Code::Cancelled,
++                        anyhow::anyhow!("client closed socket"),
 +                    )));
 +                }
 +                _ => panic!("{:?}", req),

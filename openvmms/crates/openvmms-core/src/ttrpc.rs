@@ -24,6 +24,8 @@ const MESSAGE_TYPE_RESPONSE: u8 = 2;
 const MAX_MESSAGE_SIZE: usize = 0x00ff_ffff;
 const SERVICE_VM: &str = "vmservice.VM";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_POLL_SLICE: Duration = Duration::from_millis(50);
 // socket2 truncates timeouts to whole milliseconds on Windows (microseconds on Unix),
 // and a 0 socket timeout means "block indefinitely".
 const MIN_SOCKET_TIMEOUT: Duration = Duration::from_millis(1);
@@ -269,38 +271,80 @@ impl TtrpcClient {
         &self,
         timeout: Duration,
     ) -> anyhow::Result<vmservice::PropertiesVmResponse> {
+        self.properties_vm_blocking_cancellable(timeout, &AtomicBool::new(false))
+    }
+
+    pub fn properties_vm_blocking_cancellable(
+        &self,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<vmservice::PropertiesVmResponse> {
         let req_bytes = vmservice::PropertiesVmRequest { types: vec![] }.encode_to_vec();
-        let resp_bytes = call_blocking(
+        let active_sock = Mutex::new(None);
+        let resp_bytes = call_blocking_cancellable(
             &self.socket_path,
             SERVICE_VM,
             "PropertiesVM",
             &req_bytes,
             Some(timeout),
+            cancelled,
+            &active_sock,
         )?;
         vmservice::PropertiesVmResponse::decode(resp_bytes.as_slice())
             .context("decoding ttrpc PropertiesVM response")
     }
 
     pub fn teardown_and_quit_blocking(&self, timeout: Duration) -> anyhow::Result<()> {
-        let _ = call_blocking(
+        self.teardown_and_quit_blocking_cancellable(timeout, &AtomicBool::new(false))
+    }
+
+    pub fn teardown_and_quit_blocking_cancellable(
+        &self,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        let active_sock = Mutex::new(None);
+        let _ = call_blocking_cancellable(
             &self.socket_path,
             SERVICE_VM,
             "TeardownVM",
             &[],
             Some(timeout),
+            cancelled,
+            &active_sock,
         );
-        let _ = call_blocking(&self.socket_path, SERVICE_VM, "Quit", &[], Some(timeout))?;
+        if cancelled.load(Ordering::Acquire) {
+            bail!("ttrpc call cancelled");
+        }
+        let _ = call_blocking_cancellable(
+            &self.socket_path,
+            SERVICE_VM,
+            "Quit",
+            &[],
+            Some(timeout),
+            cancelled,
+            &active_sock,
+        )?;
         Ok(())
     }
 
     pub fn is_socket_accepting(&self) -> bool {
+        self.is_socket_accepting_cancellable(Duration::from_secs(1), &AtomicBool::new(false))
+    }
+
+    pub fn is_socket_accepting_cancellable(
+        &self,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> bool {
         let Ok(sock) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
             return false;
         };
         let Ok(addr) = SockAddr::unix(&self.socket_path) else {
             return false;
         };
-        sock.connect(&addr).is_ok()
+        let deadline = Instant::now() + timeout;
+        connect_cancellable(&sock, &addr, cancelled, deadline).is_ok()
     }
 
     async fn call_unary<Req: Message, Resp: Message + Default>(
@@ -448,6 +492,206 @@ fn read_frame_cancellable(
     Ok((stream_id, message_type, payload))
 }
 
+#[cfg(unix)]
+fn poll_connect_ready(sock: &Socket, slice: Duration) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: sock.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let timeout_ms = slice.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(err);
+    }
+    if rc == 0 {
+        return Ok(false);
+    }
+    if let Some(err) = sock.take_error()? {
+        return Err(err);
+    }
+    if (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "socket connect failed",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn poll_connect_ready(sock: &Socket, slice: Duration) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        FD_SET, SOCKET, SOCKET_ERROR, TIMEVAL, WSAGetLastError, select,
+    };
+    let raw = sock.as_raw_socket() as SOCKET;
+    let mut writefds = FD_SET {
+        fd_count: 1,
+        fd_array: [0; 64],
+    };
+    writefds.fd_array[0] = raw;
+    let mut exceptfds = FD_SET {
+        fd_count: 1,
+        fd_array: [0; 64],
+    };
+    exceptfds.fd_array[0] = raw;
+    let us = slice.as_micros().min(i32::MAX as u128) as i32;
+    let tv = TIMEVAL {
+        tv_sec: us / 1_000_000,
+        tv_usec: us % 1_000_000,
+    };
+    let rc = unsafe { select(0, std::ptr::null_mut(), &mut writefds, &mut exceptfds, &tv) };
+    if rc == SOCKET_ERROR {
+        return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if rc == 0 {
+        return Ok(false);
+    }
+    if exceptfds.fd_count > 0 {
+        if let Some(err) = sock.take_error()? {
+            return Err(err);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "socket connect failed",
+        ));
+    }
+    if let Some(err) = sock.take_error()? {
+        return Err(err);
+    }
+    Ok(true)
+}
+
+fn connect_cancellable(
+    sock: &Socket,
+    addr: &SockAddr,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    sock.set_nonblocking(true)
+        .context("setting nonblocking mode on AF_UNIX socket")?;
+    let mut in_progress = false;
+    let mut first_attempt = true;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("ttrpc call cancelled");
+        }
+        let now = Instant::now();
+        if !first_attempt && now >= deadline {
+            bail!("ttrpc call timed out during connect");
+        }
+        first_attempt = false;
+        let remaining = deadline.saturating_duration_since(now);
+        if !in_progress {
+            match sock.connect(addr) {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                #[cfg(unix)]
+                Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) => {
+                    in_progress = true;
+                }
+                #[cfg(unix)]
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if remaining.is_zero() {
+                        bail!("ttrpc call timed out during connect");
+                    }
+                    // On Linux AF_UNIX, EAGAIN means the listen backlog is full; sleep briefly and retry connect().
+                    std::thread::sleep(remaining.min(Duration::from_millis(20)));
+                    continue;
+                }
+                #[cfg(windows)]
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.raw_os_error() == Some(10036) =>
+                {
+                    in_progress = true;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if in_progress {
+            if remaining.is_zero() {
+                bail!("ttrpc call timed out during connect");
+            }
+            let slice = remaining.clamp(MIN_SOCKET_TIMEOUT, CONNECT_POLL_SLICE);
+            if poll_connect_ready(sock, slice)? {
+                break;
+            }
+        }
+    }
+    sock.set_nonblocking(false)
+        .context("restoring blocking mode on AF_UNIX socket")?;
+    Ok(())
+}
+
+fn write_all_cancellable(
+    sock: &Socket,
+    buf: &[u8],
+    cancelled: &AtomicBool,
+    deadline: Option<Instant>,
+) -> anyhow::Result<()> {
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("ttrpc call cancelled");
+        }
+        let slice = if let Some(dl) = deadline {
+            let now = Instant::now();
+            if now >= dl {
+                bail!("ttrpc call timed out");
+            }
+            clamp_read_slice(dl - now)
+        } else {
+            POLL_SLICE
+        };
+        let _ = sock.set_write_timeout(Some(slice));
+        match (&*sock).write(&buf[offset..]) {
+            Ok(0) => {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("ttrpc call cancelled");
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole ttrpc frame",
+                )
+                .into());
+            }
+            Ok(n) => offset += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("ttrpc call cancelled");
+                }
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    bail!("ttrpc call timed out");
+                }
+                continue;
+            }
+            Err(err) => {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("ttrpc call cancelled");
+                }
+                return Err(err.into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn call_blocking(
     socket_path: &Path,
     service: &str,
@@ -481,15 +725,16 @@ fn call_blocking_cancellable(
         bail!("ttrpc call cancelled");
     }
     let deadline = timeout.map(|t| Instant::now() + t);
+    let connect_deadline = deadline
+        .map(|d| d.min(Instant::now() + CONNECT_TIMEOUT))
+        .unwrap_or_else(|| Instant::now() + CONNECT_TIMEOUT);
 
     let sock = Socket::new(Domain::UNIX, Type::STREAM, None)
         .context("creating AF_UNIX socket for ttrpc")?;
     let addr = SockAddr::unix(socket_path)
         .with_context(|| format!("invalid AF_UNIX path {}", socket_path.display()))?;
-    sock.connect(&addr)
+    connect_cancellable(&sock, &addr, cancelled, connect_deadline)
         .with_context(|| format!("connecting to OpenVMM RPC socket {}", socket_path.display()))?;
-    let write_timeout = timeout.unwrap_or(DEFAULT_TIMEOUT).max(MIN_SOCKET_TIMEOUT);
-    let _ = sock.set_write_timeout(Some(write_timeout));
 
     let sock = Arc::new(sock);
     {
@@ -520,8 +765,8 @@ fn call_blocking_cancellable(
     };
     let req_envelope = wire_req.encode_to_vec();
     let frame = encode_frame(1, MESSAGE_TYPE_REQUEST, &req_envelope)?;
-    (&*sock).write_all(&frame).context("writing ttrpc request")?;
-    (&*sock).flush().context("flushing ttrpc request")?;
+    write_all_cancellable(&sock, &frame, cancelled, deadline).context("writing ttrpc request")?;
+    let _ = (&*sock).flush();
 
     let (stream_id, message_type, resp_envelope) =
         read_frame_cancellable(&sock, cancelled, deadline)?;
@@ -726,5 +971,63 @@ mod tests {
         }
 
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_timeout_and_cancel_do_not_hang_on_full_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("full-backlog.sock");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        let addr = SockAddr::unix(&sock_path).unwrap();
+        listener.bind(&addr).unwrap();
+        listener.listen(1).unwrap();
+
+        // Fill the AF_UNIX listen backlog without calling accept() so subsequent connect() calls stall.
+        let mut fillers = Vec::new();
+        for _ in 0..64 {
+            let s = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            s.set_nonblocking(true).unwrap();
+            match s.connect(&addr) {
+                Ok(()) => fillers.push(s),
+                Err(_) => break,
+            }
+        }
+        assert!(!fillers.is_empty(), "expected at least one backlog filler socket");
+
+        let client = TtrpcClient::new(&sock_path);
+        let timed_start = Instant::now();
+        let timed_err = tokio::task::spawn_blocking({
+            let client = client.clone();
+            move || client.properties_vm_blocking(Duration::from_millis(80))
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            timed_start.elapsed() < Duration::from_secs(2),
+            "timed properties_vm_blocking hung on full backlog"
+        );
+        assert!(
+            format!("{timed_err:#}").contains("timed out"),
+            "expected connect timeout error, got: {timed_err:#}"
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let wait_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.wait_vm_cancellable(cancel_rx).await }
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = cancel_tx.send(true);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), wait_task)
+            .await
+            .expect("wait_vm_cancellable hung during connect()")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, WaitVmOutcome::Cancelled);
+
+        drop(fillers);
+        drop(listener);
     }
 }

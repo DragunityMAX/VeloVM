@@ -254,14 +254,14 @@ enum VmCmd {
         #[command(subcommand)]
         action: VmIsoCmd,
     },
-    /// Add a Consomme NAT port forward (e.g. tcp:127.0.0.1:3389->3389)
+    /// Add a Consomme NAT port forward (quote in shells because of '>', e.g. "tcp:127.0.0.1:3389->3389")
     PortAdd {
         vm: String,
         spec: String,
         #[arg(long)]
         nic: Option<Uuid>,
     },
-    /// Remove a Consomme NAT port forward
+    /// Remove a Consomme NAT port forward (quote in shells because of '>', e.g. "tcp:127.0.0.1:3389->3389")
     PortRemove {
         vm: String,
         spec: String,
@@ -425,13 +425,12 @@ fn handle_daemon(cli: &Cli, action: &DaemonCmd) -> anyhow::Result<()> {
         DaemonCmd::Start { foreground } => {
             if *foreground {
                 let bin = find_openvmmsd_binary()?;
-                let dir = cli
-                    .data_dir
-                    .as_deref()
-                    .map(resolve_client_path)
-                    .unwrap_or_else(default_data_dir);
+                let fg_args = build_foreground_daemon_args(
+                    cli.data_dir.as_deref(),
+                    cli.daemon_url.as_deref(),
+                )?;
                 let mut cmd = Command::new(bin);
-                cmd.arg("--data-dir").arg(&dir);
+                cmd.args(fg_args);
                 let status = cmd.status().context("running openvmmsd in foreground")?;
                 if !status.success() {
                     bail!("openvmmsd exited with {status}");
@@ -685,7 +684,7 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
                         FastDeskTransport::Tcp
                     },
                     listen_addr: "127.0.0.1:0".to_string(),
-                    vsock_port: args.hvsock.then_some(5901),
+                    vsock_port: None,
                 })
             } else {
                 None
@@ -884,6 +883,25 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
             print_vm_summary(&client.remove_port_forward(vm, nic_id, pf)?, cli.json)
         }
     }
+}
+
+fn build_foreground_daemon_args(
+    data_dir: Option<&Path>,
+    daemon_url: Option<&str>,
+) -> anyhow::Result<Vec<std::ffi::OsString>> {
+    let dir = data_dir
+        .map(resolve_client_path)
+        .unwrap_or_else(default_data_dir);
+    let mut args = vec![
+        std::ffi::OsString::from("--data-dir"),
+        dir.into_os_string(),
+    ];
+    if let Some(url) = daemon_url {
+        let listen = openvmms_core::models::parse_loopback_listen_addr(url)?.to_string();
+        args.push(std::ffi::OsString::from("--listen"));
+        args.push(std::ffi::OsString::from(listen));
+    }
+    Ok(args)
 }
 
 fn disk_attachment_from_cli_path(lun: u32, path: &Path) -> DiskAttachment {
@@ -1280,6 +1298,35 @@ mod tests {
         assert!(
             confirm_disk_deletion("VM1", &paths, &mut std::io::Cursor::new(b"n\n"), &mut out)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn foreground_daemon_args_honor_daemon_url_and_reject_https() {
+        let dir = Path::new("/tmp/openvmms-fg-test");
+        let without_url = build_foreground_daemon_args(Some(dir), None).unwrap();
+        assert_eq!(
+            without_url,
+            vec![
+                std::ffi::OsString::from("--data-dir"),
+                std::ffi::OsString::from("/tmp/openvmms-fg-test"),
+            ]
+        );
+
+        let with_url =
+            build_foreground_daemon_args(Some(dir), Some("http://127.0.0.1:48123")).unwrap();
+        assert_eq!(
+            with_url,
+            vec![
+                std::ffi::OsString::from("--data-dir"),
+                std::ffi::OsString::from("/tmp/openvmms-fg-test"),
+                std::ffi::OsString::from("--listen"),
+                std::ffi::OsString::from("127.0.0.1:48123"),
+            ]
+        );
+
+        assert!(
+            build_foreground_daemon_args(Some(dir), Some("https://127.0.0.1:48123")).is_err()
         );
     }
 }

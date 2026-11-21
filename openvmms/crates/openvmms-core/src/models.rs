@@ -17,16 +17,22 @@ pub const MAX_VM_MEMORY_MB: u64 = 16 * 1024 * 1024;
 /// non-loopback IP addresses.
 pub fn parse_loopback_listen_addr(raw: &str) -> anyhow::Result<std::net::SocketAddr> {
     let trimmed = raw.trim();
-    let without_scheme = if trimmed
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-    {
-        &trimmed[7..]
-    } else if trimmed
+    if trimmed
         .get(..8)
         .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
     {
-        &trimmed[8..]
+        bail!(
+            "HTTPS daemon URLs are not supported; openvmmsd serves plain HTTP on loopback (use http://)"
+        );
+    }
+    let without_scheme = if let Some(rest) = trimmed
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("http://"))
+        .map(|_| &trimmed[7..])
+    {
+        rest
+    } else if trimmed.contains("://") {
+        bail!("unsupported URL scheme in '{raw}'; expected http:// or host:port");
     } else {
         trimmed
     };
@@ -414,7 +420,7 @@ pub fn parse_port_forward(spec: &str) -> anyhow::Result<PortForward> {
     let (left, right) = trimmed
         .split_once("->")
         .or_else(|| trimmed.split_once("-:"))
-        .context("port forward must contain '->' (e.g. tcp:127.0.0.1:3389->3389)")?;
+        .context("port forward must contain '->' (quote it in shells, e.g. \"tcp:127.0.0.1:3389->3389\")")?;
 
     let guest_port: u16 = right
         .trim()
@@ -736,6 +742,8 @@ pub struct VmRuntimeState {
     pub rpc_socket_path: Option<PathBuf>,
     pub last_error: Option<String>,
     pub live_properties: Option<LiveVmProperties>,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -890,13 +898,21 @@ pub struct HostInfo {
     pub runtime_dir: PathBuf,
     pub listen_addr: String,
     pub resolved_paths: ResolvedHostPaths,
+    #[serde(default)]
+    pub daemon_instance_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum DaemonEvent {
-    VmUpdated { vm: VmSummary },
-    VmDeleted { id: Uuid },
+    VmUpdated {
+        vm: VmSummary,
+    },
+    VmDeleted {
+        id: Uuid,
+        #[serde(default)]
+        revision: u64,
+    },
     HostConfigUpdated,
     DaemonStopping,
 }
@@ -1149,6 +1165,10 @@ mod tests {
         );
         assert!(parse_loopback_listen_addr("0.0.0.0:47620").is_err());
         assert!(parse_loopback_listen_addr("example.com:47620").is_err());
+        let https_err = parse_loopback_listen_addr("https://127.0.0.1:47620").unwrap_err();
+        assert!(https_err.to_string().contains("HTTPS"), "{https_err:#}");
+        assert!(parse_loopback_listen_addr("HTTPS://localhost:47620").is_err());
+        assert!(parse_loopback_listen_addr("ftp://127.0.0.1:47620").is_err());
     }
 
     #[test]

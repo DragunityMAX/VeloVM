@@ -139,6 +139,7 @@ struct StubCtx {
     launch: u64,
     endpoint: Option<String>,
     stop_evt: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     wait_calls: Arc<AtomicUsize>,
     wait_in_flight: Arc<AtomicBool>,
 }
@@ -169,6 +170,10 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                     touch(&ctx.state_dir.join("first_create_entered"));
                     std::thread::sleep(Duration::from_millis(700));
                     send_ttrpc_err(&mut stream, stream_id, 13, "delayed failure from cancelled startup");
+                } else if ctx.mode == "slow_create" {
+                    touch(&ctx.state_dir.join("create_entered"));
+                    std::thread::sleep(Duration::from_millis(400));
+                    send_ttrpc_ok(&mut stream, stream_id, Vec::new());
                 } else {
                     send_ttrpc_ok(&mut stream, stream_id, Vec::new());
                 }
@@ -217,6 +222,8 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                 }
                 let state = if ctx.stop_evt.load(Ordering::Acquire) {
                     vmservice::VmState::Halted as i32
+                } else if ctx.paused.load(Ordering::Acquire) {
+                    vmservice::VmState::Paused as i32
                 } else {
                     vmservice::VmState::Running as i32
                 };
@@ -232,7 +239,11 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                 if ctx.mode == "pause_resume" && ctx.launch == 1 {
                     touch(&ctx.state_dir.join("pause_entered"));
                     std::thread::sleep(Duration::from_millis(350));
+                } else if ctx.mode == "concurrent_power" {
+                    touch(&ctx.state_dir.join("power_pause_entered"));
+                    std::thread::sleep(Duration::from_millis(300));
                 }
+                ctx.paused.store(true, Ordering::Release);
                 send_ttrpc_ok(&mut stream, stream_id, Vec::new());
             }
             "ResumeVM" => {
@@ -240,6 +251,7 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                     touch(&ctx.state_dir.join("resume_entered"));
                     std::thread::sleep(Duration::from_millis(350));
                 }
+                ctx.paused.store(false, Ordering::Release);
                 send_ttrpc_ok(&mut stream, stream_id, Vec::new());
             }
             "TeardownVM" => {
@@ -314,6 +326,7 @@ fn run_fake_openvmm_server(args: &[String]) {
         launch,
         endpoint: cfg.get("endpoint").cloned(),
         stop_evt: Arc::clone(&stop_evt),
+        paused: Arc::new(AtomicBool::new(false)),
         wait_calls: Arc::new(AtomicUsize::new(0)),
         wait_in_flight: Arc::new(AtomicBool::new(false)),
     });
@@ -1442,6 +1455,413 @@ async fn test_disconnecting_mid_disk_hotplug_and_port_forward_still_commits_conf
     sup.shutdown_all_vms().await;
 }
 
+async fn test_slow_reclaim_start_does_not_clobber_replacement_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let client = test_http_client();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+    let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
+    write_stub_mode(&runtime_dir, "normal", &[]);
+
+    let resp = client
+        .post(format!("{}/api/v1/vms", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .json(&CreateVmPayload {
+            name: "ReclaimRace-VM".into(),
+            description: String::new(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(1024),
+            fastdesk: Some(FastDeskSettings {
+                enabled: true,
+                use_shm: true,
+                ..Default::default()
+            }),
+            nics: Some(vec![]),
+            ..Default::default()
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: VmSummary = resp.json().await.unwrap();
+    let id = created.config.id;
+    let sock_path = runtime_dir.join(format!("{id}.sock"));
+    let pid_path = sock_path.with_extension("pid");
+    let shm_path = runtime_dir.join(format!("vram-{id}.shm"));
+
+    // Plant a slow leftover RPC listener on `<id>.sock` that stalls during TeardownVM.
+    let leftover_listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    leftover_listener.bind(&SockAddr::unix(&sock_path).unwrap()).unwrap();
+    leftover_listener.listen(16).unwrap();
+    let _ = leftover_listener.set_nonblocking(true);
+    fs::write(&pid_path, "999999").unwrap();
+    fs::write(&shm_path, b"STALE_SHM").unwrap();
+
+    let teardown_entered = Arc::new(AtomicBool::new(false));
+    let stop_leftover = Arc::new(AtomicBool::new(false));
+    let teardown_entered_srv = Arc::clone(&teardown_entered);
+    let stop_leftover_srv = Arc::clone(&stop_leftover);
+    let leftover_srv = std::thread::spawn(move || {
+        while !stop_leftover_srv.load(Ordering::Acquire) {
+            match leftover_listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    let te = Arc::clone(&teardown_entered_srv);
+                    std::thread::spawn(move || {
+                        while let Ok((stream_id, msg_type, bytes)) = read_frame(&mut conn) {
+                            if msg_type != MESSAGE_TYPE_REQUEST {
+                                break;
+                            }
+                            let Ok(req) = WireRequest::decode(bytes.as_slice()) else {
+                                break;
+                            };
+                            match req.method.as_str() {
+                                "PropertiesVM" => {
+                                    let payload = vmservice::PropertiesVmResponse {
+                                        state: vmservice::VmState::Running as i32,
+                                        ..Default::default()
+                                    }
+                                    .encode_to_vec();
+                                    send_ttrpc_ok(&mut conn, stream_id, payload);
+                                }
+                                "TeardownVM" => {
+                                    te.store(true, Ordering::Release);
+                                    std::thread::sleep(Duration::from_millis(600));
+                                    send_ttrpc_ok(&mut conn, stream_id, Vec::new());
+                                }
+                                "Quit" => {
+                                    send_ttrpc_ok(&mut conn, stream_id, Vec::new());
+                                    break;
+                                }
+                                _ => send_ttrpc_ok(&mut conn, stream_id, Vec::new()),
+                            }
+                        }
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let base_url = daemon.base_url.clone();
+    let token = daemon.token.clone();
+    let start1 = tokio::spawn(async move {
+        test_http_client()
+            .post(format!("{base_url}/api/v1/vms/ReclaimRace-VM/start"))
+            .bearer_auth(token)
+            .send()
+            .await
+    });
+
+    let enter_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !teardown_entered.load(Ordering::Acquire) {
+        assert!(
+            tokio::time::Instant::now() < enter_deadline,
+            "start1 did not reach leftover socket TeardownVM"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    // Cancel start1 via stop, drop the leftover listener, and immediately start replacement VM.
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/ReclaimRace-VM/stop", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    stop_leftover.store(true, Ordering::Release);
+
+    let start2_resp = client
+        .post(format!("{}/api/v1/vms/ReclaimRace-VM/start", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start2_resp.status(), 200);
+    let started2: VmSummary = start2_resp.json().await.unwrap();
+    assert_eq!(started2.runtime.status, VmStatus::Running);
+    let pid2 = started2.runtime.pid.expect("replacement VM must have PID");
+
+    let _ = start1.await;
+    let _ = leftover_srv.join();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Start #1's aborted/slow reclaim must NOT have deleted or truncated Start #2's files!
+    let check: VmSummary = client
+        .get(format!("{}/api/v1/vms/ReclaimRace-VM", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(check.runtime.status, VmStatus::Running);
+    assert_eq!(check.runtime.pid, Some(pid2));
+    assert!(sock_path.exists(), "replacement .sock was deleted by stale start");
+    assert!(pid_path.exists(), "replacement .pid was deleted by stale start");
+    assert!(shm_path.exists(), "replacement .shm was deleted by stale start");
+    assert_eq!(
+        fs::read_to_string(&pid_path).unwrap().trim(),
+        pid2.to_string(),
+        ".pid no longer matches replacement VM"
+    );
+    assert!(
+        fs::metadata(&shm_path).unwrap().len() >= 8 * 1024 * 1024,
+        "replacement .shm was truncated or shrunken"
+    );
+    assert!(TtrpcClient::new(&sock_path).is_socket_accepting());
+
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/ReclaimRace-VM/stop", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    daemon.shutdown().await;
+}
+
+async fn test_concurrent_pause_and_resume_preserve_actual_vm_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let client = test_http_client();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+    let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
+    write_stub_mode(&runtime_dir, "concurrent_power", &[]);
+
+    let created = create_stub_vm(&client, &daemon, "ConcurrentPower-VM").await;
+    let sock_path = runtime_dir.join(format!("{}.sock", created.config.id));
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/ConcurrentPower-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let base_url1 = daemon.base_url.clone();
+    let token1 = daemon.token.clone();
+    let pause_fut = tokio::spawn(async move {
+        test_http_client()
+            .post(format!("{base_url1}/api/v1/vms/ConcurrentPower-VM/pause"))
+            .bearer_auth(token1)
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_file(&runtime_dir.join("power_pause_entered")).await;
+
+    // Issue ResumeVM concurrently while PauseVM is still running in the stub; per-VM
+    // serialization must order them so both OpenVMM and daemon end up Running.
+    let resume_resp = client
+        .post(format!("{}/api/v1/vms/ConcurrentPower-VM/resume", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resume_resp.status(), 200);
+    assert_eq!(pause_fut.await.unwrap().status(), 200);
+
+    let vm: VmSummary = client
+        .get(format!("{}/api/v1/vms/ConcurrentPower-VM", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(vm.runtime.status, VmStatus::Running);
+    let props = TtrpcClient::new(&sock_path)
+        .properties_vm(vmservice::PropertiesVmRequest { types: vec![] })
+        .await
+        .unwrap();
+    assert_eq!(props.state, vmservice::VmState::Running as i32);
+
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/ConcurrentPower-VM/shutdown", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/ConcurrentPower-VM/stop", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    daemon.shutdown().await;
+}
+
+async fn test_runtime_dir_change_is_rejected_while_vm_is_starting() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let client = test_http_client();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+    let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
+    write_stub_mode(&runtime_dir, "slow_create", &[]);
+
+    create_stub_vm(&client, &daemon, "StartingHostCfg-VM").await;
+
+    let base_url = daemon.base_url.clone();
+    let token = daemon.token.clone();
+    let start_task = tokio::spawn(async move {
+        test_http_client()
+            .post(format!("{base_url}/api/v1/vms/StartingHostCfg-VM/start"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_file(&runtime_dir.join("create_entered")).await;
+
+    let mut cfg: HostConfig = client
+        .get(format!("{}/api/v1/host/config", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    cfg.runtime_dir = dir.path().join("run-new");
+    let put_resp = client
+        .put(format!("{}/api/v1/host/config", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .json(&cfg)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put_resp.status(), 409);
+
+    assert_eq!(start_task.await.unwrap().status(), 200);
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/StartingHostCfg-VM/stop", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    daemon.shutdown().await;
+}
+
+async fn test_start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = RegistryStore::new(dir.path()).unwrap();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+    let runtime_dir = dir.path().join("run");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let mut host = store.load_or_init_host_config().unwrap();
+    host.runtime_dir = runtime_dir.clone();
+    host.openvmm_bin = Some(std::env::current_exe().unwrap());
+    host.uefi_firmware_path = Some(fw_path);
+    store.save_host_config(&host).unwrap();
+    write_stub_mode(&runtime_dir, "normal", &[]);
+
+    let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+    let running_vm = sup
+        .create_vm(CreateVmPayload {
+            name: "DetachAlive-VM".into(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(1024),
+            fastdesk: Some(FastDeskSettings {
+                enabled: false,
+                ..Default::default()
+            }),
+            nics: Some(vec![]),
+            ..Default::default()
+        })
+        .unwrap();
+    let blocked_vm = sup
+        .create_vm(CreateVmPayload {
+            name: "BlockedDuringShutdown-VM".into(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(1024),
+            fastdesk: Some(FastDeskSettings {
+                enabled: false,
+                ..Default::default()
+            }),
+            nics: Some(vec![]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let started = sup.start_vm(&running_vm.config.id.to_string()).await.unwrap();
+    assert_eq!(started.runtime.status, VmStatus::Running);
+    let sock_path = runtime_dir.join(format!("{}.sock", running_vm.config.id));
+
+    sup.mark_shutting_down();
+    let err = sup
+        .start_vm(&blocked_vm.config.id.to_string())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("shutting down"),
+        "expected shutdown rejection error, got: {err:#}"
+    );
+
+    sup.detach_all_vms().await;
+    drop(sup);
+
+    assert!(
+        !runtime_dir.join("teardown_called").exists(),
+        "detach killed running VM"
+    );
+    assert!(
+        TtrpcClient::new(&sock_path).is_socket_accepting(),
+        "detached VM socket closed on supervisor drop"
+    );
+
+    touch(&runtime_dir.join("exit_now"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while TtrpcClient::new(&sock_path).is_socket_accepting() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = fs::remove_file(&sock_path);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--rpc") {
@@ -1496,6 +1916,22 @@ fn main() {
         (
             "disconnecting_mid_disk_hotplug_and_port_forward_still_commits_config",
             Box::pin(test_disconnecting_mid_disk_hotplug_and_port_forward_still_commits_config()),
+        ),
+        (
+            "slow_reclaim_start_does_not_clobber_replacement_start",
+            Box::pin(test_slow_reclaim_start_does_not_clobber_replacement_start()),
+        ),
+        (
+            "concurrent_pause_and_resume_preserve_actual_vm_state",
+            Box::pin(test_concurrent_pause_and_resume_preserve_actual_vm_state()),
+        ),
+        (
+            "runtime_dir_change_is_rejected_while_vm_is_starting",
+            Box::pin(test_runtime_dir_change_is_rejected_while_vm_is_starting()),
+        ),
+        (
+            "start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm",
+            Box::pin(test_start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm()),
         ),
     ];
 

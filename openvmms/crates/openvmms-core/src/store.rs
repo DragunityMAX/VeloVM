@@ -106,22 +106,56 @@ impl RegistryStore {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
         }
-        match file.try_lock() {
-            Ok(()) => {
-                #[cfg(windows)]
-                {
-                    set_path_owner_only_windows(&path)?;
-                }
-                Ok(file)
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fl = libc::flock {
+                l_type: libc::F_WRLCK as _,
+                l_whence: libc::SEEK_SET as _,
+                l_start: 0,
+                l_len: 0,
+                l_pid: 0,
+            };
+            let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &fl) };
+            if rc == 0 {
+                return Ok(file);
             }
-            Err(fs::TryLockError::WouldBlock) => {
+            let err = std::io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
                 bail!(
                     "another openvmmsd instance is already running for data directory {}",
                     self.data_dir.display()
                 );
             }
-            Err(fs::TryLockError::Error(err)) => {
-                Err(err).with_context(|| format!("acquiring daemon lock at {}", path.display()))
+            if err.raw_os_error() != Some(libc::EINVAL) {
+                return Err(err).with_context(|| format!("acquiring daemon lock at {}", path.display()));
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    #[cfg(windows)]
+                    {
+                        set_path_owner_only_windows(&path)?;
+                    }
+                    return Ok(file);
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "another openvmmsd instance is already running for data directory {}",
+                            self.data_dir.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(fs::TryLockError::Error(err)) => {
+                    return Err(err)
+                        .with_context(|| format!("acquiring daemon lock at {}", path.display()));
+                }
             }
         }
     }
@@ -129,10 +163,27 @@ impl RegistryStore {
     /// Returns `true` if another open file handle currently holds `<data_dir>/daemon.lock`.
     pub fn is_daemon_locked(&self) -> bool {
         let path = self.lock_path();
-        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let Ok(file) = fs::File::open(&path) else {
+                return false;
+            };
+            let mut fl = libc::flock {
+                l_type: libc::F_WRLCK as _,
+                l_whence: libc::SEEK_SET as _,
+                l_start: 0,
+                l_len: 0,
+                l_pid: 0,
+            };
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut fl) } == 0 {
+                return fl.l_type != libc::F_UNLCK as libc::c_short;
+            }
+        }
+        let Ok(file) = fs::File::open(&path) else {
             return false;
         };
-        match file.try_lock() {
+        match file.try_lock_shared() {
             Ok(()) => {
                 let _ = file.unlock();
                 false
@@ -341,9 +392,11 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
 }
 
 #[cfg(windows)]
-fn current_user_sid_bytes() -> anyhow::Result<Vec<u8>> {
+fn current_user_token_buf()
+-> anyhow::Result<Vec<std::mem::MaybeUninit<windows_sys::Win32::Security::TOKEN_USER>>> {
+    use std::mem::MaybeUninit;
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE};
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     struct HandleGuard(HANDLE);
@@ -375,19 +428,27 @@ fn current_user_sid_bytes() -> anyhow::Result<Vec<u8>> {
     if ok != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
         return Err(std::io::Error::last_os_error()).context("GetTokenInformation size query failed");
     }
-    let mut buf = vec![0u8; needed as usize];
+    let elem_size = std::mem::size_of::<TOKEN_USER>();
+    let count = (needed as usize).div_ceil(elem_size).max(1);
+    let mut buf = vec![MaybeUninit::<TOKEN_USER>::uninit(); count];
+    let buf_bytes = u32::try_from(count * elem_size).context("TOKEN_USER buffer overflow")?;
+    let mut returned = 0u32;
     let ok = unsafe {
         GetTokenInformation(
             raw_token,
             TokenUser,
             buf.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
+            buf_bytes,
+            &mut returned,
         )
     };
     if ok == 0 {
         return Err(std::io::Error::last_os_error()).context("GetTokenInformation(TokenUser) failed");
     }
+    anyhow::ensure!(
+        (returned as usize) >= elem_size,
+        "GetTokenInformation(TokenUser) returned truncated buffer ({returned} bytes)"
+    );
     Ok(buf)
 }
 
@@ -401,7 +462,6 @@ fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
-        TOKEN_USER,
     };
 
     struct LocalFreeAcl(*mut ACL);
@@ -415,8 +475,8 @@ fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let token_buf = current_user_sid_bytes()?;
-    let token_user = unsafe { &*(token_buf.as_ptr().cast::<TOKEN_USER>()) };
+    let token_buf = current_user_token_buf()?;
+    let token_user = unsafe { token_buf[0].assume_init_ref() };
     let user_sid = token_user.User.Sid;
 
     let ea = EXPLICIT_ACCESS_W {
@@ -562,7 +622,7 @@ mod tests {
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
             DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-            GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_USER,
+            GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -630,8 +690,43 @@ mod tests {
         let ace = unsafe { &*(ace_ptr.cast::<ACCESS_ALLOWED_ACE>()) };
         let ace_sid = (&raw const ace.SidStart).cast::<core::ffi::c_void>().cast_mut();
 
-        let token_buf = current_user_sid_bytes().unwrap();
-        let token_user = unsafe { &*(token_buf.as_ptr().cast::<TOKEN_USER>()) };
+        let token_buf = current_user_token_buf().unwrap();
+        let token_user = unsafe { token_buf[0].assume_init_ref() };
         assert_ne!(unsafe { EqualSid(ace_sid, token_user.User.Sid) }, 0);
+    }
+
+    #[test]
+    fn is_daemon_locked_never_blocks_acquire() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let store = store.clone();
+            let stop = Arc::clone(&stop);
+            readers.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let _ = store.is_daemon_locked();
+                }
+            }));
+        }
+
+        for _ in 0..200 {
+            let lock = store
+                .try_acquire_daemon_lock()
+                .expect("is_daemon_locked probe blocked try_acquire_daemon_lock");
+            assert!(store.is_daemon_locked());
+            drop(lock);
+        }
+
+        stop.store(true, Ordering::Release);
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 }

@@ -3025,6 +3025,7 @@ pub(crate) fn bind_display_tcp_listener(
             );
         }
     }
+    #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
     socket
         .bind(&addr.into())
@@ -3041,6 +3042,65 @@ pub(crate) fn bind_display_tcp_listener(
     }
 
     Ok(socket.into())
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn bind_fastdesk_vmsocket_listener(
+    vsock_port: u32,
+) -> anyhow::Result<(vmsocket::VmListener, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        const VMADDR_CID_LOCAL: u32 = 1;
+        const VMADDR_PORT_ANY: u32 = u32::MAX;
+        let requested = if vsock_port == 0 {
+            VMADDR_PORT_ANY
+        } else {
+            vsock_port
+        };
+        let listener = vmsocket::VmListener::bind(vmsocket::VmAddress::vsock(
+            VMADDR_CID_LOCAL,
+            requested,
+        ))
+        .with_context(|| format!("binding FastDesk local vsock port {vsock_port}"))?;
+        let bound_port = listener
+            .local_addr()
+            .context("querying FastDesk vsock local address")?
+            .port();
+        Ok((listener, bound_port))
+    }
+
+    #[cfg(windows)]
+    {
+        // Bind strictly to HV_GUID_LOOPBACK so other Hyper-V guests on the host
+        // cannot connect to this VM's unauthenticated FastDesk listener.
+        const HV_GUID_LOOPBACK: Guid = guid::guid!("e0e16197-dd56-4a10-9195-5ee7a155a838");
+        if vsock_port != 0 {
+            let listener = vmsocket::VmListener::bind(vmsocket::VmAddress::hyperv_vsock(
+                HV_GUID_LOOPBACK,
+                vsock_port,
+            ))
+            .with_context(|| format!("binding FastDesk hvsock loopback port {vsock_port}"))?;
+            return Ok((listener, vsock_port));
+        }
+
+        const MIN_PORT: u32 = 49152;
+        const SPAN: u32 = 0x7fff_ffff - MIN_PORT;
+        for _ in 0..64 {
+            let port = MIN_PORT + (Guid::new_random().data1 % SPAN);
+            match vmsocket::VmListener::bind(vmsocket::VmAddress::hyperv_vsock(
+                HV_GUID_LOOPBACK,
+                port,
+            )) {
+                Ok(listener) => return Ok((listener, port)),
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("binding FastDesk hvsock loopback port {port}"));
+                }
+            }
+        }
+        bail!("failed to allocate ephemeral FastDesk hvsock loopback port");
+    }
 }
 
 async fn run_control_inner(
@@ -3105,11 +3165,7 @@ async fn run_control_inner(
         if let Some(vsock_port) = opt.fastdesk.fastdesk_vsock_port {
             #[cfg(any(windows, target_os = "linux"))]
             {
-                let listener =
-                    vmsocket::VmListener::bind(vmsocket::VmAddress::vsock_any(vsock_port))
-                        .with_context(|| {
-                            format!("binding FastDesk vmsocket port {vsock_port}")
-                        })?;
+                let (listener, _bound_port) = bind_fastdesk_vmsocket_listener(vsock_port)?;
                 fastdesk_worker = Some(
                     fastdesk_host
                         .launch_worker(
@@ -4199,5 +4255,16 @@ mod tests {
             assert_eq!(error.to_string(), "multiple devices use PCIe port 'custom'");
             mesh.shutdown().await;
         });
+    }
+
+    #[test]
+    fn bind_display_tcp_listener_allocates_distinct_ephemeral_ports() {
+        let a = bind_display_tcp_listener("FastDesk", "127.0.0.1:0", 0).unwrap();
+        let b = bind_display_tcp_listener("FastDesk", "127.0.0.1:0", 0).unwrap();
+        let port_a = a.local_addr().unwrap().port();
+        let port_b = b.local_addr().unwrap().port();
+        assert_ne!(port_a, 0);
+        assert_ne!(port_b, 0);
+        assert_ne!(port_a, port_b);
     }
 }

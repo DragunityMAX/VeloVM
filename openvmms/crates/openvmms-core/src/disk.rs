@@ -5,6 +5,8 @@ use anyhow::Context;
 use anyhow::bail;
 use std::fs;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -147,7 +149,7 @@ pub fn create_disk_cancellable(
     match vhdx_img_bin {
         None => {
             let sized = if req.fixed {
-                write_fixed_raw_zeros(&mut file, req.size_bytes, cancelled)
+                allocate_fixed_raw(&mut file, req.size_bytes, cancelled)
                     .with_context(|| format!("allocating fixed raw disk {}", req.path.display()))
             } else {
                 file.set_len(req.size_bytes)
@@ -256,6 +258,54 @@ pub fn create_disk_cancellable(
             res
         }
     }
+}
+
+fn allocate_fixed_raw(
+    file: &mut fs::File,
+    size_bytes: u64,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        const FALLOC_CHUNK: u64 = 64 * 1024 * 1024;
+        if let Ok(total_i64) = libc::off_t::try_from(size_bytes) {
+            let mut offset = 0u64;
+            let mut fallback = false;
+            while offset < size_bytes {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("disk creation cancelled");
+                }
+                let len = (size_bytes - offset).min(FALLOC_CHUNK) as libc::off_t;
+                let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset as libc::off_t, len) };
+                if rc == 0 {
+                    offset += len as u64;
+                    continue;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if offset == 0
+                    && matches!(
+                        err.raw_os_error(),
+                        Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+                    )
+                {
+                    fallback = true;
+                    break;
+                }
+                return Err(err.into());
+            }
+            if !fallback {
+                let _ = total_i64;
+                file.sync_all()?;
+                return Ok(());
+            }
+            file.seek(SeekFrom::Start(0))?;
+        }
+    }
+    write_fixed_raw_zeros(file, size_bytes, cancelled)
 }
 
 fn write_fixed_raw_zeros(
@@ -694,6 +744,12 @@ mod tests {
         .unwrap();
         assert_eq!(fixed_info.virtual_size_bytes, size);
         assert_eq!(fs::metadata(&fixed_path).unwrap().len(), size);
+        let mut head = [1u8; 4096];
+        fs::File::open(&fixed_path)
+            .unwrap()
+            .read_exact(&mut head)
+            .unwrap();
+        assert!(head.iter().all(|&b| b == 0), "fixed raw disk must read back as zeros");
 
         let _sparse_info = create_disk(
             &CreateDiskPayload {

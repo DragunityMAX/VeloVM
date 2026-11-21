@@ -34,7 +34,7 @@ Or manage VMs from the CLI (`openvmms`):
 
 # Live management while running: ISO swap, disk hot-plug, NAT port forwards, pause/resume/reset/shutdown
 .\openvmms.exe vm iso eject Win11-Dev
-.\openvmms.exe vm port-add Win11-Dev tcp:127.0.0.1:3389->3389
+.\openvmms.exe vm port-add Win11-Dev "tcp:127.0.0.1:3389->3389"
 .\openvmms.exe vm shutdown Win11-Dev
 ```
 

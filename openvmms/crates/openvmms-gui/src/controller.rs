@@ -75,10 +75,18 @@ pub enum GuiUpdate {
         host_config: HostConfig,
         switches: Vec<VirtualSwitchInfo>,
         vms: Vec<VmSummary>,
+        snapshot_seq: u64,
     },
     DaemonDisconnected(String),
-    VmUpdated(VmSummary),
-    VmDeleted(Uuid),
+    VmUpdated {
+        vm: VmSummary,
+        select: bool,
+        is_details_fetch: bool,
+    },
+    VmDeleted {
+        id: Uuid,
+        revision: u64,
+    },
     VmLogs { id: Uuid, content: String },
     DiskInspected(DiskInfo),
     DiskCreated(DiskInfo),
@@ -118,11 +126,22 @@ struct BackendState {
     sse_active: AtomicBool,
     shutdown: AtomicBool,
     connect_in_flight: AtomicBool,
+    snapshot_seq: std::sync::atomic::AtomicU64,
     host_cfg_lock: Mutex<()>,
     logs_in_flight: Mutex<HashSet<Uuid>>,
     details_in_flight: Mutex<HashSet<Uuid>>,
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
+}
+
+fn is_idempotent_read(req: &GuiRequest) -> bool {
+    matches!(
+        req,
+        GuiRequest::RefreshAll
+            | GuiRequest::FetchVmDetails { .. }
+            | GuiRequest::FetchVmLogs { .. }
+            | GuiRequest::InspectDisk(_)
+    )
 }
 
 struct InFlightUuidGuard<'a> {
@@ -177,6 +196,7 @@ impl BackendHandle {
             sse_active: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             connect_in_flight: AtomicBool::new(false),
+            snapshot_seq: std::sync::atomic::AtomicU64::new(0),
             host_cfg_lock: Mutex::new(()),
             logs_in_flight: Mutex::new(HashSet::new()),
             details_in_flight: Mutex::new(HashSet::new()),
@@ -210,6 +230,10 @@ impl BackendState {
     fn emit(&self, msg: GuiUpdate) {
         let _ = self.upd_tx.send(msg);
         self.repaint_ctx.request_repaint();
+    }
+
+    fn next_snapshot_seq(&self) -> u64 {
+        self.snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn ensure_sse(self: &Arc<Self>) {
@@ -263,6 +287,7 @@ impl BackendState {
                     Ok(c) => {
                         set_shared_endpoint(&self.shared_endpoint, &c);
                         self.ensure_sse();
+                        let snapshot_seq = self.next_snapshot_seq();
                         match fetch_full_snapshot(&c) {
                             Ok((host_info, host_config, switches, vms)) => {
                                 let base_url = c.base_url().to_string();
@@ -273,6 +298,7 @@ impl BackendState {
                                     host_config,
                                     switches,
                                     vms,
+                                    snapshot_seq,
                                 });
                             }
                             Err(err) => {
@@ -297,17 +323,20 @@ impl BackendState {
                 {
                     set_shared_endpoint(&self.shared_endpoint, &reloaded);
                     self.ensure_sse();
-                    if !matches!(other, GuiRequest::RefreshAll)
-                        && let Ok((host_info, host_config, switches, vms)) =
+                    if !matches!(other, GuiRequest::RefreshAll) {
+                        let snapshot_seq = self.next_snapshot_seq();
+                        if let Ok((host_info, host_config, switches, vms)) =
                             fetch_full_snapshot(&reloaded)
-                    {
-                        self.emit(GuiUpdate::DaemonConnected {
-                            base_url: reloaded.base_url().to_string(),
-                            host_info,
-                            host_config,
-                            switches,
-                            vms,
-                        });
+                        {
+                            self.emit(GuiUpdate::DaemonConnected {
+                                base_url: reloaded.base_url().to_string(),
+                                host_info,
+                                host_config,
+                                switches,
+                                vms,
+                                snapshot_seq,
+                            });
+                        }
                     }
                     *self.client.write().unwrap() = Some(reloaded.clone());
                     current_client = Some(reloaded);
@@ -352,23 +381,55 @@ impl BackendState {
                                 || reloaded.token() != c.token())
                         {
                             c = reloaded;
+                            set_shared_endpoint(&self.shared_endpoint, &c);
                             *self.client.write().unwrap() = Some(c.clone());
                             self.ensure_sse();
-                            match self.execute_client_request(&mut c, other) {
-                                Ok(()) => {
-                                    if let Some(kind) = dialog_kind {
-                                        self.emit(GuiUpdate::DialogFinished { kind, error: None });
+                            if is_idempotent_read(&other)
+                                || openvmms_core::api_client::is_pre_request_connect_error(&err)
+                            {
+                                match self.execute_client_request(&mut c, other) {
+                                    Ok(()) => {
+                                        if let Some(kind) = dialog_kind {
+                                            self.emit(GuiUpdate::DialogFinished {
+                                                kind,
+                                                error: None,
+                                            });
+                                        }
+                                    }
+                                    Err(retry_err) => {
+                                        let err_msg = format!("{retry_err:#}");
+                                        self.emit(GuiUpdate::ErrorMessage(err_msg.clone()));
+                                        if let Some(kind) = dialog_kind {
+                                            self.emit(GuiUpdate::DialogFinished {
+                                                kind,
+                                                error: Some(err_msg),
+                                            });
+                                        }
                                     }
                                 }
-                                Err(retry_err) => {
-                                    let err_msg = format!("{retry_err:#}");
-                                    self.emit(GuiUpdate::ErrorMessage(err_msg.clone()));
-                                    if let Some(kind) = dialog_kind {
-                                        self.emit(GuiUpdate::DialogFinished {
-                                            kind,
-                                            error: Some(err_msg),
-                                        });
-                                    }
+                            } else {
+                                let snapshot_seq = self.next_snapshot_seq();
+                                if let Ok((host_info, host_config, switches, vms)) =
+                                    fetch_full_snapshot(&c)
+                                {
+                                    self.emit(GuiUpdate::DaemonConnected {
+                                        base_url: c.base_url().to_string(),
+                                        host_info,
+                                        host_config,
+                                        switches,
+                                        vms,
+                                        snapshot_seq,
+                                    });
+                                }
+                                let err_msg = format!(
+                                    "{err:#} (not retried after daemon endpoint changed)"
+                                );
+                                self.emit(GuiUpdate::ErrorMessage(err_msg.clone()));
+                                if let Some(kind) = dialog_kind {
+                                    self.emit(GuiUpdate::DialogFinished {
+                                        kind,
+                                        error: Some(err_msg),
+                                    });
                                 }
                             }
                         } else if c.health().is_err() {
@@ -481,6 +542,7 @@ impl BackendState {
         match req {
             GuiRequest::ConnectOrStartDaemon => Ok(()),
             GuiRequest::RefreshAll => {
+                let snapshot_seq = self.next_snapshot_seq();
                 let (host_info, host_config, switches, vms) = fetch_full_snapshot(client)?;
                 self.emit(GuiUpdate::DaemonConnected {
                     base_url: client.base_url().to_string(),
@@ -488,12 +550,17 @@ impl BackendState {
                     host_config,
                     switches,
                     vms,
+                    snapshot_seq,
                 });
                 Ok(())
             }
             GuiRequest::FetchVmDetails { id } => {
                 let vm = client.get_vm(&id.to_string())?;
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: true,
+                });
                 Ok(())
             }
             GuiRequest::FetchVmLogs { id } => {
@@ -507,7 +574,11 @@ impl BackendState {
                     "Created VM '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: true,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::UpdateVm { id, payload } => {
@@ -516,13 +587,17 @@ impl BackendState {
                     "Updated settings for '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::DeleteVm { id, delete_disks } => {
                 client.delete_vm(&id.to_string(), delete_disks)?;
                 self.emit(GuiUpdate::StatusMessage("Deleted virtual machine".to_string()));
-                self.emit(GuiUpdate::VmDeleted(id));
+                self.emit(GuiUpdate::VmDeleted { id, revision: 0 });
                 Ok(())
             }
             GuiRequest::StartVm { id } => {
@@ -531,7 +606,11 @@ impl BackendState {
                     "Started '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::StopVm { id } => {
@@ -540,7 +619,11 @@ impl BackendState {
                     "Turned off '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::ShutdownVm { id, acpi, force } => {
@@ -550,7 +633,11 @@ impl BackendState {
                     "Sent shutdown signal to '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::PauseVm { id } => {
@@ -559,7 +646,11 @@ impl BackendState {
                     "Paused '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::ResumeVm { id } => {
@@ -568,7 +659,11 @@ impl BackendState {
                     "Resumed '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::ResetVm { id } => {
@@ -577,7 +672,11 @@ impl BackendState {
                     "Reset '{}'",
                     vm.config.name
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::ConnectViewer { id, no_shm } => {
@@ -604,7 +703,11 @@ impl BackendState {
             GuiRequest::AttachDisk { id, payload } => {
                 let vm = client.attach_disk(&id.to_string(), &payload)?;
                 self.emit(GuiUpdate::StatusMessage("Attached disk".to_string()));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::DetachDisk { id, lun } => {
@@ -612,31 +715,51 @@ impl BackendState {
                 self.emit(GuiUpdate::StatusMessage(format!(
                     "Detached SCSI LUN {lun}"
                 )));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::MountIso { id, payload } => {
                 let vm = client.mount_iso(&id.to_string(), &payload)?;
                 self.emit(GuiUpdate::StatusMessage("Mounted ISO image".to_string()));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::EjectIso { id, lun } => {
                 let vm = client.eject_iso(&id.to_string(), lun)?;
                 self.emit(GuiUpdate::StatusMessage("Ejected ISO image".to_string()));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::AddPortForward { id, nic_id, port } => {
                 let vm = client.add_port_forward(&id.to_string(), nic_id, port)?;
                 self.emit(GuiUpdate::StatusMessage("Added port forward".to_string()));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::RemovePortForward { id, nic_id, port } => {
                 let vm = client.remove_port_forward(&id.to_string(), nic_id, port)?;
                 self.emit(GuiUpdate::StatusMessage("Removed port forward".to_string()));
-                self.emit(GuiUpdate::VmUpdated(vm));
+                self.emit(GuiUpdate::VmUpdated {
+                    vm,
+                    select: false,
+                    is_details_fetch: false,
+                });
                 Ok(())
             }
             GuiRequest::CreateDisk(payload) => {
@@ -698,12 +821,14 @@ fn maybe_switch_endpoint_on_disconnect(
     data_dir: Option<&Path>,
     daemon_url: Option<&str>,
     shared_endpoint: &SharedEndpoint,
+    snapshot_seq: &std::sync::atomic::AtomicU64,
     upd_tx: &mpsc::Sender<GuiUpdate>,
     repaint_ctx: &egui::Context,
 ) -> bool {
     if let Some(c) = reload_client_from_runtime_addr(data_dir, daemon_url, shared_endpoint)
         && c.base_url() != current_base_url
     {
+        let seq = snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok((host_info, host_config, switches, vms)) = fetch_full_snapshot(&c) {
             let _ = upd_tx.send(GuiUpdate::DaemonConnected {
                 base_url: c.base_url().to_string(),
@@ -711,6 +836,7 @@ fn maybe_switch_endpoint_on_disconnect(
                 host_config,
                 switches,
                 vms,
+                snapshot_seq: seq,
             });
             repaint_ctx.request_repaint();
         }
@@ -780,6 +906,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                 Ok(resp) if resp.status().is_success() => {
                     if !was_connected {
                         was_connected = true;
+                        let snapshot_seq = state.next_snapshot_seq();
                         if let Ok(c) = ApiClient::new(&base_url, &token)
                             && let Ok((host_info, host_config, switches, vms)) =
                                 fetch_full_snapshot(&c)
@@ -793,6 +920,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     host_config,
                                     switches,
                                     vms,
+                                    snapshot_seq,
                                 })
                                 .is_err()
                             {
@@ -811,13 +939,25 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         {
                             match event {
                                 DaemonEvent::VmUpdated { vm } => {
-                                    if state.upd_tx.send(GuiUpdate::VmUpdated(vm)).is_err() {
+                                    if state
+                                        .upd_tx
+                                        .send(GuiUpdate::VmUpdated {
+                                            vm,
+                                            select: false,
+                                            is_details_fetch: false,
+                                        })
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                     state.repaint_ctx.request_repaint();
                                 }
-                                DaemonEvent::VmDeleted { id } => {
-                                    if state.upd_tx.send(GuiUpdate::VmDeleted(id)).is_err() {
+                                DaemonEvent::VmDeleted { id, revision } => {
+                                    if state
+                                        .upd_tx
+                                        .send(GuiUpdate::VmDeleted { id, revision })
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                     state.repaint_ctx.request_repaint();
@@ -829,28 +969,32 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                         state.data_dir.as_deref(),
                                         state.daemon_url.as_deref(),
                                         &state.shared_endpoint,
-                                    ) && let Ok((host_info, host_config, switches, vms)) =
-                                        fetch_full_snapshot(&c)
-                                    {
-                                        let new_base = c.base_url().to_string();
-                                        *state.client.write().unwrap() = Some(c);
-                                        if state
-                                            .upd_tx
-                                            .send(GuiUpdate::DaemonConnected {
-                                                base_url: new_base.clone(),
-                                                host_info,
-                                                host_config,
-                                                switches,
-                                                vms,
-                                            })
-                                            .is_err()
+                                    ) {
+                                        let snapshot_seq = state.next_snapshot_seq();
+                                        if let Ok((host_info, host_config, switches, vms)) =
+                                            fetch_full_snapshot(&c)
                                         {
-                                            break;
-                                        }
-                                        state.repaint_ctx.request_repaint();
-                                        if new_base != base_url {
-                                            switched_endpoint = true;
-                                            break;
+                                            let new_base = c.base_url().to_string();
+                                            *state.client.write().unwrap() = Some(c);
+                                            if state
+                                                .upd_tx
+                                                .send(GuiUpdate::DaemonConnected {
+                                                    base_url: new_base.clone(),
+                                                    host_info,
+                                                    host_config,
+                                                    switches,
+                                                    vms,
+                                                    snapshot_seq,
+                                                })
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            state.repaint_ctx.request_repaint();
+                                            if new_base != base_url {
+                                                switched_endpoint = true;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -883,6 +1027,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             state.data_dir.as_deref(),
                             state.daemon_url.as_deref(),
                             &state.shared_endpoint,
+                            &state.snapshot_seq,
                             &state.upd_tx,
                             &state.repaint_ctx,
                         ) {
@@ -913,6 +1058,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         state.data_dir.as_deref(),
                         state.daemon_url.as_deref(),
                         &state.shared_endpoint,
+                        &state.snapshot_seq,
                         &state.upd_tx,
                         &state.repaint_ctx,
                     ) {
@@ -1067,9 +1213,9 @@ mod tests {
             .unwrap();
 
         match recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::VmUpdated(vm) if vm.config.id == created.config.id)
+            matches!(u, GuiUpdate::VmUpdated { vm, .. } if vm.config.id == created.config.id)
         }) {
-            GuiUpdate::VmUpdated(vm) => {
+            GuiUpdate::VmUpdated { vm, .. } => {
                 assert_eq!(vm.config.name, "PortSync-SSE-VM");
             }
             _ => unreachable!(),
@@ -1086,12 +1232,12 @@ mod tests {
         match recv_until(&backend, Duration::from_secs(5), |u| {
             matches!(
                 u,
-                GuiUpdate::VmUpdated(vm)
+                GuiUpdate::VmUpdated { vm, .. }
                     if vm.config.id == created.config.id
                         && vm.config.description == "updated via GUI after port change"
             )
         }) {
-            GuiUpdate::VmUpdated(vm) => {
+            GuiUpdate::VmUpdated { vm, .. } => {
                 assert_eq!(vm.config.description, "updated via GUI after port change");
             }
             _ => unreachable!(),
@@ -1182,9 +1328,9 @@ mod tests {
             })
             .unwrap();
         match recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::VmUpdated(vm) if vm.config.id == ext_vm.config.id)
+            matches!(u, GuiUpdate::VmUpdated { vm, .. } if vm.config.id == ext_vm.config.id)
         }) {
-            GuiUpdate::VmUpdated(vm) => assert_eq!(vm.config.name, "External-After-Restart"),
+            GuiUpdate::VmUpdated { vm, .. } => assert_eq!(vm.config.name, "External-After-Restart"),
             _ => unreachable!(),
         }
 
@@ -1408,6 +1554,7 @@ mod tests {
                                     data_dir: PathBuf::from("/tmp"),
                                     runtime_dir: PathBuf::from("/tmp"),
                                     listen_addr: addr.to_string(),
+                                    daemon_instance_id: None,
                                     resolved_paths: Default::default(),
                                 };
                                 ("200 OK", serde_json::to_string(&info).unwrap())
@@ -1513,5 +1660,344 @@ mod tests {
         stop_server.store(true, Ordering::Release);
         drop(backend);
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn non_idempotent_create_and_delete_are_not_retried_after_port_change() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        #[allow(clippy::too_many_arguments)]
+        fn spawn_mock_endpoint(
+            listener: std::net::TcpListener,
+            token: &'static str,
+            store_dir: PathBuf,
+            vm_summary: VmSummary,
+            post_count: Arc<AtomicUsize>,
+            delete_count: Arc<AtomicUsize>,
+            switch_on_post: Option<std::net::SocketAddr>,
+            switch_on_delete: Option<std::net::SocketAddr>,
+            stop: Arc<AtomicBool>,
+        ) -> thread::JoinHandle<()> {
+            let addr = listener.local_addr().unwrap();
+            let _ = listener.set_nonblocking(true);
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                            let store_dir = store_dir.clone();
+                            let vm_summary = vm_summary.clone();
+                            let post_count = Arc::clone(&post_count);
+                            let delete_count = Arc::clone(&delete_count);
+                            let stop_conn = Arc::clone(&stop);
+                            handlers.push(thread::spawn(move || {
+                                let mut raw = Vec::with_capacity(1024);
+                                let mut tmp = [0u8; 1024];
+                                let mut header_end = None;
+                                while header_end.is_none() {
+                                    match stream.read(&mut tmp) {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => {
+                                            raw.extend_from_slice(&tmp[..n]);
+                                            header_end = raw
+                                                .windows(4)
+                                                .position(|w| w == b"\r\n\r\n")
+                                                .map(|p| p + 4);
+                                            if raw.len() > 64 * 1024 {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                let Some(hdr_end) = header_end else {
+                                    return;
+                                };
+                                let headers_str = String::from_utf8_lossy(&raw[..hdr_end]).into_owned();
+                                let content_len: usize = headers_str
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        if k.eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                while raw.len() < hdr_end + content_len {
+                                    match stream.read(&mut tmp) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => raw.extend_from_slice(&tmp[..n]),
+                                    }
+                                }
+                                let first_line = headers_str.lines().next().unwrap_or("");
+                                let method = first_line.split_whitespace().next().unwrap_or("");
+                                let target = first_line.split_whitespace().nth(1).unwrap_or("");
+
+                                if target == "/api/v1/events" {
+                                    let hdrs = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                                    if stream.write_all(hdrs.as_bytes()).is_err() {
+                                        return;
+                                    }
+                                    let _ = stream.flush();
+                                    while !stop_conn.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keepalive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+
+                                if method == "POST" && target == "/api/v1/vms" {
+                                    post_count.fetch_add(1, Ordering::SeqCst);
+                                    if let Some(next_addr) = switch_on_post {
+                                        let store =
+                                            openvmms_core::store::RegistryStore::new(&store_dir)
+                                                .unwrap();
+                                        store
+                                            .write_runtime_listen_addr(&next_addr.to_string())
+                                            .unwrap();
+                                        return;
+                                    }
+                                } else if method == "DELETE" && target.starts_with("/api/v1/vms/") {
+                                    delete_count.fetch_add(1, Ordering::SeqCst);
+                                    if let Some(next_addr) = switch_on_delete {
+                                        let store =
+                                            openvmms_core::store::RegistryStore::new(&store_dir)
+                                                .unwrap();
+                                        store
+                                            .write_runtime_listen_addr(&next_addr.to_string())
+                                            .unwrap();
+                                        return;
+                                    }
+                                }
+
+                                let (status, body) = if target.starts_with("/api/v1/health?") {
+                                    let query =
+                                        target.split_once('?').map(|(_, q)| q).unwrap_or("");
+                                    let challenge = query
+                                        .split('&')
+                                        .filter_map(|kv| kv.split_once('='))
+                                        .find(|(k, _)| *k == "challenge")
+                                        .map(|(_, v)| v)
+                                        .unwrap_or("");
+                                    let proof = openvmms_core::models::compute_health_auth_proof(
+                                        token, addr, challenge,
+                                    );
+                                    (
+                                        "200 OK",
+                                        format!(
+                                            r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#
+                                        ),
+                                    )
+                                } else if target == "/api/v1/host/info" {
+                                    let info = HostInfo {
+                                        hostname: "test".into(),
+                                        os: "linux".into(),
+                                        arch: "x86_64".into(),
+                                        cpu_count: 4,
+                                        daemon_version: "0.1.0".into(),
+                                        data_dir: store_dir.clone(),
+                                        runtime_dir: store_dir.clone(),
+                                        listen_addr: addr.to_string(),
+                                        daemon_instance_id: None,
+                                        resolved_paths: Default::default(),
+                                    };
+                                    ("200 OK", serde_json::to_string(&info).unwrap())
+                                } else if target == "/api/v1/host/config" {
+                                    (
+                                        "200 OK",
+                                        serde_json::to_string(&HostConfig::default()).unwrap(),
+                                    )
+                                } else if target == "/api/v1/host/switches" {
+                                    ("200 OK", "[]".into())
+                                } else if method == "GET" && target == "/api/v1/vms" {
+                                    (
+                                        "200 OK",
+                                        serde_json::to_string(&vec![vm_summary.clone()]).unwrap(),
+                                    )
+                                } else {
+                                    ("404 Not Found", "{}".into())
+                                };
+                                let resp = format!(
+                                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                                let _ = stream.flush();
+                            }));
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        }
+
+        let listener1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let listener2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let listener3 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr3 = listener3.local_addr().unwrap();
+
+        let token = "no-retry-token";
+        let vm_id = Uuid::new_v4();
+        let mut vm_cfg = openvmms_core::models::VmConfig::from_preset(
+            "Existing-VM",
+            VmPreset::Custom,
+            Path::new("/tmp/vm"),
+        );
+        vm_cfg.id = vm_id;
+        let vm_summary = VmSummary {
+            config: vm_cfg,
+            runtime: Default::default(),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        openvmms_core::store::atomic_write(&store.token_path(), token.as_bytes(), true).unwrap();
+        store.write_runtime_listen_addr(&addr1.to_string()).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let p1_posts = Arc::new(AtomicUsize::new(0));
+        let p1_deletes = Arc::new(AtomicUsize::new(0));
+        let p2_posts = Arc::new(AtomicUsize::new(0));
+        let p2_deletes = Arc::new(AtomicUsize::new(0));
+        let p3_posts = Arc::new(AtomicUsize::new(0));
+        let p3_deletes = Arc::new(AtomicUsize::new(0));
+
+        let srv1 = spawn_mock_endpoint(
+            listener1,
+            token,
+            dir.path().to_path_buf(),
+            vm_summary.clone(),
+            Arc::clone(&p1_posts),
+            Arc::clone(&p1_deletes),
+            Some(addr2),
+            None,
+            Arc::clone(&stop),
+        );
+        let srv2 = spawn_mock_endpoint(
+            listener2,
+            token,
+            dir.path().to_path_buf(),
+            vm_summary.clone(),
+            Arc::clone(&p2_posts),
+            Arc::clone(&p2_deletes),
+            None,
+            Some(addr3),
+            Arc::clone(&stop),
+        );
+        let srv3 = spawn_mock_endpoint(
+            listener3,
+            token,
+            dir.path().to_path_buf(),
+            vm_summary,
+            Arc::clone(&p3_posts),
+            Arc::clone(&p3_deletes),
+            None,
+            None,
+            Arc::clone(&stop),
+        );
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+        let url1 = format!("http://{addr1}");
+        let url2 = format!("http://{addr2}");
+        let url3 = format!("http://{addr3}");
+
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        }) {
+            GuiUpdate::DaemonConnected { base_url, .. } => assert_eq!(base_url, url1),
+            _ => unreachable!(),
+        }
+
+        // Send CreateVm while connected to port1; port1 switches daemon.addr to port2 and drops
+        // the connection before replying. The GUI must refresh onto port2 without retrying POST.
+        backend.send(GuiRequest::CreateVm(CreateVmPayload {
+            name: "NoRetry-VM".into(),
+            preset: VmPreset::Custom,
+            vcpus: Some(2),
+            memory_mb: Some(512),
+            ..Default::default()
+        }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_url2 = false;
+        let mut saw_create_err = false;
+        while std::time::Instant::now() < deadline && (!saw_url2 || !saw_create_err) {
+            if let Some(upd) = backend.try_recv() {
+                match upd {
+                    GuiUpdate::DaemonConnected { base_url, .. } if base_url == url2 => {
+                        saw_url2 = true;
+                    }
+                    GuiUpdate::DialogFinished {
+                        kind: DialogKind::NewVmWizard,
+                        error: Some(_),
+                    } => {
+                        saw_create_err = true;
+                    }
+                    _ => {}
+                }
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(saw_url2 && saw_create_err, "CreateVm did not switch to url2 and report failure");
+        assert_eq!(p1_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(p2_posts.load(Ordering::SeqCst), 0);
+
+        // Next send DeleteVm on port2; port2 switches daemon.addr to port3 and drops the
+        // connection before replying. The GUI must refresh onto port3 without retrying DELETE.
+        backend.send(GuiRequest::DeleteVm {
+            id: vm_id,
+            delete_disks: false,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_url3 = false;
+        let mut saw_delete_err = false;
+        while std::time::Instant::now() < deadline && (!saw_url3 || !saw_delete_err) {
+            if let Some(upd) = backend.try_recv() {
+                match upd {
+                    GuiUpdate::DaemonConnected { base_url, .. } if base_url == url3 => {
+                        saw_url3 = true;
+                    }
+                    GuiUpdate::DialogFinished {
+                        kind: DialogKind::DeleteVm(id),
+                        error: Some(_),
+                    } if id == vm_id => {
+                        saw_delete_err = true;
+                    }
+                    _ => {}
+                }
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(saw_url3 && saw_delete_err, "DeleteVm did not switch to url3 and report failure");
+        assert_eq!(p2_deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(p3_deletes.load(Ordering::SeqCst), 0);
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        srv1.join().unwrap();
+        srv2.join().unwrap();
+        srv3.join().unwrap();
     }
 }
