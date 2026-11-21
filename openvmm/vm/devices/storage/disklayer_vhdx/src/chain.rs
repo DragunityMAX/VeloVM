@@ -17,6 +17,72 @@ use vm_resource::IntoResource;
 use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
 
+#[cfg(unix)]
+fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
+    if file.metadata().is_ok_and(|m| m.is_file()) {
+        let res = if read_only {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match res {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!(
+                    "disk image '{}' is already locked for writing or in use by another process",
+                    path.display()
+                );
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(err)
+                    .with_context(|| format!("failed to lock disk image {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_vhdx_file_locked(
+    path: &Path,
+    read_only: bool,
+    layer_idx: Option<usize>,
+) -> anyhow::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(!read_only);
+
+    #[cfg(windows)]
+    if path.is_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`)
+        // for both writable leaves and read-only parent layers.
+        opts.share_mode(0x0000_0001);
+    }
+
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        #[cfg(windows)]
+        Err(err) if err.raw_os_error() == Some(32) => {
+            anyhow::bail!(
+                "disk image '{}' is already locked for writing or in use by another process",
+                path.display()
+            );
+        }
+        Err(err) => {
+            return match layer_idx {
+                Some(i) => Err(err).with_context(|| {
+                    format!("failed to open vhdx layer {}: {}", i, path.display())
+                }),
+                None => Err(err.into()),
+            };
+        }
+    };
+
+    #[cfg(unix)]
+    acquire_disk_lock(&file, path, read_only)?;
+
+    Ok(file)
+}
+
 /// Open a single VHDX file as a [`LayeredDiskHandle`] with one layer.
 ///
 /// Use this for base (non-differencing) VHDX files. For differencing chains,
@@ -24,10 +90,7 @@ use vm_resource::kind::DiskHandleKind;
 ///
 /// The file is opened for read+write unless `read_only` is true.
 pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(!read_only)
-        .open(path)?;
+    let file = open_vhdx_file_locked(path, read_only, None)?;
 
     Ok(Resource::new(LayeredDiskHandle::single_layer(
         VhdxDiskLayerHandle { file, read_only },
@@ -73,11 +136,7 @@ pub fn open_vhdx_chain_explicit(
             let is_leaf = i == 0;
             let layer_read_only = !is_leaf || read_only;
 
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!layer_read_only)
-                .open(path)
-                .with_context(|| format!("failed to open vhdx layer {}: {}", i, path.display()))?;
+            let file = open_vhdx_file_locked(path, layer_read_only, Some(i))?;
 
             let handle = VhdxDiskLayerHandle {
                 file,
@@ -357,5 +416,76 @@ mod tests {
 
         let resource = open_vhdx_chain(&path, false).await.unwrap();
         let _ = resource;
+    }
+
+    #[pal_async::async_test]
+    async fn rejects_concurrent_writable_vhdx_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.vhdx");
+
+        let bf = crate::io::BlockingFile::open(&path, false).unwrap();
+        let mut params = vhdx::CreateParams {
+            disk_size: 1024 * 1024,
+            ..Default::default()
+        };
+        vhdx::create(&bf, &mut params).await.unwrap();
+        drop(bf);
+
+        let first = open_vhdx_chain(&path, false).await.unwrap();
+        let err = open_vhdx_chain(&path, false).await.unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
+
+        drop(first);
+        open_vhdx_chain(&path, false).await.unwrap();
+    }
+
+    #[pal_async::async_test]
+    async fn readonly_parent_layer_blocks_concurrent_writer_and_allows_concurrent_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.vhdx");
+        let child_a_path = dir.path().join("child_a.vhdx");
+        let child_b_path = dir.path().join("child_b.vhdx");
+
+        let bf = crate::io::BlockingFile::open(&base_path, false).unwrap();
+        let mut base_params = vhdx::CreateParams {
+            disk_size: 2 * 1024 * 1024,
+            ..Default::default()
+        };
+        vhdx::create(&bf, &mut base_params).await.unwrap();
+        drop(bf);
+
+        for child_path in [&child_a_path, &child_b_path] {
+            let parent = vhdx::VhdxParent::new(base_params.data_write_guid)
+                .with_relative_path(r".\base.vhdx")
+                .unwrap();
+            let cf = crate::io::BlockingFile::open(child_path, false).unwrap();
+            let mut child_params = vhdx::CreateParams {
+                disk_size: 2 * 1024 * 1024,
+                disk_type: vhdx::DiskType::Differencing(parent),
+                ..Default::default()
+            };
+            vhdx::create(&cf, &mut child_params).await.unwrap();
+            drop(cf);
+        }
+
+        // Opening child A takes a shared lock on base.vhdx; child B can share it read-only.
+        let child_a = open_vhdx_chain(&child_a_path, false).await.unwrap();
+        let child_b = open_vhdx_chain(&child_b_path, false).await.unwrap();
+
+        // A concurrent writable open of base.vhdx must be rejected while parents hold shared locks.
+        let err = open_vhdx_chain(&base_path, false).await.unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
+
+        drop(child_a);
+        drop(child_b);
+
+        // Once both chains close, base.vhdx can be opened writable, which in turn blocks child opens.
+        let base_rw = open_vhdx_chain(&base_path, false).await.unwrap();
+        let child_err = open_vhdx_chain(&child_a_path, false).await.unwrap_err();
+        assert!(
+            child_err.to_string().contains("already locked for writing"),
+            "{child_err:#}"
+        );
+        drop(base_rw);
     }
 }

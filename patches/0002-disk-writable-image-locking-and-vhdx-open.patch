@@ -1,0 +1,645 @@
+diff --git a/openvmm/openvmm/openvmm_helpers/src/disk.rs b/openvmm/openvmm/openvmm_helpers/src/disk.rs
+index 4eab368..6fb183d 100644
+--- a/openvmm/openvmm/openvmm_helpers/src/disk.rs
++++ b/openvmm/openvmm/openvmm_helpers/src/disk.rs
+@@ -31,15 +31,126 @@ pub struct OpenDiskOptions {
+     pub direct: bool,
+ }
+ 
++#[cfg(unix)]
++fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
++    if file.metadata().is_ok_and(|m| m.is_file()) {
++        let res = if read_only {
++            file.try_lock_shared()
++        } else {
++            file.try_lock()
++        };
++        match res {
++            Ok(()) => {}
++            Err(std::fs::TryLockError::WouldBlock) => {
++                anyhow::bail!(
++                    "disk image '{}' is already locked for writing or in use by another process",
++                    path.display()
++                );
++            }
++            Err(std::fs::TryLockError::Error(err)) => {
++                return Err(err).with_context(|| disk_open_error(path, "failed to lock"));
++            }
++        }
++    }
++    Ok(())
++}
++
++fn open_disk_file_with_lock(
++    path: &Path,
++    read_only: bool,
++    create: bool,
++    direct: bool,
++    verb: &str,
++) -> anyhow::Result<std::fs::File> {
++    let writable = !read_only || create;
++    let mut opts = std::fs::OpenOptions::new();
++    opts.read(true).write(writable);
++    if create {
++        opts.create(true).truncate(false);
++    }
++
++    #[cfg(target_os = "linux")]
++    if direct {
++        use std::os::unix::fs::OpenOptionsExt;
++        opts.custom_flags(libc::O_DIRECT);
++    }
++    #[cfg(not(target_os = "linux"))]
++    let _ = direct;
++
++    #[cfg(windows)]
++    if writable && (create || path.is_file()) {
++        use std::os::windows::fs::OpenOptionsExt;
++        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`)
++        // on writable opens and disk creation.
++        opts.share_mode(0x0000_0001);
++    }
++
++    let file = match opts.open(path) {
++        Ok(file) => file,
++        #[cfg(windows)]
++        Err(err) if writable && err.raw_os_error() == Some(32) => {
++            anyhow::bail!(
++                "disk image '{}' is already locked for writing or in use by another process",
++                path.display()
++            );
++        }
++        Err(err) => return Err(err).with_context(|| disk_open_error(path, verb)),
++    };
++
++    #[cfg(unix)]
++    acquire_disk_lock(&file, path, !writable)?;
++
++    Ok(file)
++}
++
++/// Opens `path` as a VHDX disk regardless of its file extension.
++pub async fn open_vhdx_disk(
++    path: &Path,
++    options: OpenDiskOptions,
++) -> anyhow::Result<Resource<DiskHandleKind>> {
++    #[cfg(windows)]
++    {
++        if !options.direct
++            && !path
++                .extension()
++                .and_then(|s| s.to_str())
++                .is_some_and(|s| s.eq_ignore_ascii_case("vhdx"))
++        {
++            return disklayer_vhdx::chain::open_vhdx_chain(path, options.read_only).await;
++        }
++        Ok(Resource::new(disk_vhdmp::OpenVhdmpDiskConfig(
++            disk_vhdmp::VhdmpDisk::options()
++                .read_only(options.read_only)
++                .cached_io(!options.direct)
++                .open(path)
++                .with_context(|| disk_open_error(path, "failed to open"))?,
++        )))
++    }
++    #[cfg(not(windows))]
++    {
++        if options.direct {
++            anyhow::bail!("direct I/O is not supported for .vhdx files");
++        }
++        disklayer_vhdx::chain::open_vhdx_chain(path, options.read_only).await
++    }
++}
++
++/// Opens `path` strictly as a raw file or block device without format sniffing.
++pub fn open_raw_disk_file(
++    path: &Path,
++    options: OpenDiskOptions,
++) -> anyhow::Result<Resource<DiskHandleKind>> {
++    open_raw_disk(path, options, None)
++}
++
+ /// Opens the resources needed for using a disk from a file at `path`.
+ ///
+ /// If the file ends with .vhd and is a fixed VHD1, it will be opened using
+ /// the user-mode VHD parser. Otherwise, if the file ends with .vhd, the
+ /// file will be opened using the kernel-mode VHD parser (Windows only).
+ ///
+-/// If the file ends with .vhdx, the kernel-mode VHD parser is used on
+-/// Windows. On Linux, the pure-Rust VHDX parser is used, with automatic
+-/// parent-locator walking for differencing chains.
++/// If the file ends with .vhdx (case-insensitively), the VHDX backend is used
++/// (kernel-mode VHD parser on Windows, or the pure-Rust VHDX parser on Linux).
+ ///
+ /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
+ pub async fn open_disk_type(
+@@ -53,18 +164,18 @@ pub async fn open_disk_type(
+         };
+         Ok(())
+     };
+-    Ok(match path.extension().and_then(|s| s.to_str()) {
++    let ext = path
++        .extension()
++        .and_then(|s| s.to_str())
++        .map(|s| s.to_ascii_lowercase());
++    Ok(match ext.as_deref() {
+         Some("vmdk") => {
+             ensure_no_direct(".vmdk")?;
+             disk_vmdk::open_vmdk(path, read_only)
+                 .with_context(|| disk_open_error(path, "failed to open"))?
+         }
+         Some("vhd") => {
+-            let file = std::fs::OpenOptions::new()
+-                .read(true)
+-                .write(!read_only)
+-                .open(path)
+-                .with_context(|| disk_open_error(path, "failed to open"))?;
++            let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
+ 
+             match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
+                 Ok(vhd) => {
+@@ -90,23 +201,7 @@ pub async fn open_disk_type(
+                 Err(err) => return Err(err.into()),
+             }
+         }
+-        Some("vhdx") => {
+-            #[cfg(windows)]
+-            {
+-                Resource::new(disk_vhdmp::OpenVhdmpDiskConfig(
+-                    disk_vhdmp::VhdmpDisk::options()
+-                        .read_only(read_only)
+-                        .cached_io(!options.direct)
+-                        .open(path)
+-                        .with_context(|| disk_open_error(path, "failed to open"))?,
+-                ))
+-            }
+-            #[cfg(not(windows))]
+-            {
+-                ensure_no_direct(".vhdx")?;
+-                disklayer_vhdx::chain::open_vhdx_chain(path, read_only).await?
+-            }
+-        }
++        Some("vhdx") => open_vhdx_disk(path, options).await?,
+         Some("iso") if !read_only => {
+             anyhow::bail!("iso file cannot be opened as read/write")
+         }
+@@ -114,11 +209,7 @@ pub async fn open_disk_type(
+             ensure_no_direct(".vmgs")?;
+             // VMGS files are fixed VHD1s. Don't bother to validate the footer
+             // here; let the resource resolver do that later.
+-            let file = std::fs::OpenOptions::new()
+-                .read(true)
+-                .write(!read_only)
+-                .open(path)
+-                .with_context(|| disk_open_error(path, "failed to open"))?;
++            let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
+ 
+             Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
+         }
+@@ -132,19 +223,24 @@ pub fn create_disk_type(
+     size: u64,
+     options: OpenDiskOptions,
+ ) -> anyhow::Result<Resource<DiskHandleKind>> {
+-    Ok(match path.extension().and_then(|s| s.to_str()) {
++    let ext = path
++        .extension()
++        .and_then(|s| s.to_str())
++        .map(|s| s.to_ascii_lowercase());
++    Ok(match ext.as_deref() {
+         Some("vhd") | Some("vmgs") => {
+             if options.direct {
+                 anyhow::bail!("direct I/O is not supported for VHD files");
+             }
+-            let file = std::fs::OpenOptions::new()
+-                .create(true)
+-                .truncate(true)
+-                .read(true)
+-                .write(true)
+-                .open(path)
+-                .with_context(|| disk_open_error(path, "failed to create"))?;
++            let file = open_disk_file_with_lock(
++                path,
++                options.read_only,
++                true,
++                false,
++                "failed to create",
++            )?;
+ 
++            file.set_len(0)?;
+             file.set_len(size)?;
+             disk_vhd1::Vhd1Disk::make_fixed(&file)?;
+             Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
+@@ -174,28 +270,15 @@ fn open_raw_disk(
+     }
+ 
+     let create = size.is_some();
+-    let mut opts = std::fs::OpenOptions::new();
+-    opts.read(true).write(!options.read_only);
+-    if create {
+-        opts.create(true).truncate(true);
+-    }
+-
+-    #[cfg(target_os = "linux")]
+-    if options.direct {
+-        use std::os::unix::fs::OpenOptionsExt;
+-        opts.custom_flags(libc::O_DIRECT);
+-    }
+-
+     let verb = if create {
+         "failed to create"
+     } else {
+         "failed to open"
+     };
+-    let file = opts
+-        .open(path)
+-        .with_context(|| disk_open_error(path, verb))?;
++    let file = open_disk_file_with_lock(path, options.read_only, create, options.direct, verb)?;
+ 
+     if let Some(size) = size {
++        file.set_len(0)?;
+         file.set_len(size)?;
+     }
+ 
+@@ -288,4 +371,205 @@ async fn rejects_vmdk_write_direct_io_and_creation() {
+             .is_err()
+         );
+     }
++
++    #[async_test]
++    async fn rejects_concurrent_writable_raw_disk_open() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("disk.img");
++        std::fs::write(&path, [0u8; 4096]).unwrap();
++
++        let first = open_disk_type(
++            &path,
++            OpenDiskOptions {
++                read_only: false,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap();
++
++        let err = open_disk_type(
++            &path,
++            OpenDiskOptions {
++                read_only: false,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap_err();
++        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
++
++        drop(first);
++        open_disk_type(
++            &path,
++            OpenDiskOptions {
++                read_only: false,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap();
++    }
++
++    #[async_test]
++    async fn uppercase_vhdx_dispatches_to_vhdx_and_raw_never_sniffs_vhdx_signature() {
++        let dir = tempfile::tempdir().unwrap();
++
++        // A file ending in .VHDX must not fall back to raw disk open.
++        let upper_vhdx = dir.path().join("Disk.VHDX");
++        std::fs::write(&upper_vhdx, b"not-a-valid-vhdx-payload").unwrap();
++        let err = open_disk_type(
++            &upper_vhdx,
++            OpenDiskOptions {
++                read_only: true,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap_err();
++        // Raw open would have succeeded on arbitrary bytes; VHDX backend fails parsing.
++        assert!(
++            err.chain()
++                .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
++            "{err:#}"
++        );
++
++        // A .img file starting with the VHDX header signature must open as raw (never sniffed as VHDX).
++        let sig_img = dir.path().join("data.img");
++        let mut raw_payload = vec![0u8; 512];
++        raw_payload[..8].copy_from_slice(b"vhdxfile");
++        std::fs::write(&sig_img, &raw_payload).unwrap();
++        let _raw_disk = open_disk_type(
++            &sig_img,
++            OpenDiskOptions {
++                read_only: true,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap();
++
++        // Explicit open_vhdx_disk still parses the file as VHDX and rejects the invalid payload.
++        let err = open_vhdx_disk(
++            &sig_img,
++            OpenDiskOptions {
++                read_only: true,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap_err();
++        assert!(
++            err.chain()
++                .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
++            "{err:#}"
++        );
++    }
++
++    #[async_test]
++    async fn read_only_open_succeeds_while_another_handle_is_open_for_writing() {
++        let mut temp = tempfile::NamedTempFile::new().unwrap();
++        std::io::Write::write_all(&mut temp, &[0xAB; 2048]).unwrap();
++        std::io::Write::flush(&mut temp).unwrap();
++
++        let _ro_disk = open_raw_disk_file(
++            temp.path(),
++            OpenDiskOptions {
++                read_only: true,
++                direct: false,
++            },
++        )
++        .unwrap();
++
++        let dir = tempfile::tempdir().unwrap();
++        let iso_path = dir.path().join("image.iso");
++        let mut writer = std::fs::OpenOptions::new()
++            .create(true)
++            .read(true)
++            .write(true)
++            .open(&iso_path)
++            .unwrap();
++        std::io::Write::write_all(&mut writer, &[0xCD; 2048]).unwrap();
++        std::io::Write::flush(&mut writer).unwrap();
++
++        let _ro_iso = open_disk_type(
++            &iso_path,
++            OpenDiskOptions {
++                read_only: true,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap();
++    }
++
++    #[async_test]
++    async fn creating_raw_or_vhd_or_vmgs_disk_against_locked_disk_preserves_contents() {
++        let dir = tempfile::tempdir().unwrap();
++
++        let raw_path = dir.path().join("disk.img");
++        let raw_seed = vec![0x5Au8; 4096];
++        std::fs::write(&raw_path, &raw_seed).unwrap();
++        let raw_guard = open_disk_type(
++            &raw_path,
++            OpenDiskOptions {
++                read_only: false,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap();
++        let err = create_disk_type(
++            &raw_path,
++            8192,
++            OpenDiskOptions {
++                read_only: false,
++                direct: false,
++            },
++        )
++        .unwrap_err();
++        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
++        drop(raw_guard);
++        assert_eq!(std::fs::read(&raw_path).unwrap(), raw_seed);
++
++        for name in ["disk.vhd", "disk.vmgs"] {
++            let path = dir.path().join(name);
++            let created = create_disk_type(
++                &path,
++                64 * 1024,
++                OpenDiskOptions {
++                    read_only: false,
++                    direct: false,
++                },
++            )
++            .unwrap();
++            drop(created);
++
++            let mut payload = std::fs::read(&path).unwrap();
++            payload[0..8].copy_from_slice(b"KEEPME!!");
++            std::fs::write(&path, &payload).unwrap();
++
++            let open_guard = open_disk_type(
++                &path,
++                OpenDiskOptions {
++                    read_only: false,
++                    direct: false,
++                },
++            )
++            .await
++            .unwrap();
++            let err = create_disk_type(
++                &path,
++                128 * 1024,
++                OpenDiskOptions {
++                    read_only: false,
++                    direct: false,
++                },
++            )
++            .unwrap_err();
++            assert!(err.to_string().contains("already locked for writing"), "{err:#}");
++            drop(open_guard);
++            assert_eq!(std::fs::read(&path).unwrap(), payload);
++        }
++    }
+ }
+diff --git a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
+index 3668d9c..112248c 100644
+--- a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
++++ b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
+@@ -17,6 +17,72 @@
+ use vm_resource::Resource;
+ use vm_resource::kind::DiskHandleKind;
+ 
++#[cfg(unix)]
++fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
++    if file.metadata().is_ok_and(|m| m.is_file()) {
++        let res = if read_only {
++            file.try_lock_shared()
++        } else {
++            file.try_lock()
++        };
++        match res {
++            Ok(()) => {}
++            Err(std::fs::TryLockError::WouldBlock) => {
++                anyhow::bail!(
++                    "disk image '{}' is already locked for writing or in use by another process",
++                    path.display()
++                );
++            }
++            Err(std::fs::TryLockError::Error(err)) => {
++                return Err(err)
++                    .with_context(|| format!("failed to lock disk image {}", path.display()));
++            }
++        }
++    }
++    Ok(())
++}
++
++fn open_vhdx_file_locked(
++    path: &Path,
++    read_only: bool,
++    layer_idx: Option<usize>,
++) -> anyhow::Result<std::fs::File> {
++    let mut opts = std::fs::OpenOptions::new();
++    opts.read(true).write(!read_only);
++
++    #[cfg(windows)]
++    if path.is_file() {
++        use std::os::windows::fs::OpenOptionsExt;
++        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`)
++        // for both writable leaves and read-only parent layers.
++        opts.share_mode(0x0000_0001);
++    }
++
++    let file = match opts.open(path) {
++        Ok(file) => file,
++        #[cfg(windows)]
++        Err(err) if err.raw_os_error() == Some(32) => {
++            anyhow::bail!(
++                "disk image '{}' is already locked for writing or in use by another process",
++                path.display()
++            );
++        }
++        Err(err) => {
++            return match layer_idx {
++                Some(i) => Err(err).with_context(|| {
++                    format!("failed to open vhdx layer {}: {}", i, path.display())
++                }),
++                None => Err(err.into()),
++            };
++        }
++    };
++
++    #[cfg(unix)]
++    acquire_disk_lock(&file, path, read_only)?;
++
++    Ok(file)
++}
++
+ /// Open a single VHDX file as a [`LayeredDiskHandle`] with one layer.
+ ///
+ /// Use this for base (non-differencing) VHDX files. For differencing chains,
+@@ -24,10 +90,7 @@
+ ///
+ /// The file is opened for read+write unless `read_only` is true.
+ pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
+-    let file = std::fs::OpenOptions::new()
+-        .read(true)
+-        .write(!read_only)
+-        .open(path)?;
++    let file = open_vhdx_file_locked(path, read_only, None)?;
+ 
+     Ok(Resource::new(LayeredDiskHandle::single_layer(
+         VhdxDiskLayerHandle { file, read_only },
+@@ -73,11 +136,7 @@ pub fn open_vhdx_chain_explicit(
+             let is_leaf = i == 0;
+             let layer_read_only = !is_leaf || read_only;
+ 
+-            let file = std::fs::OpenOptions::new()
+-                .read(true)
+-                .write(!layer_read_only)
+-                .open(path)
+-                .with_context(|| format!("failed to open vhdx layer {}: {}", i, path.display()))?;
++            let file = open_vhdx_file_locked(path, layer_read_only, Some(i))?;
+ 
+             let handle = VhdxDiskLayerHandle {
+                 file,
+@@ -358,4 +417,75 @@ async fn auto_walk_base_disk() {
+         let resource = open_vhdx_chain(&path, false).await.unwrap();
+         let _ = resource;
+     }
++
++    #[pal_async::async_test]
++    async fn rejects_concurrent_writable_vhdx_open() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("base.vhdx");
++
++        let bf = crate::io::BlockingFile::open(&path, false).unwrap();
++        let mut params = vhdx::CreateParams {
++            disk_size: 1024 * 1024,
++            ..Default::default()
++        };
++        vhdx::create(&bf, &mut params).await.unwrap();
++        drop(bf);
++
++        let first = open_vhdx_chain(&path, false).await.unwrap();
++        let err = open_vhdx_chain(&path, false).await.unwrap_err();
++        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
++
++        drop(first);
++        open_vhdx_chain(&path, false).await.unwrap();
++    }
++
++    #[pal_async::async_test]
++    async fn readonly_parent_layer_blocks_concurrent_writer_and_allows_concurrent_readers() {
++        let dir = tempfile::tempdir().unwrap();
++        let base_path = dir.path().join("base.vhdx");
++        let child_a_path = dir.path().join("child_a.vhdx");
++        let child_b_path = dir.path().join("child_b.vhdx");
++
++        let bf = crate::io::BlockingFile::open(&base_path, false).unwrap();
++        let mut base_params = vhdx::CreateParams {
++            disk_size: 2 * 1024 * 1024,
++            ..Default::default()
++        };
++        vhdx::create(&bf, &mut base_params).await.unwrap();
++        drop(bf);
++
++        for child_path in [&child_a_path, &child_b_path] {
++            let parent = vhdx::VhdxParent::new(base_params.data_write_guid)
++                .with_relative_path(r".\base.vhdx")
++                .unwrap();
++            let cf = crate::io::BlockingFile::open(child_path, false).unwrap();
++            let mut child_params = vhdx::CreateParams {
++                disk_size: 2 * 1024 * 1024,
++                disk_type: vhdx::DiskType::Differencing(parent),
++                ..Default::default()
++            };
++            vhdx::create(&cf, &mut child_params).await.unwrap();
++            drop(cf);
++        }
++
++        // Opening child A takes a shared lock on base.vhdx; child B can share it read-only.
++        let child_a = open_vhdx_chain(&child_a_path, false).await.unwrap();
++        let child_b = open_vhdx_chain(&child_b_path, false).await.unwrap();
++
++        // A concurrent writable open of base.vhdx must be rejected while parents hold shared locks.
++        let err = open_vhdx_chain(&base_path, false).await.unwrap_err();
++        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
++
++        drop(child_a);
++        drop(child_b);
++
++        // Once both chains close, base.vhdx can be opened writable, which in turn blocks child opens.
++        let base_rw = open_vhdx_chain(&base_path, false).await.unwrap();
++        let child_err = open_vhdx_chain(&child_a_path, false).await.unwrap_err();
++        assert!(
++            child_err.to_string().contains("already locked for writing"),
++            "{child_err:#}"
++        );
++        drop(base_rw);
++    }
+ }

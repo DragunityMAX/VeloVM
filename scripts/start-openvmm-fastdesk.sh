@@ -141,6 +141,7 @@ VMM_PID=""
 VMM_READ_FD=""
 VMM_STDIN_FD=""
 VMM_FIFO_DIR=""
+SHM_RUN_DIR=""
 SHM_AUTO_CLEANUP=0
 cleanup() {
     if [[ -n "${VMM_READ_FD:-}" ]]; then
@@ -164,6 +165,10 @@ cleanup() {
         rm -f -- "$SHM_PATH" 2>/dev/null || true
         SHM_PATH=""
     fi
+    if [[ -n "${SHM_RUN_DIR:-}" ]]; then
+        rmdir -- "$SHM_RUN_DIR" 2>/dev/null || true
+        SHM_RUN_DIR=""
+    fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -182,10 +187,9 @@ if [[ "$SHM_CUSTOM" -eq 0 ]]; then
         exit 1
     fi
     chmod 0700 "$SHM_DIR"
-    SHM_PATH="$(umask 077 && mktemp "${SHM_DIR}/vram.shm.XXXXXXXXXX")"
+    SHM_RUN_DIR="$(umask 077 && mktemp -d "${SHM_DIR}/vram.XXXXXXXXXX")"
+    SHM_PATH="${SHM_RUN_DIR}/vram.shm"
     SHM_AUTO_CLEANUP=1
-    chmod 0600 "$SHM_PATH"
-    truncate -s "${VRAM_MB}M" "$SHM_PATH"
 else
     SHM_DIR="$(dirname "$SHM_PATH")"
     if [[ ! -e "$SHM_DIR" ]]; then
@@ -200,16 +204,13 @@ else
         echo "Error: refusing symlink shared-memory file: $SHM_PATH" >&2
         exit 1
     fi
-    if [[ -e "$SHM_PATH" && ( ! -f "$SHM_PATH" || ! -O "$SHM_PATH" ) ]]; then
-        echo "Error: unsafe existing shared-memory file: $SHM_PATH" >&2
-        exit 1
+    if [[ -e "$SHM_PATH" ]]; then
+        if [[ ! -f "$SHM_PATH" || ! -O "$SHM_PATH" ]]; then
+            echo "Error: unsafe existing shared-memory file: $SHM_PATH" >&2
+            exit 1
+        fi
+        rm -f -- "$SHM_PATH"
     fi
-    (
-        umask 077
-        : >> "$SHM_PATH"
-        chmod 0600 "$SHM_PATH"
-        truncate -s "${VRAM_MB}M" "$SHM_PATH"
-    )
 fi
 
 VMM_ARGS=(
