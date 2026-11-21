@@ -62,10 +62,11 @@ fn open_disk_file_with_lock(
     direct: bool,
     verb: &str,
 ) -> anyhow::Result<std::fs::File> {
+    let writable = !read_only || create;
     let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).write(!read_only);
+    opts.read(true).write(writable);
     if create {
-        opts.create(true).truncate(true);
+        opts.create(true).truncate(false);
     }
 
     #[cfg(target_os = "linux")]
@@ -77,17 +78,17 @@ fn open_disk_file_with_lock(
     let _ = direct;
 
     #[cfg(windows)]
-    if create || path.is_file() {
+    if writable && (create || path.is_file()) {
         use std::os::windows::fs::OpenOptionsExt;
         // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`)
-        // for both writable and read-only opens.
+        // on writable opens and disk creation.
         opts.share_mode(0x0000_0001);
     }
 
     let file = match opts.open(path) {
         Ok(file) => file,
         #[cfg(windows)]
-        Err(err) if err.raw_os_error() == Some(32) => {
+        Err(err) if writable && err.raw_os_error() == Some(32) => {
             anyhow::bail!(
                 "disk image '{}' is already locked for writing or in use by another process",
                 path.display()
@@ -97,7 +98,7 @@ fn open_disk_file_with_lock(
     };
 
     #[cfg(unix)]
-    acquire_disk_lock(&file, path, read_only)?;
+    acquire_disk_lock(&file, path, !writable)?;
 
     Ok(file)
 }
@@ -231,14 +232,15 @@ pub fn create_disk_type(
             if options.direct {
                 anyhow::bail!("direct I/O is not supported for VHD files");
             }
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(path)
-                .with_context(|| disk_open_error(path, "failed to create"))?;
+            let file = open_disk_file_with_lock(
+                path,
+                options.read_only,
+                true,
+                false,
+                "failed to create",
+            )?;
 
+            file.set_len(0)?;
             file.set_len(size)?;
             disk_vhd1::Vhd1Disk::make_fixed(&file)?;
             Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
@@ -276,6 +278,7 @@ fn open_raw_disk(
     let file = open_disk_file_with_lock(path, options.read_only, create, options.direct, verb)?;
 
     if let Some(size) = size {
+        file.set_len(0)?;
         file.set_len(size)?;
     }
 
@@ -461,5 +464,112 @@ mod tests {
                 .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
             "{err:#}"
         );
+    }
+
+    #[async_test]
+    async fn read_only_open_succeeds_while_another_handle_is_open_for_writing() {
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut temp, &[0xAB; 2048]).unwrap();
+        std::io::Write::flush(&mut temp).unwrap();
+
+        let _ro_disk = open_raw_disk_file(
+            temp.path(),
+            OpenDiskOptions {
+                read_only: true,
+                direct: false,
+            },
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let iso_path = dir.path().join("image.iso");
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&iso_path)
+            .unwrap();
+        std::io::Write::write_all(&mut writer, &[0xCD; 2048]).unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        let _ro_iso = open_disk_type(
+            &iso_path,
+            OpenDiskOptions {
+                read_only: true,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[async_test]
+    async fn creating_raw_or_vhd_or_vmgs_disk_against_locked_disk_preserves_contents() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let raw_path = dir.path().join("disk.img");
+        let raw_seed = vec![0x5Au8; 4096];
+        std::fs::write(&raw_path, &raw_seed).unwrap();
+        let raw_guard = open_disk_type(
+            &raw_path,
+            OpenDiskOptions {
+                read_only: false,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap();
+        let err = create_disk_type(
+            &raw_path,
+            8192,
+            OpenDiskOptions {
+                read_only: false,
+                direct: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
+        drop(raw_guard);
+        assert_eq!(std::fs::read(&raw_path).unwrap(), raw_seed);
+
+        for name in ["disk.vhd", "disk.vmgs"] {
+            let path = dir.path().join(name);
+            let created = create_disk_type(
+                &path,
+                64 * 1024,
+                OpenDiskOptions {
+                    read_only: false,
+                    direct: false,
+                },
+            )
+            .unwrap();
+            drop(created);
+
+            let mut payload = std::fs::read(&path).unwrap();
+            payload[0..8].copy_from_slice(b"KEEPME!!");
+            std::fs::write(&path, &payload).unwrap();
+
+            let open_guard = open_disk_type(
+                &path,
+                OpenDiskOptions {
+                    read_only: false,
+                    direct: false,
+                },
+            )
+            .await
+            .unwrap();
+            let err = create_disk_type(
+                &path,
+                128 * 1024,
+                OpenDiskOptions {
+                    read_only: false,
+                    direct: false,
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("already locked for writing"), "{err:#}");
+            drop(open_guard);
+            assert_eq!(std::fs::read(&path).unwrap(), payload);
+        }
     }
 }

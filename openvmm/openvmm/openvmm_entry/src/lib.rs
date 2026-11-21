@@ -2987,55 +2987,34 @@ pub(crate) fn alloc_framebuffer_vram(
 )> {
     let (vram, resolved_shm_path) = if let Some(shm_path) = shm_path {
         validate_shm_path(shm_path)?;
-        let file = match std::fs::symlink_metadata(shm_path) {
-            Ok(meta) => {
-                anyhow::ensure!(
-                    !meta.file_type().is_symlink() && meta.file_type().is_file(),
-                    "refusing to use non-regular or symlinked FastDesk SHM path {}",
+        let mut open_opts = fs_err::OpenOptions::new();
+        open_opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
+        }
+        let file = match open_opts.open(shm_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                anyhow::bail!(
+                    "FastDesk SHM file '{}' already exists; refusing to overwrite or share an existing file",
                     shm_path.display()
                 );
-                let file = fs_err::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(shm_path)
-                    .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
-                let opened_meta = file
-                    .file()
-                    .metadata()
-                    .context("checking FastDesk SHM file metadata")?;
-                anyhow::ensure!(
-                    opened_meta.file_type().is_file(),
-                    "FastDesk SHM path {} is not a regular file",
-                    shm_path.display()
-                );
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    anyhow::ensure!(
-                        (opened_meta.dev(), opened_meta.ino()) == (meta.dev(), meta.ino()),
-                        "FastDesk SHM file {} changed concurrently during open",
-                        shm_path.display()
-                    );
-                }
-                file
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let mut open_opts = fs_err::OpenOptions::new();
-                open_opts.read(true).write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
-                }
-                open_opts
-                    .open(shm_path)
-                    .with_context(|| format!("creating FastDesk SHM file {}", shm_path.display()))?
             }
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("inspecting FastDesk SHM path {}", shm_path.display())
-                });
+                return Err(err)
+                    .with_context(|| format!("creating FastDesk SHM file {}", shm_path.display()));
             }
         };
+        struct CreatedShmGuard<'a>(&'a Path, bool);
+        impl Drop for CreatedShmGuard<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    let _ = std::fs::remove_file(self.0);
+                }
+            }
+        }
+        let mut guard = CreatedShmGuard(shm_path, true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3048,11 +3027,21 @@ pub(crate) fn alloc_framebuffer_vram(
             .context("sizing FastDesk SHM file")?;
         let mappable = sparse_mmap::new_mappable_from_file(file.file(), true, false)
             .context("creating FastDesk SHM mappable")?;
+        guard.1 = false;
         (mappable, Some(shm_path.to_string_lossy().into_owned()))
     } else {
         (alloc_shared_memory(vram_size, "vram")?, None)
     };
-    let (fb, fba) = framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer")?;
+    let (fb, fba) =
+        match framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer") {
+            Ok(res) => res,
+            Err(err) => {
+                if let Some(path) = &resolved_shm_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(err);
+            }
+        };
     Ok((fb, fba, resolved_shm_path))
 }
 
@@ -3158,7 +3147,7 @@ pub(crate) fn bind_fastdesk_vmsocket_listener(
                 port,
             )) {
                 Ok(listener) => return Ok((listener, port)),
-                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(err) if err.kind() == io::ErrorKind::AddrInUse => continue,
                 Err(err) => {
                     return Err(err)
                         .with_context(|| format!("binding FastDesk hvsock loopback port {port}"));
@@ -4361,8 +4350,19 @@ mod tests {
             assert!(alloc_framebuffer_vram(Some(&dangling), 8 * 1024 * 1024).is_err());
         }
 
+        let existing = dir.path().join("existing.shm");
+        std::fs::write(&existing, b"keep-me").unwrap();
+        assert!(alloc_framebuffer_vram(Some(&existing), 8 * 1024 * 1024).is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
+
         let valid = dir.path().join("valid.shm");
         let _ = alloc_framebuffer_vram(Some(&valid), 8 * 1024 * 1024).unwrap();
         assert!(valid.is_file());
+        assert_eq!(std::fs::metadata(&valid).unwrap().len(), 8 * 1024 * 1024);
+
+        // A second call targeting the same SHM path must fail without modifying or removing it.
+        assert!(alloc_framebuffer_vram(Some(&valid), 16 * 1024 * 1024).is_err());
+        assert!(valid.is_file());
+        assert_eq!(std::fs::metadata(&valid).unwrap().len(), 8 * 1024 * 1024);
     }
 }

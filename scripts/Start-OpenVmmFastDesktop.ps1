@@ -211,27 +211,26 @@ $autoShm = [string]::IsNullOrWhiteSpace($ShmPath)
 $vmmProc = $null
 
 try {
-    # Pre-create/size shared VRAM backing file for zero-copy local viewer mapping.
-    $vramBytes = [int64]$VramMb * 1MB
+    # Prepare the SHM path without pre-creating the file; openvmm.exe creates it
+    # exclusively with CreateNew when initializing FastDesk VRAM.
     if ($autoShm) {
         $shmDir = Join-Path ([System.IO.Path]::GetTempPath()) "openvmm-fastdesk"
         if (-not (Test-Path -LiteralPath $shmDir)) {
             New-Item -ItemType Directory -Path $shmDir -Force | Out-Null
         }
         $ShmPath = Join-Path $shmDir ("vram-{0}-{1}.shm" -f $PID, [Guid]::NewGuid().ToString("N"))
-        $shmFileMode = [System.IO.FileMode]::CreateNew
     } else {
         $shmDir = Split-Path -Parent $ShmPath
         if ($shmDir -and -not (Test-Path -LiteralPath $shmDir)) {
             New-Item -ItemType Directory -Path $shmDir -Force | Out-Null
         }
-        $shmFileMode = [System.IO.FileMode]::OpenOrCreate
-    }
-    $fs = [System.IO.File]::Open($ShmPath, $shmFileMode, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
-    try {
-        $fs.SetLength($vramBytes)
-    } finally {
-        $fs.Dispose()
+        if (Test-Path -LiteralPath $ShmPath) {
+            $existingShm = Get-Item -LiteralPath $ShmPath -Force
+            if (($existingShm.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $existingShm.PSIsContainer) {
+                throw "Refusing unsafe non-regular or symlinked FastDesk SHM path: $ShmPath"
+            }
+            Remove-Item -LiteralPath $ShmPath -Force
+        }
     }
 
     $vmmArgs = @()

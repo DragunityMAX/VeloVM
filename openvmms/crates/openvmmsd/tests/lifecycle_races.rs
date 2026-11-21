@@ -193,11 +193,50 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                     touch(&ctx.state_dir.join("first_create_entered"));
                     std::thread::sleep(Duration::from_millis(700));
                     send_ttrpc_err(&mut stream, stream_id, 13, "delayed failure from cancelled startup");
-                } else if ctx.mode == "slow_create" {
-                    touch(&ctx.state_dir.join("create_entered"));
-                    std::thread::sleep(Duration::from_millis(400));
-                    send_ttrpc_ok(&mut stream, stream_id, Vec::new());
                 } else {
+                    if ctx.mode == "slow_create" {
+                        touch(&ctx.state_dir.join("create_entered"));
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                    if let Some(fd) = create_req
+                        .config
+                        .as_ref()
+                        .and_then(|c| c.fastdesk_config.as_ref())
+                        && let Some(shm_path) = fd.shm_path.as_deref().filter(|s| !s.is_empty())
+                    {
+                        let vram_mb = if fd.vram_mb == 0 { 32 } else { fd.vram_mb };
+                        let vram_bytes = (vram_mb.clamp(8, 256) as u64) * 1024 * 1024;
+                        match fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create_new(true)
+                            .open(shm_path)
+                        {
+                            Ok(file) => {
+                                if let Err(err) = file.set_len(vram_bytes) {
+                                    let _ = fs::remove_file(shm_path);
+                                    send_ttrpc_err(
+                                        &mut stream,
+                                        stream_id,
+                                        13,
+                                        &format!("failed sizing SHM file: {err}"),
+                                    );
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                send_ttrpc_err(
+                                    &mut stream,
+                                    stream_id,
+                                    13,
+                                    &format!(
+                                        "FastDesk SHM file {shm_path} already exists or cannot be created: {err}"
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    }
                     send_ttrpc_ok(&mut stream, stream_id, Vec::new());
                 }
             }
@@ -279,6 +318,10 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
             }
             "TeardownVM" => {
                 touch(&ctx.state_dir.join("teardown_called"));
+                if ctx.mode == "ignore_quit" {
+                    send_ttrpc_ok(&mut stream, stream_id, Vec::new());
+                    continue;
+                }
                 if ctx.mode == "concurrent_stop" && ctx.launch == 1 {
                     touch(&ctx.state_dir.join("teardown_entered"));
                     std::thread::sleep(Duration::from_millis(600));
@@ -296,6 +339,10 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                 send_ttrpc_ok(&mut stream, stream_id, Vec::new());
             }
             "Quit" => {
+                if ctx.mode == "ignore_quit" {
+                    send_ttrpc_ok(&mut stream, stream_id, Vec::new());
+                    continue;
+                }
                 if ctx.mode == "concurrent_stop" && ctx.launch == 2 {
                     touch(&ctx.state_dir.join("launch2_quit"));
                 } else if ctx.mode == "pause_resume" {
@@ -2222,6 +2269,230 @@ async fn test_shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit() {
     daemon_b.shutdown().await;
 }
 
+async fn test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_peer() {
+    let client = test_http_client();
+
+    // 1. On Linux, even if .pid is missing/unverified, SO_PEERCRED identifies and terminates a
+    //    re-adopted --rpc child that ignores TeardownVM/Quit.
+    #[cfg(target_os = "linux")]
+    {
+        let dir1 = tempfile::tempdir().unwrap();
+        let fw_path1 = dir1.path().join("MSVM.fd");
+        fs::write(&fw_path1, b"FAKE_UEFI").unwrap();
+
+        let daemon1 = TestDaemonHandle::spawn(dir1.path().to_path_buf())
+            .await
+            .unwrap();
+        let runtime_dir1 = configure_stub_host(&client, &daemon1, dir1.path(), &fw_path1).await;
+        write_stub_mode(&runtime_dir1, "ignore_quit", &[]);
+
+        let created1 = create_stub_vm(&client, &daemon1, "PeerCredStop-VM").await;
+        assert_eq!(
+            client
+                .post(format!("{}/api/v1/vms/{}/start", daemon1.base_url, created1.config.id))
+                .bearer_auth(&daemon1.token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        daemon1.shutdown_preserving_vms().await;
+
+        let store1 = RegistryStore::new(dir1.path()).unwrap();
+        let lock_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while store1.is_daemon_locked() {
+            assert!(tokio::time::Instant::now() < lock_deadline);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Remove the .pid file before re-adoption so SO_PEERCRED must recover identity.
+        let pid_path1 = runtime_dir1.join(format!("{}.pid", created1.config.id));
+        let _ = fs::remove_file(&pid_path1);
+
+        let daemon2 = TestDaemonHandle::spawn(dir1.path().to_path_buf())
+            .await
+            .unwrap();
+        let stop_resp = client
+            .post(format!("{}/api/v1/vms/{}/stop", daemon2.base_url, created1.config.id))
+            .bearer_auth(&daemon2.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stop_resp.status(), 200);
+        let stopped: VmSummary = stop_resp.json().await.unwrap();
+        assert_eq!(stopped.runtime.status, VmStatus::Off);
+        assert!(!runtime_dir1.join(format!("{}.sock", created1.config.id)).exists());
+        daemon2.shutdown().await;
+    }
+
+    // 2. When no verified process handle can be obtained and the socket stays alive ignoring Quit,
+    //    stop fails (does not report Off), preserves .sock/.pid, and start is rejected.
+    let dir2 = tempfile::tempdir().unwrap();
+    let fw_path2 = dir2.path().join("MSVM.fd");
+    fs::write(&fw_path2, b"FAKE_UEFI").unwrap();
+
+    let daemon_init = TestDaemonHandle::spawn(dir2.path().to_path_buf())
+        .await
+        .unwrap();
+    let runtime_dir2 = configure_stub_host(&client, &daemon_init, dir2.path(), &fw_path2).await;
+    let created2 = create_stub_vm(&client, &daemon_init, "UnkillableAdopted-VM").await;
+    daemon_init.shutdown().await;
+
+    let store2 = RegistryStore::new(dir2.path()).unwrap();
+    let lock_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while store2.is_daemon_locked() {
+        assert!(tokio::time::Instant::now() < lock_deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let id2 = created2.config.id;
+    let sock_path2 = runtime_dir2.join(format!("{id2}.sock"));
+    let pid_path2 = runtime_dir2.join(format!("{id2}.pid"));
+    fs::write(&pid_path2, "999999\n1").unwrap();
+
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&SockAddr::unix(&sock_path2).unwrap()).unwrap();
+    listener.listen(16).unwrap();
+    let _ = listener.set_nonblocking(true);
+
+    let stop_listener = Arc::new(AtomicBool::new(false));
+    let stop_listener_srv = Arc::clone(&stop_listener);
+    let srv_thread = std::thread::spawn(move || {
+        let mut conns = Vec::new();
+        while !stop_listener_srv.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    let stop_conn = Arc::clone(&stop_listener_srv);
+                    conns.push(std::thread::spawn(move || {
+                        let mut stream = conn;
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                        while !stop_conn.load(Ordering::Acquire) {
+                            let (stream_id, msg_type, req_bytes) = match read_frame(&mut stream) {
+                                Ok(v) => v,
+                                Err(err)
+                                    if err.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+                                        matches!(
+                                            io_err.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                                | std::io::ErrorKind::Interrupted
+                                        )
+                                    }) =>
+                                {
+                                    continue;
+                                }
+                                Err(_) => break,
+                            };
+                            if msg_type != MESSAGE_TYPE_REQUEST {
+                                break;
+                            }
+                            let Ok(req) = WireRequest::decode(req_bytes.as_slice()) else {
+                                break;
+                            };
+                            match req.method.as_str() {
+                                "PropertiesVM" => {
+                                    let payload = vmservice::PropertiesVmResponse {
+                                        state: vmservice::VmState::Running as i32,
+                                        ..Default::default()
+                                    }
+                                    .encode_to_vec();
+                                    send_ttrpc_ok(&mut stream, stream_id, payload);
+                                }
+                                "WaitVM" => {
+                                    while !stop_conn.load(Ordering::Acquire) {
+                                        std::thread::sleep(Duration::from_millis(25));
+                                    }
+                                    send_ttrpc_ok(&mut stream, stream_id, Vec::new());
+                                }
+                                _ => send_ttrpc_ok(&mut stream, stream_id, Vec::new()),
+                            }
+                        }
+                    }));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(listener);
+        for h in conns {
+            let _ = h.join();
+        }
+    });
+
+    let daemon_adopted = TestDaemonHandle::spawn(dir2.path().to_path_buf())
+        .await
+        .unwrap();
+    let initial_show: VmSummary = client
+        .get(format!("{}/api/v1/vms/{id2}", daemon_adopted.base_url))
+        .bearer_auth(&daemon_adopted.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial_show.runtime.status, VmStatus::Running);
+
+    let failed_stop = client
+        .post(format!("{}/api/v1/vms/{id2}/stop", daemon_adopted.base_url))
+        .bearer_auth(&daemon_adopted.token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !failed_stop.status().is_success(),
+        "stop should fail when adopted process stays alive, got {}",
+        failed_stop.status()
+    );
+
+    let after_failed_stop: VmSummary = client
+        .get(format!("{}/api/v1/vms/{id2}", daemon_adopted.base_url))
+        .bearer_auth(&daemon_adopted.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(after_failed_stop.runtime.status, VmStatus::Off);
+    assert_eq!(after_failed_stop.runtime.status, VmStatus::Running);
+    assert!(sock_path2.exists(), ".sock must not be deleted while process is still alive");
+    assert!(pid_path2.exists(), ".pid must not be deleted while process is still alive");
+
+    // Starting a second instance must be rejected while the first VM is still running.
+    let dup_start = client
+        .post(format!("{}/api/v1/vms/{id2}/start", daemon_adopted.base_url))
+        .bearer_auth(&daemon_adopted.token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !dup_start.status().is_success(),
+        "start should be rejected while unstopped VM is still running"
+    );
+
+    // Once the underlying socket/process exits, stop succeeds and cleans up.
+    stop_listener.store(true, Ordering::Release);
+    srv_thread.join().unwrap();
+
+    let clean_stop = client
+        .post(format!("{}/api/v1/vms/{id2}/stop", daemon_adopted.base_url))
+        .bearer_auth(&daemon_adopted.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(clean_stop.status(), 200);
+    let clean_summary: VmSummary = clean_stop.json().await.unwrap();
+    assert_eq!(clean_summary.runtime.status, VmStatus::Off);
+    assert!(!sock_path2.exists());
+    assert!(!pid_path2.exists());
+    daemon_adopted.shutdown().await;
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--noop-exit") {
@@ -2303,6 +2574,10 @@ fn main() {
         (
             "shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit",
             Box::pin(test_shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit()),
+        ),
+        (
+            "adopted_vm_stop_preserves_state_when_unterminated_and_terminates_peer",
+            Box::pin(test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_peer()),
         ),
     ];
 

@@ -265,8 +265,9 @@ impl Supervisor {
                         if props.state == vmservice::VmState::Running as i32
                             || props.state == vmservice::VmState::Paused as i32 =>
                     {
-                        let verified = openvmms_core::process::open_verified_pid(
+                        let verified = openvmms_core::process::open_verified_pid_or_socket_peer(
                             &pid_path,
+                            Some(&sock_path),
                             expected_bin.as_deref(),
                         );
                         vm.runtime.status = if props.state == vmservice::VmState::Paused as i32 {
@@ -292,13 +293,19 @@ impl Supervisor {
                         info!(vm_id = %id, name = %vm.config.name, status = %vm.runtime.status, "re-adopted running OpenVMM VM");
                     }
                     Ok(_) => {
-                        let _ = ttrpc_client.teardown_and_quit_blocking(Duration::from_secs(2));
-                        cleanup_runtime_files(
-                            Some(sock_path),
-                            shm_candidate
-                                .exists()
-                                .then(|| shm_candidate.to_string_lossy().into_owned()),
-                        );
+                        if !reclaim_or_verify_inactive_socket(
+                            &sock_path,
+                            &pid_path,
+                            expected_bin.as_deref(),
+                            &AtomicBool::new(false),
+                        ) {
+                            cleanup_runtime_files(
+                                Some(sock_path),
+                                shm_candidate
+                                    .exists()
+                                    .then(|| shm_candidate.to_string_lossy().into_owned()),
+                            );
+                        }
                     }
                     Err(_) => {
                         if !ttrpc_client.is_socket_accepting() {
@@ -309,8 +316,9 @@ impl Supervisor {
                                     .then(|| shm_candidate.to_string_lossy().into_owned()),
                             );
                         } else {
-                            let verified = openvmms_core::process::open_verified_pid(
+                            let verified = openvmms_core::process::open_verified_pid_or_socket_peer(
                                 &pid_path,
+                                Some(&sock_path),
                                 expected_bin.as_deref(),
                             );
                             vm.runtime.status = VmStatus::Running;
@@ -1364,7 +1372,7 @@ impl Supervisor {
 
             let shm_path = if cfg.fastdesk.enabled && cfg.fastdesk.use_shm {
                 let path = runtime_dir.join(format!("vram-{id}.shm"));
-                preallocate_shm_file(&path, cfg.fastdesk.vram_mb)?;
+                prepare_shm_path(&path)?;
                 Some(path)
             } else {
                 None
@@ -1431,9 +1439,8 @@ impl Supervisor {
             vm.runtime.pid = Some(pid);
             vm.runtime.rpc_socket_path = Some(sock_path.clone());
             vm.runtime.shm_path = shm_path.as_ref().map(|p| p.to_string_lossy().into_owned());
-            if let Err(err) = openvmms_core::process::write_pid_file(&pid_path, pid) {
-                warn!(vm_id = %id, error = %err, "failed to write VM pid file");
-            }
+            openvmms_core::process::write_pid_file(&pid_path, pid)
+                .with_context(|| format!("writing VM pid file {}", pid_path.display()))?;
         }
         drop(prepare_guard);
 
@@ -1815,8 +1822,9 @@ impl Supervisor {
             }
         };
 
-        let exit_status = if let Some(mut child) = child_opt.take() {
-            tokio::task::spawn_blocking(move || {
+        let expected_bin = self.resolved_paths().openvmm_bin;
+        let (exit_status, stopped) = if let Some(mut child) = child_opt.take() {
+            let status = tokio::task::spawn_blocking(move || {
                 let start = std::time::Instant::now();
                 loop {
                     match child.try_wait() {
@@ -1833,15 +1841,23 @@ impl Supervisor {
             })
             .await
             .ok()
-            .flatten()
+            .flatten();
+            (status, true)
         } else {
-            if adopted_opt.is_some() || sock_opt.is_some() {
-                let _ = tokio::task::spawn_blocking(move || {
-                    wait_or_terminate_adopted_proc(sock_opt.as_deref(), adopted_opt.as_deref());
+            let stopped = if adopted_opt.is_some() || sock_opt.is_some() {
+                tokio::task::spawn_blocking(move || {
+                    wait_or_terminate_adopted_proc(
+                        sock_opt.as_deref(),
+                        adopted_opt.as_deref(),
+                        expected_bin.as_deref(),
+                    )
                 })
-                .await;
-            }
-            None
+                .await
+                .unwrap_or(false)
+            } else {
+                true
+            };
+            (None, stopped)
         };
 
         let summary = {
@@ -1854,32 +1870,42 @@ impl Supervisor {
                 let _ = stop_done_tx.send(true);
                 return;
             }
-            cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
-            vm.adopted_proc = None;
-            vm.runtime.pid = None;
-            vm.runtime.started_at = None;
-            vm.runtime.fastdesk_endpoint = None;
-            vm.runtime.live_properties = None;
-            vm.monitor_cancel = None;
-            vm.monitor_handle = None;
-            vm.stop_wait = None;
+            if !stopped {
+                vm.runtime.status = VmStatus::Running;
+                vm.runtime.last_error = Some(
+                    "OpenVMM process is still running and could not be terminated".to_string(),
+                );
+                vm.monitor_cancel = None;
+                vm.monitor_handle = None;
+                vm.stop_wait = None;
+            } else {
+                cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
+                vm.adopted_proc = None;
+                vm.runtime.pid = None;
+                vm.runtime.started_at = None;
+                vm.runtime.fastdesk_endpoint = None;
+                vm.runtime.live_properties = None;
+                vm.monitor_cancel = None;
+                vm.monitor_handle = None;
+                vm.stop_wait = None;
 
-            let halt_reason = props.as_ref().and_then(|p| p.halt_reason.clone());
-            let is_halted = props
-                .as_ref()
-                .is_some_and(|p| p.state == vmservice::VmState::Halted as i32);
-            match wait_res {
-                Ok(()) => {
-                    vm.runtime.status = VmStatus::Off;
-                    vm.runtime.last_error = halt_reason.filter(|r| r != "PowerOff");
-                }
-                Err(err) => {
-                    if exit_status.is_some_and(|st| st.success()) || is_halted {
+                let halt_reason = props.as_ref().and_then(|p| p.halt_reason.clone());
+                let is_halted = props
+                    .as_ref()
+                    .is_some_and(|p| p.state == vmservice::VmState::Halted as i32);
+                match wait_res {
+                    Ok(()) => {
                         vm.runtime.status = VmStatus::Off;
-                        vm.runtime.last_error = None;
-                    } else {
-                        vm.runtime.status = VmStatus::Error;
-                        vm.runtime.last_error = Some(format!("VM exited: {err:#}"));
+                        vm.runtime.last_error = halt_reason.filter(|r| r != "PowerOff");
+                    }
+                    Err(err) => {
+                        if exit_status.is_some_and(|st| st.success()) || is_halted {
+                            vm.runtime.status = VmStatus::Off;
+                            vm.runtime.last_error = None;
+                        } else {
+                            vm.runtime.status = VmStatus::Error;
+                            vm.runtime.last_error = Some(format!("VM exited: {err:#}"));
+                        }
                     }
                 }
             }
@@ -1975,7 +2001,8 @@ impl Supervisor {
                     let _ = tokio::time::timeout(Duration::from_secs(2), client.quit()).await;
                 }
 
-                if let Some(mut child) = child_opt {
+                let expected_bin = sup.resolved_paths().openvmm_bin;
+                let stopped = if let Some(mut child) = child_opt {
                     let _ = tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
                         loop {
@@ -1993,15 +2020,59 @@ impl Supervisor {
                         }
                     })
                     .await;
+                    true
                 } else if adopted_proc.is_some() || sock_opt.is_some() {
                     let sock_wait = sock_opt.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let proc_wait = adopted_proc.clone();
+                    tokio::task::spawn_blocking(move || {
                         wait_or_terminate_adopted_proc(
                             sock_wait.as_deref(),
-                            adopted_proc.as_deref(),
-                        );
+                            proc_wait.as_deref(),
+                            expected_bin.as_deref(),
+                        )
                     })
-                    .await;
+                    .await
+                    .unwrap_or(false)
+                } else {
+                    true
+                };
+
+                if !stopped {
+                    let summary = {
+                        let mut guard = sup.vms.write().unwrap();
+                        if let Some(vm) = guard.get_mut(&id) {
+                            if vm.generation == stop_gen {
+                                vm.runtime.rpc_socket_path = sock_opt.clone();
+                                vm.runtime.shm_path = shm_opt;
+                                vm.adopted_proc = adopted_proc;
+                                vm.runtime.status = VmStatus::Running;
+                                vm.runtime.last_error = Some(
+                                    "failed to stop adopted VM: OpenVMM process is still running and could not be terminated".to_string(),
+                                );
+                                vm.stop_wait = None;
+                                if let Some(sock) = sock_opt {
+                                    let (mon_cancel_tx, mon_cancel_rx) = watch::channel(false);
+                                    let mon_sup = Arc::clone(&sup);
+                                    let handle = tokio::spawn(async move {
+                                        mon_sup.monitor_vm(id, stop_gen, sock, mon_cancel_rx).await;
+                                    });
+                                    vm.monitor_cancel = Some(mon_cancel_tx);
+                                    vm.monitor_handle = Some(handle);
+                                }
+                                vm.runtime.revision = sup.next_revision();
+                                Some(vm.summary())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    let _ = stop_done_tx.send(true);
+                    if let Some(summary) = summary {
+                        sup.emit(DaemonEvent::VmUpdated { vm: summary });
+                    }
+                    return;
                 }
 
                 cleanup_runtime_files(sock_opt, shm_opt);
@@ -2058,7 +2129,13 @@ impl Supervisor {
                 }
                 Ok(s)
             } else {
-                Ok(vm.summary())
+                Err(anyhow::anyhow!(
+                    "{}",
+                    vm.runtime
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("failed to stop adopted VM")
+                ))
             }
         };
         if let Some(s) = emit_normalized {
@@ -3262,48 +3339,72 @@ fn sanitize_disk_stem(name: &str) -> String {
     }
 }
 
-fn preallocate_shm_file(path: &Path, vram_mb: u32) -> anyhow::Result<()> {
+fn prepare_shm_path(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = openvmms_core::store::open_shm_file_nofollow(path)
-        .with_context(|| format!("creating FastDesk SHM file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                bail!(
+                    "refusing to use non-regular or symlinked FastDesk SHM path {}",
+                    path.display()
+                );
+            }
+            fs::remove_file(path)
+                .with_context(|| format!("removing stale FastDesk SHM file {}", path.display()))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspecting FastDesk SHM path {}", path.display()));
+        }
     }
-    let size = (vram_mb.clamp(8, 256) as u64) * 1024 * 1024;
-    file.set_len(size)
-        .with_context(|| format!("sizing FastDesk SHM file {}", path.display()))?;
     Ok(())
 }
 
 fn wait_or_terminate_adopted_proc(
     sock_path: Option<&Path>,
     proc_handle: Option<&openvmms_core::process::AdoptedProcess>,
-) {
+    expected_bin: Option<&Path>,
+) -> bool {
     let client = sock_path.map(TtrpcClient::new);
+    let resolved_handle;
+    let effective_handle = if proc_handle.is_some() {
+        proc_handle
+    } else {
+        resolved_handle = sock_path.and_then(|s| {
+            openvmms_core::process::open_verified_pid_or_socket_peer(
+                &s.with_extension("pid"),
+                Some(s),
+                expected_bin,
+            )
+        });
+        resolved_handle.as_deref()
+    };
     let start = std::time::Instant::now();
     loop {
         let sock_alive = client.as_ref().is_some_and(TtrpcClient::is_socket_accepting);
-        let proc_alive = proc_handle.is_some_and(openvmms_core::process::AdoptedProcess::is_alive);
+        let proc_alive =
+            effective_handle.is_some_and(openvmms_core::process::AdoptedProcess::is_alive);
         if !sock_alive && !proc_alive {
-            return;
+            return true;
         }
         if start.elapsed() >= Duration::from_secs(5) {
-            if let Some(proc_handle) = proc_handle {
+            if let Some(proc_handle) = effective_handle {
                 proc_handle.terminate();
                 let kill_deadline = std::time::Instant::now() + Duration::from_secs(1);
                 while std::time::Instant::now() < kill_deadline {
                     let still_sock = client.as_ref().is_some_and(TtrpcClient::is_socket_accepting);
                     if !still_sock && !proc_handle.is_alive() {
-                        return;
+                        return true;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
+                let still_sock = client.as_ref().is_some_and(TtrpcClient::is_socket_accepting);
+                return !still_sock && !proc_handle.is_alive();
             }
-            return;
+            return false;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -3319,7 +3420,11 @@ fn reclaim_or_verify_inactive_socket(
         return false;
     }
     let client = TtrpcClient::new(sock_path);
-    let verified_proc = openvmms_core::process::open_verified_pid(pid_path, expected_bin);
+    let verified_proc = openvmms_core::process::open_verified_pid_or_socket_peer(
+        pid_path,
+        Some(sock_path),
+        expected_bin,
+    );
     let responded = client
         .properties_vm_blocking_cancellable(Duration::from_secs(1), cancelled)
         .is_ok();

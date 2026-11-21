@@ -390,6 +390,62 @@ pub fn open_verified_pid(pid_path: &Path, expected_bin: Option<&Path>) -> Option
     }
 }
 
+/// Resolves an `AdoptedProcess` from `pid_path`, falling back on Linux to
+/// `SO_PEERCRED` on `sock_path` when the `.pid` file is missing or unverified.
+pub fn open_verified_pid_or_socket_peer(
+    pid_path: &Path,
+    sock_path: Option<&Path>,
+    expected_bin: Option<&Path>,
+) -> Option<Arc<AdoptedProcess>> {
+    if let Some(proc_handle) = open_verified_pid(pid_path, expected_bin) {
+        return Some(proc_handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(sock) = sock_path
+        && let Ok(stream) = std::os::unix::net::UnixStream::connect(sock)
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 && len as usize == std::mem::size_of::<libc::ucred>() && cred.pid > 1 {
+            let pid = cred.pid as u32;
+            if pid != std::process::id() {
+                let pidfd = open_pidfd(pid);
+                let expected_start = process_start_token(pid);
+                if !is_linux_zombie_or_dead(pid)
+                    && verify_linux_or_unix_identity(pid, expected_bin)
+                    && (pidfd.is_some() || is_pid_alive_raw(pid))
+                {
+                    return Some(Arc::new(AdoptedProcess {
+                        pid,
+                        expected_start,
+                        expected_bin: expected_bin.map(Path::to_path_buf),
+                        pidfd,
+                    }));
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = sock_path;
+
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn open_pidfd(pid: u32) -> Option<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint) };
@@ -454,17 +510,24 @@ fn verify_linux_or_unix_identity(pid: u32, expected_bin: Option<&Path>) -> bool 
             return true;
         }
 
+        let cmdline_bytes = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let args: Vec<String> = cmdline_bytes
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let has_rpc_flag = args.iter().any(|a| a == "--rpc");
+        if pid != std::process::id()
+            && has_rpc_flag
+            && args.iter().any(|a| a.contains("transport=ttrpc"))
+        {
+            return true;
+        }
+
         if let Some(exp) = expected_bin
             && let Some(exp_name) = exp.file_name().and_then(|n| n.to_str())
             && !exp_name.is_empty()
         {
-            let cmdline_bytes = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-            let args: Vec<String> = cmdline_bytes
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).into_owned())
-                .collect();
-            let has_rpc_flag = args.iter().any(|a| a == "--rpc");
             if exe_name == exp_name && (exp_name == "openvmm" || has_rpc_flag) {
                 return true;
             }

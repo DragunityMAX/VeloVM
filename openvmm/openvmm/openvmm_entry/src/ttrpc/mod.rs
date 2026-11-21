@@ -5727,4 +5727,64 @@ mod tests {
         assert!(slot.is_none());
         assert!(!shm_file.exists());
     }
+
+    #[test]
+    fn create_vm_refuses_existing_shm_path_without_modifying_or_deleting_it() {
+        DefaultPool::run_with(async |driver| {
+            let dir = tempfile::tempdir().unwrap();
+            let existing_shm = dir.path().join("existing.shm");
+            std::fs::write(&existing_shm, b"existing-owner-data").unwrap();
+
+            let mut svc = service(driver, None);
+            svc.vm = None;
+            svc.lifecycle = VmLifecycle::Uninitialized;
+
+            let err = svc
+                .create_vm(vmservice::CreateVmRequest {
+                    log_id: "test".into(),
+                    config: Some(vmservice::VmConfig {
+                        fastdesk_config: Some(vmservice::FastDeskConfig {
+                            listen_addr: "127.0.0.1:0".into(),
+                            shm_path: Some(existing_shm.to_string_lossy().into_owned()),
+                            vram_mb: 8,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("already exists"),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(std::fs::read(&existing_shm).unwrap(), b"existing-owner-data");
+            assert!(svc.fastdesk_shm_path.is_none());
+
+            // Conversely, when openvmm itself creates a fresh SHM file and CreateVM fails later,
+            // ShmCleanupGuard removes only the file it created.
+            let fresh_shm = dir.path().join("fresh.shm");
+            let err = svc
+                .create_vm(vmservice::CreateVmRequest {
+                    log_id: "test".into(),
+                    config: Some(vmservice::VmConfig {
+                        fastdesk_config: Some(vmservice::FastDeskConfig {
+                            listen_addr: "127.0.0.1:0".into(),
+                            shm_path: Some(fresh_shm.to_string_lossy().into_owned()),
+                            vram_mb: 8,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                !err.to_string().contains("already exists"),
+                "unexpected error: {err:#}"
+            );
+            assert!(!fresh_shm.exists());
+            assert!(svc.fastdesk_shm_path.is_none());
+        });
+    }
 }

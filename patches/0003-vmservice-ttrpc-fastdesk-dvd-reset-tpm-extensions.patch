@@ -1,5 +1,5 @@
 diff --git a/openvmm/openvmm/openvmm_entry/src/lib.rs b/openvmm/openvmm/openvmm_entry/src/lib.rs
-index 4c6546f..1d671bb 100644
+index 4c6546f..57c7860 100644
 --- a/openvmm/openvmm/openvmm_entry/src/lib.rs
 +++ b/openvmm/openvmm/openvmm_entry/src/lib.rs
 @@ -1305,33 +1305,9 @@ async fn vm_config_from_command_line(
@@ -48,7 +48,7 @@ index 4c6546f..1d671bb 100644
      switch_id: Option<&str>,
  ) -> anyhow::Result<(
      openvmm_defs::config::SwitchPortId,
-@@ -2976,7 +2952,111 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
+@@ -2976,7 +2952,100 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
      result
  }
  
@@ -88,55 +88,34 @@ index 4c6546f..1d671bb 100644
 +)> {
 +    let (vram, resolved_shm_path) = if let Some(shm_path) = shm_path {
 +        validate_shm_path(shm_path)?;
-+        let file = match std::fs::symlink_metadata(shm_path) {
-+            Ok(meta) => {
-+                anyhow::ensure!(
-+                    !meta.file_type().is_symlink() && meta.file_type().is_file(),
-+                    "refusing to use non-regular or symlinked FastDesk SHM path {}",
++        let mut open_opts = fs_err::OpenOptions::new();
++        open_opts.read(true).write(true).create_new(true);
++        #[cfg(unix)]
++        {
++            fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
++        }
++        let file = match open_opts.open(shm_path) {
++            Ok(file) => file,
++            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
++                anyhow::bail!(
++                    "FastDesk SHM file '{}' already exists; refusing to overwrite or share an existing file",
 +                    shm_path.display()
 +                );
-+                let file = fs_err::OpenOptions::new()
-+                    .read(true)
-+                    .write(true)
-+                    .open(shm_path)
-+                    .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
-+                let opened_meta = file
-+                    .file()
-+                    .metadata()
-+                    .context("checking FastDesk SHM file metadata")?;
-+                anyhow::ensure!(
-+                    opened_meta.file_type().is_file(),
-+                    "FastDesk SHM path {} is not a regular file",
-+                    shm_path.display()
-+                );
-+                #[cfg(unix)]
-+                {
-+                    use std::os::unix::fs::MetadataExt;
-+                    anyhow::ensure!(
-+                        (opened_meta.dev(), opened_meta.ino()) == (meta.dev(), meta.ino()),
-+                        "FastDesk SHM file {} changed concurrently during open",
-+                        shm_path.display()
-+                    );
-+                }
-+                file
-+            }
-+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-+                let mut open_opts = fs_err::OpenOptions::new();
-+                open_opts.read(true).write(true).create_new(true);
-+                #[cfg(unix)]
-+                {
-+                    fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
-+                }
-+                open_opts
-+                    .open(shm_path)
-+                    .with_context(|| format!("creating FastDesk SHM file {}", shm_path.display()))?
 +            }
 +            Err(err) => {
-+                return Err(err).with_context(|| {
-+                    format!("inspecting FastDesk SHM path {}", shm_path.display())
-+                });
++                return Err(err)
++                    .with_context(|| format!("creating FastDesk SHM file {}", shm_path.display()));
 +            }
 +        };
++        struct CreatedShmGuard<'a>(&'a Path, bool);
++        impl Drop for CreatedShmGuard<'_> {
++            fn drop(&mut self) {
++                if self.1 {
++                    let _ = std::fs::remove_file(self.0);
++                }
++            }
++        }
++        let mut guard = CreatedShmGuard(shm_path, true);
 +        #[cfg(unix)]
 +        {
 +            use std::os::unix::fs::PermissionsExt;
@@ -149,11 +128,21 @@ index 4c6546f..1d671bb 100644
 +            .context("sizing FastDesk SHM file")?;
 +        let mappable = sparse_mmap::new_mappable_from_file(file.file(), true, false)
 +            .context("creating FastDesk SHM mappable")?;
++        guard.1 = false;
 +        (mappable, Some(shm_path.to_string_lossy().into_owned()))
 +    } else {
 +        (alloc_shared_memory(vram_size, "vram")?, None)
 +    };
-+    let (fb, fba) = framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer")?;
++    let (fb, fba) =
++        match framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer") {
++            Ok(res) => res,
++            Err(err) => {
++                if let Some(path) = &resolved_shm_path {
++                    let _ = std::fs::remove_file(path);
++                }
++                return Err(err);
++            }
++        };
 +    Ok((fb, fba, resolved_shm_path))
 +}
 +
@@ -161,7 +150,7 @@ index 4c6546f..1d671bb 100644
      label: &str,
      listen_str: &str,
      default_port: u16,
-@@ -3011,6 +3091,7 @@ fn bind_display_tcp_listener(
+@@ -3011,6 +3080,7 @@ fn bind_display_tcp_listener(
              );
          }
      }
@@ -169,7 +158,7 @@ index 4c6546f..1d671bb 100644
      socket.set_reuse_address(true)?;
      socket
          .bind(&addr.into())
-@@ -3029,6 +3110,65 @@ fn bind_display_tcp_listener(
+@@ -3029,6 +3099,65 @@ fn bind_display_tcp_listener(
      Ok(socket.into())
  }
  
@@ -221,7 +210,7 @@ index 4c6546f..1d671bb 100644
 +                port,
 +            )) {
 +                Ok(listener) => return Ok((listener, port)),
-+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
++                Err(err) if err.kind() == io::ErrorKind::AddrInUse => continue,
 +                Err(err) => {
 +                    return Err(err)
 +                        .with_context(|| format!("binding FastDesk hvsock loopback port {port}"));
@@ -235,7 +224,7 @@ index 4c6546f..1d671bb 100644
  async fn run_control_inner(
      driver: &DefaultDriver,
      mesh_slot: &mut Option<VmmMesh>,
-@@ -4186,4 +4326,43 @@ fn rejects_duplicate_pcie_port_assignment_from_storage() {
+@@ -4186,4 +4315,54 @@ fn rejects_duplicate_pcie_port_assignment_from_storage() {
              mesh.shutdown().await;
          });
      }
@@ -274,13 +263,24 @@ index 4c6546f..1d671bb 100644
 +            assert!(alloc_framebuffer_vram(Some(&dangling), 8 * 1024 * 1024).is_err());
 +        }
 +
++        let existing = dir.path().join("existing.shm");
++        std::fs::write(&existing, b"keep-me").unwrap();
++        assert!(alloc_framebuffer_vram(Some(&existing), 8 * 1024 * 1024).is_err());
++        assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
++
 +        let valid = dir.path().join("valid.shm");
 +        let _ = alloc_framebuffer_vram(Some(&valid), 8 * 1024 * 1024).unwrap();
 +        assert!(valid.is_file());
++        assert_eq!(std::fs::metadata(&valid).unwrap().len(), 8 * 1024 * 1024);
++
++        // A second call targeting the same SHM path must fail without modifying or removing it.
++        assert!(alloc_framebuffer_vram(Some(&valid), 16 * 1024 * 1024).is_err());
++        assert!(valid.is_file());
++        assert_eq!(std::fs::metadata(&valid).unwrap().len(), 8 * 1024 * 1024);
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
-index b63d6b6..0786c2e 100644
+index b63d6b6..44ef6b5 100644
 --- a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 +++ b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 @@ -35,6 +35,7 @@ struct FdRegistry {}
@@ -1273,7 +1273,7 @@ index b63d6b6..0786c2e 100644
          ] {
              assert!(validate_platform_config(&config).is_ok());
              assert!(
-@@ -4877,4 +5399,332 @@ fn reject_invalid_vfio_bar_address_config() {
+@@ -4877,4 +5399,392 @@ fn reject_invalid_vfio_bar_address_config() {
              .is_err()
          );
      }
@@ -1604,6 +1604,66 @@ index b63d6b6..0786c2e 100644
 +        cleanup_fastdesk_shm_file(&mut slot);
 +        assert!(slot.is_none());
 +        assert!(!shm_file.exists());
++    }
++
++    #[test]
++    fn create_vm_refuses_existing_shm_path_without_modifying_or_deleting_it() {
++        DefaultPool::run_with(async |driver| {
++            let dir = tempfile::tempdir().unwrap();
++            let existing_shm = dir.path().join("existing.shm");
++            std::fs::write(&existing_shm, b"existing-owner-data").unwrap();
++
++            let mut svc = service(driver, None);
++            svc.vm = None;
++            svc.lifecycle = VmLifecycle::Uninitialized;
++
++            let err = svc
++                .create_vm(vmservice::CreateVmRequest {
++                    log_id: "test".into(),
++                    config: Some(vmservice::VmConfig {
++                        fastdesk_config: Some(vmservice::FastDeskConfig {
++                            listen_addr: "127.0.0.1:0".into(),
++                            shm_path: Some(existing_shm.to_string_lossy().into_owned()),
++                            vram_mb: 8,
++                            ..Default::default()
++                        }),
++                        ..Default::default()
++                    }),
++                })
++                .await
++                .unwrap_err();
++            assert!(
++                err.to_string().contains("already exists"),
++                "unexpected error: {err:#}"
++            );
++            assert_eq!(std::fs::read(&existing_shm).unwrap(), b"existing-owner-data");
++            assert!(svc.fastdesk_shm_path.is_none());
++
++            // Conversely, when openvmm itself creates a fresh SHM file and CreateVM fails later,
++            // ShmCleanupGuard removes only the file it created.
++            let fresh_shm = dir.path().join("fresh.shm");
++            let err = svc
++                .create_vm(vmservice::CreateVmRequest {
++                    log_id: "test".into(),
++                    config: Some(vmservice::VmConfig {
++                        fastdesk_config: Some(vmservice::FastDeskConfig {
++                            listen_addr: "127.0.0.1:0".into(),
++                            shm_path: Some(fresh_shm.to_string_lossy().into_owned()),
++                            vram_mb: 8,
++                            ..Default::default()
++                        }),
++                        ..Default::default()
++                    }),
++                })
++                .await
++                .unwrap_err();
++            assert!(
++                !err.to_string().contains("already exists"),
++                "unexpected error: {err:#}"
++            );
++            assert!(!fresh_shm.exists());
++            assert!(svc.fastdesk_shm_path.is_none());
++        });
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto b/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
