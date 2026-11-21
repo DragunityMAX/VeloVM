@@ -1,6 +1,6 @@
 # Vendored OpenVMM Patches
 
-`openvmm/` vendors a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) starting from upstream commit `c4419be15ab702194f0a25c294bd2f6187804824`. Changes made inside vendored upstream crates are tracked here as named patches so they can be audited, preserved, or dropped cleanly during upstream syncs.
+`openvmm/` vendors a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) starting from upstream commit `c4419be15ab702194f0a25c294bd2f6187804824` (with FastDesk integration landed on this repository's `main` branch). Changes made inside vendored crates on the `openvmms` branch relative to `main` are tracked here as named patches so they can be audited, preserved, or dropped cleanly during upstream syncs; the only change under `openvmm/` outside these three patches relative to `main` is `openvmm/Cargo.lock`.
 
 ## Patch Inventory
 
@@ -12,9 +12,9 @@
 
 ### `0002-disk-writable-image-locking-and-vhdx-open.patch`
 - **Targets:** `openvmm/openvmm/openvmm_helpers/src/disk.rs`, `openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs`
-- **Summary:** Adds `open_vhdx_disk` (to open VHDX files regardless of extension) and `open_raw_disk_file` (for raw images without format sniffing), and acquires exclusive writable disk locks (`flock` via `File::try_lock()` on Unix, and `FILE_SHARE_READ` without `FILE_SHARE_WRITE` via `OpenOptionsExt::share_mode(0x0000_0001)` on Windows) when opening writable raw/VHD1/VMGS/VHDX disk files.
-- **Behavioral impact:** Concurrent writable opens of the same disk image fail cleanly with `"already locked for writing by another process"` on both Unix and Windows instead of silently allowing two writers to corrupt the image.
-- **Why carried:** Prevents concurrent disk corruption when attaching or starting multiple VMs against the same writable disk image, and supports extension-agnostic VHDX opens for non-`.vhdx` images (e.g. `.avhdx`) and explicit raw opens for `.img` files that happen to contain a `vhdxfile` header signature.
+- **Summary:** Adds `open_vhdx_disk` (to open VHDX files regardless of extension) and `open_raw_disk_file` (for raw images without format sniffing), acquires exclusive writable disk locks (`flock` via `File::try_lock()` on Unix, and `FILE_SHARE_READ` without `FILE_SHARE_WRITE` via `OpenOptionsExt::share_mode(0x0000_0001)` on Windows) on writable opens, and acquires shared/read-only locks (`File::try_lock_shared()` on Unix, `FILE_SHARE_READ` on Windows) on read-only opens and VHDX parent backing layers.
+- **Behavioral impact:** Concurrent writable opens of the same disk image fail cleanly with `"already locked for writing by another process"` on both Unix and Windows, and opening an active VHDX parent backing layer writable is also blocked while a child chain holds a shared lock on that parent layer.
+- **Why carried:** Prevents concurrent disk corruption when attaching or starting multiple VMs against the same writable disk image or VHDX backing chain, and supports extension-agnostic VHDX opens for non-`.vhdx` images (e.g. `.avhdx`) and explicit raw opens for `.img` files that happen to contain a `vhdxfile` header signature.
 
 ### `0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch`
 - **Targets:**
@@ -23,12 +23,12 @@
   - `openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs`
   - `openvmm/workers/fastdesk_worker/src/lib.rs`
   - `openvmm/workers/fastdesk_worker_defs/src/lib.rs`
-- **Summary:** Adds `FastDeskConfig` (loopback TCP or loopback `HV_GUID_LOOPBACK` / `VMADDR_CID_LOCAL` vsock binding in ttrpc, while preserving wildcard `vsock_any` for the standalone `--fastdesk-vsock-port` CLI flag), `PropertiesVMResponse.fastdesk_listen_addr` / `fastdesk_shm_path`, `ResetVM`, `SCSIDisk.is_dvd`, `DevicesConfig.enable_scsi_controller`, `VMConfig.tpm_enabled`, and Windows `DioBackend` auto-port creation via `new_switch_port`. Explicit `SCSI_DISK_TYPE_VHDX` uses `open_vhdx_disk`, while `SCSI_DISK_TYPE_PHYSICAL` preserves `open_disk_type` extension dispatch.
+- **Summary:** Adds `FastDeskConfig` (enforcing loopback TCP or loopback `HV_GUID_LOOPBACK` / `VMADDR_CID_LOCAL` vsock binding in the ttrpc path, while preserving wildcard `vsock_any` for the standalone `--fastdesk-vsock-port` CLI flag), `shm_path` traversal/symlink/regular-file validation plus teardown/exit/error cleanup, `PropertiesVMResponse.fastdesk_listen_addr` / `fastdesk_shm_path`, `ResetVM`, `SCSIDisk.is_dvd`, `DevicesConfig.enable_scsi_controller`, `VMConfig.tpm_enabled`, and Windows `DioBackend` auto-port creation via `new_switch_port`. Explicit `SCSI_DISK_TYPE_VHDX` uses `open_vhdx_disk`, while `SCSI_DISK_TYPE_PHYSICAL` preserves `open_disk_type` extension dispatch.
 - **Why carried:** Exposes FastDesk, DVD/ISO hot-plug, reset, vTPM 2.0, and Hyper-V switch auto-port control over `vmservice.VM` ttrpc for OpenVMMS (`openvmmsd`).
 
-## Verifying and Re-applying
+## Verifying and Regenerating
 
-From the repository root:
+From the repository root (against baseline `main`):
 
 ```bash
 # Confirm all patches match the current vendored tree:
@@ -36,6 +36,14 @@ git apply -R --check patches/0001-mesh-rpc-cancel-pending-rpcs-on-client-disconn
 git apply -R --check patches/0002-disk-writable-image-locking-and-vhdx-open.patch
 git apply -R --check patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
 
-# Apply to a clean upstream openvmm checkout (stripping the leading `openvmm/` path segment):
-cd openvmm && for p in ../patches/*.patch; do git apply -p2 "$p"; done
+# Regenerate patches from main:
+git diff main -- openvmm/support/mesh/mesh_rpc/src/server.rs \
+  > patches/0001-mesh-rpc-cancel-pending-rpcs-on-client-disconnect.patch
+git diff main -- openvmm/openvmm/openvmm_helpers/src/disk.rs openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs \
+  > patches/0002-disk-writable-image-locking-and-vhdx-open.patch
+git diff main -- openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto openvmm/openvmm/openvmm_entry/src/lib.rs openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs openvmm/workers/fastdesk_worker/src/lib.rs openvmm/workers/fastdesk_worker_defs/src/lib.rs \
+  > patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
+
+# Apply to a clean checkout of this repo's main branch:
+for p in patches/*.patch; do git apply "$p"; done
 ```

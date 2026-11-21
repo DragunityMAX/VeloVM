@@ -258,7 +258,8 @@ impl RegistryStore {
 
     pub fn load_or_create_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
-        if path.exists() {
+        if fs::symlink_metadata(&path).is_ok() {
+            check_and_repair_token_permissions(&path, true)?;
             let token = fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?
                 .trim()
@@ -276,6 +277,8 @@ impl RegistryStore {
 
     pub fn read_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
+        check_and_repair_token_permissions(&path, false)
+            .with_context(|| format!("reading daemon token at {}", path.display()))?;
         let token = fs::read_to_string(&path)
             .with_context(|| format!("reading daemon token at {}", path.display()))?
             .trim()
@@ -452,8 +455,183 @@ fn current_user_token_buf()
     Ok(buf)
 }
 
+fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        bail!(
+            "refusing to use non-regular or symlinked daemon token file {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if (mode & 0o077) != 0 {
+            if repair {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:04o}"),
+                    "daemon.token has overly permissive permissions; tightening to 0600"
+                );
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("tightening permissions on {}", path.display()))?;
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:04o}"),
+                    "daemon.token has overly permissive permissions (expected 0600)"
+                );
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if !is_path_owner_only_windows(path)? {
+            if repair {
+                tracing::warn!(
+                    path = %path.display(),
+                    "daemon.token has overly permissive Windows ACL; tightening to owner-only"
+                );
+                set_path_owner_only_windows(path)?;
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "daemon.token has overly permissive Windows ACL (expected owner-only)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && (meta.file_type().is_symlink() || !meta.file_type().is_file())
+    {
+        bail!(
+            "refusing to use non-regular or symlinked FastDesk SHM path {}",
+            path.display()
+        );
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts
+        .open(path)
+        .with_context(|| format!("creating FastDesk SHM file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        set_path_owner_only_windows(path)?;
+    }
+    Ok(file)
+}
+
 #[cfg(windows)]
-fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
+fn is_path_owner_only_windows(path: &Path) -> anyhow::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+        GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+    struct LocalFreeSd(PSECURITY_DESCRIPTOR);
+    impl Drop for LocalFreeSd {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(err as i32))
+            .with_context(|| format!("GetNamedSecurityInfoW failed for {}", path.display()));
+    }
+    let _sd_guard = LocalFreeSd(sd);
+
+    let mut control = 0u16;
+    let mut rev = 0u32;
+    if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut rev) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("GetSecurityDescriptorControl failed");
+    }
+    if (control & SE_DACL_PROTECTED) == 0 || dacl.is_null() {
+        return Ok(false);
+    }
+
+    let mut size_info = ACL_SIZE_INFORMATION {
+        AceCount: 0,
+        AclBytesInUse: 0,
+        AclBytesFree: 0,
+    };
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size_info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("GetAclInformation failed");
+    }
+    if size_info.AceCount != 1 {
+        return Ok(false);
+    }
+
+    let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+    if unsafe { GetAce(dacl, 0, &mut ace_ptr) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("GetAce failed");
+    }
+    let ace = unsafe { &*(ace_ptr.cast::<ACCESS_ALLOWED_ACE>()) };
+    if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+        return Ok(false);
+    }
+    let ace_sid = (&raw const ace.SidStart)
+        .cast::<core::ffi::c_void>()
+        .cast_mut();
+    let token_buf = current_user_token_buf()?;
+    let token_user = unsafe { token_buf[0].assume_init_ref() };
+    Ok(unsafe { EqualSid(ace_sid, token_user.User.Sid) } != 0)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_ALL, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
@@ -611,6 +789,20 @@ mod tests {
         let _ = store.load_or_create_token().unwrap();
         let tok_mode = fs::metadata(store.token_path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(tok_mode, 0o600);
+
+        // Overly permissive existing daemon.token must be repaired back to 0600 on daemon load.
+        fs::set_permissions(store.token_path(), fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = store.load_or_create_token().unwrap();
+        let repaired_mode = fs::metadata(store.token_path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(repaired_mode, 0o600);
+
+        // Symlinked daemon.token must be rejected.
+        let decoys = dir.path().join("decoy.token");
+        fs::write(&decoys, "deadbeef").unwrap();
+        fs::remove_file(store.token_path()).unwrap();
+        std::os::unix::fs::symlink(&decoys, store.token_path()).unwrap();
+        assert!(store.load_or_create_token().is_err());
+        assert!(store.read_token().is_err());
     }
 
     #[cfg(windows)]

@@ -431,6 +431,26 @@ fn read_exact_cancellable(
         } else {
             POLL_SLICE
         };
+        match poll_read_ready(sock, slice) {
+            Ok(true) => {}
+            Ok(false) => {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("ttrpc call cancelled");
+                }
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    bail!("ttrpc call timed out");
+                }
+                continue;
+            }
+            Err(err) => {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("ttrpc call cancelled");
+                }
+                return Err(err.into());
+            }
+        }
         let _ = sock.set_read_timeout(Some(slice));
         match (&*sock).read(&mut buf[offset..]) {
             Ok(0) => {
@@ -568,6 +588,57 @@ fn poll_connect_ready(sock: &Socket, slice: Duration) -> std::io::Result<bool> {
     Ok(true)
 }
 
+#[cfg(unix)]
+fn poll_io_ready(sock: &Socket, timeout: Duration, write: bool) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let event = if write { libc::POLLOUT } else { libc::POLLIN };
+    let mut pfd = libc::pollfd {
+        fd: sock.as_raw_fd(),
+        events: event,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(err);
+    }
+    if rc == 0 {
+        return Ok(false);
+    }
+    Ok((pfd.revents & (event | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0)
+}
+
+#[cfg(windows)]
+fn poll_io_ready(sock: &Socket, timeout: Duration, write: bool) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, POLLWRNORM, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+    let mut pfd = WSAPOLLFD {
+        fd: sock.as_raw_socket() as SOCKET,
+        events: if write { POLLWRNORM as _ } else { POLLRDNORM as _ },
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let rc = unsafe { WSAPoll(&mut pfd, 1, timeout_ms) };
+    if rc == SOCKET_ERROR {
+        return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    Ok(rc > 0)
+}
+
+fn poll_read_ready(sock: &Socket, timeout: Duration) -> std::io::Result<bool> {
+    poll_io_ready(sock, timeout, false)
+}
+
+fn poll_write_ready(sock: &Socket, timeout: Duration) -> std::io::Result<bool> {
+    poll_io_ready(sock, timeout, true)
+}
+
 fn connect_cancellable(
     sock: &Socket,
     addr: &SockAddr,
@@ -650,6 +721,26 @@ fn write_all_cancellable(
         } else {
             POLL_SLICE
         };
+        match poll_write_ready(sock, slice) {
+            Ok(true) => {}
+            Ok(false) => {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("ttrpc call cancelled");
+                }
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    bail!("ttrpc call timed out");
+                }
+                continue;
+            }
+            Err(err) => {
+                if cancelled.load(Ordering::Acquire) {
+                    bail!("ttrpc call cancelled");
+                }
+                return Err(err.into());
+            }
+        }
         let _ = sock.set_write_timeout(Some(slice));
         match (&*sock).write(&buf[offset..]) {
             Ok(0) => {
@@ -1053,5 +1144,78 @@ mod tests {
 
         drop(fillers);
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn wait_vm_survives_multiple_poll_slices_and_cancels_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("wait-poll.sock");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&sock_path).unwrap()).unwrap();
+        listener.listen(8).unwrap();
+
+        let server = thread::spawn(move || {
+            // Connection 1: delay longer than 2x POLL_SLICE (200ms) before replying.
+            let mut conn1 = accept_unix_with_timeout(&listener, Duration::from_secs(5));
+            let (stream_id, msg_type, _bytes) = read_frame(&mut conn1).unwrap();
+            assert_eq!(msg_type, MESSAGE_TYPE_REQUEST);
+            thread::sleep(Duration::from_millis(500));
+            let resp = WireResponse {
+                result: Some(wire_response::Result::Payload(Vec::new())),
+            };
+            let frame = encode_frame(stream_id, MESSAGE_TYPE_RESPONSE, &resp.encode_to_vec())
+                .unwrap();
+            conn1.write_all(&frame).unwrap();
+            conn1.flush().unwrap();
+
+            // Connection 2: hold open until client cancels and shuts down the socket.
+            let mut conn2 = accept_unix_with_timeout(&listener, Duration::from_secs(5));
+            let _ = read_frame(&mut conn2).unwrap();
+            let mut buf = [0u8; 16];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match conn2.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = TtrpcClient::new(&sock_path);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let outcome = client
+            .wait_vm_cancellable(cancel_rx)
+            .await
+            .expect("wait_vm across multiple poll slices should succeed");
+        assert_eq!(outcome, WaitVmOutcome::Exited);
+
+        let (cancel_tx, cancel_rx2) = tokio::sync::watch::channel(false);
+        let wait_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.wait_vm_cancellable(cancel_rx2).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = cancel_tx.send(true);
+        let cancel_outcome = tokio::time::timeout(Duration::from_secs(2), wait_task)
+            .await
+            .expect("wait_vm_cancellable did not cancel promptly after poll slices")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancel_outcome, WaitVmOutcome::Cancelled);
+
+        server.join().unwrap();
     }
 }

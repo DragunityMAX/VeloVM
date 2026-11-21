@@ -81,14 +81,17 @@ impl ApiClient {
         data_dir: Option<&Path>,
         daemon_url_override: Option<&str>,
     ) -> anyhow::Result<Self> {
+        let validated_override = daemon_url_override
+            .map(crate::models::parse_loopback_listen_addr)
+            .transpose()?;
         let dir = data_dir
             .map(resolve_client_path)
             .unwrap_or_else(default_data_dir);
         let store = RegistryStore::open(&dir);
         let cfg = store.load_host_config_or_default()?;
         let token = store.read_token()?;
-        let base_url = if let Some(u) = daemon_url_override {
-            normalize_base_url(u)
+        let base_url = if let Some(addr) = validated_override {
+            format!("http://{addr}")
         } else if store.is_daemon_locked()
             && let Some(runtime_addr) = store.read_runtime_listen_addr()
         {
@@ -320,11 +323,28 @@ impl ApiClient {
     }
 
     pub fn detach_disk(&self, id_or_name: &str, lun: u32) -> anyhow::Result<VmSummary> {
-        self.delete_json(&format!(
-            "/api/v1/vms/{}/disks/{}",
-            url_segment(id_or_name),
-            lun
-        ))
+        self.detach_disk_matching(id_or_name, lun, None)
+    }
+
+    pub fn detach_disk_matching(
+        &self,
+        id_or_name: &str,
+        lun: u32,
+        expected_path: Option<&Path>,
+    ) -> anyhow::Result<VmSummary> {
+        let path = match expected_path {
+            Some(expected) => {
+                let resolved = resolve_client_path(expected);
+                let encoded = percent_encode(&resolved.to_string_lossy());
+                format!(
+                    "/api/v1/vms/{}/disks/{}?expected_path={encoded}",
+                    url_segment(id_or_name),
+                    lun
+                )
+            }
+            None => format!("/api/v1/vms/{}/disks/{}", url_segment(id_or_name), lun),
+        };
+        self.delete_json(&path)
     }
 
     pub fn mount_iso(&self, id_or_name: &str, req: &MountIsoPayload) -> anyhow::Result<VmSummary> {
@@ -589,31 +609,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 fn validate_daemon_base_url(raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed
-        .get(..8)
-        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
-    {
-        bail!(
-            "HTTPS daemon URLs are not supported; openvmmsd serves plain HTTP on loopback (use http://)"
-        );
-    }
-    if let Some(rest) = trimmed
-        .get(..7)
-        .filter(|p| p.eq_ignore_ascii_case("http://"))
-        .map(|_| &trimmed[7..])
-    {
-        if rest.is_empty() {
-            bail!("invalid daemon URL '{raw}': missing host:port");
-        }
-        return Ok(format!("http://{rest}"));
-    }
-    if trimmed.contains("://") {
-        bail!("unsupported daemon URL scheme in '{raw}'; expected http://");
-    }
     if trimmed.is_empty() {
         bail!("daemon URL cannot be empty");
     }
-    Ok(trimmed.to_string())
+    let addr = crate::models::parse_loopback_listen_addr(trimmed)?;
+    Ok(format!("http://{addr}"))
 }
 
 pub fn normalize_base_url(listen_or_url: &str) -> String {
@@ -640,13 +640,7 @@ pub fn normalize_base_url(listen_or_url: &str) -> String {
     format!("http://{addr}")
 }
 
-fn url_segment(s: &str) -> String {
-    if s == "." {
-        return "%2E".to_string();
-    }
-    if s == ".." {
-        return "%2E%2E".to_string();
-    }
+fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -656,6 +650,16 @@ fn url_segment(s: &str) -> String {
         }
     }
     out
+}
+
+fn url_segment(s: &str) -> String {
+    if s == "." {
+        return "%2E".to_string();
+    }
+    if s == ".." {
+        return "%2E%2E".to_string();
+    }
+    percent_encode(s)
 }
 
 fn decode_json_response<T: DeserializeOwned>(resp: reqwest::blocking::Response) -> anyhow::Result<T> {
@@ -809,11 +813,28 @@ pub fn ensure_daemon_running(
         cmd.current_dir(&dir);
     }
     let log_file_path = dir.join("openvmmsd.log");
-    if let Ok(log_file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file_path)
+    let log_is_safe = match std::fs::symlink_metadata(&log_file_path) {
+        Ok(m) => !m.file_type().is_symlink() && m.file_type().is_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    };
+    let mut log_opts = std::fs::OpenOptions::new();
+    log_opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_opts.mode(0o600);
+    }
+    if log_is_safe && let Ok(log_file) = log_opts.open(&log_file_path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = log_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(windows)]
+        {
+            let _ = crate::store::set_path_owner_only_windows(&log_file_path);
+        }
         let err_file = log_file.try_clone().ok();
         cmd.stdout(Stdio::from(log_file));
         if let Some(ef) = err_file {
@@ -1494,16 +1515,20 @@ mod tests {
     }
 
     #[test]
-    fn https_and_unsupported_daemon_urls_are_rejected() {
+    fn https_and_unsupported_or_non_loopback_daemon_urls_are_rejected() {
         for url in [
             "https://127.0.0.1:47620",
             "HTTPS://localhost:47620",
             "ftp://127.0.0.1:47620",
+            "http://127.0.0.1@evil.com",
+            "http://127.0.0.1@evil.com:47620",
+            "http://evil.com:47620",
+            "http://0.0.0.0:47620",
+            "http://192.168.1.10:47620",
         ] {
-            let err = ApiClient::new(url, "tok").unwrap_err();
             assert!(
-                err.to_string().contains("HTTPS") || err.to_string().contains("unsupported"),
-                "{url}: {err:#}"
+                ApiClient::new(url, "tok").is_err(),
+                "ApiClient::new accepted {url}"
             );
             let dir = tempfile::tempdir().unwrap();
             let store = RegistryStore::new(dir.path()).unwrap();

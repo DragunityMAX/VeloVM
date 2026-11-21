@@ -328,6 +328,9 @@ impl OpenVmmsApp {
                     *rev_entry = (*rev_entry).max(revision);
                 }
                 self.vms.retain(|v| v.config.id != id);
+                if matches!(&self.logs_cache, Some((cached_id, _)) if *cached_id == id) {
+                    self.logs_cache = None;
+                }
                 if self.selected_vm == Some(id) {
                     self.selected_vm = self.vms.first().map(|v| v.config.id);
                 }
@@ -339,8 +342,10 @@ impl OpenVmmsApp {
     fn apply_misc_update(&mut self, upd: GuiUpdate) {
         match upd {
             GuiUpdate::VmLogs { id, content } => {
+                if self.selected_vm == Some(id) {
                     self.logs_cache = Some((id, content));
                 }
+            }
                 GuiUpdate::DiskCreated(info) | GuiUpdate::DiskInspected(info) => {
                     if let Some(dlg) = self.disk_mgr_dlg.as_mut() {
                         dlg.last_info = Some(info);
@@ -514,7 +519,8 @@ impl OpenVmmsApp {
     fn render_ui(&mut self, ctx: &egui::Context) {
         self.process_updates();
 
-        if self.detail_tab == DetailTab::ConsoleLogs
+        if self.connected
+            && self.detail_tab == DetailTab::ConsoleLogs
             && let Some(sel) = self.selected_vm
         {
             const LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -820,11 +826,15 @@ impl OpenVmmsApp {
                                         ui.selectable_label(selected, &vm.config.name);
                                     if row_resp.clicked() {
                                         self.selected_vm = Some(vm.config.id);
-                                        self.backend
-                                            .send(GuiRequest::FetchVmDetails { id: vm.config.id });
-                                        if self.detail_tab == DetailTab::ConsoleLogs {
-                                            self.backend
-                                                .send(GuiRequest::FetchVmLogs { id: vm.config.id });
+                                        if self.connected {
+                                            self.backend.send(GuiRequest::FetchVmDetails {
+                                                id: vm.config.id,
+                                            });
+                                            if self.detail_tab == DetailTab::ConsoleLogs {
+                                                self.backend.send(GuiRequest::FetchVmLogs {
+                                                    id: vm.config.id,
+                                                });
+                                            }
                                         }
                                     }
                                     if row_resp.double_clicked()
@@ -889,6 +899,7 @@ impl OpenVmmsApp {
                             "Console & Logs",
                         )
                         .clicked()
+                        && self.connected
                     {
                         self.last_log_fetch = Instant::now();
                         self.backend
@@ -1792,5 +1803,91 @@ mod tests {
             op: controller::StorageOpKind::MountIso,
         });
         assert!(!app.mount_iso_in_flight.contains(&vm_id));
+    }
+
+    #[test]
+    fn ignores_stale_vm_logs_and_clears_deleted_logs_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_id = Uuid::new_v4();
+        let vm_a = Uuid::new_v4();
+        let vm_b = Uuid::new_v4();
+
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![
+                make_test_vm(vm_a, "Alpha", VmStatus::Running, 1),
+                make_test_vm(vm_b, "Beta", VmStatus::Running, 1),
+            ],
+            snapshot_seq: 1,
+        });
+        app.selected_vm = Some(vm_b);
+
+        // Slow log reply for previously selected vm_a must not overwrite or populate logs_cache.
+        app.apply_update(GuiUpdate::VmLogs {
+            id: vm_a,
+            content: "stale alpha logs".into(),
+        });
+        assert!(app.logs_cache.is_none());
+
+        app.apply_update(GuiUpdate::VmLogs {
+            id: vm_b,
+            content: "beta logs".into(),
+        });
+        assert_eq!(app.logs_cache, Some((vm_b, "beta logs".into())));
+
+        // Even after valid logs are cached for vm_b, a late response for vm_a must not overwrite them.
+        app.apply_update(GuiUpdate::VmLogs {
+            id: vm_a,
+            content: "".into(),
+        });
+        assert_eq!(app.logs_cache, Some((vm_b, "beta logs".into())));
+
+        // Deleting vm_b clears its cached logs.
+        app.apply_update(GuiUpdate::VmDeleted {
+            id: vm_b,
+            revision: 2,
+        });
+        assert!(app.logs_cache.is_none());
+    }
+
+    #[test]
+    fn disconnected_log_tab_does_not_poll_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let vm_id = Uuid::new_v4();
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 1)],
+            snapshot_seq: 1,
+        });
+        app.detail_tab = DetailTab::ConsoleLogs;
+        app.connected = false;
+        let stale_ts = Instant::now() - Duration::from_secs(10);
+        app.last_log_fetch = stale_ts;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_ui(ctx);
+        });
+        assert_eq!(
+            app.last_log_fetch, stale_ts,
+            "disconnected ConsoleLogs tab must not schedule or reset log polling"
+        );
+
+        app.connected = true;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(
+            app.last_log_fetch > stale_ts,
+            "connected ConsoleLogs tab should poll logs when interval elapsed"
+        );
     }
 }

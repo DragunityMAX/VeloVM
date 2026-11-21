@@ -527,6 +527,7 @@ impl VmService {
                 }
                 Action::ControllerEvent(Some(event)) => {
                     if let Some(code) = self.handle_controller_event(event) {
+                        cleanup_fastdesk_shm_file(&mut self.fastdesk_shm_path);
                         // Like the CLI exit path, do not wait for parked VM
                         // workers or in-flight RPCs to finish teardown.
                         return Ok(code);
@@ -566,6 +567,7 @@ impl VmService {
         // have exited so DIO endpoints are never torn down under a live worker.
         #[cfg(windows)]
         self.switch_ports.lock().clear();
+        cleanup_fastdesk_shm_file(&mut self.fastdesk_shm_path);
         drop(cancel_send);
         server_task.await?;
         Ok(0)
@@ -909,7 +911,7 @@ impl VmService {
                 self.vm_controller_events.take();
                 self.halted_paused = false;
                 self.fastdesk_listen_addr = None;
-                self.fastdesk_shm_path = None;
+                cleanup_fastdesk_shm_file(&mut self.fastdesk_shm_path);
                 if let Some((_, wait_response)) = self.wait_vm_response.take() {
                     wait_response.send(Err(grpc_error(anyhow!("VM quit"))));
                 }
@@ -1137,11 +1139,22 @@ impl VmService {
 
         let fastdesk_cfg = req_config.fastdesk_config.take();
         let mut fastdesk_access = None;
+        struct ShmCleanupGuard(Option<String>);
+        impl Drop for ShmCleanupGuard {
+            fn drop(&mut self) {
+                cleanup_fastdesk_shm_file(&mut self.0);
+            }
+        }
+        let mut shm_cleanup_guard = ShmCleanupGuard(None);
         let mut fastdesk_shm_path = None;
         let mut fastdesk_dirty_recv = None;
         let mut fastdesk_cursor_recv = None;
         let mut fastdesk_vram_size = 0usize;
         let framebuffer = if let Some(fd) = &fastdesk_cfg {
+            if fd.vsock_port.is_none() {
+                let listen_str = default_fastdesk_listen_addr(&fd.listen_addr);
+                validate_fastdesk_loopback_listen_addr(listen_str)?;
+            }
             let vram_mb = if fd.vram_mb == 0 { 32 } else { fd.vram_mb };
             let vram_size = (vram_mb.clamp(8, 256) as usize) * 1024 * 1024;
             fastdesk_vram_size = vram_size;
@@ -1152,6 +1165,7 @@ impl VmService {
                 .map(Path::new);
             let (fb, fba, resolved_shm_path) = crate::alloc_framebuffer_vram(shm, vram_size)?;
             fastdesk_access = Some(fba);
+            shm_cleanup_guard.0 = resolved_shm_path.clone();
             fastdesk_shm_path = resolved_shm_path;
             Some(fb)
         } else {
@@ -1787,6 +1801,7 @@ impl VmService {
                 }
             } else {
                 let listen_str = default_fastdesk_listen_addr(&fd.listen_addr);
+                validate_fastdesk_loopback_listen_addr(listen_str)?;
                 let listener = crate::bind_display_tcp_listener("FastDesk", listen_str, 0)?;
                 let local_addr = listener
                     .local_addr()
@@ -1877,7 +1892,8 @@ impl VmService {
         self.snapshot_saved = false;
         self.memory_backing_file = active_memory_backing_file;
         self.fastdesk_listen_addr = fastdesk_listen_addr;
-        self.fastdesk_shm_path = fastdesk_shm_path;
+        self.fastdesk_shm_path = shm_cleanup_guard.0.take();
+        let _ = fastdesk_shm_path;
         self.halted_paused = false;
         self.lifecycle = VmLifecycle::Paused;
         Ok(snapshot_id)
@@ -1904,7 +1920,7 @@ impl VmService {
         self.snapshot_saved = false;
         self.memory_backing_file = None;
         self.fastdesk_listen_addr = None;
-        self.fastdesk_shm_path = None;
+        cleanup_fastdesk_shm_file(&mut self.fastdesk_shm_path);
         if let Some((_, response)) = self.wait_vm_response.take() {
             response.send(Err(grpc_error(anyhow!("VM torn down"))));
         }
@@ -2202,7 +2218,7 @@ impl VmService {
                 self.switch_ports.lock().clear();
                 self.halted_paused = false;
                 self.fastdesk_listen_addr = None;
-                self.fastdesk_shm_path = None;
+                cleanup_fastdesk_shm_file(&mut self.fastdesk_shm_path);
                 self.lifecycle = VmLifecycle::Uninitialized;
             }
             VmControllerEvent::VncWorkerStopped { error } => {
@@ -2722,6 +2738,30 @@ fn default_fastdesk_listen_addr(raw: &str) -> &str {
         "127.0.0.1:0"
     } else {
         raw
+    }
+}
+
+fn validate_fastdesk_loopback_listen_addr(listen_str: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let addr = if let Ok(sa) = listen_str.parse::<std::net::SocketAddr>() {
+        sa
+    } else {
+        let ip: std::net::IpAddr = listen_str.parse().with_context(|| {
+            format!(
+                "invalid FastDesk listen address '{listen_str}' (expected loopback IP or socket address like 127.0.0.1:0 or [::1]:0)"
+            )
+        })?;
+        std::net::SocketAddr::new(ip, 0)
+    };
+    anyhow::ensure!(
+        addr.ip().is_loopback(),
+        "FastDesk TCP listen_addr '{listen_str}' must be a loopback address (e.g. 127.0.0.1:0 or [::1]:0)"
+    );
+    Ok(addr)
+}
+
+fn cleanup_fastdesk_shm_file(shm_path: &mut Option<String>) {
+    if let Some(path) = shm_path.take() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -5667,5 +5707,24 @@ mod tests {
             default_fastdesk_listen_addr("127.0.0.1:5910"),
             "127.0.0.1:5910"
         );
+    }
+
+    #[test]
+    fn fastdesk_ttrpc_listen_addr_requires_loopback_and_teardown_cleans_shm() {
+        assert!(validate_fastdesk_loopback_listen_addr("127.0.0.1:0").is_ok());
+        assert!(validate_fastdesk_loopback_listen_addr("[::1]:5901").is_ok());
+        assert!(validate_fastdesk_loopback_listen_addr("127.0.0.1").is_ok());
+        assert!(validate_fastdesk_loopback_listen_addr("0.0.0.0:5901").is_err());
+        assert!(validate_fastdesk_loopback_listen_addr("[::]:5901").is_err());
+        assert!(validate_fastdesk_loopback_listen_addr("192.168.1.5:5901").is_err());
+        assert!(validate_fastdesk_loopback_listen_addr("example.com:5901").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let shm_file = dir.path().join("vram.shm");
+        std::fs::write(&shm_file, b"SHM").unwrap();
+        let mut slot = Some(shm_file.to_string_lossy().into_owned());
+        cleanup_fastdesk_shm_file(&mut slot);
+        assert!(slot.is_none());
+        assert!(!shm_file.exists());
     }
 }

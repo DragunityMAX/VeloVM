@@ -42,6 +42,9 @@ impl AdoptedProcess {
     pub fn is_alive(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
+            if try_reap_child_nonblocking(self.pid) {
+                return false;
+            }
             if let Some(fd) = &self.pidfd {
                 let mut pfd = libc::pollfd {
                     fd: fd.as_raw_fd(),
@@ -55,8 +58,13 @@ impl AdoptedProcess {
                     return true;
                 }
                 if rc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                    let _ = try_reap_child_nonblocking(self.pid);
                     return false;
                 }
+            }
+            if is_linux_zombie_or_dead(self.pid) {
+                let _ = try_reap_child_nonblocking(self.pid);
+                return false;
             }
             if let Some(expected) = self.expected_start {
                 return process_start_token(self.pid) == Some(expected);
@@ -74,7 +82,7 @@ impl AdoptedProcess {
 
         #[cfg(all(unix, not(target_os = "linux")))]
         {
-            is_pid_alive_raw(self.pid)
+            !try_reap_child_nonblocking(self.pid) && is_pid_alive_raw(self.pid)
         }
     }
 
@@ -291,6 +299,9 @@ pub fn open_verified_pid(pid_path: &Path, expected_bin: Option<&Path>) -> Option
         {
             return None;
         }
+        if is_linux_zombie_or_dead(pid) {
+            return None;
+        }
         if !verify_linux_or_unix_identity(pid, expected_bin) {
             return None;
         }
@@ -403,6 +414,28 @@ fn is_pid_alive_raw(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+fn try_reap_child_nonblocking(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut status: libc::c_int = 0;
+    let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    rc > 0
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_zombie_or_dead(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    let rest = stat[rparen + 1..].trim_start();
+    matches!(rest.chars().next(), Some('Z' | 'X'))
+}
+
+#[cfg(unix)]
 fn verify_linux_or_unix_identity(pid: u32, expected_bin: Option<&Path>) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -498,5 +531,40 @@ mod tests {
         // Garbage or dead PID is rejected.
         fs::write(&pid_path, "not-a-pid").unwrap();
         assert!(open_verified_pid(&pid_path, None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_process_is_alive_returns_false_when_child_exits_unreaped() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.05"])
+            .spawn()
+            .expect("spawn short-lived shell child");
+        let pid = child.id();
+        let proc_handle = AdoptedProcess {
+            pid,
+            expected_start: process_start_token(pid),
+            expected_bin: None,
+            #[cfg(target_os = "linux")]
+            pidfd: open_pidfd(pid),
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            if !proc_handle.is_alive() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.try_wait();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(exited, "AdoptedProcess::is_alive stayed true after child exited");
+        assert!(
+            !proc_handle.is_alive(),
+            "AdoptedProcess::is_alive should remain false after exit/reap"
+        );
     }
 }

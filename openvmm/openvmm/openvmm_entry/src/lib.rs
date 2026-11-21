@@ -2952,6 +2952,31 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
     result
 }
 
+fn validate_shm_path(shm_path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !shm_path.as_os_str().is_empty() && shm_path.file_name().is_some(),
+        "FastDesk SHM path '{}' must specify a file name",
+        shm_path.display()
+    );
+    anyhow::ensure!(
+        !shm_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "FastDesk SHM path '{}' cannot contain '..' components",
+        shm_path.display()
+    );
+    if let Some(parent) = shm_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        anyhow::ensure!(
+            parent.is_dir(),
+            "FastDesk SHM parent directory '{}' does not exist",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn alloc_framebuffer_vram(
     shm_path: Option<&Path>,
     vram_size: usize,
@@ -2961,15 +2986,56 @@ pub(crate) fn alloc_framebuffer_vram(
     Option<String>,
 )> {
     let (vram, resolved_shm_path) = if let Some(shm_path) = shm_path {
-        let mut open_opts = fs_err::OpenOptions::new();
-        open_opts.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
-        }
-        let file = open_opts
-            .open(shm_path)
-            .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
+        validate_shm_path(shm_path)?;
+        let file = match std::fs::symlink_metadata(shm_path) {
+            Ok(meta) => {
+                anyhow::ensure!(
+                    !meta.file_type().is_symlink() && meta.file_type().is_file(),
+                    "refusing to use non-regular or symlinked FastDesk SHM path {}",
+                    shm_path.display()
+                );
+                let file = fs_err::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(shm_path)
+                    .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
+                let opened_meta = file
+                    .file()
+                    .metadata()
+                    .context("checking FastDesk SHM file metadata")?;
+                anyhow::ensure!(
+                    opened_meta.file_type().is_file(),
+                    "FastDesk SHM path {} is not a regular file",
+                    shm_path.display()
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    anyhow::ensure!(
+                        (opened_meta.dev(), opened_meta.ino()) == (meta.dev(), meta.ino()),
+                        "FastDesk SHM file {} changed concurrently during open",
+                        shm_path.display()
+                    );
+                }
+                file
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let mut open_opts = fs_err::OpenOptions::new();
+                open_opts.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
+                }
+                open_opts
+                    .open(shm_path)
+                    .with_context(|| format!("creating FastDesk SHM file {}", shm_path.display()))?
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("inspecting FastDesk SHM path {}", shm_path.display())
+                });
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -4270,5 +4336,33 @@ mod tests {
         assert_ne!(port_a, 0);
         assert_ne!(port_b, 0);
         assert_ne!(port_a, port_b);
+    }
+
+    #[test]
+    fn alloc_framebuffer_vram_rejects_symlinks_and_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_traversal = dir.path().join("..").join("vram.shm");
+        assert!(alloc_framebuffer_vram(Some(&parent_traversal), 8 * 1024 * 1024).is_err());
+
+        let missing_dir = dir.path().join("nonexistent-dir").join("vram.shm");
+        assert!(alloc_framebuffer_vram(Some(&missing_dir), 8 * 1024 * 1024).is_err());
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("real.txt");
+            std::fs::write(&target, b"original").unwrap();
+            let link = dir.path().join("link.shm");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(alloc_framebuffer_vram(Some(&link), 8 * 1024 * 1024).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"original");
+
+            let dangling = dir.path().join("dangling.shm");
+            std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+            assert!(alloc_framebuffer_vram(Some(&dangling), 8 * 1024 * 1024).is_err());
+        }
+
+        let valid = dir.path().join("valid.shm");
+        let _ = alloc_framebuffer_vram(Some(&valid), 8 * 1024 * 1024).unwrap();
+        assert!(valid.is_file());
     }
 }

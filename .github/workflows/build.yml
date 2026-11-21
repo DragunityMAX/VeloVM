@@ -218,9 +218,11 @@ jobs:
                 $whpEnabled = $true
               }
             } catch {}
+            Write-Host "Windows smoke check: HypervisorPlatform enabled = $whpEnabled"
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm start "Smoke-VM" | Out-Null
             if ($LASTEXITCODE -eq 0) {
+              Write-Host "Windows smoke check branch: WHP available — Smoke-VM booted and running"
               $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
                 vm show "Smoke-VM" | Out-String | ConvertFrom-Json
               if ($show.runtime.status -ne "running") {
@@ -247,6 +249,7 @@ jobs:
               if ($show.runtime.last_error -notmatch "no hypervisor available|WHP") {
                 throw "Expected Smoke-VM failure to be missing hypervisor/WHP, got: $($show.runtime.last_error)"
               }
+              Write-Host "Windows smoke check branch: runner lacks WHP — verified clean VM error recovery: $($show.runtime.last_error)"
             }
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm stop "Smoke-VM" | Out-Null
@@ -501,7 +504,8 @@ jobs:
           rm -rf "$SMOKE_DIR"
           mkdir -p "$SMOKE_DIR"
           SMOKE_PORT=47692
-          ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" &
+          ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+            >"$SMOKE_DIR/daemon1.log" 2>&1 &
           SMOKE_PID=$!
           cleanup_smoke() {
             kill "$SMOKE_PID" 2>/dev/null || true
@@ -509,12 +513,32 @@ jobs:
             rm -rf "$SMOKE_DIR"
           }
           trap cleanup_smoke EXIT
-          for _ in $(seq 1 100); do
-            if curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/v1/health" >/dev/null 2>&1; then
-              break
-            fi
-            sleep 0.1
-          done
+          wait_for_health() {
+            local log_file="$1"
+            for _ in $(seq 1 150); do
+              if curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/v1/health" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 0.1
+            done
+            echo "Timed out waiting for openvmmsd /api/v1/health ($log_file):" >&2
+            cat "$log_file" >&2 || true
+            return 1
+          }
+          wait_for_pid_exit() {
+            local pid="$1"
+            for _ in $(seq 1 150); do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid"
+                return $?
+              fi
+              sleep 0.1
+            done
+            echo "Timed out waiting for openvmmsd PID $pid to exit" >&2
+            kill -9 "$pid" 2>/dev/null || true
+            return 1
+          }
+          wait_for_health "$SMOKE_DIR/daemon1.log"
           if [ ! -e /dev/kvm ]; then
             echo "Expected /dev/kvm on Linux runner to verify real VM startup" >&2
             exit 1
@@ -546,19 +570,21 @@ jobs:
           # Default daemon stop must exit promptly while preserving the running VM across restart.
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop >/dev/null
-          wait "$SMOKE_PID"
+          wait_for_pid_exit "$SMOKE_PID"
           RUST_LOG=info ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
             >"$SMOKE_DIR/daemon2.log" 2>&1 &
           SMOKE_PID=$!
+          wait_for_health "$SMOKE_DIR/daemon2.log"
+          READOPTED=0
           for _ in $(seq 1 100); do
-            if curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/v1/health" >/dev/null 2>&1; then
+            if grep -q "re-adopted running OpenVMM VM" "$SMOKE_DIR/daemon2.log"; then
+              READOPTED=1
               break
             fi
             sleep 0.1
           done
-          sleep 1
-          if ! grep -q "re-adopted running OpenVMM VM" "$SMOKE_DIR/daemon2.log"; then
-            echo "Expected re-adoption log line in daemon2.log:" >&2
+          if [ "$READOPTED" -ne 1 ]; then
+            echo "Timed out waiting for re-adoption log line in daemon2.log:" >&2
             cat "$SMOKE_DIR/daemon2.log" >&2
             exit 1
           fi
@@ -584,7 +610,7 @@ jobs:
             vm show "Smoke-Win11-TPM" | grep -q '"status": "running"'
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop --stop-vms >/dev/null
-          wait "$SMOKE_PID"
+          wait_for_pid_exit "$SMOKE_PID"
           trap - EXIT
           rm -rf "$SMOKE_DIR"
 

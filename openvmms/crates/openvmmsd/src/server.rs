@@ -39,6 +39,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -51,6 +52,26 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
     }
+}
+
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn spawn_cancel_on_shutdown(sup: &Arc<Supervisor>, cancel_flag: &Arc<AtomicBool>) -> AbortOnDrop {
+    let sup = Arc::clone(sup);
+    let cancel_flag = Arc::clone(cancel_flag);
+    let handle = tokio::spawn(async move {
+        sup.wait_for_shutdown_signal().await;
+        cancel_flag.store(true, Ordering::Release);
+    });
+    AbortOnDrop(Some(handle))
 }
 
 #[derive(Clone)]
@@ -233,7 +254,14 @@ async fn events_handler(
                                     return None;
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                if let Ok(json) = serde_json::to_string(&DaemonEvent::Resync) {
+                                    return Some((
+                                        Ok::<Event, Infallible>(Event::default().data(json)),
+                                        (rx, shutdown_rx, false),
+                                    ));
+                                }
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                         }
                     }
@@ -317,6 +345,7 @@ async fn create_disk(
 ) -> Result<Json<DiskInfo>, ApiError> {
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let _cancel_guard = CancelOnDrop(Arc::clone(&cancel_flag));
+    let _shutdown_guard = spawn_cancel_on_shutdown(&state.supervisor, &cancel_flag);
     tokio::task::spawn_blocking(move || state.supervisor.create_disk_cancellable(req, &cancel_flag))
         .await
         .map_err(ApiError::internal)?
@@ -345,6 +374,7 @@ async fn create_vm(
 ) -> Result<(StatusCode, Json<VmSummary>), ApiError> {
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let _cancel_guard = CancelOnDrop(Arc::clone(&cancel_flag));
+    let _shutdown_guard = spawn_cancel_on_shutdown(&state.supervisor, &cancel_flag);
     let summary =
         tokio::task::spawn_blocking(move || state.supervisor.create_vm_cancellable(req, &cancel_flag))
             .await
@@ -482,13 +512,20 @@ async fn attach_disk(
         .map_err(ApiError::map_anyhow)
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DetachDiskQuery {
+    #[serde(default)]
+    expected_path: Option<PathBuf>,
+}
+
 async fn detach_disk(
     State(state): State<AppState>,
     Path((id, lun)): Path<(String, u32)>,
+    Query(query): Query<DetachDiskQuery>,
 ) -> Result<Json<VmSummary>, ApiError> {
     state
         .supervisor
-        .detach_disk(&id, lun)
+        .detach_disk_matching(&id, lun, query.expected_path.as_deref())
         .await
         .map(Json)
         .map_err(ApiError::map_anyhow)

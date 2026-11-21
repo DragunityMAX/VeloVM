@@ -345,6 +345,28 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                     touch(&ctx.state_dir.join("modify_resource_entered"));
                     std::thread::sleep(Duration::from_millis(350));
                 }
+                let action_tag = match mod_req.r#type {
+                    x if x == vmservice::ModifyType::Add as i32 => "add",
+                    x if x == vmservice::ModifyType::Remove as i32 => "remove",
+                    x if x == vmservice::ModifyType::Update as i32 => "update",
+                    _ => "other",
+                };
+                let log_entry = match &mod_req.resource {
+                    Some(vmservice::modify_resource_request::Resource::ScsiDisk(disk)) => {
+                        format!("{action_tag}:scsi:{}", disk.lun)
+                    }
+                    Some(vmservice::modify_resource_request::Resource::NicConfig(nic)) => {
+                        format!("{action_tag}:nic:{}", nic.nic_id)
+                    }
+                    _ => format!("{action_tag}:other"),
+                };
+                if let Ok(mut f) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(ctx.state_dir.join("modify_resource.log"))
+                {
+                    let _ = writeln!(f, "{log_entry}");
+                }
                 send_ttrpc_ok(&mut stream, stream_id, Vec::new());
             }
             _ => send_ttrpc_ok(&mut stream, stream_id, Vec::new()),
@@ -405,6 +427,11 @@ fn run_fake_openvmm_server(args: &[String]) {
         }
     }
     // Give WaitVM/Quit responders a moment to flush replies before exiting.
+    if mode == "slow_exit_after_quit" {
+        touch(&state_dir.join("exiting_after_quit"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    touch(&state_dir.join("fake_openvmm_exited"));
     std::thread::sleep(Duration::from_millis(40));
 }
 
@@ -1930,6 +1957,271 @@ async fn test_start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm
     let _ = fs::remove_file(&sock_path);
 }
 
+async fn test_hotplug_commit_failure_rolls_back_and_detach_expected_path_enforces_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+    let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let client = test_http_client();
+    let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
+    write_stub_mode(&runtime_dir, "normal", &[]);
+
+    let created = create_stub_vm(&client, &daemon, "HotplugRollback-VM").await;
+    let vm_id = created.config.id;
+    let vm_id_str = vm_id.to_string();
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/{vm_id_str}/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let disk_a = dir.path().join("disk_a.img");
+    let disk_b = dir.path().join("disk_b.img");
+    fs::write(&disk_a, vec![0u8; 65536]).unwrap();
+    fs::write(&disk_b, vec![0u8; 65536]).unwrap();
+
+    // Force post-RPC save_vm() to fail cleanly by turning vm.toml into a directory.
+    let vm_cfg_path = dir.path().join("vms").join(&vm_id_str).join("vm.toml");
+    let saved_cfg_bytes = fs::read(&vm_cfg_path).unwrap();
+    fs::remove_file(&vm_cfg_path).unwrap();
+    fs::create_dir(&vm_cfg_path).unwrap();
+
+    let err = daemon
+        .supervisor
+        .attach_disk(
+            &vm_id_str,
+            AttachDiskPayload {
+                path: disk_a.clone(),
+                lun: Some(2),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("saving") || !err.to_string().is_empty(),
+        "expected attach commit failure, got: {err:#}"
+    );
+
+    // Restore vm.toml so later persists succeed.
+    fs::remove_dir(&vm_cfg_path).unwrap();
+    fs::write(&vm_cfg_path, saved_cfg_bytes).unwrap();
+
+    // Compensating ModifyResource(Remove) must have been sent for SCSI LUN 2.
+    let mod_log = fs::read_to_string(runtime_dir.join("modify_resource.log")).unwrap_or_default();
+    let lines: Vec<&str> = mod_log.lines().collect();
+    assert_eq!(
+        lines.as_slice(),
+        &["add:scsi:2", "remove:scsi:2"],
+        "expected compensating SCSI remove after failed attach commit, got log: {lines:?}"
+    );
+    assert!(
+        daemon
+            .supervisor
+            .get_vm(&vm_id_str)
+            .unwrap()
+            .config
+            .disks
+            .iter()
+            .all(|d| d.lun != 2),
+        "failed attach left LUN 2 in VM config"
+    );
+
+    // Attach disk_b at LUN 2 cleanly, then verify detach with mismatched expected_path conflicts.
+    daemon
+        .supervisor
+        .attach_disk(
+            &vm_id_str,
+            AttachDiskPayload {
+                path: disk_b.clone(),
+                lun: Some(2),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+        .unwrap();
+
+    let base_url = daemon.base_url.clone();
+    let token = daemon.token.clone();
+    let vm_id_for_bad = vm_id_str.clone();
+    let bad_path = disk_a.clone();
+    let bad_err = tokio::task::spawn_blocking(move || {
+        ApiClient::new(&base_url, &token)?.detach_disk_matching(&vm_id_for_bad, 2, Some(&bad_path))
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        format!("{bad_err:#}").contains("changed") || format!("{bad_err:#}").contains("409"),
+        "expected expected_path mismatch conflict, got: {bad_err:#}"
+    );
+    assert!(
+        daemon
+            .supervisor
+            .get_vm(&vm_id_str)
+            .unwrap()
+            .config
+            .disks
+            .iter()
+            .any(|d| d.lun == 2 && d.path == disk_b),
+        "mismatched expected_path still detached disk_b"
+    );
+
+    let base_url = daemon.base_url.clone();
+    let token = daemon.token.clone();
+    let vm_id_for_ok = vm_id_str.clone();
+    let ok_path = disk_b.clone();
+    let detached = tokio::task::spawn_blocking(move || {
+        ApiClient::new(&base_url, &token)?.detach_disk_matching(&vm_id_for_ok, 2, Some(&ok_path))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        detached.config.disks.iter().all(|d| d.lun != 2),
+        "matching expected_path failed to detach LUN 2"
+    );
+
+    daemon.shutdown().await;
+}
+
+async fn test_shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit() {
+    // 1. Bounded listener drain + shutdown cancelling create_disk.
+    let dir1 = tempfile::tempdir().unwrap();
+    let daemon1 = TestDaemonHandle::spawn(dir1.path().to_path_buf())
+        .await
+        .unwrap();
+
+    // Keep an idle HTTP keep-alive connection open so hyper graceful shutdown would block without timeout.
+    let addr_str = daemon1.base_url.strip_prefix("http://").unwrap().to_string();
+    let mut keepalive_conn = std::net::TcpStream::connect(&addr_str).unwrap();
+    keepalive_conn
+        .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let _ = keepalive_conn.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut tmp_buf = [0u8; 256];
+    let _ = keepalive_conn.read(&mut tmp_buf);
+
+    // Concurrent fixed disk create (512 MiB) plus post-shutdown request must cancel cleanly.
+    let big_disk = dir1.path().join("big-cancel.img");
+    let client = test_http_client();
+    let create_url = format!("{}/api/v1/disks/create", daemon1.base_url);
+    let token1 = daemon1.token.clone();
+    let create_fut = client
+        .post(&create_url)
+        .bearer_auth(&token1)
+        .json(&openvmms_core::models::CreateDiskPayload {
+            path: big_disk.clone(),
+            size_bytes: 512 * 1024 * 1024,
+            format: DiskFormat::Raw,
+            fixed: true,
+        })
+        .send();
+    let create_handle = tokio::spawn(create_fut);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let shutdown_start = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), daemon1.shutdown())
+        .await
+        .expect("daemon shutdown hung past 2s listener drain timeout");
+    assert!(
+        shutdown_start.elapsed() < Duration::from_secs(4),
+        "shutdown took too long: {:?}",
+        shutdown_start.elapsed()
+    );
+    let _ = create_handle.await;
+    drop(keepalive_conn);
+
+    // Calling create_disk_cancellable on a Supervisor marked shutting down fails immediately.
+    let sup_down = Supervisor::new(dir1.path(), Some("127.0.0.1:0")).unwrap();
+    sup_down.mark_shutting_down();
+    let err = sup_down
+        .create_disk(openvmms_core::models::CreateDiskPayload {
+            path: dir1.path().join("rejected.img"),
+            size_bytes: 4 * 1024 * 1024,
+            format: DiskFormat::Raw,
+            fixed: false,
+        })
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("shutting down"),
+        "expected shutdown cancellation error, got: {err:#}"
+    );
+
+    // 2. Stopping an adopted VM waits until the adopted process finishes exiting.
+    let dir2 = tempfile::tempdir().unwrap();
+    let fw_path2 = dir2.path().join("MSVM.fd");
+    fs::write(&fw_path2, b"FAKE_UEFI").unwrap();
+
+    let daemon_a = TestDaemonHandle::spawn(dir2.path().to_path_buf())
+        .await
+        .unwrap();
+    let runtime_dir2 = configure_stub_host(&client, &daemon_a, dir2.path(), &fw_path2).await;
+    write_stub_mode(&runtime_dir2, "slow_exit_after_quit", &[]);
+
+    let created = create_stub_vm(&client, &daemon_a, "AdoptStopWait-VM").await;
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/{}/start", daemon_a.base_url, created.config.id))
+            .bearer_auth(&daemon_a.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    daemon_a.shutdown_preserving_vms().await;
+
+    let store2 = RegistryStore::new(dir2.path()).unwrap();
+    let lock_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while store2.is_daemon_locked() {
+        assert!(tokio::time::Instant::now() < lock_deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let daemon_b = TestDaemonHandle::spawn(dir2.path().to_path_buf())
+        .await
+        .unwrap();
+    let stop_start = std::time::Instant::now();
+    let stop_resp = client
+        .post(format!("{}/api/v1/vms/{}/stop", daemon_b.base_url, created.config.id))
+        .bearer_auth(&daemon_b.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stop_resp.status(), 200);
+    let stop_elapsed = stop_start.elapsed();
+    assert!(
+        runtime_dir2.join("fake_openvmm_exited").exists(),
+        "stop returned before adopted openvmm exited"
+    );
+    assert!(
+        stop_elapsed >= Duration::from_millis(400),
+        "stop returned too early ({stop_elapsed:?}) before 500ms adopted exit delay"
+    );
+
+    // Switch stub to fast exit and confirm immediate restart works cleanly after stop returns.
+    write_stub_mode(&runtime_dir2, "normal", &[]);
+    let restart_resp = client
+        .post(format!("{}/api/v1/vms/{}/start", daemon_b.base_url, created.config.id))
+        .bearer_auth(&daemon_b.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restart_resp.status(), 200);
+    daemon_b.shutdown().await;
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--noop-exit") {
@@ -2003,6 +2295,14 @@ fn main() {
         (
             "start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm",
             Box::pin(test_start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm()),
+        ),
+        (
+            "hotplug_commit_failure_rolls_back_and_detach_expected_path_enforces_match",
+            Box::pin(test_hotplug_commit_failure_rolls_back_and_detach_expected_path_enforces_match()),
+        ),
+        (
+            "shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit",
+            Box::pin(test_shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit()),
         ),
     ];
 

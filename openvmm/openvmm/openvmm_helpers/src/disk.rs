@@ -32,13 +32,18 @@ pub struct OpenDiskOptions {
 }
 
 #[cfg(unix)]
-fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
     if file.metadata().is_ok_and(|m| m.is_file()) {
-        match file.try_lock() {
+        let res = if read_only {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match res {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 anyhow::bail!(
-                    "disk image '{}' is already locked for writing by another process",
+                    "disk image '{}' is already locked for writing or in use by another process",
                     path.display()
                 );
             }
@@ -72,18 +77,19 @@ fn open_disk_file_with_lock(
     let _ = direct;
 
     #[cfg(windows)]
-    if !read_only && (create || path.is_file()) {
+    if create || path.is_file() {
         use std::os::windows::fs::OpenOptionsExt;
-        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`).
+        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`)
+        // for both writable and read-only opens.
         opts.share_mode(0x0000_0001);
     }
 
     let file = match opts.open(path) {
         Ok(file) => file,
         #[cfg(windows)]
-        Err(err) if !read_only && err.raw_os_error() == Some(32) => {
+        Err(err) if err.raw_os_error() == Some(32) => {
             anyhow::bail!(
-                "disk image '{}' is already locked for writing by another process",
+                "disk image '{}' is already locked for writing or in use by another process",
                 path.display()
             );
         }
@@ -91,9 +97,7 @@ fn open_disk_file_with_lock(
     };
 
     #[cfg(unix)]
-    if !read_only {
-        acquire_writable_disk_lock(&file, path)?;
-    }
+    acquire_disk_lock(&file, path, read_only)?;
 
     Ok(file)
 }

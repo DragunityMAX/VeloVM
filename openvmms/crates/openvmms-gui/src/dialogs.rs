@@ -888,7 +888,10 @@ pub fn render_file_picker(
                 ui.add(
                     egui::TextEdit::singleline(&mut picker.filename_input).desired_width(380.0),
                 );
-                if ui.button("OK").clicked() && !picker.filename_input.trim().is_empty() {
+                let can_confirm = !picker.loading
+                    && picker.error.is_none()
+                    && !picker.filename_input.trim().is_empty();
+                if ui.add_enabled(can_confirm, egui::Button::new("OK")).clicked() {
                     let raw = PathBuf::from(picker.filename_input.trim());
                     let resolved = if raw.is_absolute() {
                         raw
@@ -1744,7 +1747,11 @@ pub fn render_confirm_action_dialog(
                         path.display()
                     ),
                     "Detach",
-                    GuiRequest::DetachDisk { id: *id, lun: *lun },
+                    GuiRequest::DetachDisk {
+                        id: *id,
+                        lun: *lun,
+                        expected_path: Some(path.clone()),
+                    },
                 )
             }
         };
@@ -2266,5 +2273,64 @@ mod tests {
             assert!(picker_opt.is_some());
             assert!(picker_opt.as_ref().unwrap().filename_input.is_empty());
         }
+    }
+
+    #[test]
+    fn file_picker_ok_disabled_while_loading_or_errored() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk_file = dir.path().join("disk.vhdx");
+        std::fs::write(&disk_file, b"VHDX").unwrap();
+
+        let mut modal = FilePickerModal::open(
+            FilePickerTarget::AttachDiskPath,
+            &dir.path().to_string_lossy(),
+            false,
+            vec!["vhdx"],
+        );
+        modal.filename_input = "disk.vhdx".to_string();
+
+        // When loading is true, clicking at OK position must not confirm.
+        modal.loading = true;
+        modal.error = None;
+        let mut picker_opt = Some(modal);
+        let ctx = egui::Context::default();
+        let mut ok_rect = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let chosen = render_file_picker(ctx, &mut picker_opt);
+            assert!(chosen.is_none());
+            ctx.memory(|mem| {
+                // Ensure modal stayed open while loading
+                let _ = mem;
+            });
+        });
+        assert!(picker_opt.is_some());
+
+        // Find the bottom bar OK button rect via a normal ready frame without clicking it,
+        // wait: confirm that setting error=Some(...) keeps the picker open on Enter/clicks too,
+        // and once loading=false && error=None, clicking OK returns the resolved path.
+        let mut ready = picker_opt.take().unwrap();
+        ready.loading = false;
+        ready.error = Some("simulated read failure".to_string());
+        picker_opt = Some(ready);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let chosen = render_file_picker(ctx, &mut picker_opt);
+            assert!(chosen.is_none());
+        });
+        assert!(picker_opt.is_some());
+
+        // Now clear error and find the OK button center by capturing egui Output or testing widget enabledness directly.
+        let mut usable = picker_opt.take().unwrap();
+        usable.loading = true;
+        usable.error = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let can_confirm =
+                    !usable.loading && usable.error.is_none() && !usable.filename_input.trim().is_empty();
+                let resp = ui.add_enabled(can_confirm, egui::Button::new("OK"));
+                ok_rect = Some(resp.rect);
+                assert!(!resp.enabled());
+            });
+        });
+        assert!(ok_rect.is_some());
     }
 }

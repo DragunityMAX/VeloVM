@@ -121,8 +121,8 @@ pub fn validate_runtime_dir(runtime_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validates a VM name so it is safe for CLI viewer arguments, URL path segments,
-/// and disk file name derivation.
+/// Validates a VM name so it is safe for display, CLI viewer arguments, and URL path segments.
+/// Host disk file name derivation separately sanitizes the name with `sanitize_disk_stem`.
 pub fn validate_vm_name(name: &str) -> anyhow::Result<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1077,6 +1077,7 @@ pub enum DaemonEvent {
         revision: u64,
     },
     HostConfigUpdated,
+    Resync,
     DaemonStopping,
 }
 
