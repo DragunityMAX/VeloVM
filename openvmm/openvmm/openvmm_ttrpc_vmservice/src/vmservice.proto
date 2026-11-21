@@ -770,7 +770,7 @@ message FastDeskConfig {
     // Framebuffer VRAM size in MiB (clamped to 8..=256; defaults to 32 when 0).
     uint32 vram_mb = 1;
     // TCP listen address, e.g. "127.0.0.1:0" or "127.0.0.1:5901".
-    // Used when vsock_port is not set (defaults to "127.0.0.1:5901" if empty).
+    // Used when vsock_port is not set (defaults to "127.0.0.1:0" if empty).
     string listen_addr = 2;
     // Optional AF_HYPERV / AF_VSOCK port instead of TCP.
     optional uint32 vsock_port = 3;

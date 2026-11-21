@@ -38,7 +38,7 @@ pub enum GuiRequest {
     RefreshAll,
     FetchVmDetails { id: Uuid },
     FetchVmLogs { id: Uuid },
-    CreateVm(CreateVmPayload),
+    CreateVm { wizard_id: Uuid, payload: CreateVmPayload },
     UpdateVm { id: Uuid, payload: UpdateVmPayload },
     DeleteVm { id: Uuid, delete_disks: bool },
     StartVm { id: Uuid },
@@ -60,8 +60,14 @@ pub enum GuiRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOpKind {
+    AttachDisk,
+    MountIso,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogKind {
-    NewVmWizard,
+    NewVmWizard(Uuid),
     VmSettings(Uuid),
     HostSettings,
     DeleteVm(Uuid),
@@ -99,6 +105,10 @@ pub enum GuiUpdate {
         kind: DialogKind,
         error: Option<String>,
     },
+    StorageOpFinished {
+        vm_id: Uuid,
+        op: StorageOpKind,
+    },
     StatusMessage(String),
     ErrorMessage(String),
 }
@@ -130,6 +140,8 @@ struct BackendState {
     host_cfg_lock: Mutex<()>,
     logs_in_flight: Mutex<HashSet<Uuid>>,
     details_in_flight: Mutex<HashSet<Uuid>>,
+    attach_disk_in_flight: Mutex<HashSet<Uuid>>,
+    mount_iso_in_flight: Mutex<HashSet<Uuid>>,
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
 }
@@ -147,11 +159,18 @@ fn is_idempotent_read(req: &GuiRequest) -> bool {
 struct InFlightUuidGuard<'a> {
     set: &'a Mutex<HashSet<Uuid>>,
     id: Uuid,
+    notify: Option<(&'a BackendState, StorageOpKind)>,
 }
 
 impl Drop for InFlightUuidGuard<'_> {
     fn drop(&mut self) {
         self.set.lock().unwrap().remove(&self.id);
+        if let Some((backend, op)) = self.notify {
+            backend.emit(GuiUpdate::StorageOpFinished {
+                vm_id: self.id,
+                op,
+            });
+        }
     }
 }
 
@@ -165,7 +184,7 @@ impl Drop for ResetBoolGuard<'_> {
 
 fn request_dialog_kind(req: &GuiRequest) -> Option<DialogKind> {
     match req {
-        GuiRequest::CreateVm(_) => Some(DialogKind::NewVmWizard),
+        GuiRequest::CreateVm { wizard_id, .. } => Some(DialogKind::NewVmWizard(*wizard_id)),
         GuiRequest::UpdateVm { id, .. } => Some(DialogKind::VmSettings(*id)),
         GuiRequest::SaveHostConfig(_) => Some(DialogKind::HostSettings),
         GuiRequest::DeleteVm { id, .. } => Some(DialogKind::DeleteVm(*id)),
@@ -200,12 +219,41 @@ impl BackendHandle {
             host_cfg_lock: Mutex::new(()),
             logs_in_flight: Mutex::new(HashSet::new()),
             details_in_flight: Mutex::new(HashSet::new()),
+            attach_disk_in_flight: Mutex::new(HashSet::new()),
+            mount_iso_in_flight: Mutex::new(HashSet::new()),
             upd_tx,
             repaint_ctx,
         });
 
         Self {
             rt: Some(rt),
+            state,
+            upd_rx,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(repaint_ctx: egui::Context) -> Self {
+        let (upd_tx, upd_rx) = mpsc::channel::<GuiUpdate>();
+        let state = Arc::new(BackendState {
+            data_dir: None,
+            daemon_url: None,
+            client: RwLock::new(None),
+            shared_endpoint: Arc::new(RwLock::new(None)),
+            sse_active: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            connect_in_flight: AtomicBool::new(false),
+            snapshot_seq: std::sync::atomic::AtomicU64::new(0),
+            host_cfg_lock: Mutex::new(()),
+            logs_in_flight: Mutex::new(HashSet::new()),
+            details_in_flight: Mutex::new(HashSet::new()),
+            attach_disk_in_flight: Mutex::new(HashSet::new()),
+            mount_iso_in_flight: Mutex::new(HashSet::new()),
+            upd_tx,
+            repaint_ctx,
+        });
+        Self {
+            rt: None,
             state,
             upd_rx,
         }
@@ -259,6 +307,7 @@ impl BackendState {
                 Some(InFlightUuidGuard {
                     set: &self.logs_in_flight,
                     id: *id,
+                    notify: None,
                 })
             }
             GuiRequest::FetchVmDetails { id } => {
@@ -268,6 +317,27 @@ impl BackendState {
                 Some(InFlightUuidGuard {
                     set: &self.details_in_flight,
                     id: *id,
+                    notify: None,
+                })
+            }
+            GuiRequest::AttachDisk { id, .. } => {
+                if !self.attach_disk_in_flight.lock().unwrap().insert(*id) {
+                    return;
+                }
+                Some(InFlightUuidGuard {
+                    set: &self.attach_disk_in_flight,
+                    id: *id,
+                    notify: Some((self.as_ref(), StorageOpKind::AttachDisk)),
+                })
+            }
+            GuiRequest::MountIso { id, .. } => {
+                if !self.mount_iso_in_flight.lock().unwrap().insert(*id) {
+                    return;
+                }
+                Some(InFlightUuidGuard {
+                    set: &self.mount_iso_in_flight,
+                    id: *id,
+                    notify: Some((self.as_ref(), StorageOpKind::MountIso)),
                 })
             }
             _ => None,
@@ -568,7 +638,7 @@ impl BackendState {
                 self.emit(GuiUpdate::VmLogs { id, content });
                 Ok(())
             }
-            GuiRequest::CreateVm(payload) => {
+            GuiRequest::CreateVm { payload, .. } => {
                 let vm = client.create_vm(&payload)?;
                 self.emit(GuiUpdate::StatusMessage(format!(
                     "Created VM '{}'",
@@ -1296,20 +1366,24 @@ mod tests {
         }
 
         // Requests sent through BackendHandle after external restart must succeed (never "Not connected").
-        backend.send(GuiRequest::CreateVm(CreateVmPayload {
-            name: "Gui-After-Restart".into(),
-            preset: VmPreset::Custom,
-            vcpus: Some(2),
-            memory_mb: Some(512),
-            ..Default::default()
-        }));
+        let wizard_id = Uuid::new_v4();
+        backend.send(GuiRequest::CreateVm {
+            wizard_id,
+            payload: CreateVmPayload {
+                name: "Gui-After-Restart".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            },
+        });
         match recv_until(&backend, Duration::from_secs(5), |u| {
             matches!(
                 u,
                 GuiUpdate::DialogFinished {
-                    kind: DialogKind::NewVmWizard,
+                    kind: DialogKind::NewVmWizard(wid),
                     error: None
-                }
+                } if *wid == wizard_id
             )
         }) {
             GuiUpdate::DialogFinished { error, .. } => assert!(error.is_none()),
@@ -1355,22 +1429,27 @@ mod tests {
             matches!(u, GuiUpdate::DaemonConnected { .. })
         });
 
-        backend.send(GuiRequest::CreateVm(CreateVmPayload {
-            name: "Invalid-Vcpu-VM".into(),
-            preset: VmPreset::Custom,
-            vcpus: Some(0),
-            memory_mb: Some(512),
-            ..Default::default()
-        }));
+        let wizard_id = Uuid::new_v4();
+        backend.send(GuiRequest::CreateVm {
+            wizard_id,
+            payload: CreateVmPayload {
+                name: "Invalid-Vcpu-VM".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(0),
+                memory_mb: Some(512),
+                ..Default::default()
+            },
+        });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut saw_dialog_err = false;
         while std::time::Instant::now() < deadline {
             if let Some(upd) = backend.try_recv()
                 && let GuiUpdate::DialogFinished {
-                    kind: DialogKind::NewVmWizard,
+                    kind: DialogKind::NewVmWizard(wid),
                     error: Some(err),
                 } = upd
+                && wid == wizard_id
             {
                 assert!(err.contains("vcpus"), "{err}");
                 saw_dialog_err = true;
@@ -1931,13 +2010,17 @@ mod tests {
 
         // Send CreateVm while connected to port1; port1 switches daemon.addr to port2 and drops
         // the connection before replying. The GUI must refresh onto port2 without retrying POST.
-        backend.send(GuiRequest::CreateVm(CreateVmPayload {
-            name: "NoRetry-VM".into(),
-            preset: VmPreset::Custom,
-            vcpus: Some(2),
-            memory_mb: Some(512),
-            ..Default::default()
-        }));
+        let wizard_id = Uuid::new_v4();
+        backend.send(GuiRequest::CreateVm {
+            wizard_id,
+            payload: CreateVmPayload {
+                name: "NoRetry-VM".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            },
+        });
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut saw_url2 = false;
         let mut saw_create_err = false;
@@ -1948,9 +2031,9 @@ mod tests {
                         saw_url2 = true;
                     }
                     GuiUpdate::DialogFinished {
-                        kind: DialogKind::NewVmWizard,
+                        kind: DialogKind::NewVmWizard(wid),
                         error: Some(_),
-                    } => {
+                    } if wid == wizard_id => {
                         saw_create_err = true;
                     }
                     _ => {}

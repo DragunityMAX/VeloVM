@@ -93,11 +93,99 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 pub fn default_runtime_dir(data_dir: &Path) -> PathBuf {
-    #[cfg(unix)]
-    if let Some(runtime) = dirs::runtime_dir() {
-        return runtime.join("openvmms");
-    }
     data_dir.join("run")
+}
+
+/// Validates that `runtime_dir` can host OpenVMM `AF_UNIX` ttrpc sockets and
+/// can be passed cleanly on `--rpc path=...,transport=ttrpc`.
+pub fn validate_runtime_dir(runtime_dir: &Path) -> anyhow::Result<()> {
+    if runtime_dir.as_os_str().is_empty() {
+        bail!("runtime_dir cannot be empty");
+    }
+    if runtime_dir.to_string_lossy().contains(',') {
+        bail!(
+            "runtime_dir '{}' cannot contain a comma (',')",
+            runtime_dir.display()
+        );
+    }
+    let sample_sock = runtime_dir.join("00000000-0000-0000-0000-000000000000.sock");
+    let sample_len = sample_sock.to_string_lossy().len();
+    if sample_len > 103 || socket2::SockAddr::unix(&sample_sock).is_err() {
+        bail!(
+            "runtime_dir '{}' is too long for AF_UNIX VM sockets (sample path '{}' is {} bytes, max 103)",
+            runtime_dir.display(),
+            sample_sock.display(),
+            sample_len
+        );
+    }
+    Ok(())
+}
+
+/// Validates a VM name so it is safe for CLI viewer arguments, URL path segments,
+/// and disk file name derivation.
+pub fn validate_vm_name(name: &str) -> anyhow::Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("VM name cannot be empty");
+    }
+    if trimmed == "." || trimmed == ".." {
+        bail!("VM name cannot be '.' or '..'");
+    }
+    if trimmed.starts_with('-') {
+        bail!("VM name cannot start with '-'");
+    }
+    if trimmed.len() > 128 {
+        bail!("VM name cannot exceed 128 characters");
+    }
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\' | '\0'))
+    {
+        bail!("VM name cannot contain path separators or control characters");
+    }
+    Ok(())
+}
+
+/// Normalizes a filesystem path for duplicate-attachment checks (resolving symlinks
+/// when the path exists and folding ASCII case on Windows).
+pub fn normalize_path_key(path: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        PathBuf::from(resolved.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        resolved
+    }
+}
+
+/// Validates a unicast 6-octet IEEE 802 MAC address (`-` or `:` separated).
+pub fn validate_mac_address(mac: &str) -> anyhow::Result<()> {
+    let trimmed = mac.trim();
+    let sep = if trimmed.contains('-') && !trimmed.contains(':') {
+        '-'
+    } else if trimmed.contains(':') && !trimmed.contains('-') {
+        ':'
+    } else {
+        bail!("invalid MAC address '{mac}' (expected 6 hex octets separated by '-' or ':')");
+    };
+    let parts: Vec<&str> = trimmed.split(sep).collect();
+    if parts.len() != 6 || parts.iter().any(|p| p.len() != 2) {
+        bail!("invalid MAC address '{mac}' (expected 6 hex octets)");
+    }
+    let mut bytes = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        bytes[i] = u8::from_str_radix(part, 16)
+            .with_context(|| format!("invalid hex octet '{part}' in MAC address '{mac}'"))?;
+    }
+    if bytes == [0; 6] || bytes == [0xff; 6] {
+        bail!("invalid MAC address '{mac}': cannot be all-zeros or broadcast");
+    }
+    if (bytes[0] & 0x01) != 0 {
+        bail!("invalid MAC address '{mac}': must be a unicast MAC address");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -133,8 +221,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
         &[
             &format!("openvmm/target/release/{openvmm_name}"),
             &format!("openvmm/target/debug/{openvmm_name}"),
-            &format!("../openvmm/target/release/{openvmm_name}"),
-            &format!("../openvmm/target/debug/{openvmm_name}"),
         ],
     );
 
@@ -145,8 +231,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
         &[
             &format!("fastdesk-viewer/target/release/{viewer_name}"),
             &format!("fastdesk-viewer/target/debug/{viewer_name}"),
-            &format!("../fastdesk-viewer/target/release/{viewer_name}"),
-            &format!("../fastdesk-viewer/target/debug/{viewer_name}"),
         ],
     );
 
@@ -157,8 +241,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
         &[
             &format!("openvmm/target/release/{img_name}"),
             &format!("openvmm/target/debug/{img_name}"),
-            &format!("../openvmm/target/release/{img_name}"),
-            &format!("../openvmm/target/debug/{img_name}"),
         ],
     );
 
@@ -172,7 +254,6 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
         &[
             "firmware/MSVM.fd",
             "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
-            "../openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
         ],
     );
 
@@ -182,6 +263,29 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
         openvmm_img_bin,
         uefi_firmware_path,
     }
+}
+
+/// Returns the repository root only when `exe_dir` resides inside a Cargo `target`
+/// output directory (`target/<profile>`, `target/<profile>/deps`, or
+/// `target/<triple>/<profile>[/deps]`) whose workspace root contains `Cargo.toml`.
+fn cargo_workspace_repo_root(exe_dir: &Path) -> Option<PathBuf> {
+    let mut cur = exe_dir.parent();
+    for _ in 0..3 {
+        let dir = cur?;
+        if dir.file_name().is_some_and(|n| n == "target")
+            && let Some(ws_root) = dir.parent()
+            && ws_root.join("Cargo.toml").is_file()
+        {
+            if ws_root.file_name().is_some_and(|n| n == "openvmms")
+                && let Some(repo_root) = ws_root.parent()
+            {
+                return Some(repo_root.to_path_buf());
+            }
+            return Some(ws_root.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
 }
 
 fn resolve_binary_candidate(
@@ -200,17 +304,14 @@ fn resolve_binary_candidate(
         if candidate.is_file() {
             return Some(candidate);
         }
-        // Walk up a few directories in case running from target/debug, target/debug/deps, or target/release
-        let mut cur = Some(dir);
-        for _ in 0..5 {
-            if let Some(parent) = cur {
+        if let Some(root) = cargo_workspace_repo_root(dir) {
+            for base in [root.as_path(), root.join("openvmms").as_path()] {
                 for rel in workspace_rel {
-                    let c = parent.join(rel);
+                    let c = base.join(rel);
                     if c.is_file() {
                         return Some(c);
                     }
                 }
-                cur = parent.parent();
             }
         }
     }
@@ -235,16 +336,18 @@ fn resolve_file_candidate(
         return Some(p.to_path_buf());
     }
     if let Some(dir) = exe_dir {
-        let mut cur = Some(dir);
-        for _ in 0..4 {
-            if let Some(parent) = cur {
+        let bundled = dir.join("firmware/MSVM.fd");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+        if let Some(root) = cargo_workspace_repo_root(dir) {
+            for base in [root.as_path(), root.join("openvmms").as_path()] {
                 for rel in rel_paths {
-                    let c = parent.join(rel);
+                    let c = base.join(rel);
                     if c.is_file() {
                         return Some(c);
                     }
                 }
-                cur = parent.parent();
             }
         }
     }
@@ -395,9 +498,17 @@ impl std::fmt::Display for PortForward {
 }
 
 impl PortForward {
+    pub fn normalize(&mut self) {
+        let trimmed = self.host_addr.trim();
+        self.host_addr = if trimmed.is_empty() {
+            default_host_bind()
+        } else {
+            trimmed.to_string()
+        };
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         self.host_addr
-            .trim()
             .parse::<std::net::IpAddr>()
             .with_context(|| format!("invalid port forward host address '{}'", self.host_addr))?;
         if self.host_port == 0 {
@@ -638,8 +749,9 @@ impl VmConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.name.trim().is_empty() {
-            bail!("VM name cannot be empty");
+        validate_vm_name(&self.name)?;
+        if self.name != self.name.trim() {
+            bail!("VM name cannot have leading or trailing whitespace");
         }
         if self.vcpus == 0 || self.vcpus > 256 {
             bail!("vcpus must be between 1 and 256");
@@ -650,8 +762,16 @@ impl VmConfig {
         if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
             bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
         }
+        if !self.fastdesk.listen_addr.trim().is_empty() {
+            parse_loopback_listen_addr(&self.fastdesk.listen_addr)
+                .context("invalid fastdesk.listen_addr")?;
+        }
         let mut seen_luns = std::collections::HashSet::new();
+        let mut seen_disk_paths = std::collections::HashSet::new();
         for disk in &self.disks {
+            if disk.lun > 255 {
+                bail!("SCSI LUN {} is out of range (must be between 0 and 255)", disk.lun);
+            }
             if disk.path.as_os_str().is_empty() {
                 bail!("disk path at SCSI LUN {} cannot be empty", disk.lun);
             }
@@ -667,16 +787,59 @@ impl VmConfig {
             if !seen_luns.insert(disk.lun) {
                 bail!("duplicate SCSI LUN {}", disk.lun);
             }
+            if !seen_disk_paths.insert(normalize_path_key(&disk.path)) {
+                bail!(
+                    "disk '{}' is attached multiple times to VM '{}'",
+                    disk.path.display(),
+                    self.name
+                );
+            }
         }
         for nic in &self.nics {
-            if let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend {
-                for pf in port_forwards {
-                    pf.validate()?;
+            validate_mac_address(&nic.mac_address)?;
+            match &nic.backend {
+                NicBackendConfig::Consomme { port_forwards, .. } => {
+                    for pf in port_forwards {
+                        pf.validate()?;
+                    }
                 }
-            }
-            #[cfg(target_os = "linux")]
-            if let NicBackendConfig::Tap { name } = &nic.backend {
-                validate_tap_sysfs_dir(name, &Path::new("/sys/class/net").join(name))?;
+                NicBackendConfig::VmSwitch { switch_id, .. } => {
+                    #[cfg(not(windows))]
+                    {
+                        let _ = switch_id;
+                        bail!("Windows Hyper-V VMSwitch NIC backend is only supported on Windows");
+                    }
+                    #[cfg(windows)]
+                    {
+                        let trimmed = switch_id.trim();
+                        if !trimmed.eq_ignore_ascii_case("default")
+                            && Uuid::parse_str(trimmed).is_err()
+                        {
+                            bail!(
+                                "invalid VMSwitch id '{switch_id}' (expected 'default' or a switch GUID)"
+                            );
+                        }
+                    }
+                }
+                NicBackendConfig::Tap { name } => {
+                    #[cfg(windows)]
+                    {
+                        let _ = name;
+                        bail!("Linux TAP NIC backend is only supported on Linux");
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let trimmed = name.trim();
+                        if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\0') {
+                            bail!("invalid TAP interface name '{name}'");
+                        }
+                        #[cfg(target_os = "linux")]
+                        validate_tap_sysfs_dir(
+                            trimmed,
+                            &Path::new("/sys/class/net").join(trimmed),
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
@@ -1199,5 +1362,112 @@ mod tests {
         std::fs::create_dir_all(&tap_dir).unwrap();
         std::fs::write(tap_dir.join("tun_flags"), "0x1002\n").unwrap();
         validate_tap_sysfs_dir("tap0", &tap_dir).unwrap();
+    }
+
+    #[test]
+    fn default_runtime_dir_lives_under_data_dir() {
+        let data_dir = Path::new("/tmp/openvmms-data");
+        assert_eq!(default_runtime_dir(data_dir), data_dir.join("run"));
+    }
+
+    #[test]
+    fn validates_vm_names_runtime_dir_port_forwards_and_configs() {
+        for valid in ["Win11-Dev", "ubuntu_24.04", "vm 1"] {
+            validate_vm_name(valid).unwrap();
+        }
+        let long_name = "a".repeat(129);
+        for bad in ["", "   ", ".", "..", "-flag", "a/b", "a\\b", "a\nb", &long_name] {
+            assert!(validate_vm_name(bad).is_err(), "expected '{bad}' to be rejected");
+        }
+
+        assert!(validate_runtime_dir(Path::new("/tmp/a,b/run")).is_err());
+        assert!(validate_runtime_dir(Path::new("")).is_err());
+        let too_long = PathBuf::from(format!("/tmp/{}", "x".repeat(80)));
+        assert!(validate_runtime_dir(&too_long).is_err());
+        validate_runtime_dir(Path::new("/tmp/ov-run")).unwrap();
+
+        let mut pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: " 127.0.0.1 ".into(),
+            host_port: 3389,
+            guest_port: 3389,
+        };
+        assert!(pf.validate().is_err());
+        pf.normalize();
+        assert_eq!(pf.host_addr, "127.0.0.1");
+        pf.validate().unwrap();
+
+        let mut cfg = VmConfig::from_preset("ValidVM", VmPreset::Custom, Path::new("/tmp/vm"));
+        cfg.disks.push(DiskAttachment {
+            lun: 256,
+            kind: DiskKind::HardDisk,
+            path: PathBuf::from("/tmp/d.img"),
+            read_only: false,
+            format: DiskFormat::Raw,
+        });
+        assert!(cfg.validate().is_err());
+
+        cfg.disks[0].lun = 0;
+        cfg.disks.push(DiskAttachment {
+            lun: 1,
+            kind: DiskKind::HardDisk,
+            path: PathBuf::from("/tmp/d.img"),
+            read_only: false,
+            format: DiskFormat::Raw,
+        });
+        assert!(cfg.validate().is_err());
+        cfg.disks.pop();
+
+        cfg.nics[0].mac_address = "01-15-5D-01-02-03".into();
+        assert!(cfg.validate().is_err());
+        cfg.nics[0].mac_address = generate_hyperv_mac();
+
+        #[cfg(not(windows))]
+        {
+            cfg.nics.push(NicAttachment {
+                id: Uuid::new_v4(),
+                name: "WinSwitch".into(),
+                mac_address: generate_hyperv_mac(),
+                backend: NicBackendConfig::VmSwitch {
+                    switch_id: "default".into(),
+                    switch_name: None,
+                },
+            });
+            assert!(cfg.validate().is_err());
+            cfg.nics.pop();
+        }
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn installed_binary_discovery_does_not_walk_arbitrary_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_openvmm = dir.path().join("openvmm/target/release/openvmm");
+        std::fs::create_dir_all(fake_openvmm.parent().unwrap()).unwrap();
+        std::fs::write(&fake_openvmm, b"binary").unwrap();
+
+        let installed_bin_dir = dir.path().join("a/b/c/installed/bin");
+        std::fs::create_dir_all(&installed_bin_dir).unwrap();
+        assert!(cargo_workspace_repo_root(&installed_bin_dir).is_none());
+        assert_eq!(
+            resolve_binary_candidate(
+                None,
+                Some(&installed_bin_dir),
+                "definitely-missing-openvmm-bin",
+                &["openvmm/target/release/openvmm"],
+            ),
+            None
+        );
+
+        let cargo_ws = dir.path().join("openvmms");
+        std::fs::create_dir_all(cargo_ws.join("target/debug/deps")).unwrap();
+        std::fs::write(cargo_ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let found = resolve_binary_candidate(
+            None,
+            Some(&cargo_ws.join("target/debug/deps")),
+            "openvmm",
+            &["openvmm/target/release/openvmm"],
+        );
+        assert_eq!(found, Some(fake_openvmm));
     }
 }

@@ -166,6 +166,29 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
 
         match req.method.as_str() {
             "CreateVM" => {
+                let Ok(create_req) = vmservice::CreateVmRequest::decode(req.payload.as_slice())
+                else {
+                    send_ttrpc_err(&mut stream, stream_id, 3, "invalid CreateVmRequest bytes");
+                    return;
+                };
+                let valid = !create_req.log_id.trim().is_empty()
+                    && create_req.config.as_ref().is_some_and(|c| {
+                        c.memory_config.as_ref().is_some_and(|m| m.memory_mb >= 128)
+                            && c.processor_config
+                                .as_ref()
+                                .is_some_and(|p| p.processor_count >= 1)
+                            && matches!(
+                                c.boot_config,
+                                Some(vmservice::vm_config::BootConfig::Uefi(_))
+                            )
+                            && c.devices_config
+                                .as_ref()
+                                .is_some_and(|d| d.enable_scsi_controller)
+                    });
+                if !valid {
+                    send_ttrpc_err(&mut stream, stream_id, 3, "incomplete CreateVmRequest fields");
+                    return;
+                }
                 if ctx.mode == "race_restart" && ctx.launch == 1 {
                     touch(&ctx.state_dir.join("first_create_entered"));
                     std::thread::sleep(Duration::from_millis(700));
@@ -286,6 +309,38 @@ fn handle_rpc_conn(mut stream: Socket, ctx: Arc<StubCtx>) {
                 send_ttrpc_ok(&mut stream, stream_id, Vec::new());
             }
             "ModifyResource" => {
+                let Ok(mod_req) =
+                    vmservice::ModifyResourceRequest::decode(req.payload.as_slice())
+                else {
+                    send_ttrpc_err(&mut stream, stream_id, 3, "invalid ModifyResourceRequest bytes");
+                    return;
+                };
+                let valid = matches!(
+                    mod_req.r#type,
+                    x if x == vmservice::ModifyType::Add as i32
+                        || x == vmservice::ModifyType::Remove as i32
+                        || x == vmservice::ModifyType::Update as i32
+                )
+                    && match &mod_req.resource {
+                        Some(vmservice::modify_resource_request::Resource::ScsiDisk(disk)) => {
+                            !disk.host_path.is_empty()
+                                || mod_req.r#type == vmservice::ModifyType::Remove as i32
+                        }
+                        Some(vmservice::modify_resource_request::Resource::NicConfig(nic)) => {
+                            !nic.nic_id.is_empty()
+                        }
+                        Some(_) => true,
+                        None => false,
+                    };
+                if !valid {
+                    send_ttrpc_err(
+                        &mut stream,
+                        stream_id,
+                        3,
+                        "incomplete ModifyResourceRequest payload",
+                    );
+                    return;
+                }
                 if ctx.mode == "slow_modify_resource" {
                     touch(&ctx.state_dir.join("modify_resource_entered"));
                     std::thread::sleep(Duration::from_millis(350));
@@ -331,7 +386,8 @@ fn run_fake_openvmm_server(args: &[String]) {
         wait_in_flight: Arc::new(AtomicBool::new(false)),
     });
 
-    while !stop_evt.load(Ordering::Acquire) {
+    let max_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !stop_evt.load(Ordering::Acquire) && std::time::Instant::now() < max_deadline {
         if state_dir.join("exit_now").exists() {
             stop_evt.store(true, Ordering::Release);
             break;
@@ -1498,7 +1554,16 @@ async fn test_slow_reclaim_start_does_not_clobber_replacement_start() {
     leftover_listener.bind(&SockAddr::unix(&sock_path).unwrap()).unwrap();
     leftover_listener.listen(16).unwrap();
     let _ = leftover_listener.set_nonblocking(true);
-    fs::write(&pid_path, "999999").unwrap();
+    let mut dead_child = Command::new(std::env::current_exe().unwrap())
+        .arg("--noop-exit")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let dead_pid = dead_child.id();
+    let _ = dead_child.wait();
+    fs::write(&pid_path, format!("{dead_pid}\n1")).unwrap();
     fs::write(&shm_path, b"STALE_SHM").unwrap();
 
     let teardown_entered = Arc::new(AtomicBool::new(false));
@@ -1506,7 +1571,10 @@ async fn test_slow_reclaim_start_does_not_clobber_replacement_start() {
     let teardown_entered_srv = Arc::clone(&teardown_entered);
     let stop_leftover_srv = Arc::clone(&stop_leftover);
     let leftover_srv = std::thread::spawn(move || {
-        while !stop_leftover_srv.load(Ordering::Acquire) {
+        let srv_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !stop_leftover_srv.load(Ordering::Acquire)
+            && std::time::Instant::now() < srv_deadline
+        {
             match leftover_listener.accept() {
                 Ok((mut conn, _)) => {
                     let _ = conn.set_nonblocking(false);
@@ -1613,8 +1681,8 @@ async fn test_slow_reclaim_start_does_not_clobber_replacement_start() {
     assert!(pid_path.exists(), "replacement .pid was deleted by stale start");
     assert!(shm_path.exists(), "replacement .shm was deleted by stale start");
     assert_eq!(
-        fs::read_to_string(&pid_path).unwrap().trim(),
-        pid2.to_string(),
+        openvmms_core::process::read_pid_file(&pid_path).map(|(p, _)| p),
+        Some(pid2),
         ".pid no longer matches replacement VM"
     );
     assert!(
@@ -1864,6 +1932,9 @@ async fn test_start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--noop-exit") {
+        return;
+    }
     if args.iter().any(|a| a == "--rpc") {
         run_fake_openvmm_server(&args);
         return;
@@ -1943,7 +2014,11 @@ fn main() {
             continue;
         }
         eprintln!("running lifecycle_races::{name} ...");
-        rt.block_on(fut);
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), fut)
+                .await
+                .unwrap_or_else(|_| panic!("lifecycle_races::{name} timed out after 30s"));
+        });
         eprintln!("  ok");
         ran += 1;
     }

@@ -29,9 +29,11 @@ use mesh::CancelContext;
 use mesh::MeshPayload;
 use mesh::local_node::Port;
 use pal_async::driver::Driver;
+#[cfg(target_os = "linux")]
 use pal_async::interest::PollEvents;
 use pal_async::socket::AsSockRef;
 use pal_async::socket::Listener;
+#[cfg(target_os = "linux")]
 use pal_async::socket::PollReadyExt;
 use pal_async::socket::PolledSocket;
 use std::collections::HashMap;
@@ -225,10 +227,10 @@ impl Server {
             }
             // A clean read EOF can be either a half-close (`shutdown(SHUT_WR)`),
             // where the peer still expects replies, or a full socket close.
-            // On Unix, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
+            // On Linux, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
             // so half-closed clients still receive in-flight replies while
             // full disconnects cancel pending RPCs immediately.
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
                 futures::select! {
                     _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
@@ -238,7 +240,7 @@ impl Server {
                     _ = send_done_rx.fuse() => {}
                 }
             }
-            #[cfg(not(unix))]
+            #[cfg(not(target_os = "linux"))]
             {
                 drop(send_done_rx);
                 peer_closed.store(true, std::sync::atomic::Ordering::Release);
@@ -791,7 +793,12 @@ mod tests {
             let (mut ctx, req) = recv.next().await.unwrap();
             match req {
                 items::Example::Method1(_, resp) => {
-                    ctx.cancelled().await;
+                    let mut timeout_ctx =
+                        mesh::CancelContext::new().with_timeout(std::time::Duration::from_secs(5));
+                    timeout_ctx
+                        .until_cancelled(ctx.cancelled())
+                        .await
+                        .expect("timed out waiting for client disconnect to cancel pending RPC");
                     resp.send(Err(status_from_err(
                         Code::Cancelled,
                         anyhow::anyhow!("client disconnected"),
@@ -806,7 +813,7 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn client_half_close_receives_in_flight_reply() {
         use crate::message::MESSAGE_TYPE_RESPONSE;
@@ -844,7 +851,9 @@ mod tests {
                 sock.get().shutdown(std::net::Shutdown::Write).unwrap();
                 // Wait until the server has observed the request and delayed slightly
                 // before sending the response back to the half-closed client.
-                req_seen_rx.recv().unwrap();
+                req_seen_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
                 let msg = read_message(&mut sock).await.unwrap().unwrap();
                 assert_eq!(msg.stream_id, 1);
                 assert_eq!(msg.message_type, MESSAGE_TYPE_RESPONSE);
@@ -888,7 +897,7 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn client_half_close_then_full_close_cancels_pending_rpc_context() {
         let (c, s) = unix_socket::UnixStream::pair().unwrap();
@@ -921,7 +930,9 @@ mod tests {
                 .await
                 .unwrap();
                 sock.get().shutdown(std::net::Shutdown::Write).unwrap();
-                req_seen_rx.recv().unwrap();
+                req_seen_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
                 // Full close after half-close must raise POLLHUP and cancel the RPC.
                 drop(sock);
             })
@@ -932,7 +943,12 @@ mod tests {
             match req {
                 items::Example::Method1(_, resp) => {
                     req_seen_tx.send(()).unwrap();
-                    ctx.cancelled().await;
+                    let mut timeout_ctx =
+                        mesh::CancelContext::new().with_timeout(std::time::Duration::from_secs(5));
+                    timeout_ctx
+                        .until_cancelled(ctx.cancelled())
+                        .await
+                        .expect("timed out waiting for full close to cancel pending RPC");
                     resp.send(Err(status_from_err(
                         Code::Cancelled,
                         anyhow::anyhow!("client closed socket"),

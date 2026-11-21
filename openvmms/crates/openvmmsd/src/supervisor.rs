@@ -91,6 +91,7 @@ struct ManagedVm {
     config: VmConfig,
     runtime: VmRuntimeState,
     child: Option<Child>,
+    adopted_proc: Option<Arc<openvmms_core::process::AdoptedProcess>>,
     monitor_cancel: Option<watch::Sender<bool>>,
     monitor_handle: Option<tokio::task::JoinHandle<()>>,
     generation: u64,
@@ -192,6 +193,7 @@ impl Supervisor {
                     config: cfg,
                     runtime: VmRuntimeState::default(),
                     child: None,
+                    adopted_proc: None,
                     monitor_cancel: None,
                     monitor_handle: None,
                     generation: 0,
@@ -240,6 +242,7 @@ impl Supervisor {
     /// Must only be called after the daemon has validated config and bound its HTTP listener.
     pub fn adopt_running_vms(self: &Arc<Self>) {
         let runtime_dir = self.host_config().runtime_dir;
+        let expected_bin = self.resolved_paths().openvmm_bin;
         let mut adopted_vms = Vec::new();
         {
             let mut guard = self.vms.write().unwrap();
@@ -254,21 +257,23 @@ impl Supervisor {
                 }
                 let pid_path = sock_path.with_extension("pid");
                 let shm_candidate = runtime_dir.join(format!("vram-{id}.shm"));
-                let saved_pid = fs::read_to_string(&pid_path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok());
                 let ttrpc_client = TtrpcClient::new(&sock_path);
                 match ttrpc_client.properties_vm_blocking(Duration::from_secs(2)) {
                     Ok(props)
                         if props.state == vmservice::VmState::Running as i32
                             || props.state == vmservice::VmState::Paused as i32 =>
                     {
+                        let verified = openvmms_core::process::open_verified_pid(
+                            &pid_path,
+                            expected_bin.as_deref(),
+                        );
                         vm.runtime.status = if props.state == vmservice::VmState::Paused as i32 {
                             VmStatus::Paused
                         } else {
                             VmStatus::Running
                         };
-                        vm.runtime.pid = saved_pid;
+                        vm.runtime.pid = verified.as_ref().map(|p| p.pid());
+                        vm.adopted_proc = verified;
                         vm.runtime.rpc_socket_path = Some(sock_path.clone());
                         vm.runtime.fastdesk_endpoint = props
                             .fastdesk_listen_addr
@@ -302,8 +307,13 @@ impl Supervisor {
                                     .then(|| shm_candidate.to_string_lossy().into_owned()),
                             );
                         } else {
+                            let verified = openvmms_core::process::open_verified_pid(
+                                &pid_path,
+                                expected_bin.as_deref(),
+                            );
                             vm.runtime.status = VmStatus::Running;
-                            vm.runtime.pid = saved_pid;
+                            vm.runtime.pid = verified.as_ref().map(|p| p.pid());
+                            vm.adopted_proc = verified;
                             vm.runtime.rpc_socket_path = Some(sock_path.clone());
                             vm.runtime.shm_path = shm_candidate
                                 .exists()
@@ -524,6 +534,8 @@ impl Supervisor {
                 "cannot change data_dir over the API; restart openvmmsd with --data-dir instead",
             ));
         }
+        openvmms_core::models::validate_runtime_dir(&new_cfg.runtime_dir)
+            .map_err(|e| err_bad_request(format!("{e:#}")))?;
         struct ResetRuntimeDirChanging<'a>(&'a AtomicBool);
         impl Drop for ResetRuntimeDirChanging<'_> {
             fn drop(&mut self) {
@@ -704,9 +716,8 @@ impl Supervisor {
         cancelled: &AtomicBool,
     ) -> anyhow::Result<VmSummary> {
         let trimmed_name = payload.name.trim().to_string();
-        if trimmed_name.is_empty() {
-            return Err(err_bad_request("VM name cannot be empty"));
-        }
+        openvmms_core::models::validate_vm_name(&trimmed_name)
+            .map_err(|e| err_bad_request(format!("{e:#}")))?;
 
         {
             let guard = self.vms.read().unwrap();
@@ -817,7 +828,35 @@ impl Supervisor {
             });
         }
 
+        for nic in &mut cfg.nics {
+            if let NicBackendConfig::Consomme { port_forwards, .. } = &mut nic.backend {
+                for pf in port_forwards {
+                    pf.normalize();
+                }
+            }
+        }
+
         cfg.validate().map_err(|e| err_bad_request(format!("{e:#}")))?;
+        for d in &cfg.disks {
+            ensure_disk_format_safe(&d.path, d.format, false)?;
+        }
+        {
+            let guard = self.vms.read().unwrap();
+            if guard
+                .values()
+                .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
+            {
+                return Err(err_conflict(format!(
+                    "a VM named '{trimmed_name}' already exists"
+                )));
+            }
+            ensure_disks_not_conflicting(&guard, None, &cfg.disks)?;
+        }
+
+        if let Some(ref disk_req) = pending_disk_req {
+            disk::validate_disk_path_for_format(&disk_req.path, disk_req.format)
+                .map_err(|e| err_bad_request(format!("{e:#}")))?;
+        }
 
         let created_disk_path = if let Some(disk_req) = pending_disk_req {
             let info = disk::create_disk_cancellable(
@@ -844,6 +883,7 @@ impl Supervisor {
                     "a VM named '{trimmed_name}' already exists"
                 )));
             }
+            ensure_disks_not_conflicting(&guard, None, &cfg.disks)?;
             self.store.save_vm(&cfg)?;
 
             let managed = ManagedVm {
@@ -853,6 +893,7 @@ impl Supervisor {
                     ..Default::default()
                 },
                 child: None,
+                adopted_proc: None,
                 monitor_cancel: None,
                 monitor_handle: None,
                 generation: 0,
@@ -901,9 +942,8 @@ impl Supervisor {
 
         if let Some(new_name) = &payload.name {
             let trimmed = new_name.trim();
-            if trimmed.is_empty() {
-                return Err(err_bad_request("VM name cannot be empty"));
-            }
+            openvmms_core::models::validate_vm_name(trimmed)
+                .map_err(|e| err_bad_request(format!("{e:#}")))?;
             if guard
                 .values()
                 .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(trimmed))
@@ -914,8 +954,9 @@ impl Supervisor {
             }
         }
 
+        let disks_updated = payload.disks.is_some();
         let vm = guard
-            .get_mut(&id)
+            .get(&id)
             .ok_or_else(|| err_not_found("VM not found"))?;
         if hardware_change && !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
             return Err(err_conflict(format!(
@@ -961,12 +1002,28 @@ impl Supervisor {
         if let Some(nics) = payload.nics {
             updated.nics = nics;
         }
+        for nic in &mut updated.nics {
+            if let NicBackendConfig::Consomme { port_forwards, .. } = &mut nic.backend {
+                for pf in port_forwards {
+                    pf.normalize();
+                }
+            }
+        }
         updated.updated_at = Utc::now();
 
         updated
             .validate()
             .map_err(|e| err_bad_request(format!("{e:#}")))?;
+        if disks_updated {
+            for d in &updated.disks {
+                ensure_disk_format_safe(&d.path, d.format, true)?;
+            }
+            ensure_disks_not_conflicting(&guard, Some(id), &updated.disks)?;
+        }
         self.store.save_vm(&updated)?;
+        let vm = guard
+            .get_mut(&id)
+            .ok_or_else(|| err_not_found("VM not found"))?;
         vm.config = updated;
         vm.runtime.revision = self.next_revision();
         let summary = vm.summary();
@@ -991,19 +1048,18 @@ impl Supervisor {
                     vm.config.name, vm.runtime.status
                 )));
             }
-            let vm = guard.remove(&id).unwrap();
-            let revision = self.next_revision();
             let disks = if delete_disks {
                 let referenced_by_others: HashSet<PathBuf> = guard
                     .values()
+                    .filter(|other| other.config.id != id)
                     .flat_map(|other| other.config.disks.iter())
-                    .map(|d| normalize_path_key(&d.path))
+                    .map(|d| openvmms_core::models::normalize_path_key(&d.path))
                     .collect();
                 let mut seen = HashSet::new();
                 let mut candidates = Vec::new();
                 for d in &vm.config.disks {
                     if d.kind == DiskKind::HardDisk && !d.read_only {
-                        let key = normalize_path_key(&d.path);
+                        let key = openvmms_core::models::normalize_path_key(&d.path);
                         if referenced_by_others.contains(&key) {
                             warn!(
                                 vm_id = %id,
@@ -1019,7 +1075,12 @@ impl Supervisor {
             } else {
                 Vec::new()
             };
-            (disks, revision)
+
+            // Remove persisted VM metadata first so a store failure does not
+            // orphan an active in-memory VM or delete its disk files.
+            self.store.delete_vm_dir(id)?;
+            guard.remove(&id);
+            (disks, self.next_revision())
         };
 
         for path in disks_to_delete {
@@ -1029,7 +1090,6 @@ impl Supervisor {
                 warn!(path = %path.display(), error = %err, "failed to delete VM disk");
             }
         }
-        self.store.delete_vm_dir(id)?;
         self.emit(DaemonEvent::VmDeleted { id, revision });
         Ok(())
     }
@@ -1188,7 +1248,11 @@ impl Supervisor {
                     d.path.display()
                 )));
             }
+            ensure_disk_format_safe(&d.path, d.format, d.format != DiskFormat::Raw)?;
         }
+        ensure_disks_not_conflicting(&self.vms.read().unwrap(), Some(id), &cfg.disks)?;
+        openvmms_core::models::validate_runtime_dir(&host_cfg.runtime_dir)
+            .map_err(|e| err_bad_request(format!("{e:#}")))?;
 
         if *cancel_rx.borrow()
             || self.is_shutting_down()
@@ -1219,10 +1283,16 @@ impl Supervisor {
         if sock_path.exists() {
             let sock_check = sock_path.clone();
             let pid_check = pid_path.clone();
+            let expected_bin = openvmm_bin.clone();
             let reclaim_cancel = Arc::new(AtomicBool::new(false));
             let reclaim_cancel_worker = Arc::clone(&reclaim_cancel);
             let mut reclaim_task = tokio::task::spawn_blocking(move || {
-                reclaim_or_verify_inactive_socket(&sock_check, &pid_check, &reclaim_cancel_worker)
+                reclaim_or_verify_inactive_socket(
+                    &sock_check,
+                    &pid_check,
+                    Some(&expected_bin),
+                    &reclaim_cancel_worker,
+                )
             });
             let mut shutdown_rx = self.subscribe_shutdown();
             let still_alive = tokio::select! {
@@ -1329,10 +1399,13 @@ impl Supervisor {
                 bail!("VM startup cancelled by stop request");
             }
             vm.child = Some(child);
+            vm.adopted_proc = None;
             vm.runtime.pid = Some(pid);
             vm.runtime.rpc_socket_path = Some(sock_path.clone());
             vm.runtime.shm_path = shm_path.as_ref().map(|p| p.to_string_lossy().into_owned());
-            write_pid_file(&pid_path, pid);
+            if let Err(err) = openvmms_core::process::write_pid_file(&pid_path, pid) {
+                warn!(vm_id = %id, error = %err, "failed to write VM pid file");
+            }
         }
         drop(prepare_guard);
 
@@ -1463,6 +1536,7 @@ impl Supervisor {
                 let _ = child.wait();
             }
             cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
+            vm.adopted_proc = None;
             vm.runtime.pid = None;
             vm.runtime.started_at = None;
             vm.runtime.fastdesk_endpoint = None;
@@ -1489,7 +1563,7 @@ impl Supervisor {
     }
 
     async fn is_vm_process_alive(&self, id: Uuid, run_gen: u64) -> bool {
-        let adopted_pid = {
+        let adopted_proc = {
             let mut guard = self.vms.write().unwrap();
             let Some(vm) = guard.get_mut(&id) else {
                 return false;
@@ -1500,10 +1574,10 @@ impl Supervisor {
             if let Some(child) = vm.child.as_mut() {
                 return matches!(child.try_wait(), Ok(None));
             }
-            vm.runtime.pid
+            vm.adopted_proc.clone()
         };
-        if let Some(pid) = adopted_pid {
-            return tokio::task::spawn_blocking(move || is_pid_alive(pid))
+        if let Some(proc_handle) = adopted_proc {
+            return tokio::task::spawn_blocking(move || proc_handle.is_alive())
                 .await
                 .unwrap_or(false);
         }
@@ -1742,6 +1816,7 @@ impl Supervisor {
                 return;
             }
             cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
+            vm.adopted_proc = None;
             vm.runtime.pid = None;
             vm.runtime.started_at = None;
             vm.runtime.fastdesk_endpoint = None;
@@ -1808,9 +1883,10 @@ impl Supervisor {
                 vm.stop_wait = Some(stop_done_rx.clone());
                 vm.runtime.status = VmStatus::Stopping;
                 vm.runtime.revision = self.next_revision();
-                let adopted_pid = if vm.child.is_none() {
-                    vm.runtime.pid
+                let adopted_proc = if vm.child.is_none() {
+                    vm.adopted_proc.take()
                 } else {
+                    vm.adopted_proc = None;
                     None
                 };
                 (
@@ -1820,7 +1896,7 @@ impl Supervisor {
                         vm.runtime.rpc_socket_path.take(),
                         vm.runtime.shm_path.take(),
                         vm.child.take(),
-                        adopted_pid,
+                        adopted_proc,
                         vm.monitor_cancel.take(),
                         vm.monitor_handle.take(),
                         stop_done_tx,
@@ -1834,7 +1910,7 @@ impl Supervisor {
             sock_opt,
             shm_opt,
             child_opt,
-            adopted_pid,
+            adopted_proc,
             mon_cancel_opt,
             mon_handle_opt,
             stop_done_tx,
@@ -1878,10 +1954,10 @@ impl Supervisor {
                         }
                     })
                     .await;
-                } else if let Some(pid) = adopted_pid {
+                } else if let Some(proc_handle) = adopted_proc {
                     let sock_wait = sock_opt.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        wait_or_terminate_adopted_pid(sock_wait.as_deref(), pid);
+                        wait_or_terminate_adopted_proc(sock_wait.as_deref(), &proc_handle);
                     })
                     .await;
                 }
@@ -1892,6 +1968,7 @@ impl Supervisor {
                     if let Some(vm) = guard.get_mut(&id) {
                         if vm.generation == stop_gen {
                             vm.runtime.status = VmStatus::Off;
+                            vm.adopted_proc = None;
                             vm.runtime.pid = None;
                             vm.runtime.started_at = None;
                             vm.runtime.fastdesk_endpoint = None;
@@ -2102,22 +2179,36 @@ impl Supervisor {
             )));
         }
         let id = self.resolve_vm_id(id_or_name)?;
+        let explicit_format = req.format.is_some();
         let format = req
             .format
             .unwrap_or_else(|| DiskFormat::from_path(&req.path));
+        ensure_disk_format_safe(&req.path, format, explicit_format)?;
         let kind = if format == DiskFormat::Iso {
             DiskKind::Dvd
         } else {
             DiskKind::HardDisk
         };
+        if let Some(lun) = req.lun
+            && lun > 255
+        {
+            return Err(err_bad_request(format!(
+                "SCSI LUN must be 0..=255 (got {lun})"
+            )));
+        }
 
         let pending = {
             let mut guard = self.vms.write().unwrap();
             let vm = guard
-                .get_mut(&id)
+                .get(&id)
                 .ok_or_else(|| err_not_found("VM not found"))?;
             let active_sock = vm.active_rpc_socket("attach disk")?;
             let lun = req.lun.unwrap_or_else(|| vm.config.next_free_lun());
+            if lun > 255 {
+                return Err(err_bad_request(format!(
+                    "SCSI LUN must be 0..=255 (got {lun})"
+                )));
+            }
             if vm.config.disks.iter().any(|d| d.lun == lun) {
                 return Err(err_conflict(format!("SCSI LUN {lun} is already occupied")));
             }
@@ -2128,9 +2219,16 @@ impl Supervisor {
                 read_only: req.read_only || kind == DiskKind::Dvd,
                 format,
             };
+            let mut candidate_disks = vm.config.disks.clone();
+            candidate_disks.push(attachment.clone());
+            ensure_disks_not_conflicting(&guard, Some(id), &candidate_disks)?;
+
             match active_sock {
                 Some(sock) => Ok((attachment, sock, vm.generation)),
                 None => {
+                    let vm = guard
+                        .get_mut(&id)
+                        .ok_or_else(|| err_not_found("VM not found"))?;
                     let mut updated = vm.config.clone();
                     updated.disks.push(attachment);
                     updated.disks.sort_by_key(|d| d.lun);
@@ -2158,7 +2256,7 @@ impl Supervisor {
 
                 let mut guard = self.vms.write().unwrap();
                 let vm = guard
-                    .get_mut(&id)
+                    .get(&id)
                     .ok_or_else(|| err_not_found("VM not found"))?;
                 if vm.generation != rpc_gen
                     || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
@@ -2174,11 +2272,17 @@ impl Supervisor {
                         attachment.lun
                     )));
                 }
+                let mut candidate_disks = vm.config.disks.clone();
+                candidate_disks.push(attachment.clone());
+                ensure_disks_not_conflicting(&guard, Some(id), &candidate_disks)?;
                 let mut updated = vm.config.clone();
                 updated.disks.push(attachment);
                 updated.disks.sort_by_key(|d| d.lun);
                 updated.updated_at = Utc::now();
                 self.store.save_vm(&updated)?;
+                let vm = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| err_not_found("VM not found"))?;
                 vm.config = updated;
                 vm.runtime.revision = self.next_revision();
                 vm.summary()
@@ -2300,14 +2404,29 @@ impl Supervisor {
                 req.path.display()
             )));
         }
+        if let Err(err) = fs::File::open(&req.path) {
+            return Err(err_bad_request(format!(
+                "cannot open ISO image '{}': {err}",
+                req.path.display()
+            )));
+        }
+        ensure_disk_format_safe(&req.path, DiskFormat::Iso, true)?;
+        if let Some(lun) = req.lun
+            && lun > 255
+        {
+            return Err(err_bad_request(format!(
+                "SCSI LUN must be 0..=255 (got {lun})"
+            )));
+        }
+
         let id = self.resolve_vm_id(id_or_name)?;
-        let existing_dvd_lun = {
-            let guard = self.vms.read().unwrap();
+        let active_plan = {
+            let mut guard = self.vms.write().unwrap();
             let vm = guard
                 .get(&id)
                 .ok_or_else(|| err_not_found("VM not found"))?;
-            let _ = vm.active_rpc_socket("mount ISO")?;
-            match req.lun {
+            let active_sock = vm.active_rpc_socket("mount ISO")?;
+            let (target_lun, previous_dvd) = match req.lun {
                 Some(l) => match vm.config.disks.iter().find(|d| d.lun == l) {
                     Some(d) if d.kind != DiskKind::Dvd => {
                         return Err(err_conflict(format!(
@@ -2315,41 +2434,104 @@ impl Supervisor {
                             d.path.display()
                         )));
                     }
-                    Some(d) => Some(d.lun),
-                    None => None,
+                    Some(d) => (d.lun, Some(d.clone())),
+                    None => (l, None),
                 },
-                None => vm
-                    .config
-                    .disks
-                    .iter()
-                    .find(|d| d.kind == DiskKind::Dvd)
-                    .map(|d| d.lun),
+                None => match vm.config.disks.iter().find(|d| d.kind == DiskKind::Dvd) {
+                    Some(d) => (d.lun, Some(d.clone())),
+                    None => (vm.config.next_free_lun(), None),
+                },
+            };
+            if target_lun > 255 {
+                return Err(err_bad_request(format!(
+                    "SCSI LUN must be 0..=255 (got {target_lun})"
+                )));
+            }
+
+            let new_dvd = DiskAttachment {
+                lun: target_lun,
+                kind: DiskKind::Dvd,
+                path: req.path.clone(),
+                read_only: true,
+                format: DiskFormat::Iso,
+            };
+            let mut candidate_disks: Vec<DiskAttachment> = vm
+                .config
+                .disks
+                .iter()
+                .filter(|d| d.lun != target_lun)
+                .cloned()
+                .collect();
+            candidate_disks.push(new_dvd);
+            candidate_disks.sort_by_key(|d| d.lun);
+            ensure_disks_not_conflicting(&guard, Some(id), &candidate_disks)?;
+
+            if active_sock.is_none() {
+                let mut updated = vm.config.clone();
+                updated.disks = candidate_disks;
+                updated.updated_at = Utc::now();
+                self.store.save_vm(&updated)?;
+                let vm = guard
+                    .get_mut(&id)
+                    .ok_or_else(|| err_not_found("VM not found"))?;
+                vm.config = updated;
+                vm.runtime.revision = self.next_revision();
+                Err(vm.summary())
+            } else {
+                Ok((target_lun, previous_dvd))
             }
         };
 
-        if let Some(lun) = existing_dvd_lun {
-            let _ = self.detach_disk_inner(id_or_name, lun).await?;
-            self.attach_disk_inner(
+        let (target_lun, previous_dvd) = match active_plan {
+            Err(summary) => {
+                self.emit(DaemonEvent::VmUpdated {
+                    vm: summary.clone(),
+                });
+                return Ok(summary);
+            }
+            Ok(plan) => plan,
+        };
+
+        if previous_dvd.is_some() {
+            let _ = self.detach_disk_inner(id_or_name, target_lun).await?;
+        }
+
+        match self
+            .attach_disk_inner(
                 id_or_name,
                 AttachDiskPayload {
                     path: req.path,
-                    lun: Some(lun),
+                    lun: Some(target_lun),
                     read_only: true,
                     format: Some(DiskFormat::Iso),
                 },
             )
             .await
-        } else {
-            self.attach_disk_inner(
-                id_or_name,
-                AttachDiskPayload {
-                    path: req.path,
-                    lun: req.lun,
-                    read_only: true,
-                    format: Some(DiskFormat::Iso),
-                },
-            )
-            .await
+        {
+            Ok(summary) => Ok(summary),
+            Err(attach_err) => {
+                if let Some(prev) = previous_dvd
+                    && let Err(restore_err) = self
+                        .attach_disk_inner(
+                            id_or_name,
+                            AttachDiskPayload {
+                                path: prev.path,
+                                lun: Some(prev.lun),
+                                read_only: prev.read_only,
+                                format: Some(prev.format),
+                            },
+                        )
+                        .await
+                {
+                    warn!(
+                        vm_id = %id,
+                        lun = target_lun,
+                        error = %restore_err,
+                        "failed to restore previous ISO after mount failure"
+                    );
+                }
+                Err(attach_err)
+            }
         }
     }
 
@@ -2432,9 +2614,10 @@ impl Supervisor {
         &self,
         id_or_name: &str,
         nic_id: Uuid,
-        port: PortForward,
+        mut port: PortForward,
         add: bool,
     ) -> anyhow::Result<VmSummary> {
+        port.normalize();
         if add {
             port.validate()
                 .map_err(|e| err_bad_request(format!("{e:#}")))?;
@@ -2689,6 +2872,7 @@ impl Supervisor {
             vm.detach_on_drop = true;
             if matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused) {
                 let _ = vm.child.take();
+                vm.adopted_proc = None;
                 vm.runtime.rpc_socket_path = None;
                 vm.runtime.shm_path = None;
             }
@@ -2755,16 +2939,72 @@ impl Supervisor {
     }
 }
 
-fn normalize_path_key(path: &Path) -> PathBuf {
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    #[cfg(windows)]
-    {
-        PathBuf::from(resolved.to_string_lossy().to_ascii_lowercase())
+fn ensure_disk_format_safe(
+    path: &Path,
+    format: DiskFormat,
+    explicit_format: bool,
+) -> anyhow::Result<()> {
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        return Err(err_bad_request("disk path must specify a file name"));
     }
-    #[cfg(not(windows))]
-    {
-        resolved
+    if format == DiskFormat::Raw {
+        let lower = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if matches!(
+            lower.as_deref(),
+            Some("vhdx" | "avhdx" | "vhd" | "avhd" | "vmdk" | "vmgs" | "iso")
+        ) {
+            return Err(err_bad_request(format!(
+                "disk path '{}' is incompatible with raw format: extension is reserved for another disk format (specify the matching format such as vhdx, vhd, or iso)",
+                path.display()
+            )));
+        }
+        if !explicit_format && disk::file_has_vhdx_signature(path) {
+            return Err(err_bad_request(format!(
+                "disk image '{}' starts with a VHDX signature ('vhdxfile') but its format was inferred as raw; rename it to .vhdx or specify --format vhdx explicitly",
+                path.display()
+            )));
+        }
     }
+    Ok(())
+}
+
+fn ensure_disks_not_conflicting(
+    vms: &HashMap<Uuid, ManagedVm>,
+    self_id: Option<Uuid>,
+    disks: &[DiskAttachment],
+) -> anyhow::Result<()> {
+    let mut seen_paths: HashMap<PathBuf, u32> = HashMap::new();
+    for d in disks {
+        let key = openvmms_core::models::normalize_path_key(&d.path);
+        if let Some(prev_lun) = seen_paths.insert(key.clone(), d.lun) {
+            return Err(err_conflict(format!(
+                "disk image '{}' is attached multiple times to the same VM (LUNs {prev_lun} and {})",
+                d.path.display(),
+                d.lun
+            )));
+        }
+        for other in vms.values() {
+            if Some(other.config.id) == self_id {
+                continue;
+            }
+            for other_disk in &other.config.disks {
+                if openvmms_core::models::normalize_path_key(&other_disk.path) == key
+                    && (!d.read_only || !other_disk.read_only)
+                {
+                    return Err(err_conflict(format!(
+                        "disk image '{}' is already attached to VM '{}' (LUN {}); detach it first or attach both read-only",
+                        d.path.display(),
+                        other.config.name,
+                        other_disk.lun
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sanitize_disk_stem(name: &str) -> String {
@@ -2811,95 +3051,24 @@ fn preallocate_shm_file(path: &Path, vram_mb: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_pid_file(path: &Path, pid: u32) {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    if let Ok(mut file) = opts.open(path) {
-        use std::io::Write;
-        let _ = write!(file, "{pid}");
-    }
-}
-
-fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-    #[cfg(windows)]
-    {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .is_ok_and(|out| {
-                out.status.success()
-                    && String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
-            })
-    }
-}
-
-fn terminate_pid(pid: u32) {
-    #[cfg(unix)]
-    {
-        let pid_str = pid.to_string();
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid_str])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < deadline {
-            if !is_pid_alive(pid) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid_str])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
-
-fn wait_or_terminate_adopted_pid(sock_path: Option<&Path>, pid: u32) {
+fn wait_or_terminate_adopted_proc(
+    sock_path: Option<&Path>,
+    proc_handle: &openvmms_core::process::AdoptedProcess,
+) {
     let client = sock_path.map(TtrpcClient::new);
     let start = std::time::Instant::now();
     loop {
         let sock_alive = client.as_ref().is_some_and(TtrpcClient::is_socket_accepting);
-        let pid_alive = is_pid_alive(pid);
-        if !sock_alive && !pid_alive {
+        let proc_alive = proc_handle.is_alive();
+        if !sock_alive && !proc_alive {
             return;
         }
         if start.elapsed() >= Duration::from_secs(3) {
-            terminate_pid(pid);
+            proc_handle.terminate();
             let kill_deadline = std::time::Instant::now() + Duration::from_secs(1);
             while std::time::Instant::now() < kill_deadline {
                 let still_sock = client.as_ref().is_some_and(TtrpcClient::is_socket_accepting);
-                if !still_sock && !is_pid_alive(pid) {
+                if !still_sock && !proc_handle.is_alive() {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -2913,15 +3082,14 @@ fn wait_or_terminate_adopted_pid(sock_path: Option<&Path>, pid: u32) {
 fn reclaim_or_verify_inactive_socket(
     sock_path: &Path,
     pid_path: &Path,
+    expected_bin: Option<&Path>,
     cancelled: &AtomicBool,
 ) -> bool {
     if cancelled.load(Ordering::Acquire) {
         return false;
     }
     let client = TtrpcClient::new(sock_path);
-    let saved_pid = fs::read_to_string(pid_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
+    let verified_proc = openvmms_core::process::open_verified_pid(pid_path, expected_bin);
     let responded = client
         .properties_vm_blocking_cancellable(Duration::from_secs(1), cancelled)
         .is_ok();
@@ -2943,11 +3111,11 @@ fn reclaim_or_verify_inactive_socket(
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        if let Some(pid) = saved_pid {
+        if let Some(proc_handle) = verified_proc {
             if cancelled.load(Ordering::Acquire) {
                 return false;
             }
-            terminate_pid(pid);
+            proc_handle.terminate();
             let kill_deadline = std::time::Instant::now() + Duration::from_secs(1);
             while std::time::Instant::now() < kill_deadline {
                 if cancelled.load(Ordering::Acquire) {
@@ -2993,7 +3161,7 @@ fn normalize_fastdesk_endpoint(raw: &str) -> String {
     normalized
 }
 
-fn build_create_vm_request(
+pub(crate) fn build_create_vm_request(
     cfg: &VmConfig,
     uefi_path: &Path,
     shm_path: Option<&Path>,
@@ -3307,6 +3475,7 @@ fn discover_linux_tap_interfaces() -> Vec<VirtualSwitchInfo> {
     discover_linux_tap_interfaces_in(Path::new("/sys/class/net"))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn discover_linux_tap_interfaces_in(sys_class_net: &Path) -> Vec<VirtualSwitchInfo> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(sys_class_net) {
@@ -3320,6 +3489,7 @@ fn discover_linux_tap_interfaces_in(sys_class_net: &Path) -> Vec<VirtualSwitchIn
     out
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_linux_tap_in_dir(iface_path: &Path, name: &str) -> Option<VirtualSwitchInfo> {
     const IFF_TAP: u32 = 0x0002;
     let tun_flags_raw = fs::read_to_string(iface_path.join("tun_flags")).ok()?;
@@ -3463,5 +3633,142 @@ mod tests {
         );
 
         sup.set_runtime_dir_changing_for_test(false);
+    }
+
+    #[test]
+    fn build_create_vm_request_translates_all_compute_boot_disk_nic_and_fastdesk_fields() {
+        let vm_dir = tempfile::tempdir().unwrap();
+        let disk_vhdx = vm_dir.path().join("os.vhdx");
+        let iso_path = vm_dir.path().join("install.iso");
+        let uefi_path = vm_dir.path().join("MSVM.fd");
+        let shm_path = vm_dir.path().join("vram.shm");
+        let vmgs_path = vm_dir.path().join("state.vmgs");
+
+        let mut cfg = VmConfig::from_preset(
+            "TranslateTest",
+            openvmms_core::models::VmPreset::Windows11,
+            vm_dir.path(),
+        );
+        cfg.vcpus = 6;
+        cfg.memory_mb = 6144;
+        cfg.nested_virt = true;
+        cfg.secure_boot_enabled = true;
+        cfg.secure_boot_template = SecureBootTemplateConfig::MicrosoftUefiCa;
+        cfg.tpm_enabled = true;
+        cfg.vmgs_path = Some(vmgs_path);
+        cfg.disks = vec![
+            DiskAttachment {
+                lun: 0,
+                kind: DiskKind::HardDisk,
+                path: disk_vhdx.clone(),
+                read_only: false,
+                format: DiskFormat::Vhdx,
+            },
+            DiskAttachment {
+                lun: 1,
+                kind: DiskKind::Dvd,
+                path: iso_path.clone(),
+                read_only: true,
+                format: DiskFormat::Iso,
+            },
+        ];
+        cfg.nics = vec![
+            NicAttachment {
+                id: Uuid::new_v4(),
+                name: "nat0".into(),
+                mac_address: "52:54:00:11:22:33".into(),
+                backend: NicBackendConfig::Consomme {
+                    cidr: Some("10.0.2.0/24".into()),
+                    port_forwards: vec![PortForward {
+                        host_addr: "127.0.0.1".into(),
+                        host_port: 2222,
+                        guest_port: 22,
+                        protocol: IpProto::Tcp,
+                    }],
+                    internal_dns: true,
+                    allow_host_local_access: true,
+                },
+            },
+            NicAttachment {
+                id: Uuid::new_v4(),
+                name: "tap0".into(),
+                mac_address: "52:54:00:44:55:66".into(),
+                backend: NicBackendConfig::Tap {
+                    name: "tap-test".into(),
+                },
+            },
+        ];
+        cfg.fastdesk.enabled = true;
+        cfg.fastdesk.vram_mb = 64;
+        cfg.fastdesk.listen_addr = "127.0.0.1:5905".into();
+        cfg.fastdesk.transport = FastDeskTransport::HvSock;
+        cfg.fastdesk.vsock_port = Some(6005);
+
+        let req = build_create_vm_request(&cfg, &uefi_path, Some(&shm_path)).unwrap();
+        assert_eq!(req.log_id, cfg.id.to_string());
+        let vm_cfg = req.config.unwrap();
+        assert_eq!(vm_cfg.memory_config.unwrap().memory_mb, 6144);
+        assert_eq!(vm_cfg.processor_config.unwrap().processor_count, 6);
+        assert!(vm_cfg.nested_virt);
+        assert!(vm_cfg.tpm_enabled);
+
+        match vm_cfg.boot_config.unwrap() {
+            vmservice::vm_config::BootConfig::Uefi(u) => {
+                assert_eq!(u.firmware_path, uefi_path.to_string_lossy());
+                assert!(u.secure_boot_enabled);
+                assert_eq!(
+                    u.initial_variables.unwrap().secure_boot_template,
+                    vmservice::uefi::initial_variables::SecureBootTemplate::MicrosoftUefiCertificateAuthority as i32
+                );
+            }
+            other => panic!("unexpected boot config: {other:?}"),
+        }
+
+        let devices = vm_cfg.devices_config.unwrap();
+        assert!(devices.enable_scsi_controller);
+        assert_eq!(devices.scsi_disks.len(), 2);
+        assert_eq!(devices.scsi_disks[0].lun, 0);
+        assert_eq!(
+            devices.scsi_disks[0].r#type,
+            vmservice::DiskType::ScsiDiskTypeVhdx as i32
+        );
+        assert!(!devices.scsi_disks[0].read_only);
+        assert!(!devices.scsi_disks[0].is_dvd);
+        assert_eq!(devices.scsi_disks[1].lun, 1);
+        assert_eq!(
+            devices.scsi_disks[1].r#type,
+            vmservice::DiskType::ScsiDiskTypePhysical as i32
+        );
+        assert!(devices.scsi_disks[1].read_only);
+        assert!(devices.scsi_disks[1].is_dvd);
+
+        assert_eq!(devices.nic_config.len(), 2);
+        assert_eq!(devices.nic_config[0].mac_address, "52:54:00:11:22:33");
+        match devices.nic_config[0].backend.as_ref().unwrap() {
+            vmservice::nic_config::Backend::Consomme(c) => {
+                assert_eq!(c.cidr, "10.0.2.0/24");
+                assert_eq!(c.internal_dns, Some(true));
+                assert!(c.allow_host_local_access);
+                assert_eq!(c.ports.len(), 1);
+                assert_eq!(c.ports[0].host_port, 2222);
+                assert_eq!(c.ports[0].guest_port, 22);
+            }
+            other => panic!("expected Consomme backend, got {other:?}"),
+        }
+        match devices.nic_config[1].backend.as_ref().unwrap() {
+            vmservice::nic_config::Backend::Tap(t) => {
+                assert!(matches!(
+                    t.source,
+                    Some(vmservice::tap_backend::Source::Name(ref n)) if n == "tap-test"
+                ));
+            }
+            other => panic!("expected Tap backend, got {other:?}"),
+        }
+
+        let fd = vm_cfg.fastdesk_config.unwrap();
+        assert_eq!(fd.vram_mb, 64);
+        assert_eq!(fd.listen_addr, "127.0.0.1:5905");
+        assert_eq!(fd.vsock_port, Some(6005));
+        assert_eq!(fd.shm_path.as_deref(), Some(shm_path.to_string_lossy().as_ref()));
     }
 }

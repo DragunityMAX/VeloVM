@@ -344,6 +344,25 @@ struct EditVmArgs {
     nested_virt: Option<ToggleArg>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AttachDiskFormatArg {
+    Vhdx,
+    Vhd,
+    Raw,
+    Iso,
+}
+
+impl From<AttachDiskFormatArg> for DiskFormat {
+    fn from(value: AttachDiskFormatArg) -> Self {
+        match value {
+            AttachDiskFormatArg::Vhdx => DiskFormat::Vhdx,
+            AttachDiskFormatArg::Vhd => DiskFormat::Vhd,
+            AttachDiskFormatArg::Raw => DiskFormat::Raw,
+            AttachDiskFormatArg::Iso => DiskFormat::Iso,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum VmDiskCmd {
     /// Attach an existing disk image to a VM (hot-plugs if running)
@@ -354,6 +373,8 @@ enum VmDiskCmd {
         lun: Option<u32>,
         #[arg(long)]
         ro: bool,
+        #[arg(long, value_enum)]
+        format: Option<AttachDiskFormatArg>,
     },
     /// Detach a SCSI disk by LUN (hot-unplugs if running)
     Detach {
@@ -431,11 +452,20 @@ fn handle_daemon(cli: &Cli, action: &DaemonCmd) -> anyhow::Result<()> {
                 )?;
                 let mut cmd = Command::new(bin);
                 cmd.args(fg_args);
-                let status = cmd.status().context("running openvmmsd in foreground")?;
-                if !status.success() {
-                    bail!("openvmmsd exited with {status}");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let err = cmd.exec();
+                    return Err(err).context("execing openvmmsd in foreground");
                 }
-                return Ok(());
+                #[cfg(not(unix))]
+                {
+                    let status = cmd.status().context("running openvmmsd in foreground")?;
+                    if !status.success() {
+                        bail!("openvmmsd exited with {status}");
+                    }
+                    return Ok(());
+                }
             }
             let client = ensure_daemon_running(cli.data_dir.as_deref(), cli.daemon_url.as_deref())?;
             if cli.json {
@@ -841,14 +871,20 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
             Ok(())
         }
         VmCmd::Disk { action } => match action {
-            VmDiskCmd::Attach { vm, path, lun, ro } => {
+            VmDiskCmd::Attach {
+                vm,
+                path,
+                lun,
+                ro,
+                format,
+            } => {
                 let summary = client.attach_disk(
                     vm,
                     &AttachDiskPayload {
                         path: resolve_client_path(path),
                         lun: *lun,
                         read_only: *ro,
-                        format: None,
+                        format: format.map(Into::into),
                     },
                 )?;
                 print_vm_summary(&summary, cli.json)
@@ -1304,12 +1340,13 @@ mod tests {
     #[test]
     fn foreground_daemon_args_honor_daemon_url_and_reject_https() {
         let dir = Path::new("/tmp/openvmms-fg-test");
+        let expected_dir = resolve_client_path(dir).into_os_string();
         let without_url = build_foreground_daemon_args(Some(dir), None).unwrap();
         assert_eq!(
             without_url,
             vec![
                 std::ffi::OsString::from("--data-dir"),
-                std::ffi::OsString::from("/tmp/openvmms-fg-test"),
+                expected_dir.clone(),
             ]
         );
 
@@ -1319,7 +1356,7 @@ mod tests {
             with_url,
             vec![
                 std::ffi::OsString::from("--data-dir"),
-                std::ffi::OsString::from("/tmp/openvmms-fg-test"),
+                expected_dir,
                 std::ffi::OsString::from("--listen"),
                 std::ffi::OsString::from("127.0.0.1:48123"),
             ]
@@ -1328,5 +1365,48 @@ mod tests {
         assert!(
             build_foreground_daemon_args(Some(dir), Some("https://127.0.0.1:48123")).is_err()
         );
+    }
+
+    #[test]
+    fn disk_attach_parses_explicit_format_flag() {
+        for (flag, expected) in [
+            ("vhdx", DiskFormat::Vhdx),
+            ("vhd", DiskFormat::Vhd),
+            ("raw", DiskFormat::Raw),
+            ("iso", DiskFormat::Iso),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "openvmms",
+                "vm",
+                "disk",
+                "attach",
+                "MyVm",
+                "disk.avhdx",
+                "--format",
+                flag,
+            ])
+            .unwrap();
+            match parsed.command {
+                TopCommand::Vm {
+                    action:
+                        VmCmd::Disk {
+                            action: VmDiskCmd::Attach { format, .. },
+                        },
+                } => assert_eq!(format.map(DiskFormat::from), Some(expected)),
+                other => panic!("unexpected parsed command: {other:?}"),
+            }
+        }
+
+        let omitted =
+            Cli::try_parse_from(["openvmms", "vm", "disk", "attach", "MyVm", "disk.img"]).unwrap();
+        match omitted.command {
+            TopCommand::Vm {
+                action:
+                    VmCmd::Disk {
+                        action: VmDiskCmd::Attach { format, .. },
+                    },
+            } => assert!(format.is_none()),
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
     }
 }

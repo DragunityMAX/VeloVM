@@ -641,6 +641,12 @@ pub fn normalize_base_url(listen_or_url: &str) -> String {
 }
 
 fn url_segment(s: &str) -> String {
+    if s == "." {
+        return "%2E".to_string();
+    }
+    if s == ".." {
+        return "%2E%2E".to_string();
+    }
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -728,6 +734,8 @@ pub fn ensure_daemon_running(
     data_dir: Option<&Path>,
     daemon_url_override: Option<&str>,
 ) -> anyhow::Result<ApiClient> {
+    static SPAWN_STDIO_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
     if let Some(url) = daemon_url_override {
         let _ = crate::models::parse_loopback_listen_addr(url)?;
     }
@@ -797,6 +805,9 @@ pub fn ensure_daemon_running(
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
     }
+    if dir.is_dir() {
+        cmd.current_dir(&dir);
+    }
     let log_file_path = dir.join("openvmmsd.log");
     if let Ok(log_file) = std::fs::OpenOptions::new()
         .create(true)
@@ -827,13 +838,33 @@ pub fn ensure_daemon_running(
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {}", daemon_bin.display()))?;
+    let mut child = {
+        let _spawn_guard = SPAWN_STDIO_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(windows)]
+        let _stdio_no_inherit = ClearStdioInheritGuard::acquire();
+        cmd.spawn()
+            .with_context(|| format!("spawning {}", daemon_bin.display()))?
+    };
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait()? {
+            while store.is_daemon_locked() && std::time::Instant::now() < deadline {
+                if let Ok(client) = ApiClient::from_data_dir(Some(&dir), daemon_url_override)
+                    && client.health().is_ok()
+                {
+                    return Ok(client);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if let Ok(client) = ApiClient::from_data_dir(Some(&dir), daemon_url_override)
+                && client.health().is_ok()
+            {
+                return Ok(client);
+            }
             bail!(
                 "openvmmsd exited prematurely with {status} (see {})",
                 log_file_path.display()
@@ -851,6 +882,52 @@ pub fn ensure_daemon_running(
             );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+struct ClearStdioInheritGuard {
+    saved: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl ClearStdioInheritGuard {
+    fn acquire() -> Self {
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        let mut saved = Vec::with_capacity(3);
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = unsafe { GetStdHandle(id) };
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let mut flags = 0u32;
+            if unsafe { GetHandleInformation(h, &mut flags) } != 0
+                && (flags & HANDLE_FLAG_INHERIT) != 0
+            {
+                if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                    saved.push((h, flags & HANDLE_FLAG_INHERIT));
+                }
+            }
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ClearStdioInheritGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for &(h, prev) in &self.saved {
+            unsafe {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, prev);
+            }
+        }
     }
 }
 
@@ -938,6 +1015,33 @@ mod tests {
         );
     }
 
+    fn accept_with_timeout(
+        listener: &std::net::TcpListener,
+        timeout: Duration,
+    ) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "mock TcpListener accept timed out after {timeout:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("mock TcpListener accept failed: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn client_refuses_to_send_bearer_token_to_unauthenticated_impostor_health() {
         use std::io::{Read, Write};
@@ -952,25 +1056,21 @@ mod tests {
         let saw_auth_srv = Arc::clone(&saw_auth);
 
         let srv = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                let mut buf = [0u8; 2048];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                if req.to_ascii_lowercase().contains("authorization:") {
-                    saw_auth_srv.store(true, Ordering::SeqCst);
-                }
-                let body = r#"{"status":"ok","service":"openvmmsd"}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.flush();
+            let mut stream = accept_with_timeout(&listener, Duration::from_secs(5));
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.to_ascii_lowercase().contains("authorization:") {
+                saw_auth_srv.store(true, Ordering::SeqCst);
             }
+            let body = r#"{"status":"ok","service":"openvmmsd"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
         });
 
         let client = ApiClient::new(format!("http://{addr}"), "secret-bearer-token").unwrap();
@@ -983,7 +1083,7 @@ mod tests {
             !saw_auth.load(Ordering::SeqCst),
             "bearer token must never be transmitted to an impostor health listener"
         );
-        drop(srv);
+        srv.join().unwrap();
     }
 
     #[test]
@@ -1001,7 +1101,7 @@ mod tests {
         // Genuine daemon handles one health challenge and one authenticated GET /api/v1/vms, then exits.
         let genuine_srv = std::thread::spawn(move || {
             for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
+                let mut stream = accept_with_timeout(&listener, Duration::from_secs(5));
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
@@ -1045,22 +1145,21 @@ mod tests {
         let saw_auth = Arc::new(AtomicBool::new(false));
         let saw_auth_srv = Arc::clone(&saw_auth);
         let squatter_srv = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = squatter.accept() {
-                let mut buf = [0u8; 2048];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                if req.to_ascii_lowercase().contains("authorization:") {
-                    saw_auth_srv.store(true, Ordering::SeqCst);
-                }
-                let body = r#"{"status":"ok","service":"openvmmsd"}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.flush();
+            let mut stream = accept_with_timeout(&squatter, Duration::from_secs(5));
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.to_ascii_lowercase().contains("authorization:") {
+                saw_auth_srv.store(true, Ordering::SeqCst);
             }
+            let body = r#"{"status":"ok","service":"openvmmsd"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
         });
 
         // The long-lived client must re-challenge before sending the bearer token again.
@@ -1090,7 +1189,7 @@ mod tests {
 
         // Genuine daemon responds to one relayed health check with proof bound to `real_addr`.
         let real_srv = std::thread::spawn(move || {
-            let (mut stream, _) = real_listener.accept().unwrap();
+            let mut stream = accept_with_timeout(&real_listener, Duration::from_secs(5));
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
@@ -1125,7 +1224,7 @@ mod tests {
         let saw_auth = Arc::new(AtomicBool::new(false));
         let saw_auth_relay = Arc::clone(&saw_auth);
         let relay_srv = std::thread::spawn(move || {
-            let (mut stream, _) = relay_listener.accept().unwrap();
+            let mut stream = accept_with_timeout(&relay_listener, Duration::from_secs(5));
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
@@ -1136,6 +1235,7 @@ mod tests {
             let path_and_query = first_line.split_whitespace().nth(1).unwrap_or("/api/v1/health");
             let relayed = reqwest::blocking::Client::builder()
                 .no_proxy()
+                .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap()
                 .get(format!("http://{real_addr}{path_and_query}"))
@@ -1195,7 +1295,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let token = "proxy-test-token";
         let srv = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_with_timeout(&listener, Duration::from_secs(5));
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
@@ -1286,7 +1386,7 @@ mod tests {
         let srv = std::thread::spawn(move || {
             let mut workers = Vec::new();
             for _ in 0..4 {
-                let (mut stream, _) = listener.accept().unwrap();
+                let mut stream = accept_with_timeout(&listener, Duration::from_secs(10));
                 workers.push(std::thread::spawn(move || {
                     let req = read_http_request(&mut stream);
                     let first_line = req.lines().next().unwrap_or("");
@@ -1384,6 +1484,13 @@ mod tests {
         let vm_summary = vm_thread.join().unwrap().expect("create_vm timed out");
         assert_eq!(vm_summary.config.name, "Slow-Disk-VM");
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn url_segment_encodes_dot_segments() {
+        assert_eq!(url_segment("."), "%2E");
+        assert_eq!(url_segment(".."), "%2E%2E");
+        assert_eq!(url_segment("vm-1.test"), "vm-1.test");
     }
 
     #[test]

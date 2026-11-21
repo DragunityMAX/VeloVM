@@ -794,6 +794,30 @@ mod tests {
     use super::*;
     use std::thread;
 
+    fn accept_unix_with_timeout(listener: &Socket, timeout: Duration) -> Socket {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    conn.set_nonblocking(false).unwrap();
+                    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    conn.set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return conn;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "mock AF_UNIX listener accept timed out after {timeout:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("mock AF_UNIX listener accept failed: {e}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn ttrpc_roundtrip_success_and_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -804,7 +828,7 @@ mod tests {
 
         let server = thread::spawn(move || {
             for idx in 0..2 {
-                let (mut conn, _) = listener.accept().unwrap();
+                let mut conn = accept_unix_with_timeout(&listener, Duration::from_secs(5));
                 let (stream_id, msg_type, bytes) = read_frame(&mut conn).unwrap();
                 assert_eq!(stream_id, 1);
                 assert_eq!(msg_type, MESSAGE_TYPE_REQUEST);
@@ -870,7 +894,7 @@ mod tests {
         let mut txs = [Some(peer_closed_tx), Some(peer_closed_tx2)];
         let server = thread::spawn(move || {
             for slot in &mut txs {
-                let (mut conn, _) = listener.accept().unwrap();
+                let mut conn = accept_unix_with_timeout(&listener, Duration::from_secs(5));
                 let (_sid, _mtype, _bytes) = read_frame(&mut conn).unwrap();
                 // Never reply; wait until the client shuts down/closes the socket.
                 let mut buf = [0u8; 16];
@@ -945,7 +969,7 @@ mod tests {
         let count = timeouts.len();
         let server = thread::spawn(move || {
             for _ in 0..count {
-                let (mut conn, _) = listener.accept().unwrap();
+                let mut conn = accept_unix_with_timeout(&listener, Duration::from_secs(5));
                 let _ = read_frame(&mut conn);
                 // Hold the socket open without replying until the client times out and closes it.
                 let mut buf = [0u8; 16];

@@ -50,6 +50,54 @@ fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Resu
     Ok(())
 }
 
+fn open_disk_file_with_lock(
+    path: &Path,
+    read_only: bool,
+    create: bool,
+    direct: bool,
+    verb: &str,
+) -> anyhow::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(!read_only);
+    if create {
+        opts.create(true).truncate(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    if direct {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_DIRECT);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = direct;
+
+    #[cfg(windows)]
+    if !read_only && (create || path.is_file()) {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`).
+        opts.share_mode(0x0000_0001);
+    }
+
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        #[cfg(windows)]
+        Err(err) if !read_only && err.raw_os_error() == Some(32) => {
+            anyhow::bail!(
+                "disk image '{}' is already locked for writing by another process",
+                path.display()
+            );
+        }
+        Err(err) => return Err(err).with_context(|| disk_open_error(path, verb)),
+    };
+
+    #[cfg(unix)]
+    if !read_only {
+        acquire_writable_disk_lock(&file, path)?;
+    }
+
+    Ok(file)
+}
+
 /// Opens `path` as a VHDX disk regardless of its file extension.
 pub async fn open_vhdx_disk(
     path: &Path,
@@ -122,16 +170,7 @@ pub async fn open_disk_type(
                 .with_context(|| disk_open_error(path, "failed to open"))?
         }
         Some("vhd") => {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!read_only)
-                .open(path)
-                .with_context(|| disk_open_error(path, "failed to open"))?;
-
-            #[cfg(unix)]
-            if !read_only {
-                acquire_writable_disk_lock(&file, path)?;
-            }
+            let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
 
             match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
                 Ok(vhd) => {
@@ -165,16 +204,7 @@ pub async fn open_disk_type(
             ensure_no_direct(".vmgs")?;
             // VMGS files are fixed VHD1s. Don't bother to validate the footer
             // here; let the resource resolver do that later.
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!read_only)
-                .open(path)
-                .with_context(|| disk_open_error(path, "failed to open"))?;
-
-            #[cfg(unix)]
-            if !read_only {
-                acquire_writable_disk_lock(&file, path)?;
-            }
+            let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
 
             Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
         }
@@ -234,31 +264,12 @@ fn open_raw_disk(
     }
 
     let create = size.is_some();
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).write(!options.read_only);
-    if create {
-        opts.create(true).truncate(true);
-    }
-
-    #[cfg(target_os = "linux")]
-    if options.direct {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_DIRECT);
-    }
-
     let verb = if create {
         "failed to create"
     } else {
         "failed to open"
     };
-    let file = opts
-        .open(path)
-        .with_context(|| disk_open_error(path, verb))?;
-
-    #[cfg(unix)]
-    if !options.read_only {
-        acquire_writable_disk_lock(&file, path)?;
-    }
+    let file = open_disk_file_with_lock(path, options.read_only, create, options.direct, verb)?;
 
     if let Some(size) = size {
         file.set_len(size)?;
@@ -354,7 +365,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[async_test]
     async fn rejects_concurrent_writable_raw_disk_open() {
         let dir = tempfile::tempdir().unwrap();

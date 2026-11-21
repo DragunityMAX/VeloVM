@@ -91,8 +91,9 @@ Stock OpenVMM (`--gfx`) drives its VNC worker (`workers/vnc_worker`) on a fixed 
 - Separate Cargo workspace (`openvmms/`) providing a Hyper-V-style control plane on top of OpenVMM's `vmservice.VM` `ttrpc` server over `AF_UNIX` (Windows 10/11 & Linux):
   - **`openvmms-core`**: Shared registry/VM config (`vm.toml`), cross-platform pure-Rust `ttrpc` client (`socket2`), disk orchestration, and authenticated HTTP/SSE client.
   - **`openvmmsd`**: Management daemon supervising per-VM `openvmm --rpc` processes, zero-copy SHM VRAM files, `WaitVM` lifecycle tracking, live hot-plug SCSI/ISO/`consomme` port forwards, virtual switch discovery, and local REST + SSE API (`127.0.0.1:47620` + `daemon.token`).
-  - **`openvmms`**: Scriptable CLI with formatted tables and `--json` output.
+  - **`openvmms`**: Scriptable CLI with formatted tables and `--json` output (including `vm disk attach --format <vhdx|vhd|raw|iso>`).
   - **`openvmms-gui`**: Native desktop GUI (`eframe`/`egui`) with a 3-pane Hyper-V Manager layout, New VM Wizard, Disk Manager (VHDX/Raw), live Storage/ISO/Networking tabs, log viewer, and one-click FastDesk launch.
+  - **Security Model (Single-User Desktop Host):** OpenVMMS and FastDesk are designed for single-user workstation hosts rather than multi-tenant shared servers. The `openvmmsd` REST/SSE API binds to `127.0.0.1` only and requires the per-installation `daemon.token` (`0600` on Unix, current-user DACL on Windows), while each VM's per-instance FastDesk console listener (`fastdesk.listen_addr`) binds an unauthenticated loopback TCP address (`127.0.0.1`) or explicit `AF_HYPERV`/`AF_VSOCK` endpoint (`vsock_port`). Only trusted local OS accounts with desktop session access should share the host while VMs are running.
 
 ### 4. Standalone Native Viewer (`fastdesk-viewer`)
 - Located in `fastdesk-viewer/` (separate Cargo workspace so Win32 GDI/windowing links cleanly without OpenVMM's `onecore_apiset.lib` constraint).

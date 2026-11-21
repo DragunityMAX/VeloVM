@@ -2849,12 +2849,9 @@ async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDevic
             Some(vmservice::DiskType::ScsiDiskTypeVhdx) => {
                 openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await
             }
-            Some(vmservice::DiskType::ScsiDiskTypePhysical) => {
-                openvmm_helpers::disk::open_raw_disk_file(disk.host_path.as_ref(), options)
-            }
-            Some(vmservice::DiskType::ScsiDiskTypeVhd1) | None => {
-                open_disk_type(disk.host_path.as_ref(), options).await
-            }
+            Some(vmservice::DiskType::ScsiDiskTypePhysical)
+            | Some(vmservice::DiskType::ScsiDiskTypeVhd1)
+            | None => open_disk_type(disk.host_path.as_ref(), options).await,
         }
         .with_context(|| format!("failed to open {}", disk.host_path))?;
         SimpleScsiDiskHandle {

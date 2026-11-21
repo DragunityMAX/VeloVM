@@ -103,6 +103,8 @@ struct OpenVmmsApp {
     // Inline inputs in bottom inspector tabs
     attach_disk_input: String,
     mount_iso_input: String,
+    attach_disk_in_flight: std::collections::HashSet<Uuid>,
+    mount_iso_in_flight: std::collections::HashSet<Uuid>,
     pf_proto: IpProto,
     pf_host_addr: String,
     pf_host_port: u16,
@@ -127,7 +129,15 @@ impl OpenVmmsApp {
         ctx.set_visuals(egui::Visuals::dark());
         let backend = BackendHandle::spawn(Some(data_dir.clone()), daemon_url, ctx.clone());
         backend.send(GuiRequest::ConnectOrStartDaemon);
+        Self::new_with_backend(data_dir, backend)
+    }
 
+    #[cfg(test)]
+    fn new_for_test(ctx: &egui::Context, data_dir: PathBuf) -> Self {
+        Self::new_with_backend(data_dir, BackendHandle::new_for_test(ctx.clone()))
+    }
+
+    fn new_with_backend(data_dir: PathBuf, backend: BackendHandle) -> Self {
         Self {
             data_dir,
             backend,
@@ -151,6 +161,8 @@ impl OpenVmmsApp {
             error_banner: None,
             attach_disk_input: String::new(),
             mount_iso_input: String::new(),
+            attach_disk_in_flight: std::collections::HashSet::new(),
+            mount_iso_in_flight: std::collections::HashSet::new(),
             pf_proto: IpProto::Tcp,
             pf_host_addr: "127.0.0.1".to_string(),
             pf_host_port: 3389,
@@ -240,6 +252,8 @@ impl OpenVmmsApp {
                 }
 
                 self.error_banner = None;
+                self.attach_disk_in_flight.clear();
+                self.mount_iso_in_flight.clear();
                 self.status_line = format!("{} virtual machine(s) loaded", self.vms.len());
                 if self
                     .selected_vm
@@ -250,6 +264,8 @@ impl OpenVmmsApp {
             }
             GuiUpdate::DaemonDisconnected(reason) => {
                 self.connected = false;
+                self.attach_disk_in_flight.clear();
+                self.mount_iso_in_flight.clear();
                 self.connection_status = "Disconnected".to_string();
                 self.error_banner = Some(reason);
             }
@@ -342,9 +358,19 @@ impl OpenVmmsApp {
                     self.host_config = host_config;
                 }
                 GuiUpdate::DialogFinished { kind, error } => match (kind, error) {
-                    (DialogKind::NewVmWizard, None) => self.new_vm_wizard = None,
-                    (DialogKind::NewVmWizard, Some(err)) => {
-                        if let Some(w) = self.new_vm_wizard.as_mut() {
+                    (DialogKind::NewVmWizard(wid), None) => {
+                        if self
+                            .new_vm_wizard
+                            .as_ref()
+                            .is_some_and(|w| w.wizard_id == wid)
+                        {
+                            self.new_vm_wizard = None;
+                        }
+                    }
+                    (DialogKind::NewVmWizard(wid), Some(err)) => {
+                        if let Some(w) = self.new_vm_wizard.as_mut()
+                            && w.wizard_id == wid
+                        {
                             w.submitting = false;
                             w.error = Some(err);
                         }
@@ -381,6 +407,14 @@ impl OpenVmmsApp {
                             d.submitting = false;
                             d.error = Some(err);
                         }
+                    }
+                },
+                GuiUpdate::StorageOpFinished { vm_id, op } => match op {
+                    controller::StorageOpKind::AttachDisk => {
+                        self.attach_disk_in_flight.remove(&vm_id);
+                    }
+                    controller::StorageOpKind::MountIso => {
+                        self.mount_iso_in_flight.remove(&vm_id);
                     }
                 },
                 GuiUpdate::StatusMessage(msg) => {
@@ -1033,7 +1067,14 @@ impl OpenVmmsApp {
                     vec!["vhdx", "vhd", "img", "raw"],
                 ));
             }
-            if ui.button("Attach").clicked() && !self.attach_disk_input.trim().is_empty() {
+            let attach_busy = self.attach_disk_in_flight.contains(&id);
+            let attach_label = if attach_busy { "Attaching…" } else { "Attach" };
+            let can_attach = !attach_busy && !self.attach_disk_input.trim().is_empty();
+            if ui
+                .add_enabled(can_attach, egui::Button::new(attach_label))
+                .clicked()
+            {
+                self.attach_disk_in_flight.insert(id);
                 self.backend.send(GuiRequest::AttachDisk {
                     id,
                     payload: AttachDiskPayload {
@@ -1057,7 +1098,18 @@ impl OpenVmmsApp {
                     vec!["iso"],
                 ));
             }
-            if ui.button("Mount ISO").clicked() && !self.mount_iso_input.trim().is_empty() {
+            let mount_busy = self.mount_iso_in_flight.contains(&id);
+            let mount_label = if mount_busy {
+                "Mounting…"
+            } else {
+                "Mount ISO"
+            };
+            let can_mount = !mount_busy && !self.mount_iso_input.trim().is_empty();
+            if ui
+                .add_enabled(can_mount, egui::Button::new(mount_label))
+                .clicked()
+            {
+                self.mount_iso_in_flight.insert(id);
                 self.backend.send(GuiRequest::MountIso {
                     id,
                     payload: MountIsoPayload {
@@ -1320,8 +1372,12 @@ fn run_self_test() -> anyhow::Result<()> {
     wiz.name = "SelfTest-VM".to_string();
     wiz.disk_mode = dialogs::DiskMode::None;
     let create_payload = wiz.build_create_payload(&app.switches);
+    let wizard_id = wiz.wizard_id;
     app.new_vm_wizard = Some(wiz);
-    app.backend.send(GuiRequest::CreateVm(create_payload));
+    app.backend.send(GuiRequest::CreateVm {
+        wizard_id,
+        payload: create_payload,
+    });
     wait_for_app(&ctx, &mut app, Duration::from_secs(15), "VM creation", |a| {
         a.new_vm_wizard.is_none() && a.vms.iter().any(|v| v.config.name == "SelfTest-VM")
     })?;
@@ -1549,11 +1605,7 @@ mod tests {
     #[test]
     fn external_vm_update_does_not_hijack_selection_while_gui_create_selects() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = OpenVmmsApp::new_headless(
-            &egui::Context::default(),
-            dir.path().to_path_buf(),
-            Some("http://127.0.0.1:1".into()),
-        );
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
         let daemon_id = Uuid::new_v4();
         let vm_a_id = Uuid::new_v4();
         let vm_b_id = Uuid::new_v4();
@@ -1600,11 +1652,7 @@ mod tests {
     #[test]
     fn late_details_fetch_and_stale_updates_do_not_resurrect_or_regress_vm() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = OpenVmmsApp::new_headless(
-            &egui::Context::default(),
-            dir.path().to_path_buf(),
-            Some("http://127.0.0.1:1".into()),
-        );
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
         let daemon_id = Uuid::new_v4();
         let vm_a_id = Uuid::new_v4();
         let vm_b_id = Uuid::new_v4();
@@ -1688,5 +1736,61 @@ mod tests {
         assert_eq!(vm_a.config.id, vm_a_id);
         assert_eq!(vm_a.runtime.status, VmStatus::Running);
         assert_eq!(vm_a.runtime.revision, 5);
+    }
+
+    #[test]
+    fn stale_new_vm_wizard_completion_does_not_close_newer_wizard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+
+        let old_wiz = NewVmWizard::new(dir.path());
+        let old_id = old_wiz.wizard_id;
+        let new_wiz = NewVmWizard::new(dir.path());
+        let new_id = new_wiz.wizard_id;
+        assert_ne!(old_id, new_id);
+        app.new_vm_wizard = Some(new_wiz);
+
+        // Completion (success or error) from a cancelled/superseded wizard must not
+        // close or mutate the currently open wizard.
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::NewVmWizard(old_id),
+            error: Some("stale failure".into()),
+        });
+        assert!(app.new_vm_wizard.as_ref().is_some_and(|w| w.wizard_id == new_id && w.error.is_none()));
+
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::NewVmWizard(old_id),
+            error: None,
+        });
+        assert!(app.new_vm_wizard.as_ref().is_some_and(|w| w.wizard_id == new_id));
+
+        // Matching wizard_id completion closes it cleanly.
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::NewVmWizard(new_id),
+            error: None,
+        });
+        assert!(app.new_vm_wizard.is_none());
+    }
+
+    #[test]
+    fn storage_in_flight_flags_clear_on_storage_op_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let vm_id = Uuid::new_v4();
+
+        app.attach_disk_in_flight.insert(vm_id);
+        app.mount_iso_in_flight.insert(vm_id);
+        app.apply_update(GuiUpdate::StorageOpFinished {
+            vm_id,
+            op: controller::StorageOpKind::AttachDisk,
+        });
+        assert!(!app.attach_disk_in_flight.contains(&vm_id));
+        assert!(app.mount_iso_in_flight.contains(&vm_id));
+
+        app.apply_update(GuiUpdate::StorageOpFinished {
+            vm_id,
+            op: controller::StorageOpKind::MountIso,
+        });
+        assert!(!app.mount_iso_in_flight.contains(&vm_id));
     }
 }

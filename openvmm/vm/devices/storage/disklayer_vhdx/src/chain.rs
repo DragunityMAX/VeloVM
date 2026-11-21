@@ -37,6 +37,48 @@ fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Resu
     Ok(())
 }
 
+fn open_vhdx_file_locked(
+    path: &Path,
+    read_only: bool,
+    layer_idx: Option<usize>,
+) -> anyhow::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(!read_only);
+
+    #[cfg(windows)]
+    if !read_only && path.is_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`).
+        opts.share_mode(0x0000_0001);
+    }
+
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        #[cfg(windows)]
+        Err(err) if !read_only && err.raw_os_error() == Some(32) => {
+            anyhow::bail!(
+                "disk image '{}' is already locked for writing by another process",
+                path.display()
+            );
+        }
+        Err(err) => {
+            return match layer_idx {
+                Some(i) => Err(err).with_context(|| {
+                    format!("failed to open vhdx layer {}: {}", i, path.display())
+                }),
+                None => Err(err.into()),
+            };
+        }
+    };
+
+    #[cfg(unix)]
+    if !read_only {
+        acquire_writable_disk_lock(&file, path)?;
+    }
+
+    Ok(file)
+}
+
 /// Open a single VHDX file as a [`LayeredDiskHandle`] with one layer.
 ///
 /// Use this for base (non-differencing) VHDX files. For differencing chains,
@@ -44,15 +86,7 @@ fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Resu
 ///
 /// The file is opened for read+write unless `read_only` is true.
 pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(!read_only)
-        .open(path)?;
-
-    #[cfg(unix)]
-    if !read_only {
-        acquire_writable_disk_lock(&file, path)?;
-    }
+    let file = open_vhdx_file_locked(path, read_only, None)?;
 
     Ok(Resource::new(LayeredDiskHandle::single_layer(
         VhdxDiskLayerHandle { file, read_only },
@@ -98,16 +132,7 @@ pub fn open_vhdx_chain_explicit(
             let is_leaf = i == 0;
             let layer_read_only = !is_leaf || read_only;
 
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!layer_read_only)
-                .open(path)
-                .with_context(|| format!("failed to open vhdx layer {}: {}", i, path.display()))?;
-
-            #[cfg(unix)]
-            if !layer_read_only {
-                acquire_writable_disk_lock(&file, path)?;
-            }
+            let file = open_vhdx_file_locked(path, layer_read_only, Some(i))?;
 
             let handle = VhdxDiskLayerHandle {
                 file,
@@ -389,7 +414,6 @@ mod tests {
         let _ = resource;
     }
 
-    #[cfg(unix)]
     #[pal_async::async_test]
     async fn rejects_concurrent_writable_vhdx_open() {
         let dir = tempfile::tempdir().unwrap();

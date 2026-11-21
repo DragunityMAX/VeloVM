@@ -1,56 +1,21 @@
-From: OpenVMMS Maintainers <fastdesk@localhost>
-Subject: [PATCH 1/1] mesh_rpc: cancel pending RPCs and drop responses on client disconnect
-Upstream-Base: microsoft/openvmm@c4419be15ab702194f0a25c294bd2f6187804824
-
-In `mesh_rpc::Server::serve_connection`, closing the ttrpc client socket
-previously did not cancel the connection's `CancelContext`, and `send_task`
-attempted to write responses back to the closed stream.
-
-This patch wires `CancelContext::new().with_cancel()`, `peer_closed`, and
-`send_done` into `serve_connection`:
-- On read/write errors, `cancel.cancel()` cancels all pending RPCs on that
-  connection and `send_task` drops their responses rather than writing to
-  the dead socket.
-- On Unix, a clean read EOF (which may be a client `shutdown(SHUT_WR)`
-  half-close still expecting replies) waits on `POLLHUP`/`POLLERR` vs
-  `send_task` finishing so half-closed clients still receive in-flight
-  replies while full socket closes cancel pending RPCs immediately.
-- On non-Unix platforms (`AF_UNIX` on Windows), read EOF continues to
-  cancel immediately because half-close cannot be distinguished from
-  socket close at read EOF without writing.
-
-Behavioral impact across every ttrpc service:
-- Any ttrpc client that disconnects before receiving a response cancels all
-  pending RPCs on that connection (via `CancelContext`) and drops their
-  responses. In particular, if `openvmmsd` restarts or disconnects while
-  `SaveVm`, `RestoreVm`, or `ShutdownVm` is running, that operation is
-  cancelled instead of finishing.
-
-Rationale in this repository:
-- OpenVMM's `VmService::WaitVm` stores a single `(CancelContext, response)`
-  waiter per VM. Cancelling `WaitVm`'s `CancelContext` when `openvmmsd` closes
-  the socket during `daemon stop` / `SIGTERM` lets a restarted daemon cleanly
-  re-adopt the running VM and re-attach `WaitVm` without hitting
-  `"wait VM already in flight"`.
-
-Carry forward or upstream when syncing `openvmm/` past `c4419be15ab702194f0a25c294bd2f6187804824`.
----
 diff --git a/openvmm/support/mesh/mesh_rpc/src/server.rs b/openvmm/support/mesh/mesh_rpc/src/server.rs
-index 24acaf8..2726365 100644
+index 24acaf8..63d481f 100644
 --- a/openvmm/support/mesh/mesh_rpc/src/server.rs
 +++ b/openvmm/support/mesh/mesh_rpc/src/server.rs
-@@ -29,8 +29,10 @@
+@@ -29,8 +29,12 @@
  use mesh::MeshPayload;
  use mesh::local_node::Port;
  use pal_async::driver::Driver;
++#[cfg(target_os = "linux")]
 +use pal_async::interest::PollEvents;
  use pal_async::socket::AsSockRef;
  use pal_async::socket::Listener;
++#[cfg(target_os = "linux")]
 +use pal_async::socket::PollReadyExt;
  use pal_async::socket::PolledSocket;
  use std::collections::HashMap;
  use std::io::Read;
-@@ -168,44 +170,80 @@ pub async fn serve_connection(
+@@ -168,44 +172,80 @@ pub async fn serve_connection(
      ) -> anyhow::Result<()> {
          let (mut reader, mut writer) = stream.split();
          let (stream_send, mut stream_recv) = mesh::channel();
@@ -143,10 +108,10 @@ index 24acaf8..2726365 100644
 +            }
 +            // A clean read EOF can be either a half-close (`shutdown(SHUT_WR)`),
 +            // where the peer still expects replies, or a full socket close.
-+            // On Unix, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
++            // On Linux, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
 +            // so half-closed clients still receive in-flight replies while
 +            // full disconnects cancel pending RPCs immediately.
-+            #[cfg(unix)]
++            #[cfg(target_os = "linux")]
 +            {
 +                futures::select! {
 +                    _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
@@ -156,7 +121,7 @@ index 24acaf8..2726365 100644
 +                    _ = send_done_rx.fuse() => {}
                  }
              }
-+            #[cfg(not(unix))]
++            #[cfg(not(target_os = "linux"))]
 +            {
 +                drop(send_done_rx);
 +                peer_closed.store(true, std::sync::atomic::Ordering::Release);
@@ -165,7 +130,7 @@ index 24acaf8..2726365 100644
              Ok(())
          };
          let send_task = async {
-@@ -239,16 +277,24 @@ enum Event<T> {
+@@ -239,16 +279,24 @@ enum Event<T> {
                          responses.push(recv);
                      }
                      Event::Response((stream_id, payload)) => {
@@ -197,7 +162,7 @@ index 24acaf8..2726365 100644
              anyhow::Result::<_>::Ok(())
          };
          (recv_task, send_task).try_join().await?;
-@@ -626,6 +672,9 @@ mod tests {
+@@ -626,6 +674,9 @@ mod tests {
      use crate::Client;
      use crate::Server;
      use crate::client::ExistingConnection;
@@ -207,7 +172,7 @@ index 24acaf8..2726365 100644
      use crate::service::Code;
      use crate::service::ServiceRpc;
      use futures::StreamExt;
-@@ -702,4 +751,199 @@ fn client_server() {
+@@ -702,4 +753,213 @@ fn client_server() {
          client_thread.join().unwrap();
          server_thread.join().unwrap().unwrap();
      }
@@ -251,7 +216,12 @@ index 24acaf8..2726365 100644
 +            let (mut ctx, req) = recv.next().await.unwrap();
 +            match req {
 +                items::Example::Method1(_, resp) => {
-+                    ctx.cancelled().await;
++                    let mut timeout_ctx =
++                        mesh::CancelContext::new().with_timeout(std::time::Duration::from_secs(5));
++                    timeout_ctx
++                        .until_cancelled(ctx.cancelled())
++                        .await
++                        .expect("timed out waiting for client disconnect to cancel pending RPC");
 +                    resp.send(Err(status_from_err(
 +                        Code::Cancelled,
 +                        anyhow::anyhow!("client disconnected"),
@@ -266,7 +236,7 @@ index 24acaf8..2726365 100644
 +        server_thread.join().unwrap().unwrap();
 +    }
 +
-+    #[cfg(unix)]
++    #[cfg(target_os = "linux")]
 +    #[test]
 +    fn client_half_close_receives_in_flight_reply() {
 +        use crate::message::MESSAGE_TYPE_RESPONSE;
@@ -304,7 +274,9 @@ index 24acaf8..2726365 100644
 +                sock.get().shutdown(std::net::Shutdown::Write).unwrap();
 +                // Wait until the server has observed the request and delayed slightly
 +                // before sending the response back to the half-closed client.
-+                req_seen_rx.recv().unwrap();
++                req_seen_rx
++                    .recv_timeout(std::time::Duration::from_secs(5))
++                    .unwrap();
 +                let msg = read_message(&mut sock).await.unwrap().unwrap();
 +                assert_eq!(msg.stream_id, 1);
 +                assert_eq!(msg.message_type, MESSAGE_TYPE_RESPONSE);
@@ -348,7 +320,7 @@ index 24acaf8..2726365 100644
 +        server_thread.join().unwrap().unwrap();
 +    }
 +
-+    #[cfg(unix)]
++    #[cfg(target_os = "linux")]
 +    #[test]
 +    fn client_half_close_then_full_close_cancels_pending_rpc_context() {
 +        let (c, s) = unix_socket::UnixStream::pair().unwrap();
@@ -381,7 +353,9 @@ index 24acaf8..2726365 100644
 +                .await
 +                .unwrap();
 +                sock.get().shutdown(std::net::Shutdown::Write).unwrap();
-+                req_seen_rx.recv().unwrap();
++                req_seen_rx
++                    .recv_timeout(std::time::Duration::from_secs(5))
++                    .unwrap();
 +                // Full close after half-close must raise POLLHUP and cancel the RPC.
 +                drop(sock);
 +            })
@@ -392,7 +366,12 @@ index 24acaf8..2726365 100644
 +            match req {
 +                items::Example::Method1(_, resp) => {
 +                    req_seen_tx.send(()).unwrap();
-+                    ctx.cancelled().await;
++                    let mut timeout_ctx =
++                        mesh::CancelContext::new().with_timeout(std::time::Duration::from_secs(5));
++                    timeout_ctx
++                        .until_cancelled(ctx.cancelled())
++                        .await
++                        .expect("timed out waiting for full close to cancel pending RPC");
 +                    resp.send(Err(status_from_err(
 +                        Code::Cancelled,
 +                        anyhow::anyhow!("client closed socket"),

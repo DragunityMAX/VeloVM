@@ -5,7 +5,9 @@ use anyhow::Context;
 use anyhow::bail;
 use std::fs;
 use std::io::Read;
+#[cfg(target_os = "linux")]
 use std::io::Seek;
+#[cfg(target_os = "linux")]
 use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
@@ -15,6 +17,15 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// Returns `true` if `path` starts with the 8-byte VHDX container signature (`b"vhdxfile"`).
+pub fn file_has_vhdx_signature(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).is_ok() && &magic == b"vhdxfile"
+}
 
 /// Validates that `path` has a file name and does not collide with another disk format's
 /// reserved extension.
@@ -40,7 +51,7 @@ pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow:
         DiskFormat::Raw => {
             if matches!(
                 lower.as_deref(),
-                Some("vhdx" | "vhd" | "vmdk" | "vmgs" | "iso")
+                Some("vhdx" | "avhdx" | "vhd" | "avhd" | "vmdk" | "vmgs" | "iso")
             ) {
                 bail!(
                     "disk path {} is incompatible with raw format: extension .{} is reserved for another disk format (use e.g. .img or .raw)",
@@ -833,5 +844,65 @@ mod tests {
             assert!(res.is_err());
             assert!(!vhdx_cancel_path.exists());
         }
+    }
+
+    #[test]
+    fn create_and_inspect_real_vhdx_disk_when_binary_present() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir.join("../../..");
+        let img_name = if cfg!(windows) {
+            "openvmm-img.exe"
+        } else {
+            "openvmm-img"
+        };
+        let img_bin = [
+            repo_root.join("openvmm/target/release").join(img_name),
+            repo_root.join("openvmm/target/debug").join(img_name),
+        ]
+        .into_iter()
+        .find(|p| p.is_file());
+
+        let Some(img_bin) = img_bin else {
+            if std::env::var_os("OPENVMM_REQUIRE_REAL_BINARY").is_some() {
+                panic!(
+                    "OPENVMM_REQUIRE_REAL_BINARY is set, but real {img_name} binary was not found under {}",
+                    repo_root.display()
+                );
+            }
+            eprintln!("skipping create_and_inspect_real_vhdx_disk: {img_name} not built yet");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let dyn_path = dir.path().join("dynamic.vhdx");
+        let dyn_info = create_disk(
+            &CreateDiskPayload {
+                path: dyn_path.clone(),
+                size_bytes: 16 * 1024 * 1024,
+                format: DiskFormat::Vhdx,
+                fixed: false,
+            },
+            Some(&img_bin),
+        )
+        .unwrap();
+        assert_eq!(dyn_info.format, "vhdx");
+        assert_eq!(dyn_info.virtual_size_bytes, 16 * 1024 * 1024);
+        assert!(file_has_vhdx_signature(&dyn_path));
+
+        let fixed_path = dir.path().join("fixed.vhdx");
+        let fixed_info = create_disk(
+            &CreateDiskPayload {
+                path: fixed_path.clone(),
+                size_bytes: 8 * 1024 * 1024,
+                format: DiskFormat::Vhdx,
+                fixed: true,
+            },
+            Some(&img_bin),
+        )
+        .unwrap();
+        assert_eq!(fixed_info.format, "vhdx");
+        assert_eq!(fixed_info.virtual_size_bytes, 8 * 1024 * 1024);
+        assert!(fixed_info.file_size_bytes >= 8 * 1024 * 1024);
+        assert!(file_has_vhdx_signature(&fixed_path));
     }
 }

@@ -3165,7 +3165,11 @@ async fn run_control_inner(
         if let Some(vsock_port) = opt.fastdesk.fastdesk_vsock_port {
             #[cfg(any(windows, target_os = "linux"))]
             {
-                let (listener, _bound_port) = bind_fastdesk_vmsocket_listener(vsock_port)?;
+                let listener =
+                    vmsocket::VmListener::bind(vmsocket::VmAddress::vsock_any(vsock_port))
+                        .with_context(|| {
+                            format!("binding FastDesk vmsocket port {vsock_port}")
+                        })?;
                 fastdesk_worker = Some(
                     fastdesk_host
                         .launch_worker(

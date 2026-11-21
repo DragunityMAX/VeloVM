@@ -157,6 +157,22 @@ jobs:
             throw "openvmms-gui.exe --self-test failed:`n$guiTestOut"
           }
 
+          $autoDir = Join-Path $env:RUNNER_TEMP "openvmms-autostart-win"
+          if (Test-Path $autoDir) { Remove-Item -Recurse -Force $autoDir }
+          New-Item -ItemType Directory -Force -Path $autoDir | Out-Null
+          try {
+            $autoOut = & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --json vm list | Out-String
+            if ($LASTEXITCODE -ne 0 -or $autoOut -notmatch '\[\]') {
+              throw "openvmms auto-start stdout-capture check failed (exit $LASTEXITCODE):`n$autoOut"
+            }
+          } finally {
+            try {
+              & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --no-auto-start daemon stop | Out-Null
+            } catch {}
+            Start-Sleep -Milliseconds 300
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $autoDir
+          }
+
           $smokeDir = Join-Path $env:RUNNER_TEMP "openvmms-smoke-win"
           if (Test-Path $smokeDir) { Remove-Item -Recurse -Force $smokeDir }
           New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
@@ -177,7 +193,16 @@ jobs:
             $smokeDisk = Join-Path $smokeDir "smoke.img"
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               disk create $smokeDisk --size 16M --format raw | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms disk create failed" }
+            if ($LASTEXITCODE -ne 0) { throw "openvmms disk create (raw) failed" }
+            $smokeVhdx = Join-Path $smokeDir "smoke.vhdx"
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              disk create $smokeVhdx --size 64M --format vhdx | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms disk create (vhdx) failed" }
+            $vhdxInfo = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+              disk info $smokeVhdx | Out-String | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $vhdxInfo.format -ne "vhdx") {
+              throw "Expected VHDX disk info format 'vhdx', got $($vhdxInfo | ConvertTo-Json -Compress)"
+            }
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm create "Smoke-VM" --preset win11 --cpus 2 --memory 2G --disk $smokeDisk | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "openvmms vm create failed" }
@@ -226,9 +251,33 @@ jobs:
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm stop "Smoke-VM" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "openvmms vm stop failed" }
+            # Verify daemon stop + restart preserves VM registry and disk state cleanly on Windows.
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              daemon stop | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop (restart check) failed" }
+            if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
+              throw "openvmmsd smoke daemon did not exit cleanly before restart (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
+            }
+            $smokeDaemon = Start-Process -FilePath (Resolve-Path ".\openvmms\target\release\openvmmsd.exe").Path `
+              -ArgumentList @("--data-dir", $smokeDir, "--listen", "127.0.0.1:$smokePort") -PassThru -NoNewWindow
+            $deadline = (Get-Date).AddSeconds(15)
+            $healthy = $false
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $r = Invoke-RestMethod -Uri "http://127.0.0.1:$smokePort/api/v1/health" -TimeoutSec 1
+                if ($r.status -eq "ok") { $healthy = $true; break }
+              } catch {}
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not $healthy) { throw "restarted openvmmsd smoke daemon did not become healthy" }
+            $restartedShow = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+              vm show "Smoke-VM" | Out-String | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $restartedShow.config.name -ne "Smoke-VM") {
+              throw "Expected Smoke-VM to persist across Windows daemon restart"
+            }
             & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               daemon stop --stop-vms | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop failed" }
+            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop --stop-vms failed" }
             if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
               throw "openvmmsd smoke daemon did not exit cleanly (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
             }
@@ -435,6 +484,19 @@ jobs:
           ./openvmms/target/release/openvmms --help >/dev/null
           ./openvmms/target/release/openvmms-gui --self-test | grep -q "SELF-TEST OK"
 
+          AUTO_DIR="$RUNNER_TEMP/openvmms-autostart-linux"
+          rm -rf "$AUTO_DIR"
+          mkdir -p "$AUTO_DIR"
+          cleanup_auto() {
+            ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --no-auto-start daemon stop >/dev/null 2>&1 || true
+            rm -rf "$AUTO_DIR"
+          }
+          trap cleanup_auto EXIT
+          AUTO_OUT="$(timeout 15s ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --json vm list)"
+          echo "$AUTO_OUT" | grep -q '\[\]'
+          cleanup_auto
+          trap - EXIT
+
           SMOKE_DIR="$RUNNER_TEMP/openvmms-smoke-linux"
           rm -rf "$SMOKE_DIR"
           mkdir -p "$SMOKE_DIR"
@@ -460,6 +522,10 @@ jobs:
           sudo chmod 666 /dev/kvm
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.img" --size 16M --format raw >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            disk create "$SMOKE_DIR/smoke.vhdx" --size 64M --format vhdx >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            disk info "$SMOKE_DIR/smoke.vhdx" | grep -q '"format": "vhdx"'
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \

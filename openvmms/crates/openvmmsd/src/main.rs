@@ -26,8 +26,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let raw_data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+    let data_dir = openvmms_core::api_client::resolve_client_path(&raw_data_dir);
+    let _ = std::fs::create_dir_all(&data_dir);
+    // Do not retain a caller's working directory across daemon lifetime.
+    let _ = std::env::set_current_dir(&data_dir);
     run_daemon(DaemonOptions {
-        data_dir: args.data_dir.unwrap_or_else(default_data_dir),
+        data_dir,
         listen_addr: args.listen,
     })
     .await

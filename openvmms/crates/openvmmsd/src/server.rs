@@ -159,15 +159,7 @@ async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
 
-    let query_token = request.uri().query().and_then(|q| {
-        q.split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(k, _)| *k == "token")
-            .map(|(_, v)| v)
-    });
-
-    let candidate = header_token.or(query_token);
-    if candidate.is_some_and(|t| constant_time_eq(t.as_bytes(), state.token.as_bytes())) {
+    if header_token.is_some_and(|t| constant_time_eq(t.as_bytes(), state.token.as_bytes())) {
         Ok(next.run(request).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -880,7 +872,7 @@ mod tests {
             .open("/dev/kvm")
             .is_ok();
         #[cfg(not(target_os = "linux"))]
-        let kvm_ready = false;
+        let kvm_ready = cfg!(windows);
 
         let missing_reason = if openvmm_bin.is_none() {
             Some(format!(
@@ -947,53 +939,47 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        let create_req = vmservice::CreateVmRequest {
-            config: Some(vmservice::VmConfig {
-                memory_config: Some(vmservice::MemoryConfig {
-                    memory_mb: 512,
-                    ..Default::default()
-                }),
-                processor_config: Some(vmservice::ProcessorConfig {
-                    processor_count: 1,
-                    ..Default::default()
-                }),
-                boot_config: Some(vmservice::vm_config::BootConfig::Uefi(vmservice::Uefi {
-                    firmware_path: msvm_fd.to_string_lossy().into_owned(),
-                    initial_variables: Some(vmservice::uefi::InitialVariables {
-                        secure_boot_template:
-                            vmservice::uefi::initial_variables::SecureBootTemplate::None as i32,
-                        custom_uefi_json_path: None,
-                    }),
-                    secure_boot_enabled: false,
-                })),
-                devices_config: Some(vmservice::DevicesConfig {
-                    scsi_disks: vec![vmservice::ScsiDisk {
-                        controller: 0,
-                        lun: 0,
-                        host_path: disk_path.to_string_lossy().into_owned(),
-                        r#type: vmservice::DiskType::ScsiDiskTypePhysical as i32,
-                        read_only: false,
-                        is_dvd: false,
-                    }],
-                    enable_scsi_controller: true,
-                    ..Default::default()
-                }),
-                vmgs: Some(vmservice::VmgsConfig {
-                    backend: Some(vmservice::DiskBackend {
-                        kind: Some(vmservice::disk_backend::Kind::File(vmservice::FileDisk {
-                            path: vmgs_path.to_string_lossy().into_owned(),
-                            direct: false,
-                            create_size_bytes: Some(4 * 1024 * 1024),
-                        })),
-                    }),
-                    provision_condition: vmservice::vmgs_config::ProvisionCondition::OnEmpty as i32,
-                }),
-                tpm_enabled: false,
-                ..Default::default()
-            }),
-            log_id: "real-wait-vm-test".into(),
-        };
-        client.create_vm(create_req).await.unwrap();
+        let mut cfg = openvmms_core::models::VmConfig::from_preset(
+            "RealWaitVm",
+            VmPreset::Custom,
+            dir.path(),
+        );
+        cfg.vcpus = 1;
+        cfg.memory_mb = 512;
+        cfg.tpm_enabled = false;
+        cfg.fastdesk.enabled = false;
+        cfg.nics.clear();
+        cfg.vmgs_path = Some(vmgs_path);
+        cfg.disks = vec![openvmms_core::models::DiskAttachment {
+            lun: 0,
+            kind: DiskKind::HardDisk,
+            path: disk_path,
+            read_only: false,
+            format: DiskFormat::Raw,
+        }];
+        let create_req =
+            crate::supervisor::build_create_vm_request(&cfg, &msvm_fd, None).unwrap();
+        if let Err(err) = client.create_vm(create_req).await {
+            let msg = format!("{err:#}");
+            let lower = msg.to_ascii_lowercase();
+            let hypervisor_missing = cfg!(windows)
+                && (lower.contains("hypervisor")
+                    || lower.contains("whp")
+                    || lower.contains("partition")
+                    || lower.contains("virtualization")
+                    || lower.contains("not present")
+                    || lower.contains("not enabled"));
+            if hypervisor_missing && std::env::var_os("OPENVMM_REQUIRE_REAL_KVM_TEST").is_none() {
+                eprintln!(
+                    "skipping rest of real_openvmm_wait_vm_cancels_on_disconnect_and_reattaches after spawning openvmm.exe --rpc (WHP unavailable): {msg}"
+                );
+                let _ = client.quit().await;
+                let status = child_guard.0.take().unwrap().wait().unwrap();
+                assert!(status.success(), "openvmm --rpc exited with {status}");
+                return;
+            }
+            panic!("CreateVM RPC failed: {msg}");
+        }
         client.resume_vm().await.unwrap();
 
         let props = client
@@ -1270,12 +1256,10 @@ mod tests {
             .unwrap();
         let client = test_http_client();
 
-        // Open a persistent SSE stream like openvmms-gui does.
+        // Open a persistent SSE stream using bearer authentication.
         let mut sse_resp = client
-            .get(format!(
-                "{}/api/v1/events?token={}",
-                daemon.base_url, daemon.token
-            ))
+            .get(format!("{}/api/v1/events", daemon.base_url))
+            .bearer_auth(&daemon.token)
             .send()
             .await
             .unwrap();
@@ -1673,7 +1657,53 @@ mod tests {
             );
         }
 
-        // Retrying with corrected vcpus using the same disk path must now succeed.
+        // Exercise post-disk-creation rollback: `create_disk_cancellable` succeeds
+        // and creates `disk_path`, then `save_vm` fails because `vms/` is blocked
+        // by a regular file; the newly created disk must be removed cleanly.
+        let vms_dir = dir.path().join("vms");
+        fs::remove_dir(&vms_dir).unwrap();
+        fs::write(&vms_dir, b"blocker").unwrap();
+        let rollback_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Validate-First-VM".into(),
+                description: String::new(),
+                preset: VmPreset::Custom,
+                vcpus: Some(4),
+                memory_mb: Some(1024),
+                nested_virt: None,
+                uefi_firmware: None,
+                secure_boot_enabled: None,
+                secure_boot_template: None,
+                tpm_enabled: None,
+                fastdesk: None,
+                disks: vec![],
+                create_disk: Some(CreateDiskPayload {
+                    path: disk_path.clone(),
+                    size_bytes: 16 * 1024 * 1024,
+                    format: DiskFormat::Raw,
+                    fixed: false,
+                }),
+                iso_path: None,
+                nics: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !rollback_resp.status().is_success(),
+            "expected failure when save_vm cannot create vms/<id>"
+        );
+        assert!(
+            !disk_path.exists(),
+            "post-disk-creation rollback failed to remove {}",
+            disk_path.display()
+        );
+        fs::remove_file(&vms_dir).unwrap();
+        fs::create_dir_all(&vms_dir).unwrap();
+
+        // Retrying with corrected state using the same disk path must now succeed.
         let ok_resp = client
             .post(format!("{}/api/v1/vms", daemon.base_url))
             .bearer_auth(&daemon.token)
@@ -1764,11 +1794,6 @@ mod tests {
     #[tokio::test]
     async fn delete_disks_preserves_disk_referenced_by_another_vm() {
         let dir = tempfile::tempdir().unwrap();
-        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
-            .await
-            .unwrap();
-        let client = test_http_client();
-
         let shared_disk = dir.path().join("shared.img");
         let private_disk = dir.path().join("private.img");
         fs::write(&shared_disk, b"SHARED").unwrap();
@@ -1782,42 +1807,32 @@ mod tests {
             format: DiskFormat::Raw,
         };
 
-        assert_eq!(
-            client
-                .post(format!("{}/api/v1/vms", daemon.base_url))
-                .bearer_auth(&daemon.token)
-                .json(&CreateVmPayload {
-                    name: "VM-Owner-1".into(),
-                    preset: VmPreset::Custom,
-                    vcpus: Some(2),
-                    memory_mb: Some(512),
-                    disks: vec![mk_disk(0, shared_disk.clone()), mk_disk(1, private_disk.clone())],
-                    ..Default::default()
-                })
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            201
+        // Pre-seed two persisted VM configs referencing the same image to verify
+        // `delete_vm(delete_disks=true)` preserves disks still referenced elsewhere.
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let mut owner1 = openvmms_core::models::VmConfig::from_preset(
+            "VM-Owner-1",
+            VmPreset::Custom,
+            &store.vm_dir(uuid::Uuid::new_v4()),
         );
-        assert_eq!(
-            client
-                .post(format!("{}/api/v1/vms", daemon.base_url))
-                .bearer_auth(&daemon.token)
-                .json(&CreateVmPayload {
-                    name: "VM-Owner-2".into(),
-                    preset: VmPreset::Custom,
-                    vcpus: Some(2),
-                    memory_mb: Some(512),
-                    disks: vec![mk_disk(0, shared_disk.clone())],
-                    ..Default::default()
-                })
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            201
+        owner1.disks = vec![
+            mk_disk(0, shared_disk.clone()),
+            mk_disk(1, private_disk.clone()),
+        ];
+        store.save_vm(&owner1).unwrap();
+
+        let mut owner2 = openvmms_core::models::VmConfig::from_preset(
+            "VM-Owner-2",
+            VmPreset::Custom,
+            &store.vm_dir(uuid::Uuid::new_v4()),
         );
+        owner2.disks = vec![mk_disk(0, shared_disk.clone())];
+        store.save_vm(&owner2).unwrap();
+
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
 
         let del = client
             .delete(format!(
@@ -2029,6 +2044,309 @@ mod tests {
         assert_eq!(vm.config.disks[0].kind, DiskKind::Dvd);
         assert!(vm.config.disks[0].read_only);
         assert_eq!(vm.config.disks[0].format, DiskFormat::Iso);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_missing_wrong_empty_truncated_and_query_tokens_across_all_protected_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+        let truncated = &daemon.token[..daemon.token.len().saturating_sub(1)];
+
+        let routes: Vec<(reqwest::Method, &str)> = vec![
+            (reqwest::Method::GET, "/api/v1/events"),
+            (reqwest::Method::GET, "/api/v1/host/info"),
+            (reqwest::Method::GET, "/api/v1/host/config"),
+            (reqwest::Method::PUT, "/api/v1/host/config"),
+            (reqwest::Method::GET, "/api/v1/host/switches"),
+            (reqwest::Method::POST, "/api/v1/daemon/shutdown"),
+            (reqwest::Method::POST, "/api/v1/disks/create"),
+            (reqwest::Method::POST, "/api/v1/disks/inspect"),
+            (reqwest::Method::GET, "/api/v1/vms"),
+            (reqwest::Method::POST, "/api/v1/vms"),
+            (
+                reqwest::Method::GET,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000",
+            ),
+            (
+                reqwest::Method::PUT,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000",
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/start",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/stop",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/shutdown",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/pause",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/resume",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/reset",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/disks",
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/disks/0",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/iso",
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/iso",
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/iso/0",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/nics/00000000-0000-0000-0000-000000000000/ports",
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/nics/00000000-0000-0000-0000-000000000000/ports",
+            ),
+            (
+                reqwest::Method::GET,
+                "/api/v1/vms/00000000-0000-0000-0000-000000000000/logs",
+            ),
+        ];
+
+        for (method, path) in &routes {
+            for case in ["missing", "wrong", "empty", "truncated", "query"] {
+                let req = match case {
+                    "missing" => client.request(method.clone(), format!("{}{path}", daemon.base_url)),
+                    "wrong" => client
+                        .request(method.clone(), format!("{}{path}", daemon.base_url))
+                        .bearer_auth("definitely-not-the-valid-token"),
+                    "empty" => client
+                        .request(method.clone(), format!("{}{path}", daemon.base_url))
+                        .header(reqwest::header::AUTHORIZATION, "Bearer "),
+                    "truncated" => client
+                        .request(method.clone(), format!("{}{path}", daemon.base_url))
+                        .bearer_auth(truncated),
+                    "query" => client.request(
+                        method.clone(),
+                        format!("{}{path}?token={}", daemon.base_url, daemon.token),
+                    ),
+                    _ => unreachable!(),
+                };
+                let resp = req.send().await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    401,
+                    "route {method} {path} ({case}) must return 401"
+                );
+            }
+        }
+
+        let health = client
+            .get(format!("{}/api/v1/health", daemon.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn attach_and_create_vm_reject_duplicate_writable_disk_and_vhdx_magic_as_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let disk_a = dir.path().join("disk-a.img");
+        let disk_b = dir.path().join("disk-b.img");
+        let shared_ro = dir.path().join("shared-ro.img");
+        let disguised_vhdx = dir.path().join("checkpoint.dat");
+        fs::write(&disk_a, vec![0u8; 4096]).unwrap();
+        fs::write(&disk_b, vec![0u8; 4096]).unwrap();
+        fs::write(&shared_ro, vec![0u8; 4096]).unwrap();
+        fs::write(&disguised_vhdx, b"vhdxfile\0\0\0\0\0\0\0\0").unwrap();
+
+        // 1. Creating VM-1 with disguised VHDX marked as raw fails cleanly.
+        let bad_create = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "BadMagic-VM".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                disks: vec![openvmms_core::models::DiskAttachment {
+                    lun: 0,
+                    kind: DiskKind::HardDisk,
+                    path: disguised_vhdx.clone(),
+                    read_only: false,
+                    format: DiskFormat::Raw,
+                }],
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_create.status(), 400);
+
+        // 2. Create VM-1 owning writable disk_a + read-only shared_ro.
+        let vm1_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "DiskGuard-1".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                disks: vec![
+                    openvmms_core::models::DiskAttachment {
+                        lun: 0,
+                        kind: DiskKind::HardDisk,
+                        path: disk_a.clone(),
+                        read_only: false,
+                        format: DiskFormat::Raw,
+                    },
+                    openvmms_core::models::DiskAttachment {
+                        lun: 2,
+                        kind: DiskKind::HardDisk,
+                        path: shared_ro.clone(),
+                        read_only: true,
+                        format: DiskFormat::Raw,
+                    },
+                ],
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vm1_resp.status(), 201);
+
+        // 3. Re-attaching disk_a on another LUN of VM-1 fails with 409 Conflict.
+        let dup_same_vm = client
+            .post(format!("{}/api/v1/vms/DiskGuard-1/disks", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::AttachDiskPayload {
+                path: disk_a.clone(),
+                lun: Some(3),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dup_same_vm.status(), 409);
+
+        // 4. Creating VM-2 with writable disk_a fails with 409 Conflict.
+        let conflict_create = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "DiskGuard-2".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                disks: vec![openvmms_core::models::DiskAttachment {
+                    lun: 0,
+                    kind: DiskKind::HardDisk,
+                    path: disk_a.clone(),
+                    read_only: false,
+                    format: DiskFormat::Raw,
+                }],
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict_create.status(), 409);
+
+        // 5. Create VM-2 with disk_b + read-only shared_ro -> 201 (both RO allowed).
+        let vm2_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "DiskGuard-2".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                disks: vec![
+                    openvmms_core::models::DiskAttachment {
+                        lun: 0,
+                        kind: DiskKind::HardDisk,
+                        path: disk_b.clone(),
+                        read_only: false,
+                        format: DiskFormat::Raw,
+                    },
+                    openvmms_core::models::DiskAttachment {
+                        lun: 1,
+                        kind: DiskKind::HardDisk,
+                        path: shared_ro,
+                        read_only: true,
+                        format: DiskFormat::Raw,
+                    },
+                ],
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vm2_resp.status(), 201);
+
+        // 6. Attaching disk_a (writable or read-only) to VM-2 fails with 409 Conflict.
+        let cross_attach = client
+            .post(format!("{}/api/v1/vms/DiskGuard-2/disks", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::AttachDiskPayload {
+                path: disk_a,
+                lun: Some(2),
+                read_only: true,
+                format: Some(DiskFormat::Raw),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cross_attach.status(), 409);
+
+        // 7. Attaching disguised_vhdx with inferred format (format: None) fails with 400.
+        let inferred_vhdx = client
+            .post(format!("{}/api/v1/vms/DiskGuard-2/disks", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::AttachDiskPayload {
+                path: disguised_vhdx,
+                lun: Some(3),
+                read_only: false,
+                format: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(inferred_vhdx.status(), 400);
 
         daemon.shutdown().await;
     }

@@ -107,6 +107,7 @@ pub struct FilePickerModal {
     load_seq: u64,
     load_rx: Option<std::sync::mpsc::Receiver<FilePickerLoadResult>>,
     repaint_ctx: Option<egui::Context>,
+    ignore_file_clicks_until: Option<std::time::Instant>,
 }
 
 impl FilePickerModal {
@@ -137,6 +138,7 @@ impl FilePickerModal {
             load_seq: 0,
             load_rx: None,
             repaint_ctx: None,
+            ignore_file_clicks_until: None,
         };
         let filter_exts_owned = modal.filter_exts.clone();
         modal.start_load(trimmed.clone(), move |seq| {
@@ -230,6 +232,8 @@ impl FilePickerModal {
         let dir_str = dir.to_string_lossy().into_owned();
         self.dir_input = dir_str.clone();
         self.dir_input_edited = false;
+        self.ignore_file_clicks_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
         let filter_exts = self.filter_exts.clone();
         self.start_load(dir_str.clone(), move |seq| {
             if dir.is_dir() {
@@ -275,6 +279,7 @@ pub enum DiskMode {
 }
 
 pub struct NewVmWizard {
+    pub wizard_id: Uuid,
     pub step: usize,
     pub name: String,
     pub description: String,
@@ -306,6 +311,7 @@ pub struct NewVmWizard {
 impl NewVmWizard {
     pub fn new(default_dir: &std::path::Path) -> Self {
         let mut w = Self {
+            wizard_id: Uuid::new_v4(),
             step: 0,
             name: "Windows-11-VM".to_string(),
             description: String::new(),
@@ -553,60 +559,67 @@ impl VmSettingsDialog {
         }
     }
 
+    pub fn has_hardware_changes(&self) -> bool {
+        self.vcpus != self.initial_config.vcpus
+            || self.memory_mb != self.initial_config.memory_mb
+            || self.nested_virt != self.initial_config.nested_virt
+            || string_to_opt(&self.uefi_firmware) != self.initial_config.uefi_firmware
+            || self.secure_boot_enabled != self.initial_config.secure_boot_enabled
+            || self.secure_boot_template != self.initial_config.secure_boot_template
+            || self.tpm_enabled != self.initial_config.tpm_enabled
+            || self.fastdesk_enabled != self.initial_config.fastdesk.enabled
+            || self.vram_mb != self.initial_config.fastdesk.vram_mb
+            || self.use_shm != self.initial_config.fastdesk.use_shm
+            || self.transport != self.initial_config.fastdesk.transport
+            || self.selected_switch_id != self.initial_switch_id
+    }
+
     pub fn build_update_payload(&self, switches: &[VirtualSwitchInfo]) -> UpdateVmPayload {
         let trimmed_name = self.name.trim();
         let name = (trimmed_name != self.initial_config.name).then(|| trimmed_name.to_string());
         let description =
             (self.description != self.initial_config.description).then(|| self.description.clone());
 
-        if self.is_offline {
-            // Only emit fields that were actually changed so concurrent CLI/API edits
-            // to other fields are never overwritten by a stale dialog snapshot.
-            let nics = (self.selected_switch_id != self.initial_switch_id).then(|| {
-                build_nics_from_switch_id(&self.selected_switch_id, switches, &self.nics)
-            });
-            let fastdesk_changed = self.fastdesk_enabled != self.initial_config.fastdesk.enabled
-                || self.vram_mb != self.initial_config.fastdesk.vram_mb
-                || self.use_shm != self.initial_config.fastdesk.use_shm
-                || self.transport != self.initial_config.fastdesk.transport;
-            let fastdesk_diff = fastdesk_changed.then(|| {
-                let mut fastdesk = self.base_fastdesk.clone();
-                fastdesk.enabled = self.fastdesk_enabled;
-                fastdesk.vram_mb = self.vram_mb;
-                fastdesk.use_shm = self.use_shm;
-                fastdesk.transport = self.transport;
-                fastdesk
-            });
-            let cur_fw = string_to_opt(&self.uefi_firmware);
-            let uefi_firmware = (cur_fw != self.initial_config.uefi_firmware).then_some(cur_fw);
+        // Only emit fields that were actually changed so concurrent CLI/API edits
+        // to other fields are never overwritten by a stale dialog snapshot.
+        let nics = (self.selected_switch_id != self.initial_switch_id).then(|| {
+            build_nics_from_switch_id(&self.selected_switch_id, switches, &self.nics)
+        });
+        let fastdesk_changed = self.fastdesk_enabled != self.initial_config.fastdesk.enabled
+            || self.vram_mb != self.initial_config.fastdesk.vram_mb
+            || self.use_shm != self.initial_config.fastdesk.use_shm
+            || self.transport != self.initial_config.fastdesk.transport;
+        let fastdesk_diff = fastdesk_changed.then(|| {
+            let mut fastdesk = self.base_fastdesk.clone();
+            fastdesk.enabled = self.fastdesk_enabled;
+            fastdesk.vram_mb = self.vram_mb;
+            fastdesk.use_shm = self.use_shm;
+            fastdesk.transport = self.transport;
+            fastdesk
+        });
+        let cur_fw = string_to_opt(&self.uefi_firmware);
+        let uefi_firmware = (cur_fw != self.initial_config.uefi_firmware).then_some(cur_fw);
 
-            UpdateVmPayload {
-                name,
-                description,
-                vcpus: (self.vcpus != self.initial_config.vcpus).then_some(self.vcpus),
-                memory_mb: (self.memory_mb != self.initial_config.memory_mb)
-                    .then_some(self.memory_mb),
-                nested_virt: (self.nested_virt != self.initial_config.nested_virt)
-                    .then_some(self.nested_virt),
-                uefi_firmware,
-                secure_boot_enabled: (self.secure_boot_enabled
-                    != self.initial_config.secure_boot_enabled)
-                    .then_some(self.secure_boot_enabled),
-                secure_boot_template: (self.secure_boot_template
-                    != self.initial_config.secure_boot_template)
-                    .then_some(self.secure_boot_template),
-                tpm_enabled: (self.tpm_enabled != self.initial_config.tpm_enabled)
-                    .then_some(self.tpm_enabled),
-                fastdesk: fastdesk_diff,
-                nics,
-                ..Default::default()
-            }
-        } else {
-            UpdateVmPayload {
-                name,
-                description,
-                ..Default::default()
-            }
+        UpdateVmPayload {
+            name,
+            description,
+            vcpus: (self.vcpus != self.initial_config.vcpus).then_some(self.vcpus),
+            memory_mb: (self.memory_mb != self.initial_config.memory_mb)
+                .then_some(self.memory_mb),
+            nested_virt: (self.nested_virt != self.initial_config.nested_virt)
+                .then_some(self.nested_virt),
+            uefi_firmware,
+            secure_boot_enabled: (self.secure_boot_enabled
+                != self.initial_config.secure_boot_enabled)
+                .then_some(self.secure_boot_enabled),
+            secure_boot_template: (self.secure_boot_template
+                != self.initial_config.secure_boot_template)
+                .then_some(self.secure_boot_template),
+            tpm_enabled: (self.tpm_enabled != self.initial_config.tpm_enabled)
+                .then_some(self.tpm_enabled),
+            fastdesk: fastdesk_diff,
+            nics,
+            ..Default::default()
         }
     }
 }
@@ -733,7 +746,13 @@ pub fn build_nics_from_switch_id(
             Some(existing) if matches!(existing.backend, NicBackendConfig::Consomme { .. }) => {
                 existing.clone()
             }
-            _ => NicAttachment::default_consomme(),
+            Some(existing) => {
+                let mut nic = NicAttachment::default_consomme();
+                nic.id = existing.id;
+                nic.mac_address = existing.mac_address.clone();
+                nic
+            }
+            None => NicAttachment::default_consomme(),
         };
         let mut out = vec![primary];
         out.extend(trailing);
@@ -835,27 +854,32 @@ pub fn render_file_picker(
                 .id_salt("file_picker_scroll")
                 .max_height(290.0)
                 .show(ui, |ui| {
+                    let allow_file_click = picker
+                        .ignore_file_clicks_until
+                        .is_none_or(|until| std::time::Instant::now() >= until);
                     let entries = picker.entries.clone();
-                    for (name, path, is_dir) in entries {
-                        let label = if is_dir {
-                            format!("📁 {name}")
-                        } else {
-                            format!("📄 {name}")
-                        };
-                        let selected = !is_dir && picker.filename_input == name;
-                        let resp = ui.selectable_label(selected, label);
-                        if resp.clicked() {
-                            if is_dir {
-                                picker.navigate_to(path.clone());
+                    ui.push_id(picker.load_seq, |ui| {
+                        for (name, path, is_dir) in entries {
+                            let label = if is_dir {
+                                format!("📁 {name}")
                             } else {
-                                picker.filename_input = name;
+                                format!("📄 {name}")
+                            };
+                            let selected = !is_dir && picker.filename_input == name;
+                            let resp = ui.selectable_label(selected, label);
+                            if resp.clicked() {
+                                if is_dir {
+                                    picker.navigate_to(path.clone());
+                                } else if allow_file_click {
+                                    picker.filename_input = name;
+                                }
+                            }
+                            if resp.double_clicked() && !is_dir && allow_file_click {
+                                chosen = Some((picker.target, path));
+                                close = true;
                             }
                         }
-                        if resp.double_clicked() && !is_dir {
-                            chosen = Some((picker.target, path));
-                            close = true;
-                        }
-                    }
+                    });
                 });
 
             ui.separator();
@@ -1179,7 +1203,10 @@ pub fn render_new_vm_wizard(
                                 w.error = None;
                                 w.submitting = true;
                                 let payload = w.build_create_payload(switches);
-                                backend.send(GuiRequest::CreateVm(payload));
+                                backend.send(GuiRequest::CreateVm {
+                                    wizard_id: w.wizard_id,
+                                    payload,
+                                });
                             }
                         } else if ui.button("Next >").clicked() {
                             w.step += 1;
@@ -1339,8 +1366,16 @@ pub fn render_vm_settings_dialog(
                 ui.horizontal(|ui| {
                     let save_label = if d.submitting { "Saving…" } else { "Save Changes" };
                     if ui.add_enabled(!d.submitting, egui::Button::new(save_label)).clicked() {
-                        if d.name.trim().is_empty() {
-                            d.error = Some("VM name cannot be empty".to_string());
+                        let trimmed = d.name.trim();
+                        if let Err(err) = openvmms_core::models::validate_vm_name(trimmed) {
+                            d.error = Some(err.to_string());
+                            return;
+                        }
+                        if !d.is_offline && d.has_hardware_changes() {
+                            d.error = Some(
+                                "Cannot save hardware changes while the VM is active. Turn off the VM first, or revert hardware changes to save only name/description."
+                                    .to_string(),
+                            );
                             return;
                         }
                         let payload = d.build_update_payload(switches);
@@ -2114,5 +2149,122 @@ mod tests {
         assert_eq!(fd.listen_addr, "127.0.0.1:5955");
         assert!(vram_payload.vcpus.is_none());
         assert!(vram_payload.nics.is_none());
+    }
+
+    #[test]
+    fn vm_settings_dialog_has_hardware_changes_and_build_update_payload_never_drops_edits() {
+        let mut cfg = VmConfig::from_preset("ActiveHw", VmPreset::Custom, Path::new("/tmp/vm"));
+        cfg.vcpus = 4;
+        cfg.memory_mb = 4096;
+
+        let mut dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Running);
+        assert!(!dlg.is_offline);
+        assert!(!dlg.has_hardware_changes());
+
+        dlg.description = "only meta".to_string();
+        assert!(!dlg.has_hardware_changes());
+
+        dlg.vcpus = 8;
+        dlg.memory_mb = 8192;
+        assert!(dlg.has_hardware_changes());
+
+        let payload = dlg.build_update_payload(&[]);
+        assert_eq!(payload.vcpus, Some(8));
+        assert_eq!(payload.memory_mb, Some(8192));
+        assert_eq!(payload.description.as_deref(), Some("only meta"));
+    }
+
+    #[test]
+    fn build_nics_preserves_id_and_mac_when_switching_to_consomme() {
+        let nic_id = Uuid::new_v4();
+        let mac = "00:15:5d:ab:cd:ef".to_string();
+        let existing = vec![NicAttachment {
+            id: nic_id,
+            name: "eth-tap".to_string(),
+            mac_address: mac.clone(),
+            backend: NicBackendConfig::Tap {
+                name: "tap0".to_string(),
+            },
+        }];
+
+        let nics = build_nics_from_switch_id("consomme", &[], &existing);
+        assert_eq!(nics.len(), 1);
+        assert_eq!(nics[0].id, nic_id);
+        assert_eq!(nics[0].mac_address, mac);
+        assert!(matches!(nics[0].backend, NicBackendConfig::Consomme { .. }));
+    }
+
+    #[test]
+    fn file_picker_folder_navigation_blocks_immediate_file_click_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("a_subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let inner_file = subdir.join("target.vhdx");
+        std::fs::write(&inner_file, b"VHDX").unwrap();
+
+        let mut modal = FilePickerModal::open(
+            FilePickerTarget::AttachDiskPath,
+            &dir.path().to_string_lossy(),
+            false,
+            vec!["vhdx"],
+        );
+        let start_seq = modal.load_seq;
+        modal.navigate_to(subdir.clone());
+        assert!(modal.load_seq > start_seq);
+        assert!(modal.ignore_file_clicks_until.is_some());
+
+        // Populate loaded entries immediately while the click-through cooldown is still active.
+        modal.entries = vec![("target.vhdx".into(), inner_file.clone(), false)];
+        modal.loading = false;
+        let mut picker_opt = Some(modal);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let chosen = render_file_picker(ctx, &mut picker_opt);
+            assert!(chosen.is_none());
+        });
+
+        // Directly run frames with rapid double-clicks across rows in the scroll area to
+        // verify click-through onto the file row is suppressed during the cooldown window.
+        for pos in [
+            egui::pos2(ctx.screen_rect().center().x, 120.0),
+            egui::pos2(ctx.screen_rect().center().x, 150.0),
+            egui::pos2(ctx.screen_rect().center().x, 180.0),
+            egui::pos2(ctx.screen_rect().center().x, 210.0),
+        ] {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::PointerMoved(pos));
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let mut chosen = None;
+            let _ = ctx.run(input, |ctx| {
+                chosen = render_file_picker(ctx, &mut picker_opt);
+            });
+            assert!(chosen.is_none(), "double-click must not click through during cooldown");
+            assert!(picker_opt.is_some());
+            assert!(picker_opt.as_ref().unwrap().filename_input.is_empty());
+        }
     }
 }
