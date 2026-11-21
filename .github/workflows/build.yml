@@ -575,7 +575,7 @@ jobs:
             vm show "Smoke-VM" | grep -q '"status": "off"'
           # Verify win11 preset enables vTPM 2.0 and boots openvmm with --tpm.
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
-            vm create "Smoke-Win11-TPM" --preset win11 --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
+            vm create "Smoke-Win11-TPM" --preset win11 --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.vhdx" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm show "Smoke-Win11-TPM" | grep -q '"tpm_enabled": true'
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
