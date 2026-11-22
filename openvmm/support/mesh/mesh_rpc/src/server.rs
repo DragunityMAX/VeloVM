@@ -29,9 +29,11 @@ use mesh::CancelContext;
 use mesh::MeshPayload;
 use mesh::local_node::Port;
 use pal_async::driver::Driver;
+#[cfg(unix)]
 use pal_async::interest::PollEvents;
 use pal_async::socket::AsSockRef;
 use pal_async::socket::Listener;
+#[cfg(unix)]
 use pal_async::socket::PollReadyExt;
 use pal_async::socket::PolledSocket;
 use std::collections::HashMap;
@@ -223,17 +225,29 @@ impl Server {
                 cancel.lock().cancel();
                 return res;
             }
-            // A clean read EOF can be either a half-close (`shutdown(SHUT_WR)`),
-            // where the peer still expects replies, or a full socket close.
-            // Wait for peer disconnect vs `send_task` completing so half-closed
-            // clients still receive in-flight replies while full disconnects
-            // cancel pending RPCs across all platforms.
+            // On Unix (`epoll` on Linux and `kqueue` on macOS/BSD), read EOF can be
+            // a half-close (`shutdown(SHUT_WR)` -> `RDHUP`) where the peer still
+            // expects in-flight replies, rather than a full disconnect (`HUP`/`ERR`).
+            // Keep pending RPCs alive until either full disconnect or `send_task`
+            // finishes draining responses.
+            #[cfg(unix)]
             futures::select! {
-                _ = wait_for_peer_close(&mut reader).fuse() => {
+                _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
                     peer_closed.store(true, std::sync::atomic::Ordering::Release);
                     cancel.lock().cancel();
                 }
                 _ = send_done_rx.fuse() => {}
+            }
+            // On Windows `afunix.sys` / AFD, both `shutdown(SD_SEND)` and a
+            // graceful `closesocket()` raise `AFD_POLL_DISCONNECT` (`PollEvents::RDHUP`)
+            // rather than `AFD_POLL_ABORT` (`PollEvents::HUP`), so full disconnect
+            // cannot be distinguished from half-close via socket readiness. Cancel on
+            // read EOF so client disconnects (e.g. `WaitVM`) release promptly.
+            #[cfg(not(unix))]
+            {
+                drop(send_done_rx);
+                peer_closed.store(true, std::sync::atomic::Ordering::Release);
+                cancel.lock().cancel();
             }
             Ok(())
         };
@@ -290,40 +304,6 @@ impl Server {
         };
         (recv_task, send_task).try_join().await?;
         Ok(())
-    }
-}
-
-async fn wait_for_peer_close(reader: &mut pal_async::socket::ReadHalf<impl AsSockRef>) {
-    #[cfg(target_os = "linux")]
-    {
-        reader.wait_ready(PollEvents::HUP | PollEvents::ERR).await;
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        loop {
-            let hup_ready = {
-                let mut hup = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse();
-                let mut timer_ctx = CancelContext::new()
-                    .with_timeout(std::time::Duration::from_millis(10));
-                let mut timer = timer_ctx.cancelled().fuse();
-                futures::select! {
-                    _ = hup => true,
-                    _ = timer => false,
-                }
-            };
-            if hup_ready {
-                break;
-            }
-            match (&*reader.get().as_sock_ref()).write(&[]) {
-                Ok(_) => {}
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) => {}
-                Err(_) => break,
-            }
-        }
     }
 }
 
@@ -836,6 +816,7 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn client_half_close_receives_in_flight_reply() {
         use crate::message::MESSAGE_TYPE_RESPONSE;
@@ -919,6 +900,7 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn client_half_close_then_full_close_cancels_pending_rpc_context() {
         let (c, s) = unix_socket::UnixStream::pair().unwrap();
