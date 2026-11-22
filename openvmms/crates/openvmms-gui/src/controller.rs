@@ -147,11 +147,12 @@ struct BackendState {
     shutdown: AtomicBool,
     connect_in_flight: AtomicBool,
     snapshot_seq: std::sync::atomic::AtomicU64,
+    daemon_instance_id: Mutex<(u64, Option<Uuid>)>,
     host_cfg_lock: Mutex<()>,
     logs_in_flight: Mutex<HashSet<Uuid>>,
     details_in_flight: Mutex<HashSet<Uuid>>,
-    attach_disk_in_flight: Mutex<HashSet<Uuid>>,
-    mount_iso_in_flight: Mutex<HashSet<Uuid>>,
+    attach_disk_in_flight: Mutex<HashSet<(Option<Uuid>, Uuid)>>,
+    mount_iso_in_flight: Mutex<HashSet<(Option<Uuid>, Uuid)>>,
     sse_read_timeout: Duration,
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
@@ -167,21 +168,40 @@ fn is_idempotent_read(req: &GuiRequest) -> bool {
     )
 }
 
-struct InFlightUuidGuard<'a> {
-    set: &'a Mutex<HashSet<Uuid>>,
-    id: Uuid,
-    notify: Option<(&'a BackendState, StorageOpKind, u64)>,
+enum InFlightGuard<'a> {
+    Uuid {
+        set: &'a Mutex<HashSet<Uuid>>,
+        id: Uuid,
+    },
+    StorageOp {
+        set: &'a Mutex<HashSet<(Option<Uuid>, Uuid)>>,
+        key: (Option<Uuid>, Uuid),
+        backend: &'a BackendState,
+        op: StorageOpKind,
+        op_id: u64,
+    },
 }
 
-impl Drop for InFlightUuidGuard<'_> {
+impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        self.set.lock().unwrap().remove(&self.id);
-        if let Some((backend, op, op_id)) = self.notify {
-            backend.emit(GuiUpdate::StorageOpFinished {
-                vm_id: self.id,
+        match *self {
+            InFlightGuard::Uuid { set, id } => {
+                set.lock().unwrap().remove(&id);
+            }
+            InFlightGuard::StorageOp {
+                set,
+                key,
+                backend,
                 op,
                 op_id,
-            });
+            } => {
+                set.lock().unwrap().remove(&key);
+                backend.emit(GuiUpdate::StorageOpFinished {
+                    vm_id: key.1,
+                    op,
+                    op_id,
+                });
+            }
         }
     }
 }
@@ -238,6 +258,7 @@ impl BackendHandle {
             shutdown: AtomicBool::new(false),
             connect_in_flight: AtomicBool::new(false),
             snapshot_seq: std::sync::atomic::AtomicU64::new(0),
+            daemon_instance_id: Mutex::new((0, None)),
             host_cfg_lock: Mutex::new(()),
             logs_in_flight: Mutex::new(HashSet::new()),
             details_in_flight: Mutex::new(HashSet::new()),
@@ -268,6 +289,7 @@ impl BackendHandle {
             shutdown: AtomicBool::new(false),
             connect_in_flight: AtomicBool::new(false),
             snapshot_seq: std::sync::atomic::AtomicU64::new(0),
+            daemon_instance_id: Mutex::new((0, None)),
             host_cfg_lock: Mutex::new(()),
             logs_in_flight: Mutex::new(HashSet::new()),
             details_in_flight: Mutex::new(HashSet::new()),
@@ -302,8 +324,23 @@ impl BackendHandle {
 impl BackendState {
     fn emit_checked(&self, msg: GuiUpdate) -> bool {
         match &msg {
-            GuiUpdate::DaemonConnected { .. } | GuiUpdate::HostConfigUpdated { .. } => {
+            GuiUpdate::DaemonConnected {
+                host_info,
+                snapshot_seq,
+                ..
+            } => {
                 self.notified_connected.store(true, Ordering::Release);
+                let mut guard = self.daemon_instance_id.lock().unwrap();
+                if *snapshot_seq >= guard.0 {
+                    guard.0 = *snapshot_seq;
+                    guard.1 = host_info.daemon_instance_id;
+                }
+            }
+            GuiUpdate::HostConfigUpdated { host_info, .. } => {
+                self.notified_connected.store(true, Ordering::Release);
+                if host_info.daemon_instance_id.is_some() {
+                    self.daemon_instance_id.lock().unwrap().1 = host_info.daemon_instance_id;
+                }
             }
             GuiUpdate::DaemonDisconnected(_) => {
                 self.notified_connected.store(false, Ordering::Release);
@@ -323,6 +360,33 @@ impl BackendState {
 
     fn next_snapshot_seq(&self) -> u64 {
         self.snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn acquire_storage_op_guard<'a>(
+        self: &'a Arc<Self>,
+        set: &'a Mutex<HashSet<(Option<Uuid>, Uuid)>>,
+        vm_id: Uuid,
+        op: StorageOpKind,
+        op_id: u64,
+        busy_msg: &str,
+    ) -> Option<InFlightGuard<'a>> {
+        let key = (self.daemon_instance_id.lock().unwrap().1, vm_id);
+        if !set.lock().unwrap().insert(key) {
+            self.emit(GuiUpdate::StatusMessage(busy_msg.to_string()));
+            self.emit(GuiUpdate::StorageOpFinished {
+                vm_id,
+                op,
+                op_id,
+            });
+            return None;
+        }
+        Some(InFlightGuard::StorageOp {
+            set,
+            key,
+            backend: self.as_ref(),
+            op,
+            op_id,
+        })
     }
 
     fn ensure_sse(self: &Arc<Self>) {
@@ -345,51 +409,43 @@ impl BackendState {
                 if !self.logs_in_flight.lock().unwrap().insert(*id) {
                     return;
                 }
-                Some(InFlightUuidGuard {
+                Some(InFlightGuard::Uuid {
                     set: &self.logs_in_flight,
                     id: *id,
-                    notify: None,
                 })
             }
             GuiRequest::FetchVmDetails { id } => {
                 if !self.details_in_flight.lock().unwrap().insert(*id) {
                     return;
                 }
-                Some(InFlightUuidGuard {
+                Some(InFlightGuard::Uuid {
                     set: &self.details_in_flight,
                     id: *id,
-                    notify: None,
                 })
             }
             GuiRequest::AttachDisk { id, op_id, .. } => {
-                if !self.attach_disk_in_flight.lock().unwrap().insert(*id) {
-                    self.emit(GuiUpdate::StorageOpFinished {
-                        vm_id: *id,
-                        op: StorageOpKind::AttachDisk,
-                        op_id: *op_id,
-                    });
+                let Some(guard) = self.acquire_storage_op_guard(
+                    &self.attach_disk_in_flight,
+                    *id,
+                    StorageOpKind::AttachDisk,
+                    *op_id,
+                    "Disk attach is already in progress for this VM",
+                ) else {
                     return;
-                }
-                Some(InFlightUuidGuard {
-                    set: &self.attach_disk_in_flight,
-                    id: *id,
-                    notify: Some((self.as_ref(), StorageOpKind::AttachDisk, *op_id)),
-                })
+                };
+                Some(guard)
             }
             GuiRequest::MountIso { id, op_id, .. } => {
-                if !self.mount_iso_in_flight.lock().unwrap().insert(*id) {
-                    self.emit(GuiUpdate::StorageOpFinished {
-                        vm_id: *id,
-                        op: StorageOpKind::MountIso,
-                        op_id: *op_id,
-                    });
+                let Some(guard) = self.acquire_storage_op_guard(
+                    &self.mount_iso_in_flight,
+                    *id,
+                    StorageOpKind::MountIso,
+                    *op_id,
+                    "ISO mount is already in progress for this VM",
+                ) else {
                     return;
-                }
-                Some(InFlightUuidGuard {
-                    set: &self.mount_iso_in_flight,
-                    id: *id,
-                    notify: Some((self.as_ref(), StorageOpKind::MountIso, *op_id)),
-                })
+                };
+                Some(guard)
             }
             _ => None,
         };
@@ -1095,6 +1151,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 }
                             }
                             DaemonEvent::Resync => {
+                                let snapshot_seq = state.next_snapshot_seq();
                                 let reload_res = ApiClient::new(&base_url, &token)
                                     .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                                 match reload_res {
@@ -1106,7 +1163,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                             host_config,
                                             switches,
                                             vms,
-                                            snapshot_seq: state.next_snapshot_seq(),
+                                            snapshot_seq,
                                         }) {
                                             sse_send_closed = true;
                                             break;
@@ -1119,6 +1176,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 }
                             }
                             DaemonEvent::HostConfigUpdated => {
+                                let snapshot_seq = state.next_snapshot_seq();
                                 let reload_res = resolve_updated_client(
                                     &base_url,
                                     &token,
@@ -1138,7 +1196,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                             host_config,
                                             switches,
                                             vms,
-                                            snapshot_seq: state.next_snapshot_seq(),
+                                            snapshot_seq,
                                         }) {
                                             sse_send_closed = true;
                                             break;
@@ -3031,7 +3089,7 @@ mod tests {
         fail_vms.store(true, Ordering::Release);
         send_resync.store(true, Ordering::Release);
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 3, .. })
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 3)
         });
         assert_eq!(sse_count.load(Ordering::Acquire), 2);
 
@@ -3201,6 +3259,12 @@ mod tests {
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
             matches!(
                 u,
+                GuiUpdate::StatusMessage(msg) if msg == "Disk attach is already in progress for this VM"
+            )
+        });
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
                 GuiUpdate::StorageOpFinished {
                     vm_id: id,
                     op: StorageOpKind::AttachDisk,
@@ -3236,6 +3300,258 @@ mod tests {
         health_fail.store(true, Ordering::Release);
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
             matches!(u, GuiUpdate::DaemonDisconnected(_))
+        });
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn storage_op_retry_succeeds_after_daemon_instance_switch_while_prior_op_blocked() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let daemon_a = Uuid::new_v4();
+        let daemon_b = Uuid::new_v4();
+        let current_instance_id = Arc::new(std::sync::Mutex::new(daemon_a));
+        let attach_count = Arc::new(AtomicUsize::new(0));
+        let first_attach_started = Arc::new(AtomicBool::new(false));
+        let unblock_first_attach = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let vm_id = Uuid::new_v4();
+        let mut vm_cfg = openvmms_core::models::VmConfig::from_preset(
+            "DaemonSwitch-VM",
+            VmPreset::Custom,
+            &dir.path().join("vm"),
+        );
+        vm_cfg.id = vm_id;
+
+        let server = {
+            let token = token.clone();
+            let current_instance_id = Arc::clone(&current_instance_id);
+            let attach_count = Arc::clone(&attach_count);
+            let first_attach_started = Arc::clone(&first_attach_started);
+            let unblock_first_attach = Arc::clone(&unblock_first_attach);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let current_instance_id = Arc::clone(&current_instance_id);
+                            let attach_count = Arc::clone(&attach_count);
+                            let first_attach_started = Arc::clone(&first_attach_started);
+                            let unblock_first_attach = Arc::clone(&unblock_first_attach);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            let vm_cfg = vm_cfg.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let first = req_text.lines().next().unwrap_or("");
+                                let mut parts = first.split_whitespace();
+                                let method = parts.next().unwrap_or("");
+                                let target = parts.next().unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    while !stop.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keep-alive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+                                if method == "POST" && target.ends_with("/disks") {
+                                    let idx = attach_count.fetch_add(1, Ordering::SeqCst);
+                                    if idx == 0 {
+                                        first_attach_started.store(true, Ordering::Release);
+                                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                                        while !unblock_first_attach.load(Ordering::Acquire)
+                                            && !stop.load(Ordering::Acquire)
+                                            && std::time::Instant::now() < deadline
+                                        {
+                                            thread::sleep(Duration::from_millis(10));
+                                        }
+                                    }
+                                    let summary = VmSummary {
+                                        config: vm_cfg,
+                                        runtime: Default::default(),
+                                    };
+                                    let resp = mock_http_response(
+                                        "200 OK",
+                                        &serde_json::to_string(&summary).unwrap(),
+                                    );
+                                    let _ = stream.write_all(resp.as_bytes());
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/host/info" {
+                                    let info = HostInfo {
+                                        hostname: "test".into(),
+                                        os: "linux".into(),
+                                        arch: "x86_64".into(),
+                                        cpu_count: 4,
+                                        daemon_version: "0.1.0".into(),
+                                        data_dir: store_dir.clone(),
+                                        runtime_dir: store_dir.clone(),
+                                        listen_addr: addr.to_string(),
+                                        daemon_instance_id: Some(*current_instance_id.lock().unwrap()),
+                                        event_revision: 0,
+                                        resolved_paths: Default::default(),
+                                    };
+                                    ("200 OK", serde_json::to_string(&info).unwrap())
+                                } else if target == "/api/v1/vms" {
+                                    ("200 OK", "[]".to_string())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timeout(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(5),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { host_info, .. }
+                    if host_info.daemon_instance_id == Some(daemon_a)
+            )
+        });
+
+        // Start op 1 on daemon A and wait until it blocks inside the HTTP POST handler.
+        backend.send(GuiRequest::AttachDisk {
+            id: vm_id,
+            op_id: 1,
+            payload: AttachDiskPayload {
+                path: dir.path().join("d1.img"),
+                lun: None,
+                read_only: false,
+                format: None,
+            },
+        });
+        let wait_start = std::time::Instant::now();
+        while !first_attach_started.load(Ordering::Acquire) {
+            assert!(
+                wait_start.elapsed() < Duration::from_secs(5),
+                "timed out waiting for op 1 to hit mock server"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Duplicate op 2 on the same daemon instance must be rejected with StatusMessage + StorageOpFinished.
+        backend.send(GuiRequest::AttachDisk {
+            id: vm_id,
+            op_id: 2,
+            payload: AttachDiskPayload {
+                path: dir.path().join("d1.img"),
+                lun: None,
+                read_only: false,
+                format: None,
+            },
+        });
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::StatusMessage(msg) if msg == "Disk attach is already in progress for this VM"
+            )
+        });
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::StorageOpFinished {
+                    vm_id: id,
+                    op: StorageOpKind::AttachDisk,
+                    op_id: 2
+                } if *id == vm_id
+            )
+        });
+
+        // Switch to daemon B while op 1 on daemon A is still blocked.
+        *current_instance_id.lock().unwrap() = daemon_b;
+        backend.send(GuiRequest::RefreshAll);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { host_info, .. }
+                    if host_info.daemon_instance_id == Some(daemon_b)
+            )
+        });
+
+        // Retry op 3 on daemon B must proceed (not be dropped) and complete immediately.
+        backend.send(GuiRequest::AttachDisk {
+            id: vm_id,
+            op_id: 3,
+            payload: AttachDiskPayload {
+                path: dir.path().join("d1.img"),
+                lun: None,
+                read_only: false,
+                format: None,
+            },
+        });
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::StorageOpFinished {
+                    vm_id: id,
+                    op: StorageOpKind::AttachDisk,
+                    op_id: 3
+                } if *id == vm_id
+            )
+        });
+        assert_eq!(attach_count.load(Ordering::Acquire), 2);
+
+        // Unblock op 1 and verify it finishes cleanly as well.
+        unblock_first_attach.store(true, Ordering::Release);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::StorageOpFinished {
+                    vm_id: id,
+                    op: StorageOpKind::AttachDisk,
+                    op_id: 1
+                } if *id == vm_id
+            )
         });
 
         drop(backend);

@@ -1364,7 +1364,9 @@ impl Supervisor {
                         "concurrent disk configuration changes while updating VM; please retry",
                     ));
                 }
-                extend_disk_path_keys(&mut path_keys, missing, "update_vm").await?;
+                if let Err(err) = extend_disk_path_keys(&mut path_keys, missing, "update_vm").await {
+                    break 'commit Err(err);
+                }
             }
             unreachable!()
         };
@@ -3004,7 +3006,11 @@ impl Supervisor {
                                 "concurrent disk configuration changes while attaching disk; please retry",
                             ));
                         }
-                        extend_disk_path_keys(&mut path_keys, missing, "attach_disk").await?;
+                        if let Err(err) =
+                            extend_disk_path_keys(&mut path_keys, missing, "attach_disk").await
+                        {
+                            break 'commit Err(err);
+                        }
                     }
                     unreachable!()
                 };
@@ -3671,7 +3677,11 @@ impl Supervisor {
                                 "concurrent disk configuration changes while mounting ISO; please retry",
                             ));
                         }
-                        extend_disk_path_keys(&mut path_keys, missing, "mount_iso").await?;
+                        if let Err(err) =
+                            extend_disk_path_keys(&mut path_keys, missing, "mount_iso").await
+                        {
+                            break 'commit Err(err);
+                        }
                     }
                     unreachable!()
                 };
