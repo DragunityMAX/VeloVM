@@ -257,6 +257,58 @@ impl RegistryStore {
     }
 
     pub fn load_or_create_token(&self) -> anyhow::Result<String> {
+        #[cfg(unix)]
+        {
+            self.load_or_create_token_with(enforce_unix_0600)
+        }
+        #[cfg(not(unix))]
+        {
+            self.load_or_create_token_default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn load_or_create_token_with<F>(&self, enforce_0600: F) -> anyhow::Result<String>
+    where
+        F: FnOnce(&fs::File) -> std::io::Result<Option<u32>>,
+    {
+        let path = self.token_path();
+        if let Some((token, was_permissive)) = open_and_read_token(&path)? {
+            if was_permissive {
+                if !token.is_empty() {
+                    let a = Uuid::new_v4().as_u128();
+                    let b = Uuid::new_v4().as_u128();
+                    let new_token = format!("{a:032x}{b:032x}");
+                    if try_rotate_token_if_0600_enforced(&path, &new_token, enforce_0600)? {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "regenerated daemon.token after detecting overly permissive file permissions"
+                        );
+                        return Ok(new_token);
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        "filesystem does not enforce 0600 permissions on daemon.token; keeping existing token"
+                    );
+                    return Ok(token);
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    "regenerating daemon.token after detecting overly permissive file permissions"
+                );
+            } else if !token.is_empty() {
+                return Ok(token);
+            }
+        }
+        let a = Uuid::new_v4().as_u128();
+        let b = Uuid::new_v4().as_u128();
+        let token = format!("{a:032x}{b:032x}");
+        atomic_write(&path, token.as_bytes(), true)?;
+        Ok(token)
+    }
+
+    #[cfg(not(unix))]
+    fn load_or_create_token_default(&self) -> anyhow::Result<String> {
         let path = self.token_path();
         if let Some((token, was_permissive)) = open_and_read_token(&path)? {
             if was_permissive {
@@ -357,8 +409,9 @@ impl RegistryStore {
         // Remove logs first so that if removing open log files fails (e.g. on
         // Windows), vm.toml and state.vmgs remain intact and the VM does not
         // vanish or lose TPM/UEFI state on restart. Remove vm.toml before
-        // state.vmgs because deleting vm.toml is the point of no return and an
-        // orphaned .vmgs is harmless if state.vmgs removal fails afterward.
+        // state.vmgs because deleting vm.toml is the point of no return and any
+        // orphaned state.vmgs left by a transient failure is cleaned up on the
+        // next daemon startup via `cleanup_orphaned_vmgs`.
         let logs_dir = vm_dir.join("logs");
         if logs_dir.is_dir() {
             fs::remove_dir_all(&logs_dir)
@@ -384,6 +437,125 @@ impl RegistryStore {
         let _ = fs::remove_dir(&vm_dir);
         Ok(())
     }
+
+    /// Removes orphaned `state.vmgs` files left behind in UUID-named VM directories
+    /// that lack `vm.toml`, and removes the directory if empty (preserving user disks).
+    pub fn cleanup_orphaned_vmgs(&self) {
+        let vms_dir = self.vms_dir();
+        let Ok(entries) = fs::read_dir(&vms_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let dir_path = entry.path();
+            let Some(name) = dir_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if Uuid::parse_str(name).is_err() {
+                continue;
+            }
+            if dir_path.join("vm.toml").exists() {
+                continue;
+            }
+            let vmgs_path = dir_path.join("state.vmgs");
+            if vmgs_path.is_file() {
+                match fs::remove_file(&vmgs_path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            vm_id = %name,
+                            path = %vmgs_path.display(),
+                            "removed orphaned state.vmgs"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            vm_id = %name,
+                            path = %vmgs_path.display(),
+                            error = %err,
+                            "failed to remove orphaned state.vmgs"
+                        );
+                    }
+                }
+            }
+            let _ = fs::remove_dir(&dir_path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) {
+    if let Ok(dir) = fs::File::open(parent)
+        && let Err(err) = dir.sync_all()
+        && {
+            #[allow(unreachable_patterns)]
+            let ignored = matches!(
+                err.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTSUP | libc::EROFS)
+            );
+            !ignored
+        }
+    {
+        tracing::warn!(
+            dir = %parent.display(),
+            error = %err,
+            "failed to sync parent directory after atomic write"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn enforce_unix_0600(file: &fs::File) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match file.set_permissions(fs::Permissions::from_mode(0o600)) {
+        Ok(()) => Ok(Some(file.metadata()?.permissions().mode() & 0o777)),
+        #[allow(unreachable_patterns)]
+        Err(err)
+            if err.kind() == std::io::ErrorKind::Unsupported
+                || matches!(
+                    err.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS | libc::EINVAL)
+                ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+fn try_rotate_token_if_0600_enforced<F>(
+    path: &Path,
+    new_token: &str,
+    enforce_0600: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce(&fs::File) -> std::io::Result<Option<u32>>,
+{
+    let parent = path
+        .parent()
+        .context("target path has no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+    let mode = enforce_0600(tmp.as_file()).context("setting owner-only permissions")?;
+    if !matches!(mode, Some(m) if (m & 0o077) == 0) {
+        return Ok(false);
+    }
+    tmp.write_all(new_token.as_bytes())
+        .with_context(|| format!("writing temp file for {}", path.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temp file for {}", path.display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("persisting {}", path.display()))?;
+    sync_parent_dir(parent);
+    Ok(true)
 }
 
 pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Result<()> {
@@ -417,25 +589,7 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
         .map_err(|e| e.error)
         .with_context(|| format!("persisting {}", path.display()))?;
     #[cfg(unix)]
-    {
-        if let Ok(dir) = fs::File::open(parent)
-            && let Err(err) = dir.sync_all()
-            && {
-                #[allow(unreachable_patterns)]
-                let ignored = matches!(
-                    err.raw_os_error(),
-                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTSUP | libc::EROFS)
-                );
-                !ignored
-            }
-        {
-            tracing::warn!(
-                dir = %parent.display(),
-                error = %err,
-                "failed to sync parent directory after atomic write"
-            );
-        }
-    }
+    sync_parent_dir(parent);
     Ok(())
 }
 
@@ -1162,5 +1316,71 @@ mod tests {
             }
             other => panic!("unexpected backend: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_token_kept_when_filesystem_does_not_enforce_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let original_token = store.load_or_create_token().unwrap();
+        fs::set_permissions(store.token_path(), fs::Permissions::from_mode(0o644)).unwrap();
+
+        // When chmod leaves group/other bits set (e.g. drvfs without metadata, vfat, fixed-mode CIFS),
+        // load_or_create_token warns and preserves the existing token.
+        let kept = store
+            .load_or_create_token_with(|_| Ok(Some(0o644)))
+            .unwrap();
+        assert_eq!(kept, original_token);
+        assert_eq!(
+            fs::read_to_string(store.token_path()).unwrap(),
+            original_token
+        );
+
+        // When chmod is unsupported on the filesystem, the existing token is also preserved.
+        let kept_unsupported = store.load_or_create_token_with(|_| Ok(None)).unwrap();
+        assert_eq!(kept_unsupported, original_token);
+    }
+
+    #[test]
+    fn cleanup_orphaned_vmgs_removes_orphans_and_preserves_disks_and_active_vms() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+
+        // 1. Orphaned UUID directory with only state.vmgs -> state.vmgs and directory removed.
+        let orphan_only_id = Uuid::new_v4();
+        let orphan_only_dir = store.vm_dir(orphan_only_id);
+        fs::create_dir_all(&orphan_only_dir).unwrap();
+        fs::write(orphan_only_dir.join("state.vmgs"), b"secret-tpm").unwrap();
+
+        // 2. Orphaned UUID directory with state.vmgs + user disk -> state.vmgs removed, disk kept.
+        let orphan_with_disk_id = Uuid::new_v4();
+        let orphan_with_disk_dir = store.vm_dir(orphan_with_disk_id);
+        fs::create_dir_all(&orphan_with_disk_dir).unwrap();
+        fs::write(orphan_with_disk_dir.join("state.vmgs"), b"secret-tpm").unwrap();
+        let user_disk = orphan_with_disk_dir.join("disk0.vhdx");
+        fs::write(&user_disk, b"user-data").unwrap();
+
+        // 3. Active VM with vm.toml + state.vmgs -> untouched.
+        let active = VmConfig::from_preset("ActiveVm", VmPreset::Custom, dir.path());
+        store.save_vm(&active).unwrap();
+        let active_vmgs = store.vm_dir(active.id).join("state.vmgs");
+        fs::write(&active_vmgs, b"active-tpm").unwrap();
+
+        // 4. Non-UUID directory with state.vmgs -> untouched.
+        let non_uuid_dir = store.vms_dir().join("not-a-uuid");
+        fs::create_dir_all(&non_uuid_dir).unwrap();
+        fs::write(non_uuid_dir.join("state.vmgs"), b"keep").unwrap();
+
+        store.cleanup_orphaned_vmgs();
+
+        assert!(!orphan_only_dir.exists());
+        assert!(!orphan_with_disk_dir.join("state.vmgs").exists());
+        assert!(user_disk.is_file());
+        assert!(active_vmgs.is_file());
+        assert!(store.vm_config_path(active.id).is_file());
+        assert!(non_uuid_dir.join("state.vmgs").is_file());
     }
 }

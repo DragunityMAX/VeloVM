@@ -414,8 +414,8 @@ impl BackendState {
                 snapshot_seq,
                 ..
             } => {
-                self.notified_connected.store(true, Ordering::Release);
                 if let Some(info) = host_info {
+                    self.notified_connected.store(true, Ordering::Release);
                     let mut guard = self.daemon_instance_id.lock().unwrap();
                     if *snapshot_seq >= guard.0 {
                         guard.0 = *snapshot_seq;
@@ -1083,8 +1083,8 @@ impl BackendState {
             }
             GuiRequest::SaveHostConfig(patch) => {
                 let _guard = self.host_cfg_lock.lock().unwrap();
-                let snapshot_seq = self.next_snapshot_seq();
                 let updated = client.patch_host_config(&patch)?;
+                let snapshot_seq = self.next_snapshot_seq();
                 // Follow only `daemon.addr` when the daemon rebinds; never connect to `updated.listen_addr`.
                 if let Some(next_client) = reload_client_from_runtime_addr(
                     self.data_dir.as_deref(),
@@ -1177,7 +1177,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
         };
         let mut reported_initial_error = false;
         let mut retry_delay = state.sse_backoff_initial;
-        let stable_threshold = state.sse_read_timeout.min(Duration::from_secs(5));
         let next_delay = |d: Duration| d.saturating_mul(2).min(state.sse_backoff_max);
         while !state.shutdown.load(Ordering::Acquire) {
             let endpoint = state.shared_endpoint.read().unwrap().clone().or_else(|| {
@@ -1234,6 +1233,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         Ok((c, (host_info, host_config, switches, vms))) => {
                             let inst_id = host_info.daemon_instance_id;
                             reported_initial_error = false;
+                            retry_delay = state.sse_backoff_initial;
                             *state.client.write().unwrap() = Some(c);
                             if !state.emit_checked(GuiUpdate::DaemonConnected {
                                 base_url: base_url.clone(),
@@ -1265,8 +1265,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             continue;
                         }
                     };
-                    let stream_started = std::time::Instant::now();
-                    let mut saw_meaningful_event = false;
                     let reader = std::io::BufReader::new(resp);
                     let mut skip_leading_resync = true;
                     let mut sse_send_closed = false;
@@ -1286,7 +1284,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         }
                         match event {
                             DaemonEvent::VmUpdated { vm } => {
-                                saw_meaningful_event = true;
                                 if !state.emit_checked(GuiUpdate::VmUpdated {
                                     vm,
                                     select: false,
@@ -1298,7 +1295,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 }
                             }
                             DaemonEvent::VmDeleted { id, revision } => {
-                                saw_meaningful_event = true;
                                 if !state.emit_checked(GuiUpdate::VmDeleted {
                                     id,
                                     revision,
@@ -1314,7 +1310,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                                 match reload_res {
                                     Ok((c, (host_info, host_config, switches, vms))) => {
-                                        saw_meaningful_event = true;
                                         sse_instance_id = host_info.daemon_instance_id;
                                         *state.client.write().unwrap() = Some(c);
                                         if !state.emit_checked(GuiUpdate::DaemonConnected {
@@ -1348,7 +1343,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                                 match reload_res {
                                     Ok((c, (host_info, host_config, switches, vms))) => {
-                                        saw_meaningful_event = true;
                                         sse_instance_id = host_info.daemon_instance_id;
                                         let new_base = c.base_url().to_string();
                                         *state.client.write().unwrap() = Some(c);
@@ -1400,9 +1394,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
                             retry_delay = state.sse_backoff_initial;
                             continue;
-                        }
-                        if saw_meaningful_event || stream_started.elapsed() >= stable_threshold {
-                            retry_delay = state.sse_backoff_initial;
                         }
                         let healthy =
                             ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
@@ -4091,5 +4082,413 @@ mod tests {
                 } if *id == vm_id
             )
         });
+    }
+
+    #[test]
+    fn sse_backoff_resets_after_successful_connect_and_daemon_stopping() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let events_times = Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let sse_attempts = Arc::new(AtomicUsize::new(0));
+        let send_stopping_1 = Arc::new(AtomicBool::new(false));
+        let send_stopping_2 = Arc::new(AtomicBool::new(false));
+        let stopping_1_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let stopping_2_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let vm_4_cfg = openvmms_core::models::VmConfig::from_preset(
+            "Attempt4",
+            VmPreset::Custom,
+            &dir.path().join("vm4"),
+        );
+        let vm_5_cfg = openvmms_core::models::VmConfig::from_preset(
+            "Attempt5",
+            VmPreset::Custom,
+            &dir.path().join("vm5"),
+        );
+
+        let server = {
+            let token = token.clone();
+            let events_times = Arc::clone(&events_times);
+            let sse_attempts = Arc::clone(&sse_attempts);
+            let send_stopping_1 = Arc::clone(&send_stopping_1);
+            let send_stopping_2 = Arc::clone(&send_stopping_2);
+            let stopping_1_at = Arc::clone(&stopping_1_at);
+            let stopping_2_at = Arc::clone(&stopping_2_at);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let events_times = Arc::clone(&events_times);
+                            let sse_attempts = Arc::clone(&sse_attempts);
+                            let send_stopping_1 = Arc::clone(&send_stopping_1);
+                            let send_stopping_2 = Arc::clone(&send_stopping_2);
+                            let stopping_1_at = Arc::clone(&stopping_1_at);
+                            let stopping_2_at = Arc::clone(&stopping_2_at);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            let vm_4_cfg = vm_4_cfg.clone();
+                            let vm_5_cfg = vm_5_cfg.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let target = req_text
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let idx = sse_attempts.fetch_add(1, Ordering::SeqCst);
+                                    events_times.lock().unwrap().push(std::time::Instant::now());
+                                    if idx < 4 {
+                                        let resp = mock_http_response(
+                                            "500 Internal Server Error",
+                                            r#"{"error":"transient events error"}"#,
+                                        );
+                                        let _ = stream.write_all(resp.as_bytes());
+                                        return;
+                                    }
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    let (flag, sent_at) = if idx == 4 {
+                                        (&send_stopping_1, &stopping_1_at)
+                                    } else if idx == 5 {
+                                        (&send_stopping_2, &stopping_2_at)
+                                    } else {
+                                        while !stop.load(Ordering::Acquire) {
+                                            if stream.write_all(b": keepalive\n\n").is_err() {
+                                                break;
+                                            }
+                                            let _ = stream.flush();
+                                            thread::sleep(Duration::from_millis(20));
+                                        }
+                                        return;
+                                    };
+                                    while !stop.load(Ordering::Acquire) {
+                                        if flag.load(Ordering::Acquire) {
+                                            *sent_at.lock().unwrap() =
+                                                Some(std::time::Instant::now());
+                                            let _ = stream.write_all(
+                                                b"data: {\"event\":\"daemon_stopping\"}\n\n",
+                                            );
+                                            let _ = stream.flush();
+                                            break;
+                                        }
+                                        if stream.write_all(b": keepalive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(10));
+                                    }
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/vms" {
+                                    let cur = sse_attempts.load(Ordering::Acquire);
+                                    let vms = if cur == 5 {
+                                        vec![VmSummary {
+                                            config: vm_4_cfg,
+                                            runtime: openvmms_core::models::VmRuntimeState {
+                                                status: VmStatus::Off,
+                                                revision: 1,
+                                                ..Default::default()
+                                            },
+                                        }]
+                                    } else if cur == 6 {
+                                        vec![VmSummary {
+                                            config: vm_5_cfg,
+                                            runtime: openvmms_core::models::VmRuntimeState {
+                                                status: VmStatus::Off,
+                                                revision: 2,
+                                                ..Default::default()
+                                            },
+                                        }]
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    ("200 OK", serde_json::to_string(&vms).unwrap())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timing(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(2),
+            Duration::from_millis(40),
+            Duration::from_millis(640),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        // Wait until SSE succeeds after 4 backoff failures (40+80+160+320ms -> delay was 640ms).
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { vms, .. }
+                    if vms.iter().any(|v| v.config.name == "Attempt4")
+            )
+        });
+        send_stopping_1.store(true, Ordering::Release);
+
+        // Next connect after DaemonStopping must also reset backoff before the second DaemonStopping.
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { vms, .. }
+                    if vms.iter().any(|v| v.config.name == "Attempt5")
+            )
+        });
+        send_stopping_2.store(true, Ordering::Release);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while events_times.lock().unwrap().len() < 7 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for reconnect after second DaemonStopping"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let times = events_times.lock().unwrap().clone();
+        let stop1 = stopping_1_at.lock().unwrap().unwrap();
+        let stop2 = stopping_2_at.lock().unwrap().unwrap();
+        let gap_after_stop1 = times[5].duration_since(stop1);
+        let gap_after_stop2 = times[6].duration_since(stop2);
+        assert!(
+            gap_after_stop1 < Duration::from_millis(300),
+            "expected reconnect delay to reset to ~40ms after connect snapshot, got {gap_after_stop1:?}"
+        );
+        assert!(
+            gap_after_stop2 < Duration::from_millis(300),
+            "expected reconnect delay to remain reset across DaemonStopping restarts, got {gap_after_stop2:?}"
+        );
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn save_host_config_takes_snapshot_seq_after_patch() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let patch_started = Arc::new(AtomicBool::new(false));
+        let unblock_patch = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let old_bin = dir.path().join("old-openvmm");
+        let new_bin = dir.path().join("new-openvmm");
+
+        let server = {
+            let token = token.clone();
+            let patch_started = Arc::clone(&patch_started);
+            let unblock_patch = Arc::clone(&unblock_patch);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            let old_bin = old_bin.clone();
+            let new_bin = new_bin.clone();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let patch_started = Arc::clone(&patch_started);
+                            let unblock_patch = Arc::clone(&unblock_patch);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            let old_bin = old_bin.clone();
+                            let new_bin = new_bin.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let first = req_text.lines().next().unwrap_or("");
+                                let mut parts = first.split_whitespace();
+                                let method = parts.next().unwrap_or("");
+                                let target = parts.next().unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    while !stop.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keepalive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+                                let (status, body) =
+                                    if method == "PATCH" && target == "/api/v1/host/config" {
+                                        patch_started.store(true, Ordering::Release);
+                                        while !unblock_patch.load(Ordering::Acquire)
+                                            && !stop.load(Ordering::Acquire)
+                                        {
+                                            thread::sleep(Duration::from_millis(10));
+                                        }
+                                        let mut cfg = HostConfig::default();
+                                        cfg.openvmm_bin = Some(new_bin);
+                                        ("200 OK", serde_json::to_string(&cfg).unwrap())
+                                    } else if method == "GET" && target == "/api/v1/host/config" {
+                                        let mut cfg = HostConfig::default();
+                                        cfg.openvmm_bin = Some(old_bin);
+                                        ("200 OK", serde_json::to_string(&cfg).unwrap())
+                                    } else if target == "/api/v1/vms" {
+                                        ("200 OK", "[]".to_string())
+                                    } else {
+                                        mock_common_endpoint(target, &token, addr, &store_dir)
+                                            .unwrap_or(("404 Not Found", "{}".into()))
+                                    };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+        let initial_seq = match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        }) {
+            GuiUpdate::DaemonConnected { snapshot_seq, .. } => snapshot_seq,
+            _ => unreachable!(),
+        };
+
+        backend.send(GuiRequest::SaveHostConfig(HostConfigPatch {
+            openvmm_bin: Some(Some(new_bin.clone())),
+            ..Default::default()
+        }));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !patch_started.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for PATCH to start"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // A RefreshAll starting while PATCH is in-flight reads the old config.
+        backend.send(GuiRequest::RefreshAll);
+        let refresh_seq = match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq > initial_seq
+            )
+        }) {
+            GuiUpdate::DaemonConnected {
+                snapshot_seq,
+                host_config,
+                ..
+            } => {
+                assert_eq!(host_config.openvmm_bin, Some(old_bin));
+                snapshot_seq
+            }
+            _ => unreachable!(),
+        };
+
+        unblock_patch.store(true, Ordering::Release);
+        let save_seq = match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::HostConfigUpdated { .. })
+        }) {
+            GuiUpdate::HostConfigUpdated {
+                snapshot_seq,
+                host_config,
+                ..
+            } => {
+                assert_eq!(host_config.openvmm_bin, Some(new_bin));
+                snapshot_seq
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            save_seq > refresh_seq,
+            "SaveHostConfig seq ({save_seq}) must exceed RefreshAll seq ({refresh_seq}) started before PATCH returned"
+        );
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn host_config_updated_without_host_info_does_not_mark_notified_connected() {
+        let backend = BackendHandle::new_for_test(egui::Context::default());
+        assert!(!backend.state.notified_connected.load(Ordering::Acquire));
+        assert!(backend.state.emit_checked(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: None,
+            host_config: HostConfig::default(),
+            snapshot_seq: 1,
+        }));
+        assert!(!backend.state.notified_connected.load(Ordering::Acquire));
     }
 }

@@ -125,7 +125,7 @@ pub fn open_raw_disk_file(
 /// the user-mode VHD parser. Otherwise, if the file ends with .vhd or .avhd, the
 /// file will be opened using the kernel-mode VHD parser (Windows only).
 ///
-/// If the file ends with .vhdx (case-insensitively), the VHDX backend is used
+/// If the file ends with .vhdx or .avhdx (case-insensitively), the VHDX backend is used
 /// (kernel-mode VHD parser on Windows, or the pure-Rust VHDX parser on Linux).
 ///
 /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
@@ -177,7 +177,7 @@ pub async fn open_disk_type(
                 Err(err) => return Err(err.into()),
             }
         }
-        Some("vhdx") => open_vhdx_disk(path, options).await?,
+        Some("vhdx" | "avhdx") => open_vhdx_disk(path, options).await?,
         Some("iso") if !read_only => {
             anyhow::bail!("iso file cannot be opened as read/write")
         }
@@ -224,7 +224,7 @@ pub fn create_disk_type(
         Some("avhd") => {
             anyhow::bail!("creating avhd not supported")
         }
-        Some("vhdx") => {
+        Some("vhdx" | "avhdx") => {
             anyhow::bail!("creating vhdx not supported")
         }
         Some("vmdk") => {
@@ -646,5 +646,34 @@ mod tests {
                 "{err:#}"
             );
         }
+
+        // `.avhdx` dispatches to the VHDX backend rather than falling back to raw.
+        let avhdx = dir.path().join("snapshot.avhdx");
+        std::fs::write(&avhdx, b"not-a-valid-vhdx-payload").unwrap();
+        let err = open_disk_type(
+            &avhdx,
+            OpenDiskOptions {
+                read_only: true,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
+            "{err:#}"
+        );
+        assert!(
+            create_disk_type(
+                &avhdx,
+                512,
+                OpenDiskOptions {
+                    read_only: false,
+                    direct: false,
+                },
+            )
+            .is_err()
+        );
     }
 }

@@ -795,20 +795,20 @@ pub fn resolve_local_viewer_binary(data_dir: Option<&Path>) -> anyhow::Result<Pa
     let configured = RegistryStore::open(&dir)
         .load_host_config_or_default()
         .unwrap_or_default();
+    if let Some(resolved) = crate::models::resolve_host_paths(&configured).fastdesk_viewer_bin {
+        return Ok(resolved);
+    }
     if let Some(explicit) = configured
         .fastdesk_viewer_bin
         .as_deref()
         .filter(|p| !p.as_os_str().is_empty())
-        && !explicit.is_file()
     {
         bail!(
-            "configured fastdesk-viewer binary not found at {}",
+            "configured fastdesk-viewer binary not found at '{}'",
             explicit.display()
         );
     }
-    crate::models::resolve_host_paths(&configured)
-        .fastdesk_viewer_bin
-        .context("fastdesk-viewer binary not found next to current executable or in PATH")
+    bail!("fastdesk-viewer binary not found next to current executable or in PATH")
 }
 
 pub fn ensure_daemon_running(

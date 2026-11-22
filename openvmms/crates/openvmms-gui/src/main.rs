@@ -444,11 +444,11 @@ impl OpenVmmsApp {
                         }
                         self.daemon_instance_id = info.daemon_instance_id;
                         self.host_info = Some(info);
+                        self.connected_base_url = Some(base_url.clone());
+                        self.connected = true;
+                        self.connection_status = format!("Connected ({base_url})");
                     }
-                    self.connected_base_url = Some(base_url.clone());
-                    self.connected = true;
                     self.host_config_loaded = true;
-                    self.connection_status = format!("Connected ({base_url})");
                     self.host_config = host_config;
                     if let Some(d) = self.host_settings_dlg.as_mut() {
                         d.sync_from_config(&self.host_config);
@@ -2367,5 +2367,29 @@ mod tests {
             app.vms.iter().find(|v| v.config.id == vm_id).unwrap().runtime.status,
             VmStatus::Running
         );
+    }
+
+    #[test]
+    fn host_config_updated_without_host_info_does_not_mark_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        assert!(!app.connected);
+        let initial_status = app.connection_status.clone();
+
+        let mut cfg = HostConfig::default();
+        cfg.openvmm_bin = Some(PathBuf::from("/tmp/updated-openvmm"));
+
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: None,
+            host_config: cfg.clone(),
+            snapshot_seq: 1,
+        });
+
+        assert!(!app.connected);
+        assert_eq!(app.connected_base_url, None);
+        assert_eq!(app.connection_status, initial_status);
+        assert!(app.host_config_loaded);
+        assert_eq!(app.host_config.openvmm_bin, cfg.openvmm_bin);
     }
 }

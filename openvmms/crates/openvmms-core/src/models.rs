@@ -375,6 +375,25 @@ fn cargo_workspace_repo_root(exe_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Resolves an explicit file path (e.g. per-VM `uefi_firmware`) against CWD, the
+/// current executable directory, and any enclosing Cargo workspace root.
+pub fn resolve_explicit_file_path(explicit: &Path) -> Option<PathBuf> {
+    if explicit.as_os_str().is_empty() {
+        return None;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().ok();
+    resolve_file_candidate(
+        Some(explicit),
+        exe_dir.as_deref(),
+        cwd.as_deref(),
+        None,
+        &[],
+    )
+}
+
 fn resolve_binary_candidate(
     explicit: Option<&Path>,
     exe_dir: Option<&Path>,
@@ -382,7 +401,32 @@ fn resolve_binary_candidate(
     workspace_rel: &[&str],
 ) -> Option<PathBuf> {
     if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
-        return p.is_file().then(|| p.to_path_buf());
+        if p.is_absolute() {
+            return p.is_file().then(|| p.to_path_buf());
+        }
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+        if let Some(dir) = exe_dir {
+            let candidate = dir.join(p);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if let Some(root) = cargo_workspace_repo_root(dir) {
+                for base in [root.as_path(), root.join("openvmms").as_path()] {
+                    let c = base.join(p);
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        if p.components().count() == 1
+            && let Some(name) = p.to_str()
+        {
+            return find_in_path(name);
+        }
+        return None;
     }
     if let Some(dir) = exe_dir {
         let candidate = dir.join(bin_name);
@@ -411,7 +455,28 @@ fn resolve_file_candidate(
     rel_paths: &[&str],
 ) -> Option<PathBuf> {
     if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
-        return p.is_file().then(|| p.to_path_buf());
+        if p.is_absolute() {
+            return p.is_file().then(|| p.to_path_buf());
+        }
+        let cwd_candidate = cwd.map(|d| d.join(p)).unwrap_or_else(|| p.to_path_buf());
+        if cwd_candidate.is_file() {
+            return Some(cwd_candidate);
+        }
+        if let Some(dir) = exe_dir {
+            let candidate = dir.join(p);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if let Some(root) = cargo_workspace_repo_root(dir) {
+                for base in [root.as_path(), root.join("openvmms").as_path()] {
+                    let c = base.join(p);
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        return None;
     }
     if let Some(p) = env_override
         && p.is_file()
@@ -581,7 +646,11 @@ impl std::fmt::Display for PortForward {
 }
 
 fn canonical_bind_ip(addr: &str) -> Option<std::net::IpAddr> {
-    match addr.trim().parse::<std::net::IpAddr>().ok()? {
+    let trimmed = addr.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    match trimmed.parse::<std::net::IpAddr>().ok()? {
         std::net::IpAddr::V4(v4) => Some(std::net::IpAddr::V4(v4)),
         std::net::IpAddr::V6(v6) => Some(
             v6.to_ipv4_mapped()
@@ -638,7 +707,11 @@ impl PortForward {
             (Some(std::net::IpAddr::V6(a)), Some(std::net::IpAddr::V6(b))) => {
                 a == b || a.is_unspecified() || b.is_unspecified()
             }
-            _ => false,
+            (Some(_), Some(_)) => false,
+            _ => self
+                .host_addr
+                .trim()
+                .eq_ignore_ascii_case(other.host_addr.trim()),
         }
     }
 
@@ -651,7 +724,10 @@ impl PortForward {
             canonical_bind_ip(&other.host_addr),
         ) {
             (Some(a), Some(b)) => a.is_ipv4() == b.is_ipv4(),
-            _ => false,
+            _ => self
+                .host_addr
+                .trim()
+                .eq_ignore_ascii_case(other.host_addr.trim()),
         }
     }
 }
@@ -1809,6 +1885,71 @@ mod tests {
             ),
             None
         );
+
+        // Relative explicit paths resolve against exe_dir and workspace root, while
+        // non-existent relative paths still fail without falling back to unrelated defaults.
+        let sibling_bin = cargo_ws.join("target/debug/deps/custom-openvmm");
+        std::fs::write(&sibling_bin, b"sibling").unwrap();
+        assert_eq!(
+            resolve_binary_candidate(
+                Some(Path::new("custom-openvmm")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                "openvmm",
+                &["openvmm/target/release/openvmm"],
+            ),
+            Some(sibling_bin)
+        );
+        assert_eq!(
+            resolve_binary_candidate(
+                Some(Path::new("openvmm/target/release/openvmm")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                "definitely-missing-openvmm-bin",
+                &[],
+            ),
+            Some(fake_openvmm)
+        );
+        assert_eq!(
+            resolve_binary_candidate(
+                Some(Path::new("missing/custom-openvmm")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                "openvmm",
+                &["openvmm/target/release/openvmm"],
+            ),
+            None
+        );
+
+        assert_eq!(
+            resolve_file_candidate(
+                Some(Path::new("firmware/MSVM.fd")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                Some(&installed_bin_dir),
+                None,
+                &[],
+            ),
+            Some(fake_fw)
+        );
+        let sibling_fw = cargo_ws.join("target/debug/deps/local.fd");
+        std::fs::write(&sibling_fw, b"fw").unwrap();
+        assert_eq!(
+            resolve_file_candidate(
+                Some(Path::new("local.fd")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                Some(&installed_bin_dir),
+                None,
+                &[],
+            ),
+            Some(sibling_fw)
+        );
+        assert_eq!(
+            resolve_file_candidate(
+                Some(Path::new("missing/local.fd")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                Some(&installed_bin_dir),
+                None,
+                &[],
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1915,6 +2056,46 @@ mod tests {
         assert!(v6_wild.overlaps(&v6_loopback));
         assert!(!v4_wild.overlaps(&v6_loopback));
         assert!(v4_wild.overlaps(&v4_loopback));
+
+        // Legacy "localhost" and non-IP hostnames compare properly in overlaps/same_nic_guest_conflict.
+        let v4_loopback_80 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 8081,
+            guest_port: 80,
+        };
+        let localhost_8080 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "localhost".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let localhost_8081 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "LOCALHOST".into(),
+            host_port: 8081,
+            guest_port: 80,
+        };
+        let custom_a = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "myhost".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let custom_b = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "MYHOST".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        assert!(localhost_8080.overlaps(&v4_loopback));
+        assert!(localhost_8080.overlaps(&v4_wild));
+        assert!(localhost_8080.same_nic_guest_conflict(&v4_loopback_80));
+        assert!(!localhost_8080.same_nic_guest_conflict(&v4_loopback));
+        assert!(localhost_8080.same_nic_guest_conflict(&localhost_8081));
+        assert!(custom_a.overlaps(&custom_b));
+        assert!(custom_a.same_nic_guest_conflict(&custom_b));
+        assert!(!custom_a.same_nic_guest_conflict(&v4_loopback_80));
 
         // 0.0.0.0:8080->80 + [::]:8080->80 coexist on the same NIC.
         cfg.nics[0].backend = NicBackendConfig::Consomme {

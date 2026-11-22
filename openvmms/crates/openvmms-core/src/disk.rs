@@ -380,6 +380,7 @@ struct Vhd1Meta {
     disk_type: String,
     virtual_size_bytes: u64,
     block_size_bytes: Option<u32>,
+    parent_path: Option<String>,
 }
 
 fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Option<(u32, u64, u64)> {
@@ -421,6 +422,71 @@ fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Option<(
     Some((disk_type, current_size, data_offset))
 }
 
+fn decode_utf16_until_nul(bytes: &[u8], little_endian: bool) -> Option<String> {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .take_while(|&u| u != 0)
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+    String::from_utf16(&units).ok().filter(|s| !s.is_empty())
+}
+
+fn parse_vhd1_parent_path(
+    file: &mut fs::File,
+    dyn_hdr: &[u8; 1024],
+    file_size_bytes: u64,
+) -> Option<String> {
+    const MAX_LOCATOR_BYTES: u32 = 65_536;
+    for platform in [b"W2ru", b"W2ku", b"MacX"] {
+        for entry in dyn_hdr[576..768].chunks_exact(24) {
+            if &entry[0..4] != platform {
+                continue;
+            }
+            let data_len = u32::from_be_bytes([entry[8], entry[9], entry[10], entry[11]]);
+            let data_offset = u64::from_be_bytes([
+                entry[16], entry[17], entry[18], entry[19], entry[20], entry[21], entry[22],
+                entry[23],
+            ]);
+            if data_len == 0
+                || data_len > MAX_LOCATOR_BYTES
+                || data_offset
+                    .checked_add(u64::from(data_len))
+                    .is_none_or(|end| end > file_size_bytes)
+            {
+                continue;
+            }
+            let mut buf = vec![0u8; data_len as usize];
+            if file.seek(SeekFrom::Start(data_offset)).is_err()
+                || file.read_exact(&mut buf).is_err()
+            {
+                continue;
+            }
+            let decoded = if platform == b"MacX" {
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                std::str::from_utf8(&buf[..end])
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+            } else {
+                decode_utf16_until_nul(&buf, true)
+            };
+            if decoded.is_some() {
+                return decoded;
+            }
+        }
+    }
+    decode_utf16_until_nul(&dyn_hdr[64..576], false)
+}
+
 fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Option<Vhd1Meta>> {
     if file_size_bytes < 512 {
         return Ok(None);
@@ -429,8 +495,10 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
         .with_context(|| format!("opening {} to inspect VHD1 footer", path.display()))?;
 
     let mut footer = [0u8; 512];
-    file.seek(SeekFrom::End(-512))?;
-    file.read_exact(&mut footer)?;
+    file.seek(SeekFrom::End(-512))
+        .with_context(|| format!("seeking VHD1 footer in {}", path.display()))?;
+    file.read_exact(&mut footer)
+        .with_context(|| format!("reading VHD1 footer from {}", path.display()))?;
     let Some((disk_type_code, virtual_size_bytes, data_offset)) =
         parse_vhd1_footer_bytes(&footer, file_size_bytes)
     else {
@@ -454,6 +522,7 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
         _ => unreachable!(),
     };
     let mut block_size_bytes = None;
+    let mut parent_path = None;
     if matches!(disk_type_code, 3 | 4)
         && data_offset != u64::MAX
         && data_offset
@@ -480,6 +549,9 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
                 if block_size > 0 {
                     block_size_bytes = Some(block_size);
                 }
+                if disk_type_code == 4 {
+                    parent_path = parse_vhd1_parent_path(&mut file, &dyn_hdr, file_size_bytes);
+                }
             }
         }
     }
@@ -488,6 +560,7 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
         disk_type,
         virtual_size_bytes,
         block_size_bytes,
+        parent_path,
     }))
 }
 
@@ -534,20 +607,22 @@ pub fn inspect_disk_with_explicit_tool(
 
     match detected {
         DetectedFormat::Vhdx => {
-            if let Some(explicit) = explicit_img_bin.filter(|p| !p.as_os_str().is_empty())
-                && !explicit.is_file()
-            {
-                bail!(
-                    "configured openvmm-img binary not found at '{}'",
-                    explicit.display()
-                );
-            }
-            let img_bin = resolved_img_bin.with_context(|| {
-                format!(
-                    "cannot inspect VHDX metadata for {}: openvmm-img binary not found; configure openvmm_img_bin in host settings",
-                    path.display()
-                )
-            })?;
+            let img_bin = match resolved_img_bin {
+                Some(bin) => bin,
+                None => {
+                    if let Some(explicit) = explicit_img_bin.filter(|p| !p.as_os_str().is_empty())
+                    {
+                        bail!(
+                            "configured openvmm-img binary not found at '{}'",
+                            explicit.display()
+                        );
+                    }
+                    bail!(
+                        "cannot inspect VHDX metadata for {}: openvmm-img binary not found; configure openvmm_img_bin in host settings",
+                        path.display()
+                    );
+                }
+            };
             let output = Command::new(img_bin)
                 .arg("info")
                 .arg("--json")
@@ -614,7 +689,7 @@ pub fn inspect_disk_with_explicit_tool(
                 file_size_bytes,
                 block_size_bytes: vhd.block_size_bytes,
                 sector_size_bytes: Some(512),
-                parent_path: None,
+                parent_path: vhd.parent_path,
                 read_only,
                 warning,
             })
@@ -1380,5 +1455,64 @@ mod tests {
         fs::write(&iso_file, &iso_bytes).unwrap();
         let iso_info = inspect_disk(&iso_file, None).unwrap();
         assert_eq!(iso_info.format, "iso");
+
+        // Differencing VHD1 extracts parent_path from W2ru locator (UTF-16LE), falling back
+        // to Parent Unicode Name (UTF-16BE) when no locator entry is present.
+        let diff_footer = build_vhd1_footer(4, dyn_virtual, 512);
+        let locator_bytes: Vec<u8> = "base/parent.vhd"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let locator_offset = (512 + 1024) as u64;
+        let mut diff_hdr = [0u8; 1024];
+        diff_hdr[0..8].copy_from_slice(b"cxsparse");
+        diff_hdr[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+        diff_hdr[16..24].copy_from_slice(&(locator_offset + locator_bytes.len() as u64).to_be_bytes());
+        diff_hdr[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        diff_hdr[28..32].copy_from_slice(&5120u32.to_be_bytes());
+        diff_hdr[32..36].copy_from_slice(&(2 * 1024 * 1024u32).to_be_bytes());
+        // Parent Unicode Name fallback (overridden by W2ru locator when present).
+        let unicode_name_bytes: Vec<u8> = "fallback-parent.vhd"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        diff_hdr[64..64 + unicode_name_bytes.len()].copy_from_slice(&unicode_name_bytes);
+        // First Parent Locator entry: W2ru pointing at locator_offset.
+        diff_hdr[576..580].copy_from_slice(b"W2ru");
+        diff_hdr[580..584].copy_from_slice(&512u32.to_be_bytes());
+        diff_hdr[584..588].copy_from_slice(&(locator_bytes.len() as u32).to_be_bytes());
+        diff_hdr[592..600].copy_from_slice(&locator_offset.to_be_bytes());
+        let sum: u32 = diff_hdr.iter().map(|&b| b as u32).sum();
+        diff_hdr[36..40].copy_from_slice(&(!sum).to_be_bytes());
+
+        let mut diff_bytes = Vec::new();
+        diff_bytes.extend_from_slice(&diff_footer);
+        diff_bytes.extend_from_slice(&diff_hdr);
+        diff_bytes.extend_from_slice(&locator_bytes);
+        diff_bytes.extend_from_slice(&diff_footer);
+        let diff_avhd = dir.path().join("child.avhd");
+        fs::write(&diff_avhd, &diff_bytes).unwrap();
+        let diff_info = inspect_disk(&diff_avhd, None).unwrap();
+        assert_eq!(diff_info.disk_type, "differencing");
+        assert_eq!(diff_info.parent_path.as_deref(), Some("base/parent.vhd"));
+
+        // Clear locator entries and recompute checksum -> falls back to Parent Unicode Name.
+        let mut fallback_hdr = diff_hdr;
+        fallback_hdr[36..40].fill(0);
+        fallback_hdr[576..768].fill(0);
+        let fallback_sum: u32 = fallback_hdr.iter().map(|&b| b as u32).sum();
+        fallback_hdr[36..40].copy_from_slice(&(!fallback_sum).to_be_bytes());
+        let mut fallback_bytes = Vec::new();
+        fallback_bytes.extend_from_slice(&diff_footer);
+        fallback_bytes.extend_from_slice(&fallback_hdr);
+        fallback_bytes.extend_from_slice(&diff_footer);
+        let fallback_avhd = dir.path().join("child-fallback.avhd");
+        fs::write(&fallback_avhd, &fallback_bytes).unwrap();
+        let fallback_info = inspect_disk(&fallback_avhd, None).unwrap();
+        assert_eq!(fallback_info.disk_type, "differencing");
+        assert_eq!(
+            fallback_info.parent_path.as_deref(),
+            Some("fallback-parent.vhd")
+        );
     }
 }

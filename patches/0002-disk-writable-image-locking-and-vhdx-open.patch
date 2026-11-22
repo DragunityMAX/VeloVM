@@ -1,5 +1,5 @@
 diff --git a/openvmm/openvmm/openvmm_helpers/src/disk.rs b/openvmm/openvmm/openvmm_helpers/src/disk.rs
-index 4eab368..881eab6 100644
+index 4eab368..88735d4 100644
 --- a/openvmm/openvmm/openvmm_helpers/src/disk.rs
 +++ b/openvmm/openvmm/openvmm_helpers/src/disk.rs
 @@ -31,15 +31,102 @@ pub struct OpenDiskOptions {
@@ -105,7 +105,7 @@ index 4eab368..881eab6 100644
 -/// If the file ends with .vhdx, the kernel-mode VHD parser is used on
 -/// Windows. On Linux, the pure-Rust VHDX parser is used, with automatic
 -/// parent-locator walking for differencing chains.
-+/// If the file ends with .vhdx (case-insensitively), the VHDX backend is used
++/// If the file ends with .vhdx or .avhdx (case-insensitively), the VHDX backend is used
 +/// (kernel-mode VHD parser on Windows, or the pure-Rust VHDX parser on Linux).
  ///
  /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
@@ -157,7 +157,7 @@ index 4eab368..881eab6 100644
 -                disklayer_vhdx::chain::open_vhdx_chain(path, read_only).await?
 -            }
 -        }
-+        Some("vhdx") => open_vhdx_disk(path, options).await?,
++        Some("vhdx" | "avhdx") => open_vhdx_disk(path, options).await?,
          Some("iso") if !read_only => {
              anyhow::bail!("iso file cannot be opened as read/write")
          }
@@ -174,7 +174,7 @@ index 4eab368..881eab6 100644
  
              Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
          }
-@@ -132,23 +199,31 @@ pub fn create_disk_type(
+@@ -132,24 +199,32 @@ pub fn create_disk_type(
      size: u64,
      options: OpenDiskOptions,
  ) -> anyhow::Result<Resource<DiskHandleKind>> {
@@ -208,12 +208,14 @@ index 4eab368..881eab6 100644
              disk_vhd1::Vhd1Disk::make_fixed(&file)?;
              Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
          }
+-        Some("vhdx") => {
 +        Some("avhd") => {
 +            anyhow::bail!("creating avhd not supported")
 +        }
-         Some("vhdx") => {
++        Some("vhdx" | "avhdx") => {
              anyhow::bail!("creating vhdx not supported")
          }
+         Some("vmdk") => {
 @@ -174,28 +249,15 @@ fn open_raw_disk(
      }
  
@@ -245,7 +247,7 @@ index 4eab368..881eab6 100644
          file.set_len(size)?;
      }
  
-@@ -288,4 +350,301 @@ async fn rejects_vmdk_write_direct_io_and_creation() {
+@@ -288,4 +350,330 @@ async fn rejects_vmdk_write_direct_io_and_creation() {
              .is_err()
          );
      }
@@ -545,6 +547,35 @@ index 4eab368..881eab6 100644
 +                "{err:#}"
 +            );
 +        }
++
++        // `.avhdx` dispatches to the VHDX backend rather than falling back to raw.
++        let avhdx = dir.path().join("snapshot.avhdx");
++        std::fs::write(&avhdx, b"not-a-valid-vhdx-payload").unwrap();
++        let err = open_disk_type(
++            &avhdx,
++            OpenDiskOptions {
++                read_only: true,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap_err();
++        assert!(
++            err.chain()
++                .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
++            "{err:#}"
++        );
++        assert!(
++            create_disk_type(
++                &avhdx,
++                512,
++                OpenDiskOptions {
++                    read_only: false,
++                    direct: false,
++                },
++            )
++            .is_err()
++        );
 +    }
  }
 diff --git a/openvmm/vm/devices/storage/disklayer_vhdx/Cargo.toml b/openvmm/vm/devices/storage/disklayer_vhdx/Cargo.toml

@@ -195,6 +195,7 @@ impl Supervisor {
         let initial_listen_addr = parse_loopback_listen_addr(&raw_listen_addr)?.to_string();
         let auth_token = store.load_or_create_token()?;
         let loaded_vms = store.load_all_vms()?;
+        store.cleanup_orphaned_vmgs();
 
         let mut vm_map = HashMap::new();
         for cfg in loaded_vms {
@@ -883,7 +884,8 @@ impl Supervisor {
             )));
         }
 
-        let paths = self.resolved_paths();
+        let host_cfg = self.host_config();
+        let paths = resolve_host_paths(&host_cfg);
 
         for mut disk_att in payload.disks {
             if disk_att.kind == DiskKind::Dvd
@@ -978,7 +980,8 @@ impl Supervisor {
                 .map_err(|e| err_bad_request(format!("{e:#}")))?;
             if disk_req.format == DiskFormat::Vhdx {
                 validate_explicit_path(
-                    self.host_config().openvmm_img_bin.as_deref(),
+                    host_cfg.openvmm_img_bin.as_deref(),
+                    paths.openvmm_img_bin.as_deref(),
                     "openvmm-img binary",
                 )?;
             }
@@ -1780,19 +1783,33 @@ impl Supervisor {
         host_cfg: HostConfig,
         paths: ResolvedHostPaths,
     ) -> anyhow::Result<VmSummary> {
-        validate_explicit_path(host_cfg.openvmm_bin.as_deref(), "openvmm binary")?;
+        validate_explicit_path(
+            host_cfg.openvmm_bin.as_deref(),
+            paths.openvmm_bin.as_deref(),
+            "openvmm binary",
+        )?;
         let openvmm_bin = paths.openvmm_bin.ok_or_else(|| {
             err_bad_request(
                 "openvmm binary not found; configure openvmm_bin in Host Settings or place openvmm next to openvmmsd",
             )
         })?;
-        validate_explicit_path(cfg.uefi_firmware.as_deref(), "VM UEFI firmware")?;
-        if cfg.uefi_firmware.is_none() {
-            validate_explicit_path(host_cfg.uefi_firmware_path.as_deref(), "UEFI firmware")?;
-        }
-        let uefi_path = cfg
+        let vm_uefi_explicit = cfg
             .uefi_firmware
-            .clone()
+            .as_deref()
+            .filter(|p| !p.as_os_str().is_empty());
+        let resolved_vm_uefi =
+            vm_uefi_explicit.map(openvmms_core::models::resolve_explicit_file_path);
+        if let Some(resolved) = &resolved_vm_uefi {
+            validate_explicit_path(vm_uefi_explicit, resolved.as_deref(), "VM UEFI firmware")?;
+        } else {
+            validate_explicit_path(
+                host_cfg.uefi_firmware_path.as_deref(),
+                paths.uefi_firmware_path.as_deref(),
+                "UEFI firmware",
+            )?;
+        }
+        let uefi_path = resolved_vm_uefi
+            .flatten()
             .or(paths.uefi_firmware_path)
             .ok_or_else(|| {
                 err_bad_request(
@@ -2525,9 +2542,21 @@ impl Supervisor {
                 .get_mut(&id)
                 .ok_or_else(|| err_not_found("VM not found"))?;
             if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
+                let changed =
+                    vm.runtime.status != VmStatus::Off || vm.runtime.last_error.is_some();
                 vm.runtime.status = VmStatus::Off;
                 vm.runtime.last_error = None;
-                return Ok(vm.summary());
+                if changed {
+                    vm.runtime.revision = self.next_revision();
+                }
+                let summary = vm.summary();
+                drop(guard);
+                if changed {
+                    self.emit(DaemonEvent::VmUpdated {
+                        vm: summary.clone(),
+                    });
+                }
+                return Ok(summary);
             }
             if vm.runtime.status == VmStatus::Stopping {
                 if let Some(rx) = vm.stop_wait.clone() {
@@ -4205,20 +4234,22 @@ impl Supervisor {
         if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             return Err(err_bad_request("cancelled: daemon is shutting down"));
         }
+        let host_cfg = self.host_config();
+        let paths = resolve_host_paths(&host_cfg);
         if req.format == DiskFormat::Vhdx {
             validate_explicit_path(
-                self.host_config().openvmm_img_bin.as_deref(),
+                host_cfg.openvmm_img_bin.as_deref(),
+                paths.openvmm_img_bin.as_deref(),
                 "openvmm-img binary",
             )?;
         }
-        let paths = self.resolved_paths();
         disk::create_disk_cancellable(&req, paths.openvmm_img_bin.as_deref(), cancelled)
             .map_err(|e| err_bad_request(format!("{e:#}")))
     }
 
     pub fn inspect_disk(&self, path: &Path) -> anyhow::Result<DiskInfo> {
         let host_cfg = self.host_config();
-        let paths = self.resolved_paths();
+        let paths = resolve_host_paths(&host_cfg);
         disk::inspect_disk_with_explicit_tool(
             path,
             host_cfg.openvmm_img_bin.as_deref(),
@@ -4421,9 +4452,13 @@ impl Supervisor {
     }
 }
 
-fn validate_explicit_path(path: Option<&Path>, label: &str) -> anyhow::Result<()> {
-    if let Some(p) = path.filter(|p| !p.as_os_str().is_empty())
-        && !p.is_file()
+fn validate_explicit_path(
+    explicit: Option<&Path>,
+    resolved: Option<&Path>,
+    label: &str,
+) -> anyhow::Result<()> {
+    if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty())
+        && resolved.is_none()
     {
         return Err(err_bad_request(format!(
             "configured {label} not found at '{}'",
@@ -4606,6 +4641,7 @@ fn ensure_port_forwards_not_conflicting_with_active_vms(
     self_id: Uuid,
     nics: &[NicAttachment],
 ) -> anyhow::Result<()> {
+    let mut candidate_forwards: Vec<(&str, &PortForward)> = Vec::new();
     for nic in nics {
         if let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend {
             for (idx, pf) in port_forwards.iter().enumerate() {
@@ -4618,13 +4654,17 @@ fn ensure_port_forwards_not_conflicting_with_active_vms(
                         nic.name
                     )));
                 }
+                if let Some((existing_nic, existing)) = candidate_forwards
+                    .iter()
+                    .find(|(_, existing)| existing.overlaps(pf))
+                {
+                    return Err(err_conflict(format!(
+                        "port forward {pf} on NIC {} overlaps existing rule {existing} on NIC {existing_nic}",
+                        nic.name
+                    )));
+                }
+                candidate_forwards.push((nic.name.as_str(), pf));
             }
-        }
-    }
-    let mut candidate_forwards: Vec<&PortForward> = Vec::new();
-    for nic in nics {
-        if let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend {
-            candidate_forwards.extend(port_forwards.iter());
         }
     }
     if candidate_forwards.is_empty() {
@@ -4637,7 +4677,7 @@ fn ensure_port_forwards_not_conflicting_with_active_vms(
         for other_nic in &other.config.nics {
             if let NicBackendConfig::Consomme { port_forwards, .. } = &other_nic.backend {
                 for existing in port_forwards {
-                    for pf in &candidate_forwards {
+                    for (_, pf) in &candidate_forwards {
                         if existing.overlaps(pf) {
                             return Err(err_conflict(format!(
                                 "port forward {pf} overlaps existing rule {existing} on active VM '{}' (NIC {})",
@@ -6473,5 +6513,138 @@ mod tests {
             !format!("{err2:#}").contains("duplicate guest port"),
             "cross-NIC guest ports must not trigger same-NIC conflict: {err2:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn start_vm_rejects_intra_vm_overlapping_and_localhost_port_forwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let mut legacy = openvmms_core::models::VmConfig::from_preset(
+            "IntraVmOverlap-VM",
+            openvmms_core::models::VmPreset::Custom,
+            &store.vm_dir(Uuid::new_v4()),
+        );
+        legacy.nics[0].name = "nat0".into();
+        legacy.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8080,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        let mut nat1 = NicAttachment::default_consomme();
+        nat1.name = "nat1".into();
+        nat1.backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "0.0.0.0".into(),
+                host_port: 8080,
+                guest_port: 81,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        legacy.nics.push(nat1);
+        store.save_vm_unchecked(&legacy).unwrap();
+
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let err = sup.start_vm(&legacy.id.to_string()).await.unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::Conflict(_))),
+            "expected HTTP 409 conflict for intra-VM overlapping host port, got: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("overlaps existing rule"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            sup.get_vm(&legacy.id.to_string()).unwrap().runtime.status,
+            VmStatus::Off
+        );
+
+        // Legacy "localhost" duplicates on the same NIC are also caught as 409 Conflict.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = openvmms_core::store::RegistryStore::new(dir2.path()).unwrap();
+        let mut localhost_dup = openvmms_core::models::VmConfig::from_preset(
+            "LocalhostDup-VM",
+            openvmms_core::models::VmPreset::Custom,
+            &store2.vm_dir(Uuid::new_v4()),
+        );
+        localhost_dup.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "localhost".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "localhost".into(),
+                    host_port: 8081,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        store2.save_vm_unchecked(&localhost_dup).unwrap();
+
+        let sup2 = Supervisor::new(dir2.path(), Some("127.0.0.1:0")).unwrap();
+        let err2 = sup2.start_vm(&localhost_dup.id.to_string()).await.unwrap_err();
+        assert!(
+            matches!(err2.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::Conflict(_))),
+            "expected HTTP 409 conflict for duplicate localhost guest port, got: {err2:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_vm_in_error_state_bumps_revision_and_emits_vm_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let cfg = openvmms_core::models::VmConfig::from_preset(
+            "ErrorStop-VM",
+            openvmms_core::models::VmPreset::Custom,
+            &store.vm_dir(Uuid::new_v4()),
+        );
+        store.save_vm(&cfg).unwrap();
+
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let initial_rev = {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&cfg.id).unwrap();
+            vm.runtime.status = VmStatus::Error;
+            vm.runtime.last_error = Some("boot failure".into());
+            vm.runtime.revision = sup.next_revision();
+            vm.runtime.revision
+        };
+
+        let mut rx = sup.subscribe();
+        let stopped = sup.stop_vm(&cfg.id.to_string()).await.unwrap();
+        assert_eq!(stopped.runtime.status, VmStatus::Off);
+        assert_eq!(stopped.runtime.last_error, None);
+        assert!(stopped.runtime.revision > initial_rev);
+
+        let evt = rx.try_recv().unwrap();
+        match evt {
+            DaemonEvent::VmUpdated { vm } => {
+                assert_eq!(vm.config.id, cfg.id);
+                assert_eq!(vm.runtime.status, VmStatus::Off);
+                assert_eq!(vm.runtime.last_error, None);
+                assert_eq!(vm.runtime.revision, stopped.runtime.revision);
+            }
+            other => panic!("expected VmUpdated event, got {other:?}"),
+        }
+
+        // Idempotent stop when already Off with no error does not emit another event.
+        let again = sup.stop_vm(&cfg.id.to_string()).await.unwrap();
+        assert_eq!(again.runtime.revision, stopped.runtime.revision);
+        assert!(rx.try_recv().is_err());
     }
 }
