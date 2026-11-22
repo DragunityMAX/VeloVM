@@ -2493,7 +2493,7 @@ async fn test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_p
     daemon_adopted.shutdown().await;
 }
 
-async fn test_online_hotplug_save_failure_does_not_rollback_restarted_vm() {
+async fn test_online_hotplug_in_flight_does_not_hit_restarted_vm() {
     let dir = tempfile::tempdir().unwrap();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
@@ -2542,7 +2542,8 @@ async fn test_online_hotplug_save_failure_does_not_rollback_restarted_vm() {
     wait_for_file(&runtime_dir.join("modify_resource_entered")).await;
 
     // Stop generation 1 and immediately start generation 2 (normal mode) on the same `<id>.sock`
-    // while generation 1's attach_disk is still in flight.
+    // while generation 1's attach_disk is still in flight. `start_vm` must wait for gen-1's
+    // hotplug_lock so gen-2 never receives gen-1's RPC or rollback.
     write_stub_mode(&runtime_dir, "normal", &[]);
     assert_eq!(
         client
@@ -2576,7 +2577,98 @@ async fn test_online_hotplug_save_failure_does_not_rollback_restarted_vm() {
     let gen2_mod_log = fs::read_to_string(runtime_dir.join("modify_resource.log")).unwrap_or_default();
     assert!(
         gen2_mod_log.trim().is_empty(),
-        "gen-1 attach rollback must NOT send ModifyResource to restarted gen-2 VM, got: {gen2_mod_log:?}"
+        "gen-1 attach/rollback must NOT send ModifyResource to restarted gen-2 VM, got: {gen2_mod_log:?}"
+    );
+    let vm_after = daemon.supervisor.get_vm(&vm_id_str).unwrap();
+    assert!(
+        vm_after.config.disks.iter().all(|d| d.lun != 2),
+        "restarted gen-2 VM must not have unpersisted LUN 2: {:?}",
+        vm_after.config.disks
+    );
+
+    daemon.shutdown().await;
+}
+
+async fn test_concurrent_online_hot_add_same_writable_disk_blocks_second_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+    let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let client = test_http_client();
+    let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
+    write_stub_mode(&runtime_dir, "slow_modify_resource", &[]);
+
+    let vm_a = create_stub_vm(&client, &daemon, "HotAddRace-A").await;
+    let vm_b = create_stub_vm(&client, &daemon, "HotAddRace-B").await;
+    for id in [vm_a.config.id, vm_b.config.id] {
+        assert_eq!(
+            client
+                .post(format!("{}/api/v1/vms/{id}/start", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+
+    let shared_disk = dir.path().join("shared-writable.img");
+    fs::write(&shared_disk, vec![0u8; 65536]).unwrap();
+
+    let sup_a = Arc::clone(&daemon.supervisor);
+    let sup_b = Arc::clone(&daemon.supervisor);
+    let id_a = vm_a.config.id.to_string();
+    let id_b = vm_b.config.id.to_string();
+    let disk_a = shared_disk.clone();
+    let disk_b = shared_disk.clone();
+
+    let (res_a, res_b) = tokio::join!(
+        async move {
+            sup_a
+                .attach_disk(
+                    &id_a,
+                    AttachDiskPayload {
+                        path: disk_a,
+                        lun: Some(2),
+                        read_only: false,
+                        format: Some(DiskFormat::Raw),
+                    },
+                )
+                .await
+        },
+        async move {
+            sup_b
+                .attach_disk(
+                    &id_b,
+                    AttachDiskPayload {
+                        path: disk_b,
+                        lun: Some(2),
+                        read_only: false,
+                        format: Some(DiskFormat::Raw),
+                    },
+                )
+                .await
+        }
+    );
+
+    assert_ne!(
+        res_a.is_ok(),
+        res_b.is_ok(),
+        "exactly one concurrent writable hot-add must succeed: A={res_a:?}, B={res_b:?}"
+    );
+
+    let mod_log = fs::read_to_string(runtime_dir.join("modify_resource.log")).unwrap_or_default();
+    let add_count = mod_log
+        .lines()
+        .filter(|line| line.trim() == "add:scsi:2")
+        .count();
+    assert_eq!(
+        add_count, 1,
+        "loser must be blocked before sending ModifyResource(Add), log:\n{mod_log}"
     );
 
     daemon.shutdown().await;
@@ -2669,8 +2761,12 @@ fn main() {
             Box::pin(test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_peer()),
         ),
         (
-            "online_hotplug_save_failure_does_not_rollback_restarted_vm",
-            Box::pin(test_online_hotplug_save_failure_does_not_rollback_restarted_vm()),
+            "online_hotplug_in_flight_does_not_hit_restarted_vm",
+            Box::pin(test_online_hotplug_in_flight_does_not_hit_restarted_vm()),
+        ),
+        (
+            "concurrent_online_hot_add_same_writable_disk_blocks_second_rpc",
+            Box::pin(test_concurrent_online_hot_add_same_writable_disk_blocks_second_rpc()),
         ),
     ];
 

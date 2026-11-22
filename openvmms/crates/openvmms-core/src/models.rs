@@ -71,6 +71,7 @@ pub struct HostConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
@@ -511,8 +512,8 @@ impl DiskFormat {
             .map(|s| s.to_ascii_lowercase())
             .as_deref()
         {
-            Some("vhdx") => Self::Vhdx,
-            Some("vhd") => Self::Vhd,
+            Some("vhdx" | "avhdx") => Self::Vhdx,
+            Some("vhd" | "avhd") => Self::Vhd,
             Some("iso") => Self::Iso,
             _ => Self::Raw,
         }
@@ -901,7 +902,49 @@ impl VmConfig {
             nic.normalize();
         }
     }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmValidationOptions {
+    pub validate_name: bool,
+    pub validate_vcpus: bool,
+    pub validate_memory: bool,
+    pub validate_fastdesk: bool,
+    pub validate_disks: bool,
+    pub strict_disks_absolute: bool,
+    pub validate_nics: bool,
+    pub strict_nic_conflicts: bool,
+}
+
+impl VmValidationOptions {
+    pub fn strict() -> Self {
+        Self {
+            validate_name: true,
+            validate_vcpus: true,
+            validate_memory: true,
+            validate_fastdesk: true,
+            validate_disks: true,
+            strict_disks_absolute: true,
+            validate_nics: true,
+            strict_nic_conflicts: true,
+        }
+    }
+
+    pub fn for_update(payload: &UpdateVmPayload) -> Self {
+        Self {
+            validate_name: payload.name.is_some(),
+            validate_vcpus: payload.vcpus.is_some(),
+            validate_memory: payload.memory_mb.is_some(),
+            validate_fastdesk: payload.fastdesk.is_some(),
+            validate_disks: payload.disks.is_some(),
+            strict_disks_absolute: payload.disks.is_some(),
+            validate_nics: payload.nics.is_some(),
+            strict_nic_conflicts: payload.nics.is_some(),
+        }
+    }
+}
+
+impl VmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_with_options(true, true)
     }
@@ -911,139 +954,155 @@ impl VmConfig {
         strict_disks_absolute: bool,
         strict_nic_conflicts: bool,
     ) -> anyhow::Result<()> {
-        validate_vm_name(&self.name)?;
-        if self.name != self.name.trim() {
-            bail!("VM name cannot have leading or trailing whitespace");
+        self.validate_with_field_options(VmValidationOptions {
+            strict_disks_absolute,
+            strict_nic_conflicts,
+            ..VmValidationOptions::strict()
+        })
+    }
+
+    pub fn validate_with_field_options(&self, opts: VmValidationOptions) -> anyhow::Result<()> {
+        if opts.validate_name {
+            validate_vm_name(&self.name)?;
+            if self.name != self.name.trim() {
+                bail!("VM name cannot have leading or trailing whitespace");
+            }
         }
-        if self.vcpus == 0 || self.vcpus > 256 {
+        if opts.validate_vcpus && (self.vcpus == 0 || self.vcpus > 256) {
             bail!("vcpus must be between 1 and 256");
         }
-        if self.memory_mb < 128 || self.memory_mb > MAX_VM_MEMORY_MB {
+        if opts.validate_memory && (self.memory_mb < 128 || self.memory_mb > MAX_VM_MEMORY_MB) {
             bail!("memory_mb must be between 128 and {MAX_VM_MEMORY_MB} MiB");
         }
-        if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
-            bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
-        }
-        if !self.fastdesk.listen_addr.trim().is_empty() {
-            parse_loopback_listen_addr(&self.fastdesk.listen_addr)
-                .context("invalid fastdesk.listen_addr")?;
-        }
-        let mut seen_luns = std::collections::HashSet::new();
-        let mut seen_disk_paths = std::collections::HashSet::new();
-        for disk in &self.disks {
-            if disk.lun > 255 {
-                bail!("SCSI LUN {} is out of range (must be between 0 and 255)", disk.lun);
+        if opts.validate_fastdesk {
+            if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
+                bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
             }
-            if disk.path.as_os_str().is_empty() {
-                bail!("disk path at SCSI LUN {} cannot be empty", disk.lun);
-            }
-            if strict_disks_absolute && !disk.path.is_absolute() {
-                bail!(
-                    "disk path '{}' at SCSI LUN {} must be an absolute path",
-                    disk.path.display(),
-                    disk.lun
-                );
-            }
-            if (disk.format == DiskFormat::Iso || DiskFormat::from_path(&disk.path) == DiskFormat::Iso)
-                && (disk.kind != DiskKind::Dvd || !disk.read_only)
-            {
-                bail!(
-                    "ISO image '{}' at SCSI LUN {} must be attached as a read-only DVD drive",
-                    disk.path.display(),
-                    disk.lun
-                );
-            }
-            if !seen_luns.insert(disk.lun) {
-                bail!("duplicate SCSI LUN {}", disk.lun);
-            }
-            if !seen_disk_paths.insert(normalize_path_key(&disk.path)) {
-                bail!(
-                    "disk '{}' is attached multiple times to VM '{}'",
-                    disk.path.display(),
-                    self.name
-                );
+            if !self.fastdesk.listen_addr.trim().is_empty() {
+                parse_loopback_listen_addr(&self.fastdesk.listen_addr)
+                    .context("invalid fastdesk.listen_addr")?;
             }
         }
-        let mut seen_nic_ids = std::collections::HashSet::new();
-        let mut seen_macs = std::collections::HashSet::new();
-        let mut seen_port_forwards: Vec<&PortForward> = Vec::new();
-        for nic in &self.nics {
-            if strict_nic_conflicts && !seen_nic_ids.insert(nic.id) {
-                bail!("duplicate NIC id {}", nic.id);
-            }
-            let mac_bytes = parse_mac_bytes(&nic.mac_address)?;
-            if strict_nic_conflicts && !seen_macs.insert(mac_bytes) {
-                bail!("duplicate MAC address '{}' across NICs", nic.mac_address);
-            }
-            match &nic.backend {
-                NicBackendConfig::Consomme { port_forwards, .. } => {
-                    let mut seen_nic_forwards: Vec<&PortForward> = Vec::new();
-                    for pf in port_forwards {
-                        pf.validate()?;
-                        if strict_nic_conflicts {
-                            if let Some(conflict) =
-                                seen_port_forwards.iter().find(|e| e.overlaps(pf))
-                            {
-                                bail!(
-                                    "port forward '{pf}' overlaps with existing port forward '{conflict}'"
-                                );
-                            }
-                            if let Some(conflict) =
-                                seen_nic_forwards.iter().find(|e| e.same_nic_guest_conflict(pf))
-                            {
-                                bail!(
-                                    "port forward '{pf}' conflicts with existing port forward '{conflict}' on NIC '{}' (duplicate guest port for protocol and IP family)",
-                                    nic.name
-                                );
-                            }
-                            seen_port_forwards.push(pf);
-                            seen_nic_forwards.push(pf);
-                        }
-                    }
+        if opts.validate_disks {
+            let mut seen_luns = std::collections::HashSet::new();
+            let mut seen_disk_paths = std::collections::HashSet::new();
+            for disk in &self.disks {
+                if disk.lun > 255 {
+                    bail!("SCSI LUN {} is out of range (must be between 0 and 255)", disk.lun);
                 }
-                NicBackendConfig::VmSwitch { switch_id, .. } => {
-                    #[cfg(not(windows))]
-                    {
-                        let _ = switch_id;
-                        bail!("Windows Hyper-V VMSwitch NIC backend is only supported on Windows");
-                    }
-                    #[cfg(windows)]
-                    {
-                        if switch_id != switch_id.trim() {
-                            bail!(
-                                "VMSwitch id '{switch_id}' cannot have leading or trailing whitespace"
-                            );
+                if disk.path.as_os_str().is_empty() {
+                    bail!("disk path at SCSI LUN {} cannot be empty", disk.lun);
+                }
+                if opts.strict_disks_absolute && !disk.path.is_absolute() {
+                    bail!(
+                        "disk path '{}' at SCSI LUN {} must be an absolute path",
+                        disk.path.display(),
+                        disk.lun
+                    );
+                }
+                if (disk.format == DiskFormat::Iso || DiskFormat::from_path(&disk.path) == DiskFormat::Iso)
+                    && (disk.kind != DiskKind::Dvd || !disk.read_only)
+                {
+                    bail!(
+                        "ISO image '{}' at SCSI LUN {} must be attached as a read-only DVD drive",
+                        disk.path.display(),
+                        disk.lun
+                    );
+                }
+                if !seen_luns.insert(disk.lun) {
+                    bail!("duplicate SCSI LUN {}", disk.lun);
+                }
+                if !seen_disk_paths.insert(normalize_path_key(&disk.path)) {
+                    bail!(
+                        "disk '{}' is attached multiple times to VM '{}'",
+                        disk.path.display(),
+                        self.name
+                    );
+                }
+            }
+        }
+        if opts.validate_nics {
+            let mut seen_nic_ids = std::collections::HashSet::new();
+            let mut seen_macs = std::collections::HashSet::new();
+            let mut seen_port_forwards: Vec<&PortForward> = Vec::new();
+            for nic in &self.nics {
+                if opts.strict_nic_conflicts && !seen_nic_ids.insert(nic.id) {
+                    bail!("duplicate NIC id {}", nic.id);
+                }
+                let mac_bytes = parse_mac_bytes(&nic.mac_address)?;
+                if opts.strict_nic_conflicts && !seen_macs.insert(mac_bytes) {
+                    bail!("duplicate MAC address '{}' across NICs", nic.mac_address);
+                }
+                match &nic.backend {
+                    NicBackendConfig::Consomme { port_forwards, .. } => {
+                        let mut seen_nic_forwards: Vec<&PortForward> = Vec::new();
+                        for pf in port_forwards {
+                            pf.validate()?;
+                            if opts.strict_nic_conflicts {
+                                if let Some(conflict) =
+                                    seen_port_forwards.iter().find(|e| e.overlaps(pf))
+                                {
+                                    bail!(
+                                        "port forward '{pf}' overlaps with existing port forward '{conflict}'"
+                                    );
+                                }
+                                if let Some(conflict) =
+                                    seen_nic_forwards.iter().find(|e| e.same_nic_guest_conflict(pf))
+                                {
+                                    bail!(
+                                        "port forward '{pf}' conflicts with existing port forward '{conflict}' on NIC '{}' (duplicate guest port for protocol and IP family)",
+                                        nic.name
+                                    );
+                                }
+                                seen_port_forwards.push(pf);
+                                seen_nic_forwards.push(pf);
+                            }
                         }
-                        if !switch_id.eq_ignore_ascii_case("default")
-                            && Uuid::parse_str(switch_id).is_err()
+                    }
+                    NicBackendConfig::VmSwitch { switch_id, .. } => {
+                        #[cfg(not(windows))]
                         {
-                            bail!(
-                                "invalid VMSwitch id '{switch_id}' (expected 'default' or a switch GUID)"
-                            );
+                            let _ = switch_id;
+                            bail!("Windows Hyper-V VMSwitch NIC backend is only supported on Windows");
+                        }
+                        #[cfg(windows)]
+                        {
+                            if switch_id != switch_id.trim() {
+                                bail!(
+                                    "VMSwitch id '{switch_id}' cannot have leading or trailing whitespace"
+                                );
+                            }
+                            if !switch_id.eq_ignore_ascii_case("default")
+                                && Uuid::parse_str(switch_id).is_err()
+                            {
+                                bail!(
+                                    "invalid VMSwitch id '{switch_id}' (expected 'default' or a switch GUID)"
+                                );
+                            }
                         }
                     }
-                }
-                NicBackendConfig::Tap { name } => {
-                    #[cfg(windows)]
-                    {
-                        let _ = name;
-                        bail!("Linux TAP NIC backend is only supported on Linux");
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        if name != name.trim() {
-                            bail!(
-                                "TAP interface name '{name}' cannot have leading or trailing whitespace"
-                            );
+                    NicBackendConfig::Tap { name } => {
+                        #[cfg(windows)]
+                        {
+                            let _ = name;
+                            bail!("Linux TAP NIC backend is only supported on Linux");
                         }
-                        if name.is_empty() || name.contains('/') || name.contains('\0') {
-                            bail!("invalid TAP interface name '{name}'");
+                        #[cfg(not(windows))]
+                        {
+                            if name != name.trim() {
+                                bail!(
+                                    "TAP interface name '{name}' cannot have leading or trailing whitespace"
+                                );
+                            }
+                            if name.is_empty() || name.contains('/') || name.contains('\0') {
+                                bail!("invalid TAP interface name '{name}'");
+                            }
+                            #[cfg(target_os = "linux")]
+                            validate_tap_sysfs_dir(
+                                name,
+                                &Path::new("/sys/class/net").join(name),
+                            )?;
                         }
-                        #[cfg(target_os = "linux")]
-                        validate_tap_sysfs_dir(
-                            name,
-                            &Path::new("/sys/class/net").join(name),
-                        )?;
                     }
                 }
             }
@@ -1246,6 +1305,8 @@ pub struct DiskInfo {
     pub sector_size_bytes: Option<u32>,
     pub parent_path: Option<String>,
     pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1957,5 +2018,41 @@ mod tests {
         assert!(parse_mac_bytes("+0:+1:+2:+3:+4:+5").is_err());
         assert!(parse_mac_bytes("+2:00:00:00:00:01").is_err());
         assert!(parse_mac_bytes("02-00-00-00-00-01").is_ok());
+    }
+
+    #[test]
+    fn host_config_patch_nullable_absent_and_deny_unknown_fields() {
+        let patch_null: HostConfigPatch =
+            serde_json::from_str(r#"{"openvmm_bin": null}"#).unwrap();
+        assert_eq!(patch_null.openvmm_bin, Some(None));
+        assert_eq!(patch_null.fastdesk_viewer_bin, None);
+
+        let patch_empty: HostConfigPatch =
+            serde_json::from_str(r#"{"openvmm_bin": ""}"#).unwrap();
+        assert_eq!(patch_empty.openvmm_bin, Some(None));
+
+        let patch_absent: HostConfigPatch = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(patch_absent.openvmm_bin, None);
+        assert!(patch_absent.is_empty());
+
+        let patch_path: HostConfigPatch =
+            serde_json::from_str(r#"{"openvmm_bin": "/usr/local/bin/openvmm"}"#).unwrap();
+        assert_eq!(
+            patch_path.openvmm_bin,
+            Some(Some(PathBuf::from("/usr/local/bin/openvmm")))
+        );
+
+        let unknown = serde_json::from_str::<HostConfigPatch>(r#"{"runtime_dir": "/tmp/x"}"#);
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn disk_format_from_path_handles_avhdx_and_avhd() {
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.vhdx")), DiskFormat::Vhdx);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.avhdx")), DiskFormat::Vhdx);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.AVHDX")), DiskFormat::Vhdx);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.vhd")), DiskFormat::Vhd);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.avhd")), DiskFormat::Vhd);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.AVHD")), DiskFormat::Vhd);
     }
 }

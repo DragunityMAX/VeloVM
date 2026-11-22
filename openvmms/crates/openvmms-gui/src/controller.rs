@@ -94,10 +94,12 @@ pub enum GuiUpdate {
         vm: VmSummary,
         select: bool,
         is_details_fetch: bool,
+        daemon_instance_id: Option<Uuid>,
     },
     VmDeleted {
         id: Uuid,
         revision: u64,
+        daemon_instance_id: Option<Uuid>,
     },
     VmLogs { id: Uuid, content: String },
     DiskInspected(DiskInfo),
@@ -389,13 +391,16 @@ impl BackendState {
         })
     }
 
-    fn ensure_sse(self: &Arc<Self>) {
+    fn ensure_sse(self: &Arc<Self>) -> bool {
         if self
             .sse_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
             spawn_sse_listener(Arc::clone(self));
+            true
+        } else {
+            false
         }
     }
 
@@ -463,23 +468,25 @@ impl BackendState {
                 match ensure_daemon_running(self.data_dir.as_deref(), self.daemon_url.as_deref()) {
                     Ok(c) => {
                         set_shared_endpoint(&self.shared_endpoint, &c);
-                        self.ensure_sse();
-                        let snapshot_seq = self.next_snapshot_seq();
-                        match fetch_full_snapshot(&c) {
-                            Ok((host_info, host_config, switches, vms)) => {
-                                let base_url = c.base_url().to_string();
-                                *self.client.write().unwrap() = Some(c);
-                                self.emit(GuiUpdate::DaemonConnected {
-                                    base_url,
-                                    host_info,
-                                    host_config,
-                                    switches,
-                                    vms,
-                                    snapshot_seq,
-                                });
-                            }
-                            Err(err) => {
-                                self.emit(GuiUpdate::DaemonDisconnected(format!("{err:#}")));
+                        *self.client.write().unwrap() = Some(c.clone());
+                        if !self.ensure_sse() {
+                            let snapshot_seq = self.next_snapshot_seq();
+                            match fetch_full_snapshot(&c) {
+                                Ok((host_info, host_config, switches, vms)) => {
+                                    let base_url = c.base_url().to_string();
+                                    *self.client.write().unwrap() = Some(c);
+                                    self.emit(GuiUpdate::DaemonConnected {
+                                        base_url,
+                                        host_info,
+                                        host_config,
+                                        switches,
+                                        vms,
+                                        snapshot_seq,
+                                    });
+                                }
+                                Err(err) => {
+                                    self.emit(GuiUpdate::DaemonDisconnected(format!("{err:#}")));
+                                }
                             }
                         }
                     }
@@ -719,6 +726,7 @@ impl BackendState {
         client: &mut ApiClient,
         req: GuiRequest,
     ) -> anyhow::Result<()> {
+        let req_instance_id = self.daemon_instance_id.lock().unwrap().1;
         match req {
             GuiRequest::ConnectOrStartDaemon => Ok(()),
             GuiRequest::RefreshAll => {
@@ -740,6 +748,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: true,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -758,6 +767,7 @@ impl BackendState {
                     vm,
                     select: true,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -771,13 +781,18 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
             GuiRequest::DeleteVm { id, delete_disks } => {
                 client.delete_vm(&id.to_string(), delete_disks)?;
                 self.emit(GuiUpdate::StatusMessage("Deleted virtual machine".to_string()));
-                self.emit(GuiUpdate::VmDeleted { id, revision: 0 });
+                self.emit(GuiUpdate::VmDeleted {
+                    id,
+                    revision: 0,
+                    daemon_instance_id: req_instance_id,
+                });
                 Ok(())
             }
             GuiRequest::StartVm { id } => {
@@ -790,6 +805,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -803,6 +819,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -817,6 +834,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -830,6 +848,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -843,6 +862,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -856,6 +876,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -887,6 +908,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -907,6 +929,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -917,6 +940,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -927,6 +951,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -937,6 +962,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -947,6 +973,7 @@ impl BackendState {
                     vm,
                     select: false,
                     is_details_fetch: false,
+                    daemon_instance_id: req_instance_id,
                 });
                 Ok(())
             }
@@ -1014,19 +1041,7 @@ fn maybe_switch_endpoint_on_disconnect(
         &state.shared_endpoint,
     ) && c.base_url() != current_base_url
     {
-        let snapshot_seq = state.next_snapshot_seq();
-        if let Ok((host_info, host_config, switches, vms)) = fetch_full_snapshot(&c) {
-            let base_url = c.base_url().to_string();
-            *state.client.write().unwrap() = Some(c);
-            let _ = state.emit_checked(GuiUpdate::DaemonConnected {
-                base_url,
-                host_info,
-                host_config,
-                switches,
-                vms,
-                snapshot_seq,
-            });
-        }
+        *state.client.write().unwrap() = Some(c);
         return true;
     }
     false
@@ -1045,6 +1060,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                 return;
             }
         };
+        let mut reported_initial_error = false;
         while !state.shutdown.load(Ordering::Acquire) {
             let endpoint = state.shared_endpoint.read().unwrap().clone().or_else(|| {
                 reload_client_from_runtime_addr(
@@ -1068,7 +1084,10 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     base_url = reloaded.base_url().to_string();
                     token = reloaded.token().to_string();
                 } else {
-                    if state.notified_connected.swap(false, Ordering::AcqRel) {
+                    if state.notified_connected.swap(false, Ordering::AcqRel)
+                        || !reported_initial_error
+                    {
+                        reported_initial_error = true;
                         *state.client.write().unwrap() = None;
                         if !state.emit_checked(GuiUpdate::DaemonDisconnected(
                             "Lost connection or failed daemon verification".to_string(),
@@ -1088,8 +1107,10 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     let snapshot_seq = state.next_snapshot_seq();
                     let sync_res = ApiClient::new(&base_url, &token)
                         .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
-                    match sync_res {
+                    let mut sse_instance_id = match sync_res {
                         Ok((c, (host_info, host_config, switches, vms))) => {
+                            let inst_id = host_info.daemon_instance_id;
+                            reported_initial_error = false;
                             *state.client.write().unwrap() = Some(c);
                             if !state.emit_checked(GuiUpdate::DaemonConnected {
                                 base_url: base_url.clone(),
@@ -1101,10 +1122,14 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             }) {
                                 break;
                             }
+                            inst_id
                         }
                         Err(_) => {
                             drop(resp);
-                            if state.notified_connected.swap(false, Ordering::AcqRel) {
+                            if state.notified_connected.swap(false, Ordering::AcqRel)
+                                || !reported_initial_error
+                            {
+                                reported_initial_error = true;
                                 *state.client.write().unwrap() = None;
                                 if !state.emit_checked(GuiUpdate::DaemonDisconnected(
                                     "Failed to reload daemon state; retrying…".to_string(),
@@ -1115,7 +1140,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             thread::sleep(Duration::from_millis(500));
                             continue;
                         }
-                    }
+                    };
                     let reader = std::io::BufReader::new(resp);
                     let mut skip_leading_resync = true;
                     let mut sse_send_closed = false;
@@ -1139,13 +1164,18 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     vm,
                                     select: false,
                                     is_details_fetch: false,
+                                    daemon_instance_id: sse_instance_id,
                                 }) {
                                     sse_send_closed = true;
                                     break;
                                 }
                             }
                             DaemonEvent::VmDeleted { id, revision } => {
-                                if !state.emit_checked(GuiUpdate::VmDeleted { id, revision }) {
+                                if !state.emit_checked(GuiUpdate::VmDeleted {
+                                    id,
+                                    revision,
+                                    daemon_instance_id: sse_instance_id,
+                                }) {
                                     sse_send_closed = true;
                                     break;
                                 }
@@ -1156,6 +1186,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                                 match reload_res {
                                     Ok((c, (host_info, host_config, switches, vms))) => {
+                                        sse_instance_id = host_info.daemon_instance_id;
                                         *state.client.write().unwrap() = Some(c);
                                         if !state.emit_checked(GuiUpdate::DaemonConnected {
                                             base_url: base_url.clone(),
@@ -1188,6 +1219,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                                 match reload_res {
                                     Ok((c, (host_info, host_config, switches, vms))) => {
+                                        sse_instance_id = host_info.daemon_instance_id;
                                         let new_base = c.base_url().to_string();
                                         *state.client.write().unwrap() = Some(c);
                                         if !state.emit_checked(GuiUpdate::DaemonConnected {
@@ -1237,7 +1269,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         }
                         let healthy =
                             ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                        if !healthy && state.notified_connected.swap(false, Ordering::AcqRel) {
+                        if !healthy
+                            && (state.notified_connected.swap(false, Ordering::AcqRel)
+                                || !reported_initial_error)
+                        {
+                            reported_initial_error = true;
                             *state.client.write().unwrap() = None;
                             if !state.emit_checked(GuiUpdate::DaemonDisconnected(
                                 "Lost connection to openvmmsd".to_string(),
@@ -1254,7 +1290,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     }
                     let healthy =
                         ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                    if !healthy && state.notified_connected.swap(false, Ordering::AcqRel) {
+                    if !healthy
+                        && (state.notified_connected.swap(false, Ordering::AcqRel)
+                            || !reported_initial_error)
+                    {
+                        reported_initial_error = true;
                         *state.client.write().unwrap() = None;
                         if !state.emit_checked(GuiUpdate::DaemonDisconnected(
                             "Lost connection to openvmmsd".to_string(),
@@ -2386,17 +2426,8 @@ mod tests {
         );
         backend.send(GuiRequest::ConnectOrStartDaemon);
 
-        let seq1 = match recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::DaemonConnected { .. })
-        }) {
-            GuiUpdate::DaemonConnected { snapshot_seq, .. } => snapshot_seq,
-            _ => unreachable!(),
-        };
         let seq_sse1 = match recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(
-                u,
-                GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq > seq1
-            )
+            matches!(u, GuiUpdate::DaemonConnected { .. })
         }) {
             GuiUpdate::DaemonConnected { snapshot_seq, .. } => snapshot_seq,
             _ => unreachable!(),
@@ -2932,23 +2963,23 @@ mod tests {
         );
         backend.send(GuiRequest::ConnectOrStartDaemon);
 
-        // ConnectOrStartDaemon (1) + initial SSE connect sync (2); wait briefly for leading Resync to arrive.
+        // Single initial SSE connect sync (1); wait briefly for leading Resync to arrive.
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 2, .. })
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 1, .. })
         });
         thread::sleep(Duration::from_millis(200));
         assert_eq!(
             vms_reqs.load(Ordering::Acquire),
-            2,
-            "leading Resync right after initial SSE connect sync must not trigger a third snapshot fetch"
+            1,
+            "leading Resync right after initial SSE connect sync must not trigger a second snapshot fetch"
         );
 
         // Subsequent Resync on the same stream must still refresh.
         send_second_resync.store(true, Ordering::Release);
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 3)
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 2)
         });
-        assert_eq!(vms_reqs.load(Ordering::Acquire), 3);
+        assert_eq!(vms_reqs.load(Ordering::Acquire), 2);
 
         drop(backend);
         stop.store(true, Ordering::Release);
@@ -3112,7 +3143,7 @@ mod tests {
         backend.send(GuiRequest::ConnectOrStartDaemon);
 
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 2, .. })
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 1, .. })
         });
 
         // 1. Mid-stream Resync fails snapshot -> must drop stream and reconnect (sse_count == 2),
@@ -3120,7 +3151,7 @@ mod tests {
         fail_vms.store(true, Ordering::Release);
         send_resync.store(true, Ordering::Release);
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
-            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 3)
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 2)
         });
         assert_eq!(sse_count.load(Ordering::Acquire), 2);
 

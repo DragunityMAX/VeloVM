@@ -3319,4 +3319,101 @@ mod tests {
 
         daemon.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn patch_host_config_empty_preserves_port0_listener_and_handles_unknown_null_empty_absent()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+            let mut cfg = store.load_or_init_host_config().unwrap();
+            cfg.listen_addr = "127.0.0.1:0".into();
+            store.save_host_config(&cfg).unwrap();
+        }
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        // Daemon config starts with listen_addr = "127.0.0.1:0" on an ephemeral bound port.
+        let initial: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(initial.listen_addr, "127.0.0.1:0");
+
+        let custom_openvmm = dir.path().join("bin-openvmm");
+        let custom_viewer = dir.path().join("bin-viewer");
+        let custom_img = dir.path().join("bin-img");
+        let seed_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({
+                "openvmm_bin": custom_openvmm,
+                "fastdesk_viewer_bin": custom_viewer,
+                "openvmm_img_bin": custom_img,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(seed_resp.status(), 200);
+
+        // 1. Empty PATCH {} must NOT rebind the listener when listen_addr is "127.0.0.1:0".
+        let empty_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_resp.status(), 200);
+        // Daemon must still be reachable at the exact same base_url (listener did not move).
+        let health = client
+            .get(format!("{}/api/v1/health", daemon.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200);
+        let after_empty: openvmms_core::models::HostConfig = empty_resp.json().await.unwrap();
+        assert_eq!(after_empty.openvmm_bin.as_ref(), Some(&custom_openvmm));
+        assert_eq!(
+            after_empty.fastdesk_viewer_bin.as_ref(),
+            Some(&custom_viewer)
+        );
+        assert_eq!(after_empty.openvmm_img_bin.as_ref(), Some(&custom_img));
+
+        // 2. Unknown fields must be rejected (422 Unprocessable Entity), not silently ignored.
+        let unknown_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({ "runtime_dir": "/tmp/ignored" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown_resp.status(), 422);
+
+        // 3. `null` clears openvmm_bin, `""` clears fastdesk_viewer_bin, absent preserves openvmm_img_bin.
+        let nullable_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({
+                "openvmm_bin": null,
+                "fastdesk_viewer_bin": "",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(nullable_resp.status(), 200);
+        let cleared: openvmms_core::models::HostConfig = nullable_resp.json().await.unwrap();
+        assert_eq!(cleared.openvmm_bin, None);
+        assert_eq!(cleared.fastdesk_viewer_bin, None);
+        assert_eq!(cleared.openvmm_img_bin, Some(custom_img));
+
+        daemon.shutdown().await;
+    }
 }

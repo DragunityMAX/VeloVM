@@ -1543,6 +1543,10 @@ pub fn render_disk_manager_dialog(
                             ui.end_row();
                         },
                     );
+                    if let Some(warning) = &info.warning {
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::from_rgb(240, 190, 70), warning);
+                    }
                 }
 
                 ui.separator();

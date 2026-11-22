@@ -415,9 +415,7 @@ fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Option<(
         footer[16], footer[17], footer[18], footer[19], footer[20], footer[21], footer[22],
         footer[23],
     ]);
-    if disk_type == 2
-        && (data_offset != u64::MAX || current_size > file_size_bytes.saturating_sub(512))
-    {
+    if disk_type == 2 && current_size > file_size_bytes.saturating_sub(512) {
         return None;
     }
     Some((disk_type, current_size, data_offset))
@@ -592,19 +590,32 @@ pub fn inspect_disk_with_explicit_tool(
                 sector_size_bytes,
                 parent_path,
                 read_only,
+                warning: None,
             })
         }
-        DetectedFormat::Vhd(Some(vhd)) => Ok(DiskInfo {
-            path: path.to_path_buf(),
-            format: "vhd".to_string(),
-            disk_type: vhd.disk_type,
-            virtual_size_bytes: vhd.virtual_size_bytes,
-            file_size_bytes,
-            block_size_bytes: vhd.block_size_bytes,
-            sector_size_bytes: Some(512),
-            parent_path: None,
-            read_only,
-        }),
+        DetectedFormat::Vhd(Some(vhd)) => {
+            #[cfg(not(windows))]
+            let warning = (vhd.disk_type != "fixed").then(|| {
+                format!(
+                    "{} VHD1 images are not supported by OpenVMM on this platform (only fixed VHD1 images can be attached; convert to VHDX or fixed VHD)",
+                    vhd.disk_type
+                )
+            });
+            #[cfg(windows)]
+            let warning = None;
+            Ok(DiskInfo {
+                path: path.to_path_buf(),
+                format: "vhd".to_string(),
+                disk_type: vhd.disk_type,
+                virtual_size_bytes: vhd.virtual_size_bytes,
+                file_size_bytes,
+                block_size_bytes: vhd.block_size_bytes,
+                sector_size_bytes: Some(512),
+                parent_path: None,
+                read_only,
+                warning,
+            })
+        }
         DetectedFormat::Vhd(None) => bail!(
             "invalid or corrupt VHD1 image: missing valid VHD footer in {}",
             path.display()
@@ -619,6 +630,7 @@ pub fn inspect_disk_with_explicit_tool(
             sector_size_bytes: Some(512),
             parent_path: None,
             read_only,
+            warning: None,
         }),
         DetectedFormat::Raw => Ok(DiskInfo {
             path: path.to_path_buf(),
@@ -630,6 +642,7 @@ pub fn inspect_disk_with_explicit_tool(
             sector_size_bytes: Some(512),
             parent_path: None,
             read_only,
+            warning: None,
         }),
     }
 }
@@ -1168,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_disk_reports_vhd1_virtual_sizes_and_detects_by_content() {
+    fn inspect_disk_reports_vhd1_virtual_sizes_by_extension() {
         let dir = tempfile::tempdir().unwrap();
 
         // Relative path must be rejected by inspect_disk.
@@ -1185,6 +1198,25 @@ mod tests {
         assert_eq!(fixed_info.disk_type, "fixed");
         assert_eq!(fixed_info.virtual_size_bytes, fixed_virtual);
         assert_eq!(fixed_info.file_size_bytes, fixed_virtual + 512);
+        assert_eq!(fixed_info.warning, None);
+
+        // Fixed VHD1 written with a 32-bit 0xFFFFFFFF data_offset (instead of u64::MAX) is valid.
+        let fixed_32bit_offset_vhd = dir.path().join("fixed-32bit-offset.vhd");
+        let mut fixed_32bit_bytes = vec![0u8; fixed_virtual as usize];
+        fixed_32bit_bytes.extend_from_slice(&build_vhd1_footer(2, fixed_virtual, 0xFFFF_FFFF));
+        fs::write(&fixed_32bit_offset_vhd, &fixed_32bit_bytes).unwrap();
+        let fixed_32bit_info = inspect_disk(&fixed_32bit_offset_vhd, None).unwrap();
+        assert_eq!(fixed_32bit_info.format, "vhd");
+        assert_eq!(fixed_32bit_info.disk_type, "fixed");
+        assert_eq!(fixed_32bit_info.virtual_size_bytes, fixed_virtual);
+        assert_eq!(fixed_32bit_info.warning, None);
+
+        // `.avhd` extension also inspects as VHD1.
+        let avhd_path = dir.path().join("snapshot.avhd");
+        fs::write(&avhd_path, &fixed_bytes).unwrap();
+        let avhd_info = inspect_disk(&avhd_path, None).unwrap();
+        assert_eq!(avhd_info.format, "vhd");
+        assert_eq!(avhd_info.disk_type, "fixed");
 
         // Dynamic VHD1: virtual_size_bytes comes from footer.current_size (much larger than file size),
         // and block_size_bytes comes from the dynamic header (`cxsparse`) at bytes 32..36 (while
@@ -1217,6 +1249,17 @@ mod tests {
         assert_eq!(dyn_info.virtual_size_bytes, dyn_virtual);
         assert_eq!(dyn_info.file_size_bytes, dyn_bytes.len() as u64);
         assert_eq!(dyn_info.block_size_bytes, Some(2 * 1024 * 1024));
+        #[cfg(not(windows))]
+        assert!(
+            dyn_info
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("not supported")),
+            "expected platform warning for dynamic VHD on non-Windows, got {:?}",
+            dyn_info.warning
+        );
+        #[cfg(windows)]
+        assert_eq!(dyn_info.warning, None);
 
         // Dynamic VHD1 with corrupted trailing footer falls back to offset-0 header copy.
         let dyn_offset0_vhd = dir.path().join("dynamic-offset0.vhd");
@@ -1243,18 +1286,18 @@ mod tests {
         fs::write(&bad_ver_vhd, &bad_ver_bytes).unwrap();
         assert_eq!(inspect_disk(&bad_ver_vhd, None).unwrap().block_size_bytes, None);
 
-        // Fixed VHD1 at offset 0 only, with non-MAX data_offset, zero size, or unaligned size is rejected.
+        // Fixed VHD1 at offset 0 only, oversized current_size, zero size, or unaligned size is rejected.
         let fixed_offset0_vhd = dir.path().join("fixed-offset0.vhd");
         let mut fixed_offset0_bytes = build_vhd1_footer(2, 64 * 1024, u64::MAX).to_vec();
         fixed_offset0_bytes.extend_from_slice(&vec![0u8; 64 * 1024]);
         fs::write(&fixed_offset0_vhd, &fixed_offset0_bytes).unwrap();
         assert!(inspect_disk(&fixed_offset0_vhd, None).is_err());
 
-        let fixed_bad_offset_vhd = dir.path().join("fixed-bad-offset.vhd");
-        let mut fixed_bad_offset_bytes = vec![0u8; 64 * 1024];
-        fixed_bad_offset_bytes.extend_from_slice(&build_vhd1_footer(2, 64 * 1024, 512));
-        fs::write(&fixed_bad_offset_vhd, &fixed_bad_offset_bytes).unwrap();
-        assert!(inspect_disk(&fixed_bad_offset_vhd, None).is_err());
+        let fixed_too_small_vhd = dir.path().join("fixed-too-small.vhd");
+        let mut fixed_too_small_bytes = vec![0u8; 32 * 1024];
+        fixed_too_small_bytes.extend_from_slice(&build_vhd1_footer(2, 64 * 1024, u64::MAX));
+        fs::write(&fixed_too_small_vhd, &fixed_too_small_bytes).unwrap();
+        assert!(inspect_disk(&fixed_too_small_vhd, None).is_err());
 
         let zero_size_vhd = dir.path().join("zero-size.vhd");
         fs::write(&zero_size_vhd, build_vhd1_footer(3, 0, 512)).unwrap();

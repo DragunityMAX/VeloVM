@@ -1503,6 +1503,7 @@ mod tests {
                             sector_size_bytes: Some(512),
                             parent_path: None,
                             read_only: false,
+                            warning: None,
                         };
                         ("HTTP/1.1 200 OK", serde_json::to_string(&disk_info).unwrap())
                     } else if first_line.starts_with("POST /api/v1/vms ") {

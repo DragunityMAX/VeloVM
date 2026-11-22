@@ -91,6 +91,7 @@ struct OpenVmmsApp {
     vms: Vec<VmSummary>,
     selected_vm: Option<Uuid>,
     daemon_instance_id: Option<Uuid>,
+    connected_base_url: Option<String>,
     last_snapshot_seq: u64,
     vm_revisions: std::collections::HashMap<Uuid, u64>,
     deleted_vms: std::collections::HashMap<Uuid, u64>,
@@ -152,6 +153,7 @@ impl OpenVmmsApp {
             vms: Vec::new(),
             selected_vm: None,
             daemon_instance_id: None,
+            connected_base_url: None,
             last_snapshot_seq: 0,
             vm_revisions: std::collections::HashMap::new(),
             deleted_vms: std::collections::HashMap::new(),
@@ -202,9 +204,17 @@ impl OpenVmmsApp {
                 if snapshot_seq > self.last_snapshot_seq {
                     self.last_snapshot_seq = snapshot_seq;
                 }
+                let was_connected = self.connected;
+                let prev_id = self.daemon_instance_id;
+                let prev_url = self.connected_base_url.clone();
                 let same_daemon = self.daemon_instance_id.is_some()
                     && self.daemon_instance_id == host_info.daemon_instance_id;
+                let daemon_changed = ((prev_id.is_some() || host_info.daemon_instance_id.is_some())
+                    && prev_id != host_info.daemon_instance_id)
+                    || !was_connected
+                    || prev_url.as_deref() != Some(base_url.as_str());
                 self.daemon_instance_id = host_info.daemon_instance_id;
+                self.connected_base_url = Some(base_url.clone());
 
                 let snap_rev_watermark = host_info
                     .event_revision
@@ -273,8 +283,10 @@ impl OpenVmmsApp {
                 } else {
                     self.vm_revisions.clear();
                     self.deleted_vms.clear();
-                    self.attach_disk_in_flight.clear();
-                    self.mount_iso_in_flight.clear();
+                    if daemon_changed {
+                        self.attach_disk_in_flight.clear();
+                        self.mount_iso_in_flight.clear();
+                    }
                     self.logs_cache = None;
                     for vm in &vms {
                         if vm.runtime.revision > 0 {
@@ -302,7 +314,14 @@ impl OpenVmmsApp {
                 vm,
                 select,
                 is_details_fetch,
+                daemon_instance_id,
             } => {
+                if self.daemon_instance_id.is_some()
+                    && daemon_instance_id.is_some()
+                    && daemon_instance_id != self.daemon_instance_id
+                {
+                    return;
+                }
                 let id = vm.config.id;
                 if self.deleted_vms.contains_key(&id) {
                     return;
@@ -347,7 +366,17 @@ impl OpenVmmsApp {
                     }
                 }
             }
-            GuiUpdate::VmDeleted { id, revision } => {
+            GuiUpdate::VmDeleted {
+                id,
+                revision,
+                daemon_instance_id,
+            } => {
+                if self.daemon_instance_id.is_some()
+                    && daemon_instance_id.is_some()
+                    && daemon_instance_id != self.daemon_instance_id
+                {
+                    return;
+                }
                 let del_entry = self.deleted_vms.entry(id).or_insert(0);
                 *del_entry = (*del_entry).max(revision);
                 if revision > 0 {
@@ -1673,6 +1702,7 @@ mod tests {
             vm: make_test_vm(vm_b_id, "Beta", VmStatus::Off, 2),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(app.vms.len(), 2);
         assert_eq!(app.selected_vm, Some(vm_a_id));
@@ -1683,12 +1713,14 @@ mod tests {
             vm: make_test_vm(vm_c_id, "Gamma", VmStatus::Running, 4),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(app.selected_vm, Some(vm_a_id));
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_c_id, "Gamma", VmStatus::Off, 3),
             select: true,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(app.selected_vm, Some(vm_c_id));
         let vm_c = app.vms.iter().find(|v| v.config.id == vm_c_id).unwrap();
@@ -1734,11 +1766,13 @@ mod tests {
             vm: make_test_vm(vm_a_id, "Alpha", VmStatus::Running, 5),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_a_id, "Alpha", VmStatus::Off, 3),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(
             app.vms.iter().find(|v| v.config.id == vm_a_id).unwrap().runtime.status,
@@ -1749,6 +1783,7 @@ mod tests {
         app.apply_update(GuiUpdate::VmDeleted {
             id: vm_b_id,
             revision: 6,
+            daemon_instance_id: Some(daemon_id),
         });
         assert!(!app.vms.iter().any(|v| v.config.id == vm_b_id));
 
@@ -1756,16 +1791,19 @@ mod tests {
             vm: make_test_vm(vm_b_id, "Beta", VmStatus::Off, 2),
             select: false,
             is_details_fetch: true,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(unknown_id, "Unknown", VmStatus::Off, 1),
             select: false,
             is_details_fetch: true,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_b_id, "Beta", VmStatus::Off, 2),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::DaemonConnected {
             base_url: "http://127.0.0.1:1".into(),
@@ -1888,6 +1926,7 @@ mod tests {
         app.apply_update(GuiUpdate::VmDeleted {
             id: vm_b,
             revision: 2,
+            daemon_instance_id: Some(daemon_id),
         });
         assert!(app.logs_cache.is_none());
     }
@@ -1953,6 +1992,7 @@ mod tests {
             vm: make_test_vm(vm_b, "Beta", VmStatus::Off, 5),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert!(app.vms.iter().any(|v| v.config.id == vm_b));
 
@@ -2003,6 +2043,7 @@ mod tests {
             vm: make_test_vm(vm_b, "Beta", VmStatus::Off, 5),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert!(!app.vms.iter().any(|v| v.config.id == vm_b));
 
@@ -2011,11 +2052,13 @@ mod tests {
             vm: make_test_vm(vm_a, "Alpha", VmStatus::Running, 7),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_a, "Alpha", VmStatus::Off, 0),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(
             app.vms.iter().find(|v| v.config.id == vm_a).unwrap().runtime.status,
@@ -2097,5 +2140,100 @@ mod tests {
             op_id: 10,
         });
         assert!(!app.attach_disk_in_flight.contains_key(&vm_a));
+    }
+
+    #[test]
+    fn late_update_from_previous_daemon_instance_does_not_block_new_daemon_lower_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_a = Uuid::new_v4();
+        let daemon_b = Uuid::new_v4();
+        let vm_id = Uuid::new_v4();
+
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_a)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 50)],
+            snapshot_seq: 1,
+        });
+
+        // Switch to daemon_b (restarted daemon whose revision counter restarted at 1).
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_b)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 2,
+        });
+
+        // Late VmUpdated / VmDeleted from daemon_a with high revision 99 must be ignored.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_id, "Alpha", VmStatus::Running, 99),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_a),
+        });
+        app.apply_update(GuiUpdate::VmDeleted {
+            id: vm_id,
+            revision: 100,
+            daemon_instance_id: Some(daemon_a),
+        });
+        assert_eq!(app.vms.len(), 1);
+        assert_eq!(app.vms[0].runtime.status, VmStatus::Off);
+
+        // Lower-revision update from daemon_b (revision 2) must still apply cleanly.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_id, "Alpha", VmStatus::Running, 2),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_b),
+        });
+        assert_eq!(app.vms[0].runtime.status, VmStatus::Running);
+        assert_eq!(app.vms[0].runtime.revision, 2);
+    }
+
+    #[test]
+    fn refresh_with_missing_daemon_instance_id_preserves_inflight_flags_on_same_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let vm_id = Uuid::new_v4();
+
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 1)],
+            snapshot_seq: 1,
+        });
+        app.attach_disk_in_flight.insert(vm_id, 1);
+        app.mount_iso_in_flight.insert(vm_id, 2);
+
+        // Refresh on same URL while connected with daemon_instance_id == None preserves flags.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 2)],
+            snapshot_seq: 2,
+        });
+        assert!(app.attach_disk_in_flight.contains_key(&vm_id));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_id));
+
+        // Switching to a different URL clears flags.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:2".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 1)],
+            snapshot_seq: 3,
+        });
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_id));
+        assert!(!app.mount_iso_in_flight.contains_key(&vm_id));
     }
 }

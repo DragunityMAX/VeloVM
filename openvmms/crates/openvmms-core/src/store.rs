@@ -345,6 +345,10 @@ impl RegistryStore {
         strict_nic_conflicts: bool,
     ) -> anyhow::Result<()> {
         vm.validate_with_options(strict_disks_absolute, strict_nic_conflicts)?;
+        self.save_vm_unchecked(vm)
+    }
+
+    pub fn save_vm_unchecked(&self, vm: &VmConfig) -> anyhow::Result<()> {
         let vm_dir = self.vm_dir(vm.id);
         fs::create_dir_all(vm_dir.join("logs"))
             .with_context(|| format!("creating VM directory {}", vm_dir.display()))?;
@@ -373,14 +377,9 @@ impl RegistryStore {
                 .with_context(|| format!("removing {}", vm_toml.display()))?;
         }
         let vmgs_path = vm_dir.join("state.vmgs");
-        if vmgs_path.is_file()
-            && let Err(err) = fs::remove_file(&vmgs_path)
-        {
-            tracing::warn!(
-                path = %vmgs_path.display(),
-                error = %err,
-                "failed to remove orphaned state.vmgs during VM deletion"
-            );
+        if vmgs_path.is_file() {
+            fs::remove_file(&vmgs_path)
+                .with_context(|| format!("removing {}", vmgs_path.display()))?;
         }
         // Remove the VM directory only if it is now empty.
         let _ = fs::remove_dir(&vm_dir);

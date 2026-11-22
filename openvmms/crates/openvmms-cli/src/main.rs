@@ -1049,6 +1049,9 @@ fn print_disk_info(info: &DiskInfo, json: bool) -> anyhow::Result<()> {
         if let Some(parent) = &info.parent_path {
             println!("Parent:       {parent}");
         }
+        if let Some(warning) = &info.warning {
+            println!("Warning:      {warning}");
+        }
     }
     Ok(())
 }
