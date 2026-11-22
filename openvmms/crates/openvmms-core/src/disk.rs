@@ -490,20 +490,6 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
     }))
 }
 
-fn file_has_iso9660_signature(path: &Path, file_size_bytes: u64) -> bool {
-    if file_size_bytes < 0x8006 {
-        return false;
-    }
-    let Ok(mut file) = fs::File::open(path) else {
-        return false;
-    };
-    if file.seek(SeekFrom::Start(0x8001)).is_err() {
-        return false;
-    }
-    let mut magic = [0u8; 5];
-    file.read_exact(&mut magic).is_ok() && &magic == b"CD001"
-}
-
 pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Result<DiskInfo> {
     inspect_disk_with_explicit_tool(path, None, openvmm_img_bin)
 }
@@ -535,26 +521,14 @@ pub fn inspect_disk_with_explicit_tool(
         Raw,
     }
 
-    // Known extensions determine the format directly without sniffing raw images,
-    // matching how VM attach opens them and ensuring guest-written bytes inside a
-    // raw `.img`/`.raw` disk cannot alter inspection results. Unknown/missing
-    // extensions fall back to content signature inspection.
+    // Classify solely by extension so `inspect_disk` matches `DiskFormat::from_path`
+    // and VM attach without sniffing raw disk contents (even for unknown extensions
+    // like `.dsk` or `.blob`).
     let detected = match ext.as_deref() {
         Some("vhdx" | "avhdx") => DetectedFormat::Vhdx,
         Some("vhd" | "avhd") => DetectedFormat::Vhd(parse_vhd1_metadata(path, file_size_bytes)?),
         Some("iso") => DetectedFormat::Iso,
-        Some("img" | "raw" | "bin") => DetectedFormat::Raw,
-        _ => {
-            if file_has_vhdx_signature(path) {
-                DetectedFormat::Vhdx
-            } else if let Some(vhd) = parse_vhd1_metadata(path, file_size_bytes)? {
-                DetectedFormat::Vhd(Some(vhd))
-            } else if file_has_iso9660_signature(path, file_size_bytes) {
-                DetectedFormat::Iso
-            } else {
-                DetectedFormat::Raw
-            }
-        }
+        _ => DetectedFormat::Raw,
     };
 
     match detected {
@@ -910,9 +884,9 @@ mod tests {
             assert_eq!(vhdx_err, 7);
             assert_eq!(fs::read(&vhdx_path).unwrap(), b"VHDX_WINNER_PAYLOAD");
 
-            // Case-insensitive .VHDX succeeds as VHDX, .vhd classifies as Vhd, and VHDX magic
-            // in an .img file is detected by inspect_disk via content signature while
-            // DiskFormat::from_path still preserves extension classification.
+            // Case-insensitive .VHDX succeeds as VHDX, .vhd classifies as Vhd, and
+            // inspect_disk treats `.img` and unknown extensions (e.g. `.blob`) as raw
+            // without content sniffing even if they contain `vhdxfile` magic.
             let vhdx_stub = dir.path().join("vhdx-stub-openvmm-img.sh");
             fs::write(
                 &vhdx_stub,
@@ -961,7 +935,7 @@ mod tests {
             let unknown_with_magic = dir.path().join("unknown-with-magic.blob");
             fs::write(&unknown_with_magic, b"vhdxfileDUMMY").unwrap();
             let inspected = inspect_disk(&unknown_with_magic, Some(&vhdx_stub)).unwrap();
-            assert_eq!(inspected.format, "vhdx");
+            assert_eq!(inspected.format, "raw");
         }
     }
 
@@ -1314,7 +1288,8 @@ mod tests {
         .unwrap();
         assert_eq!(raw_vhdx_info.format, "raw");
 
-        // Unknown/extensionless files still detect VHD1/ISO/VHDX by content.
+        // Unknown/extensionless files (e.g. `.blob`, `.dsk`) are also treated as raw without
+        // content sniffing, matching VM attach behavior.
         let renamed_vhd = dir.path().join("disguised-vhd.blob");
         fs::write(&renamed_vhd, &dyn_bytes).unwrap();
         let renamed_info = inspect_disk_with_explicit_tool(
@@ -1323,8 +1298,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(renamed_info.format, "vhd");
-        assert_eq!(renamed_info.virtual_size_bytes, dyn_virtual);
+        assert_eq!(renamed_info.format, "raw");
+        assert_eq!(renamed_info.virtual_size_bytes, dyn_bytes.len() as u64);
 
         // Inspecting non-VHDX fails only when inspecting an actual `.vhdx` with missing explicit tool.
         let bad_explicit_vhdx = dir.path().join("needs-tool.vhdx");
@@ -1343,13 +1318,18 @@ mod tests {
         fs::write(&bad_vhd, vec![0u8; 4096]).unwrap();
         assert!(inspect_disk(&bad_vhd, None).is_err());
 
-        // ISO9660 primary volume descriptor magic (`CD001` at 0x8001) detects ISO by content
-        // on extensionless/unknown-extension files.
-        let iso_bin = dir.path().join("installer.blob");
+        // Unknown extensions with ISO9660 magic (`CD001`) are treated as raw, while `.iso`
+        // files classify as `"iso"`.
+        let iso_blob = dir.path().join("installer.blob");
         let mut iso_bytes = vec![0u8; 0x9000];
         iso_bytes[0x8001..0x8006].copy_from_slice(b"CD001");
-        fs::write(&iso_bin, &iso_bytes).unwrap();
-        let iso_info = inspect_disk(&iso_bin, None).unwrap();
+        fs::write(&iso_blob, &iso_bytes).unwrap();
+        let blob_info = inspect_disk(&iso_blob, None).unwrap();
+        assert_eq!(blob_info.format, "raw");
+
+        let iso_file = dir.path().join("installer.iso");
+        fs::write(&iso_file, &iso_bytes).unwrap();
+        let iso_info = inspect_disk(&iso_file, None).unwrap();
         assert_eq!(iso_info.format, "iso");
     }
 }

@@ -607,45 +607,30 @@ impl PortForward {
             return false;
         }
         match (
-            normalize_bind_addr(&self.host_addr),
-            normalize_bind_addr(&other.host_addr),
+            self.host_addr.trim().parse::<std::net::IpAddr>(),
+            other.host_addr.trim().parse::<std::net::IpAddr>(),
         ) {
-            (Ok(ip_a), Ok(ip_b)) => {
-                if ip_a == ip_b {
-                    return true;
-                }
-                let is_v6_wildcard = |ip: std::net::IpAddr| {
-                    matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unspecified())
-                };
-                let is_v4_wildcard = |ip: std::net::IpAddr| {
-                    matches!(ip, std::net::IpAddr::V4(v4) if v4.is_unspecified())
-                };
-                // Dual-stack wildcard bind (`::`) conflicts with any IPv4 or IPv6 bind on the same port.
-                if is_v6_wildcard(ip_a) || is_v6_wildcard(ip_b) {
-                    return true;
-                }
-                (is_v4_wildcard(ip_a) || is_v4_wildcard(ip_b))
-                    && ip_a.is_ipv4()
-                    && ip_b.is_ipv4()
+            (Ok(std::net::IpAddr::V4(a)), Ok(std::net::IpAddr::V4(b))) => {
+                a == b || a.is_unspecified() || b.is_unspecified()
             }
-            (Err(a), Err(b)) => a == b,
+            (Ok(std::net::IpAddr::V6(a)), Ok(std::net::IpAddr::V6(b))) => {
+                a == b || a.is_unspecified() || b.is_unspecified()
+            }
             _ => false,
         }
     }
-}
 
-fn normalize_bind_addr(addr: &str) -> Result<std::net::IpAddr, String> {
-    let trimmed = addr.trim();
-    if trimmed.eq_ignore_ascii_case("localhost") {
-        return Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    }
-    match trimmed.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
-            Some(v4) => Ok(std::net::IpAddr::V4(v4)),
-            None => Ok(std::net::IpAddr::V6(v6)),
-        },
-        Ok(v4 @ std::net::IpAddr::V4(_)) => Ok(v4),
-        Err(_) => Err(trimmed.to_ascii_lowercase()),
+    pub fn same_nic_guest_conflict(&self, other: &PortForward) -> bool {
+        if self.protocol != other.protocol || self.guest_port != other.guest_port {
+            return false;
+        }
+        match (
+            self.host_addr.trim().parse::<std::net::IpAddr>(),
+            other.host_addr.trim().parse::<std::net::IpAddr>(),
+        ) {
+            (Ok(a), Ok(b)) => a.is_ipv4() == b.is_ipv4(),
+            _ => false,
+        }
     }
 }
 
@@ -992,6 +977,7 @@ impl VmConfig {
             }
             match &nic.backend {
                 NicBackendConfig::Consomme { port_forwards, .. } => {
+                    let mut seen_nic_forwards: Vec<&PortForward> = Vec::new();
                     for pf in port_forwards {
                         pf.validate()?;
                         if strict_nic_conflicts {
@@ -1002,7 +988,16 @@ impl VmConfig {
                                     "port forward '{pf}' overlaps with existing port forward '{conflict}'"
                                 );
                             }
+                            if let Some(conflict) =
+                                seen_nic_forwards.iter().find(|e| e.same_nic_guest_conflict(pf))
+                            {
+                                bail!(
+                                    "port forward '{pf}' conflicts with existing port forward '{conflict}' on NIC '{}' (duplicate guest port for protocol and IP family)",
+                                    nic.name
+                                );
+                            }
                             seen_port_forwards.push(pf);
+                            seen_nic_forwards.push(pf);
                         }
                     }
                 }
@@ -1806,8 +1801,8 @@ mod tests {
         assert_eq!(parse_memory_mb("2048K").unwrap(), 2);
         assert_eq!(parse_memory_mb("1G").unwrap(), 1024);
 
-        // Dual-stack `::` wildcard overlaps both IPv4 and IPv6 on the same port;
-        // `localhost` and case-insensitive hostnames overlap canonically.
+        // Consomme sets IPV6_V6ONLY on IPv6 sockets, so IPv4 and IPv6 wildcards on the same
+        // host port do not overlap each other, while wildcards overlap binds in their own family.
         let v6_wild = PortForward {
             protocol: IpProto::Tcp,
             host_addr: "::".into(),
@@ -1832,25 +1827,120 @@ mod tests {
             host_port: 8080,
             guest_port: 83,
         };
-        let host_lower = PortForward {
-            protocol: IpProto::Tcp,
-            host_addr: "localhost".into(),
-            host_port: 8080,
-            guest_port: 84,
-        };
-        let host_upper = PortForward {
-            protocol: IpProto::Tcp,
-            host_addr: "LOCALHOST".into(),
-            host_port: 8080,
-            guest_port: 85,
-        };
-        assert!(v6_wild.overlaps(&v4_loopback));
-        assert!(v4_loopback.overlaps(&v6_wild));
-        assert!(v6_wild.overlaps(&v4_wild));
+        assert!(!v6_wild.overlaps(&v4_loopback));
+        assert!(!v4_loopback.overlaps(&v6_wild));
+        assert!(!v6_wild.overlaps(&v4_wild));
         assert!(v6_wild.overlaps(&v6_loopback));
         assert!(!v4_wild.overlaps(&v6_loopback));
-        assert!(host_lower.overlaps(&v4_loopback));
-        assert!(host_lower.overlaps(&host_upper));
+        assert!(v4_wild.overlaps(&v4_loopback));
+
+        // 0.0.0.0:8080->80 + [::]:8080->80 coexist on the same NIC.
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "0.0.0.0".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "::".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.nics[1].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.validate().unwrap();
+
+        // Same NIC duplicate (protocol, IP family, guest_port) with different host ports fails.
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 8081,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate guest port")
+        );
+
+        // Different NICs may share the same (protocol, IP family, guest_port) when host ports differ.
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8080,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.nics[1].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8081,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.validate().unwrap();
+
+        // Same NIC may reuse guest_port across different IP families (IPv4 vs IPv6).
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "::1".into(),
+                    host_port: 8081,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.nics[1].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.validate().unwrap();
 
         // Legacy validation options allow relative disk paths / pre-existing NIC conflicts when unchanged.
         cfg.disks.push(DiskAttachment {

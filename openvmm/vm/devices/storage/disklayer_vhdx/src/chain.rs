@@ -19,11 +19,12 @@ use vm_resource::kind::DiskHandleKind;
 
 #[cfg(unix)]
 fn is_unsupported_lock_error(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::Unsupported
-        || matches!(
-            err.raw_os_error(),
-            Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS)
-        )
+    #[allow(unreachable_patterns)]
+    let unsupported_errno = matches!(
+        err.raw_os_error(),
+        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS)
+    );
+    err.kind() == std::io::ErrorKind::Unsupported || unsupported_errno
 }
 
 #[cfg(unix)]
@@ -42,7 +43,7 @@ fn handle_disk_lock_result(
         }
         Err(std::fs::TryLockError::Error(err)) if is_unsupported_lock_error(&err) => {
             // Match QEMU's fallback on filesystems without advisory lock support
-            // (e.g., ENOLCK / EOPNOTSUPP / ENOSYS on NFS, CIFS, or 9p): warn and continue.
+            // (e.g., ENOLCK / EOPNOTSUPP / ENOTSUP / ENOSYS on NFS, CIFS, or 9p): warn and continue.
             tracing::warn!(
                 path = %path.display(),
                 read_only,
@@ -519,7 +520,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_wouldblock_lock_error_warns_and_continues() {
+    fn unsupported_lock_error_warns_and_real_io_errors_fail() {
         let p = Path::new("/mnt/9p/base.vhdx");
         handle_disk_lock_result(
             Err(std::fs::TryLockError::Error(std::io::Error::from(

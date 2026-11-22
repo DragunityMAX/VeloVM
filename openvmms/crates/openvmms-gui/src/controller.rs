@@ -2264,6 +2264,12 @@ mod tests {
                                     let _ = stream.write_all(
                                         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                                     );
+                                    // Match daemon subscribe behavior: emit an initial leading Resync frame.
+                                    let leading_json =
+                                        serde_json::to_string(&DaemonEvent::Resync).unwrap();
+                                    let _ = stream.write_all(
+                                        format!("data: {leading_json}\n\n").as_bytes(),
+                                    );
                                     let _ = stream.flush();
                                     if idx == 1 {
                                         // Keep SSE stream alive with keep-alives until stage 1 Resync is requested.
@@ -2386,6 +2392,16 @@ mod tests {
             GuiUpdate::DaemonConnected { snapshot_seq, .. } => snapshot_seq,
             _ => unreachable!(),
         };
+        let seq_sse1 = match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq > seq1
+            )
+        }) {
+            GuiUpdate::DaemonConnected { snapshot_seq, .. } => snapshot_seq,
+            _ => unreachable!(),
+        };
+        assert_eq!(sse_count.load(Ordering::SeqCst), 1);
 
         // 1. DaemonEvent::Resync triggers a snapshot refetch with updated VM state (stage 1).
         vms_stage.store(1, Ordering::Release);
@@ -2394,12 +2410,17 @@ mod tests {
             matches!(
                 u,
                 GuiUpdate::DaemonConnected { snapshot_seq, vms, .. }
-                    if *snapshot_seq > seq1 && vms.iter().any(|v| v.runtime.revision == 2)
+                    if *snapshot_seq > seq_sse1 && vms.iter().any(|v| v.runtime.revision == 2)
             )
         }) {
             GuiUpdate::DaemonConnected { snapshot_seq, .. } => snapshot_seq,
             _ => unreachable!(),
         };
+        assert_eq!(
+            sse_count.load(Ordering::SeqCst),
+            1,
+            "stage 1 should reconcile via DaemonEvent::Resync on the existing SSE stream, not via reconnect"
+        );
 
         // 2. Stage 2 happens before the 300ms SSE read timeout fires; reconnect fetches stage 2 snapshot.
         vms_stage.store(2, Ordering::Release);
@@ -2410,6 +2431,10 @@ mod tests {
                     if *snapshot_seq > seq2 && vms.iter().any(|v| v.runtime.revision == 3)
             )
         });
+        assert!(
+            sse_count.load(Ordering::SeqCst) >= 2,
+            "stage 2 should reconcile via SSE read-timeout reconnect"
+        );
 
         // 3. With health now wedged, the next SSE read timeout emits DaemonDisconnected.
         health_wedged.store(true, Ordering::Release);
@@ -2664,6 +2689,12 @@ mod tests {
                                     let idx = sse_count.fetch_add(1, Ordering::SeqCst) + 1;
                                     let _ = stream.write_all(
                                         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    // Match daemon subscribe behavior: emit an initial leading Resync frame.
+                                    let leading_json =
+                                        serde_json::to_string(&DaemonEvent::Resync).unwrap();
+                                    let _ = stream.write_all(
+                                        format!("data: {leading_json}\n\n").as_bytes(),
                                     );
                                     let _ = stream.flush();
                                     if idx == 1 {

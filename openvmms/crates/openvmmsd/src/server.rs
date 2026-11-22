@@ -2780,13 +2780,53 @@ mod tests {
                     host_port: 8080,
                     guest_port: 8443,
                     protocol: IpProto::Tcp,
-                    host_addr: String::new(),
+                    host_addr: "0.0.0.0".into(),
                 },
             })
             .send()
             .await
             .unwrap();
         assert_eq!(cross_nic_wildcard.status(), 409);
+
+        // IPv6 wildcard on same host port and guest port coexists with IPv4 rule (IPV6_V6ONLY) -> 200 OK.
+        let ipv6_coexist_ok = client
+            .post(format!(
+                "{}/api/v1/vms/{}/nics/{nic1_id}/ports",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&PortForwardPayload {
+                port: PortForward {
+                    host_port: 8080,
+                    guest_port: 80,
+                    protocol: IpProto::Tcp,
+                    host_addr: "::".into(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ipv6_coexist_ok.status(), 200);
+
+        // Same NIC duplicate (protocol, IP family, guest_port) with a different host port -> 409 Conflict.
+        let same_nic_guest_dup = client
+            .post(format!(
+                "{}/api/v1/vms/{}/nics/{nic1_id}/ports",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&PortForwardPayload {
+                port: PortForward {
+                    host_port: 8081,
+                    guest_port: 80,
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(same_nic_guest_dup.status(), 409);
 
         // Different protocol (UDP) on the same host port is allowed -> 200 OK.
         let udp_ok = client

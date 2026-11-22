@@ -1158,17 +1158,6 @@ impl Supervisor {
         let nics_updated = payload.nics.is_some();
         let (prev_cfg, updated, snap_gen, all_disk_paths) = {
             let guard = self.vms.read().unwrap();
-            if let Some(new_name) = &payload.name {
-                let trimmed = new_name.trim();
-                if guard
-                    .values()
-                    .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(trimmed))
-                {
-                    return Err(err_conflict(format!(
-                        "another VM is already named '{trimmed}'"
-                    )));
-                }
-            }
             let vm = guard
                 .get(&id)
                 .ok_or_else(|| err_not_found("VM not found"))?;
@@ -1183,6 +1172,18 @@ impl Supervisor {
                     "cannot edit hardware configuration while VM '{}' is {}",
                     vm.config.name, vm.runtime.status
                 )));
+            }
+            if let Some(new_name) = &payload.name {
+                let trimmed = new_name.trim();
+                if !trimmed.eq_ignore_ascii_case(&vm.config.name)
+                    && guard
+                        .values()
+                        .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(trimmed))
+                {
+                    return Err(err_conflict(format!(
+                        "another VM is already named '{trimmed}'"
+                    )));
+                }
             }
 
             let prev_cfg = vm.config.clone();
@@ -1239,23 +1240,22 @@ impl Supervisor {
             (prev_cfg, updated, vm.generation, all_paths)
         };
 
-        updated
-            .validate_with_options(disks_updated, nics_updated)
-            .map_err(|e| err_bad_request(format!("{e:#}")))?;
-
-        let mut path_keys = if disks_updated {
-            let disks_check = updated.disks.clone();
-            tokio::task::spawn_blocking(move || {
-                for d in &disks_check {
+        let updated_to_validate = updated.clone();
+        let mut path_keys = tokio::task::spawn_blocking(move || {
+            updated_to_validate
+                .validate_with_options(disks_updated, nics_updated)
+                .map_err(|e| err_bad_request(format!("{e:#}")))?;
+            if disks_updated {
+                for d in &updated_to_validate.disks {
                     ensure_disk_format_safe(&d.path, d.format, true, true)?;
                 }
                 Ok::<_, anyhow::Error>(precompute_disk_path_keys(all_disk_paths))
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("update_vm disk check task failed: {e}"))??
-        } else {
-            HashMap::new()
-        };
+            } else {
+                Ok(HashMap::new())
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("update_vm validation task failed: {e}"))??;
 
         if disks_updated {
             for attempt in 0..=MAX_PATH_KEY_RETRIES {
@@ -1312,9 +1312,11 @@ impl Supervisor {
                         )));
                     }
                     should_rollback_disk_file = true;
-                    if guard
-                        .values()
-                        .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(&updated.name))
+                    let name_changed = !updated.name.eq_ignore_ascii_case(&prev_cfg.name);
+                    if name_changed
+                        && guard
+                            .values()
+                            .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(&updated.name))
                     {
                         break 'commit Err(err_conflict(format!(
                             "another VM is already named '{}'",
@@ -2829,13 +2831,14 @@ impl Supervisor {
         let id = self.resolve_vm_id(id_or_name)?;
         let hp_lock = self.hotplug_lock(id)?;
         let _hp_guard = hp_lock.lock().await;
-        self.attach_disk_locked(id, req).await
+        self.attach_disk_locked(id, req, true).await
     }
 
     async fn attach_disk_locked(
         &self,
         id: Uuid,
         req: AttachDiskPayload,
+        require_absolute: bool,
     ) -> anyhow::Result<VmSummary> {
         if let Some(lun) = req.lun
             && lun > 255
@@ -2860,7 +2863,7 @@ impl Supervisor {
         let req_path = req.path;
         let path_to_check = req_path.clone();
         let mut path_keys = tokio::task::spawn_blocking(move || {
-            ensure_disk_format_safe(&path_to_check, format, explicit_format, true)?;
+            ensure_disk_format_safe(&path_to_check, format, explicit_format, require_absolute)?;
             if !path_to_check.is_file() {
                 return Err(err_bad_request(format!(
                     "disk file not found: {}",
@@ -3716,6 +3719,7 @@ impl Supervisor {
                     read_only: true,
                     format: Some(DiskFormat::Iso),
                 },
+                true,
             )
             .await
         {
@@ -3731,6 +3735,7 @@ impl Supervisor {
                                 read_only: prev.read_only,
                                 format: Some(prev.format),
                             },
+                            false,
                         )
                         .await
                 {
@@ -4493,6 +4498,14 @@ fn validate_port_forward_change(
     if add {
         if port_forwards.contains(port) {
             return Err(err_conflict(format!("port forward {port} already exists")));
+        }
+        for existing in port_forwards {
+            if existing.same_nic_guest_conflict(port) {
+                return Err(err_conflict(format!(
+                    "port forward {port} conflicts with existing rule {existing} on NIC {} (duplicate guest port for protocol and IP family)",
+                    nic.name
+                )));
+            }
         }
         for other_nic in &cfg.nics {
             if let NicBackendConfig::Consomme { port_forwards, .. } = &other_nic.backend {

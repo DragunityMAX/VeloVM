@@ -367,12 +367,20 @@ impl RegistryStore {
             fs::remove_dir_all(&logs_dir)
                 .with_context(|| format!("removing {}", logs_dir.display()))?;
         }
-        for file_name in ["vm.toml", "state.vmgs"] {
-            let p = vm_dir.join(file_name);
-            if p.is_file() {
-                fs::remove_file(&p)
-                    .with_context(|| format!("removing {}", p.display()))?;
-            }
+        let vm_toml = vm_dir.join("vm.toml");
+        if vm_toml.is_file() {
+            fs::remove_file(&vm_toml)
+                .with_context(|| format!("removing {}", vm_toml.display()))?;
+        }
+        let vmgs_path = vm_dir.join("state.vmgs");
+        if vmgs_path.is_file()
+            && let Err(err) = fs::remove_file(&vmgs_path)
+        {
+            tracing::warn!(
+                path = %vmgs_path.display(),
+                error = %err,
+                "failed to remove orphaned state.vmgs during VM deletion"
+            );
         }
         // Remove the VM directory only if it is now empty.
         let _ = fs::remove_dir(&vm_dir);
@@ -423,8 +431,11 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
                 !ignored
             }
         {
-            return Err(err)
-                .with_context(|| format!("syncing parent directory {}", parent.display()));
+            tracing::warn!(
+                dir = %parent.display(),
+                error = %err,
+                "failed to sync parent directory after atomic write"
+            );
         }
     }
     Ok(())

@@ -57,7 +57,7 @@ impl AdoptedProcess {
                     return false;
                 }
                 if rc == 0 {
-                    return !is_linux_zombie_or_dead(self.pid);
+                    return true;
                 }
             }
             if is_linux_zombie_or_dead(self.pid) {

@@ -29,11 +29,11 @@ use mesh::CancelContext;
 use mesh::MeshPayload;
 use mesh::local_node::Port;
 use pal_async::driver::Driver;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use pal_async::interest::PollEvents;
 use pal_async::socket::AsSockRef;
 use pal_async::socket::Listener;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use pal_async::socket::PollReadyExt;
 use pal_async::socket::PolledSocket;
 use std::collections::HashMap;
@@ -225,16 +225,13 @@ impl Server {
                 cancel.lock().cancel();
                 return res;
             }
-            // On Unix (`epoll` on Linux and `kqueue` on macOS/BSD), read EOF can be
-            // a half-close (`shutdown(SHUT_WR)` -> `RDHUP`) where the peer still
-            // expects in-flight replies, rather than a full disconnect (`HUP`/`ERR`).
-            // Keep pending RPCs alive until either full disconnect or `send_task`
-            // finishes draining responses. Note: this assumes `AF_UNIX` stream
-            // sockets (used by OpenVMM's ttrpc transport) — on Unix TCP sockets, a
-            // peer `close()` only sends `FIN` and won't trigger `HUP`, and
-            // `pal_async`'s `kqueue` backend never sets `PollEvents::ERR` (relying
-            // on `EV_EOF` -> `PollEvents::HUP`).
-            #[cfg(unix)]
+            // On Linux (`epoll`), read EOF can be a half-close (`shutdown(SHUT_WR)` ->
+            // `EPOLLRDHUP`) where the peer still expects in-flight replies, rather than a
+            // full disconnect (`EPOLLHUP`/`EPOLLERR`). Keep pending RPCs alive until
+            // either full disconnect or `send_task` finishes draining responses. Note: this
+            // assumes `AF_UNIX` stream sockets (used by OpenVMM's ttrpc transport); on
+            // TCP sockets, a peer `close()` only sends `FIN` and won't trigger `HUP`.
+            #[cfg(target_os = "linux")]
             futures::select! {
                 _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
                     peer_closed.store(true, std::sync::atomic::Ordering::Release);
@@ -245,9 +242,11 @@ impl Server {
             // On Windows `afunix.sys` / AFD, both `shutdown(SD_SEND)` and a
             // graceful `closesocket()` raise `AFD_POLL_DISCONNECT` (`PollEvents::RDHUP`)
             // rather than `AFD_POLL_ABORT` (`PollEvents::HUP`), so full disconnect
-            // cannot be distinguished from half-close via socket readiness. Cancel on
-            // read EOF so client disconnects (e.g. `WaitVM`) release promptly.
-            #[cfg(not(unix))]
+            // cannot be distinguished from half-close via socket readiness. On
+            // non-Linux Unix targets (e.g., macOS `kqueue`), `PollEvents` handling is
+            // untested. Cancel on read EOF so client disconnects (e.g. `WaitVM`) release
+            // promptly.
+            #[cfg(not(target_os = "linux"))]
             {
                 drop(send_done_rx);
                 peer_closed.store(true, std::sync::atomic::Ordering::Release);
@@ -820,7 +819,7 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn client_half_close_receives_in_flight_reply() {
         use crate::message::MESSAGE_TYPE_RESPONSE;
@@ -904,7 +903,7 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn client_half_close_then_full_close_cancels_pending_rpc_context() {
         let (c, s) = unix_socket::UnixStream::pair().unwrap();
