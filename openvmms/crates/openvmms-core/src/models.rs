@@ -69,6 +69,79 @@ pub struct HostConfig {
     pub uefi_firmware_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostConfigPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub openvmm_bin: Option<Option<PathBuf>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub fastdesk_viewer_bin: Option<Option<PathBuf>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub openvmm_img_bin: Option<Option<PathBuf>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub uefi_firmware_path: Option<Option<PathBuf>>,
+}
+
+impl HostConfigPatch {
+    pub fn is_empty(&self) -> bool {
+        self.listen_addr.is_none()
+            && self.openvmm_bin.is_none()
+            && self.fastdesk_viewer_bin.is_none()
+            && self.openvmm_img_bin.is_none()
+            && self.uefi_firmware_path.is_none()
+    }
+
+    pub fn apply_to(&self, cfg: &mut HostConfig) {
+        if let Some(addr) = &self.listen_addr {
+            cfg.listen_addr = addr.clone();
+        }
+        if let Some(val) = &self.openvmm_bin {
+            cfg.openvmm_bin = val.clone();
+        }
+        if let Some(val) = &self.fastdesk_viewer_bin {
+            cfg.fastdesk_viewer_bin = val.clone();
+        }
+        if let Some(val) = &self.openvmm_img_bin {
+            cfg.openvmm_img_bin = val.clone();
+        }
+        if let Some(val) = &self.uefi_firmware_path {
+            cfg.uefi_firmware_path = val.clone();
+        }
+    }
+
+    pub fn from_diff(base: &HostConfig, edited: &HostConfig) -> Self {
+        Self {
+            listen_addr: (edited.listen_addr != base.listen_addr)
+                .then(|| edited.listen_addr.clone()),
+            openvmm_bin: (edited.openvmm_bin != base.openvmm_bin)
+                .then(|| edited.openvmm_bin.clone()),
+            fastdesk_viewer_bin: (edited.fastdesk_viewer_bin != base.fastdesk_viewer_bin)
+                .then(|| edited.fastdesk_viewer_bin.clone()),
+            openvmm_img_bin: (edited.openvmm_img_bin != base.openvmm_img_bin)
+                .then(|| edited.openvmm_img_bin.clone()),
+            uefi_firmware_path: (edited.uefi_firmware_path != base.uefi_firmware_path)
+                .then(|| edited.uefi_firmware_path.clone()),
+        }
+    }
+}
+
 impl Default for HostConfig {
     fn default() -> Self {
         let data_dir = default_data_dir();
@@ -529,16 +602,45 @@ impl PortForward {
             return false;
         }
         match (
-            self.host_addr.trim().parse::<std::net::IpAddr>(),
-            other.host_addr.trim().parse::<std::net::IpAddr>(),
+            normalize_bind_addr(&self.host_addr),
+            normalize_bind_addr(&other.host_addr),
         ) {
             (Ok(ip_a), Ok(ip_b)) => {
-                ip_a == ip_b
-                    || ((ip_a.is_unspecified() || ip_b.is_unspecified())
-                        && ip_a.is_ipv4() == ip_b.is_ipv4())
+                if ip_a == ip_b {
+                    return true;
+                }
+                let is_v6_wildcard = |ip: std::net::IpAddr| {
+                    matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unspecified())
+                };
+                let is_v4_wildcard = |ip: std::net::IpAddr| {
+                    matches!(ip, std::net::IpAddr::V4(v4) if v4.is_unspecified())
+                };
+                // Dual-stack wildcard bind (`::`) conflicts with any IPv4 or IPv6 bind on the same port.
+                if is_v6_wildcard(ip_a) || is_v6_wildcard(ip_b) {
+                    return true;
+                }
+                (is_v4_wildcard(ip_a) || is_v4_wildcard(ip_b))
+                    && ip_a.is_ipv4()
+                    && ip_b.is_ipv4()
             }
-            _ => self.host_addr.trim() == other.host_addr.trim(),
+            (Err(a), Err(b)) => a == b,
+            _ => false,
         }
+    }
+}
+
+fn normalize_bind_addr(addr: &str) -> Result<std::net::IpAddr, String> {
+    let trimmed = addr.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => Ok(std::net::IpAddr::V4(v4)),
+            None => Ok(std::net::IpAddr::V6(v6)),
+        },
+        Ok(v4 @ std::net::IpAddr::V4(_)) => Ok(v4),
+        Err(_) => Err(trimmed.to_ascii_lowercase()),
     }
 }
 
@@ -811,6 +913,14 @@ impl VmConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_with_options(true, true)
+    }
+
+    pub fn validate_with_options(
+        &self,
+        strict_disks_absolute: bool,
+        strict_nic_conflicts: bool,
+    ) -> anyhow::Result<()> {
         validate_vm_name(&self.name)?;
         if self.name != self.name.trim() {
             bail!("VM name cannot have leading or trailing whitespace");
@@ -837,7 +947,7 @@ impl VmConfig {
             if disk.path.as_os_str().is_empty() {
                 bail!("disk path at SCSI LUN {} cannot be empty", disk.lun);
             }
-            if !disk.path.is_absolute() {
+            if strict_disks_absolute && !disk.path.is_absolute() {
                 bail!(
                     "disk path '{}' at SCSI LUN {} must be an absolute path",
                     disk.path.display(),
@@ -868,23 +978,27 @@ impl VmConfig {
         let mut seen_macs = std::collections::HashSet::new();
         let mut seen_port_forwards: Vec<&PortForward> = Vec::new();
         for nic in &self.nics {
-            if !seen_nic_ids.insert(nic.id) {
+            if strict_nic_conflicts && !seen_nic_ids.insert(nic.id) {
                 bail!("duplicate NIC id {}", nic.id);
             }
             let mac_bytes = parse_mac_bytes(&nic.mac_address)?;
-            if !seen_macs.insert(mac_bytes) {
+            if strict_nic_conflicts && !seen_macs.insert(mac_bytes) {
                 bail!("duplicate MAC address '{}' across NICs", nic.mac_address);
             }
             match &nic.backend {
                 NicBackendConfig::Consomme { port_forwards, .. } => {
                     for pf in port_forwards {
                         pf.validate()?;
-                        if let Some(conflict) = seen_port_forwards.iter().find(|e| e.overlaps(pf)) {
-                            bail!(
-                                "port forward '{pf}' overlaps with existing port forward '{conflict}'"
-                            );
+                        if strict_nic_conflicts {
+                            if let Some(conflict) =
+                                seen_port_forwards.iter().find(|e| e.overlaps(pf))
+                            {
+                                bail!(
+                                    "port forward '{pf}' overlaps with existing port forward '{conflict}'"
+                                );
+                            }
+                            seen_port_forwards.push(pf);
                         }
-                        seen_port_forwards.push(pf);
                     }
                 }
                 NicBackendConfig::VmSwitch { switch_id, .. } => {
@@ -1273,9 +1387,13 @@ pub fn parse_memory_mb(input: &str) -> anyhow::Result<u64> {
         bail!("memory size cannot be empty");
     }
     if trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return trimmed
+        let mb = trimmed
             .parse::<u64>()
-            .context("invalid memory MiB integer");
+            .context("invalid memory MiB integer")?;
+        if mb == 0 {
+            bail!("memory size '{input}' must be a non-zero whole number of MiB");
+        }
+        return Ok(mb);
     }
     let bytes = parse_byte_size(trimmed)?;
     const MIB: u64 = 1024 * 1024;
@@ -1674,12 +1792,70 @@ mod tests {
             cfg.validate().unwrap();
         }
 
-        // parse_memory_mb rejects sub-MiB / non-multiple values instead of silently truncating.
+        // parse_memory_mb rejects sub-MiB / zero / non-multiple values instead of silently truncating.
         assert!(parse_memory_mb("1536K").is_err());
         assert!(parse_memory_mb("512K").is_err());
         assert!(parse_memory_mb("0M").is_err());
+        assert!(parse_memory_mb("0").is_err());
         assert!(parse_memory_mb("").is_err());
         assert_eq!(parse_memory_mb("2048K").unwrap(), 2);
         assert_eq!(parse_memory_mb("1G").unwrap(), 1024);
+
+        // Dual-stack `::` wildcard overlaps both IPv4 and IPv6 on the same port;
+        // `localhost` and case-insensitive hostnames overlap canonically.
+        let v6_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let v4_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 8080,
+            guest_port: 81,
+        };
+        let v4_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "0.0.0.0".into(),
+            host_port: 8080,
+            guest_port: 82,
+        };
+        let v6_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::1".into(),
+            host_port: 8080,
+            guest_port: 83,
+        };
+        let host_lower = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "localhost".into(),
+            host_port: 8080,
+            guest_port: 84,
+        };
+        let host_upper = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "LOCALHOST".into(),
+            host_port: 8080,
+            guest_port: 85,
+        };
+        assert!(v6_wild.overlaps(&v4_loopback));
+        assert!(v4_loopback.overlaps(&v6_wild));
+        assert!(v6_wild.overlaps(&v4_wild));
+        assert!(v6_wild.overlaps(&v6_loopback));
+        assert!(!v4_wild.overlaps(&v6_loopback));
+        assert!(host_lower.overlaps(&v4_loopback));
+        assert!(host_lower.overlaps(&host_upper));
+
+        // Legacy validation options allow relative disk paths / pre-existing NIC conflicts when unchanged.
+        cfg.disks.push(DiskAttachment {
+            lun: 0,
+            kind: DiskKind::HardDisk,
+            path: PathBuf::from("legacy/relative.img"),
+            read_only: false,
+            format: DiskFormat::Raw,
+        });
+        assert!(cfg.validate().is_err());
+        cfg.validate_with_options(false, true).unwrap();
     }
 }

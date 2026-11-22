@@ -22,6 +22,9 @@ tracing.workspace = true
 vhdx.workspace = true
 vm_resource.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 pal_async.workspace = true
 storage_tests.workspace = true

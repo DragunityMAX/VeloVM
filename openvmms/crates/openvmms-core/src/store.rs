@@ -320,13 +320,14 @@ impl RegistryStore {
                     continue;
                 }
             };
-            let vm: VmConfig = match toml::from_str(&text) {
+            let mut vm: VmConfig = match toml::from_str(&text) {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::warn!(path = %cfg_path.display(), error = %err, "skipping corrupt vm.toml");
                     continue;
                 }
             };
+            vm.normalize();
             out.push(vm);
         }
         out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
@@ -334,7 +335,16 @@ impl RegistryStore {
     }
 
     pub fn save_vm(&self, vm: &VmConfig) -> anyhow::Result<()> {
-        vm.validate()?;
+        self.save_vm_with_options(vm, true, true)
+    }
+
+    pub fn save_vm_with_options(
+        &self,
+        vm: &VmConfig,
+        strict_disks_absolute: bool,
+        strict_nic_conflicts: bool,
+    ) -> anyhow::Result<()> {
+        vm.validate_with_options(strict_disks_absolute, strict_nic_conflicts)?;
         let vm_dir = self.vm_dir(vm.id);
         fs::create_dir_all(vm_dir.join("logs"))
             .with_context(|| format!("creating VM directory {}", vm_dir.display()))?;
@@ -347,16 +357,17 @@ impl RegistryStore {
         if !vm_dir.exists() {
             return Ok(());
         }
-        // Remove logs and state before vm.toml so that if removing open log files
-        // fails (e.g. on Windows), vm.toml remains intact and the VM does not
-        // vanish on daemon restart with orphaned disks. User disk images inside
-        // vm_dir are preserved unless explicitly deleted by the caller.
+        // Remove logs first so that if removing open log files fails (e.g. on
+        // Windows), vm.toml and state.vmgs remain intact and the VM does not
+        // vanish or lose TPM/UEFI state on restart. Remove vm.toml before
+        // state.vmgs because deleting vm.toml is the point of no return and an
+        // orphaned .vmgs is harmless if state.vmgs removal fails afterward.
         let logs_dir = vm_dir.join("logs");
         if logs_dir.is_dir() {
             fs::remove_dir_all(&logs_dir)
                 .with_context(|| format!("removing {}", logs_dir.display()))?;
         }
-        for file_name in ["state.vmgs", "vm.toml"] {
+        for file_name in ["vm.toml", "state.vmgs"] {
             let p = vm_dir.join(file_name);
             if p.is_file() {
                 fs::remove_file(&p)
@@ -961,6 +972,9 @@ mod tests {
         let vm = VmConfig::from_preset("KeepToml", VmPreset::Custom, dir.path());
         store.save_vm(&vm).unwrap();
 
+        let vmgs_path = store.vm_dir(vm.id).join("state.vmgs");
+        fs::write(&vmgs_path, b"tpm-state").unwrap();
+
         let logs_dir = store.vm_dir(vm.id).join("logs");
         let log_file = logs_dir.join("openvmm.log");
         fs::write(&log_file, b"still open").unwrap();
@@ -975,11 +989,13 @@ mod tests {
         let _restore = RestoreLogsPerm(logs_dir.clone());
 
         // If running as non-root, deleting the non-empty read-only logs dir must fail
-        // BEFORE vm.toml is touched, so load_all_vms() still sees the VM.
+        // BEFORE vm.toml or state.vmgs is touched, so load_all_vms() still sees the VM
+        // and its TPM/UEFI state stays intact.
         if fs::remove_file(&log_file).is_err() {
             let err = store.delete_vm_dir(vm.id).unwrap_err();
             assert!(err.to_string().contains("removing"), "{err:#}");
             assert!(store.vm_config_path(vm.id).is_file());
+            assert!(vmgs_path.is_file());
             let loaded = store.load_all_vms().unwrap();
             assert_eq!(loaded.len(), 1);
             assert_eq!(loaded[0].id, vm.id);
@@ -988,5 +1004,41 @@ mod tests {
         drop(_restore);
         store.delete_vm_dir(vm.id).unwrap();
         assert!(!store.vm_config_path(vm.id).exists());
+        assert!(!vmgs_path.exists());
+    }
+
+    #[test]
+    fn load_all_vms_normalizes_legacy_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let mut vm = VmConfig::from_preset("TrimMe", VmPreset::Custom, dir.path());
+        vm.name = "  TrimMe  ".into();
+        vm.nics[0].mac_address = format!("  {}  ", crate::models::generate_hyperv_mac());
+        vm.nics[0].backend = crate::models::NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![crate::models::PortForward {
+                protocol: crate::models::IpProto::Tcp,
+                host_addr: " 127.0.0.1 ".into(),
+                host_port: 8080,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        let vm_dir = store.vm_dir(vm.id);
+        fs::create_dir_all(&vm_dir).unwrap();
+        let text = toml::to_string_pretty(&vm).unwrap();
+        fs::write(store.vm_config_path(vm.id), text).unwrap();
+
+        let loaded = store.load_all_vms().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "TrimMe");
+        assert_eq!(loaded[0].nics[0].mac_address, vm.nics[0].mac_address.trim());
+        match &loaded[0].nics[0].backend {
+            crate::models::NicBackendConfig::Consomme { port_forwards, .. } => {
+                assert_eq!(port_forwards[0].host_addr, "127.0.0.1");
+            }
+            other => panic!("unexpected backend: {other:?}"),
+        }
     }
 }

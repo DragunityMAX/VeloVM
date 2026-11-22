@@ -32,57 +32,7 @@ use uuid::Uuid;
 
 type SharedEndpoint = Arc<RwLock<Option<(String, String)>>>;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HostConfigPatch {
-    pub listen_addr: Option<String>,
-    pub openvmm_bin: Option<Option<PathBuf>>,
-    pub fastdesk_viewer_bin: Option<Option<PathBuf>>,
-    pub openvmm_img_bin: Option<Option<PathBuf>>,
-    pub uefi_firmware_path: Option<Option<PathBuf>>,
-}
-
-impl HostConfigPatch {
-    pub fn is_empty(&self) -> bool {
-        self.listen_addr.is_none()
-            && self.openvmm_bin.is_none()
-            && self.fastdesk_viewer_bin.is_none()
-            && self.openvmm_img_bin.is_none()
-            && self.uefi_firmware_path.is_none()
-    }
-
-    pub fn apply_to(&self, cfg: &mut HostConfig) {
-        if let Some(addr) = &self.listen_addr {
-            cfg.listen_addr = addr.clone();
-        }
-        if let Some(val) = &self.openvmm_bin {
-            cfg.openvmm_bin = val.clone();
-        }
-        if let Some(val) = &self.fastdesk_viewer_bin {
-            cfg.fastdesk_viewer_bin = val.clone();
-        }
-        if let Some(val) = &self.openvmm_img_bin {
-            cfg.openvmm_img_bin = val.clone();
-        }
-        if let Some(val) = &self.uefi_firmware_path {
-            cfg.uefi_firmware_path = val.clone();
-        }
-    }
-
-    pub fn from_diff(base: &HostConfig, edited: &HostConfig) -> Self {
-        Self {
-            listen_addr: (edited.listen_addr != base.listen_addr)
-                .then(|| edited.listen_addr.clone()),
-            openvmm_bin: (edited.openvmm_bin != base.openvmm_bin)
-                .then(|| edited.openvmm_bin.clone()),
-            fastdesk_viewer_bin: (edited.fastdesk_viewer_bin != base.fastdesk_viewer_bin)
-                .then(|| edited.fastdesk_viewer_bin.clone()),
-            openvmm_img_bin: (edited.openvmm_img_bin != base.openvmm_img_bin)
-                .then(|| edited.openvmm_img_bin.clone()),
-            uefi_firmware_path: (edited.uefi_firmware_path != base.uefi_firmware_path)
-                .then(|| edited.uefi_firmware_path.clone()),
-        }
-    }
-}
+pub use openvmms_core::models::HostConfigPatch;
 
 #[derive(Debug, Clone)]
 pub enum GuiRequest {
@@ -926,9 +876,7 @@ impl BackendState {
             }
             GuiRequest::SaveHostConfig(patch) => {
                 let _guard = self.host_cfg_lock.lock().unwrap();
-                let mut live = client.host_config()?;
-                patch.apply_to(&mut live);
-                let updated = client.update_host_config(&live)?;
+                let updated = client.patch_host_config(&patch)?;
                 // Follow only `daemon.addr` when the daemon rebinds; never connect to `updated.listen_addr`.
                 if let Some(next_client) = reload_client_from_runtime_addr(
                     self.data_dir.as_deref(),
@@ -1099,9 +1047,24 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         }
                     }
                     let reader = std::io::BufReader::new(resp);
+                    let mut skip_leading_resync = true;
                     for line in reader.lines().map_while(Result::ok) {
                         if state.shutdown.load(Ordering::Acquire) {
                             break;
+                        }
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if skip_leading_resync {
+                            skip_leading_resync = false;
+                            if let Some(json_str) = line.strip_prefix("data: ")
+                                && matches!(
+                                    serde_json::from_str::<DaemonEvent>(json_str),
+                                    Ok(DaemonEvent::Resync)
+                                )
+                            {
+                                continue;
+                            }
                         }
                         if let Some(json_str) = line.strip_prefix("data: ")
                             && let Ok(event) = serde_json::from_str::<DaemonEvent>(json_str)
@@ -2810,5 +2773,131 @@ mod tests {
 
         drop(backend);
         rt.block_on(daemon.shutdown());
+    }
+
+    #[test]
+    fn sse_leading_resync_skips_duplicate_snapshot_while_later_resync_refreshes() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let vms_reqs = Arc::new(AtomicUsize::new(0));
+        let send_second_resync = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let token = token.clone();
+            let vms_reqs = Arc::clone(&vms_reqs);
+            let send_second_resync = Arc::clone(&send_second_resync);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let vms_reqs = Arc::clone(&vms_reqs);
+                            let send_second_resync = Arc::clone(&send_second_resync);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let target = req_text
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\ndata: {\"event\":\"resync\"}\n\n",
+                                    );
+                                    let _ = stream.flush();
+                                    let mut sent_second = false;
+                                    while !stop.load(Ordering::Acquire) {
+                                        if !sent_second
+                                            && send_second_resync.load(Ordering::Acquire)
+                                        {
+                                            sent_second = true;
+                                            if stream
+                                                .write_all(b"data: {\"event\":\"resync\"}\n\n")
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            let _ = stream.flush();
+                                        }
+                                        thread::sleep(Duration::from_millis(20));
+                                    }
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/vms" {
+                                    vms_reqs.fetch_add(1, Ordering::SeqCst);
+                                    ("200 OK", "[]".to_string())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timeout(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(5),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        // ConnectOrStartDaemon (1) + initial SSE connect sync (2); wait briefly for leading Resync to arrive.
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            vms_reqs.load(Ordering::Acquire),
+            2,
+            "leading Resync right after initial SSE connect sync must not trigger a third snapshot fetch"
+        );
+
+        // Subsequent Resync on the same stream must still refresh.
+        send_second_resync.store(true, Ordering::Release);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 3)
+        });
+        assert_eq!(vms_reqs.load(Ordering::Acquire), 3);
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
     }
 }

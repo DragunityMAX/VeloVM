@@ -1887,6 +1887,7 @@ dependencies = [
  "guestmem",
  "guid",
  "inspect",
+ "libc",
  "pal_async",
  "scsi_buffers",
  "storage_tests",

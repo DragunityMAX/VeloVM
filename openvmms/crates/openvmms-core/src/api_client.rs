@@ -5,6 +5,7 @@ use crate::models::CreateVmPayload;
 use crate::models::DEFAULT_DAEMON_LISTEN;
 use crate::models::DiskInfo;
 use crate::models::HostConfig;
+use crate::models::HostConfigPatch;
 use crate::models::HostInfo;
 use crate::models::InspectDiskPayload;
 use crate::models::MountIsoPayload;
@@ -210,6 +211,21 @@ impl ApiClient {
             .as_deref()
             .map(resolve_client_path);
         self.put("/api/v1/host/config", &resolved)
+    }
+
+    pub fn patch_host_config(&self, patch: &HostConfigPatch) -> anyhow::Result<HostConfig> {
+        let mut resolved = patch.clone();
+        for path_opt in [
+            &mut resolved.openvmm_bin,
+            &mut resolved.fastdesk_viewer_bin,
+            &mut resolved.openvmm_img_bin,
+            &mut resolved.uefi_firmware_path,
+        ] {
+            if let Some(Some(p)) = path_opt {
+                *p = resolve_client_path(p);
+            }
+        }
+        self.patch("/api/v1/host/config", &resolved)
     }
 
     pub fn list_switches(&self) -> anyhow::Result<Vec<VirtualSwitchInfo>> {
@@ -503,17 +519,31 @@ impl ApiClient {
         decode_json_response(resp)
     }
 
-    fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> anyhow::Result<T> {
+    fn send_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &B,
+    ) -> anyhow::Result<T> {
         self.ensure_verified()?;
+        let label = method.as_str().to_string();
         let resp = self
             .client
-            .put(format!("{}{path}", self.base_url))
+            .request(method, format!("{}{path}", self.base_url))
             .bearer_auth(&self.token)
             .json(body)
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
-            .with_context(|| format!("PUT {path}"))?;
+            .with_context(|| format!("{label} {path}"))?;
         decode_json_response(resp)
+    }
+
+    fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> anyhow::Result<T> {
+        self.send_json(reqwest::Method::PUT, path, body)
+    }
+
+    fn patch<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> anyhow::Result<T> {
+        self.send_json(reqwest::Method::PATCH, path, body)
     }
 
     fn delete_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {

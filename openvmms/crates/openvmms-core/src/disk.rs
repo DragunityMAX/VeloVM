@@ -488,6 +488,14 @@ fn file_has_iso9660_signature(path: &Path, file_size_bytes: u64) -> bool {
 }
 
 pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Result<DiskInfo> {
+    inspect_disk_with_explicit_tool(path, None, openvmm_img_bin)
+}
+
+pub fn inspect_disk_with_explicit_tool(
+    path: &Path,
+    explicit_img_bin: Option<&Path>,
+    resolved_img_bin: Option<&Path>,
+) -> anyhow::Result<DiskInfo> {
     if !path.is_absolute() {
         bail!("disk path '{}' must be an absolute path", path.display());
     }
@@ -503,65 +511,99 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
-    let is_vhdx =
-        matches!(ext.as_deref(), Some("vhdx" | "avhdx")) || file_has_vhdx_signature(path);
-    if is_vhdx {
-        let img_bin = openvmm_img_bin.with_context(|| {
-            format!(
-                "cannot inspect VHDX metadata for {}: openvmm-img binary not found; configure openvmm_img_bin in host settings",
-                path.display()
-            )
-        })?;
-        let output = Command::new(img_bin)
-            .arg("info")
-            .arg("--json")
-            .arg("--")
-            .arg(path)
-            .output()
-            .with_context(|| format!("running {}", img_bin.display()))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            bail!(
-                "openvmm-img info failed ({}): {}{}",
-                output.status,
-                stderr.trim(),
-                if stdout.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", stdout.trim())
-                }
-            );
-        }
-        let val: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .context("parsing openvmm-img info JSON output")?;
-        let virtual_size_bytes = val["disk_size"]
-            .as_u64()
-            .context("missing disk_size in openvmm-img info JSON output")?;
-        let disk_type = val["type"].as_str().unwrap_or("vhdx").to_string();
-        let block_size_bytes = val["block_size"].as_u64().and_then(|v| u32::try_from(v).ok());
-        let sector_size_bytes = val["logical_sector_size"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok());
-        let parent_path = val["relative_path"]
-            .as_str()
-            .or_else(|| val["absolute_win32_path"].as_str())
-            .map(ToOwned::to_owned);
-        return Ok(DiskInfo {
-            path: path.to_path_buf(),
-            format: "vhdx".to_string(),
-            disk_type,
-            virtual_size_bytes,
-            file_size_bytes,
-            block_size_bytes,
-            sector_size_bytes,
-            parent_path,
-            read_only,
-        });
+    enum DetectedFormat {
+        Vhdx,
+        Vhd(Option<Vhd1Meta>),
+        Iso,
+        Raw,
     }
 
-    if let Some(vhd) = parse_vhd1_metadata(path, file_size_bytes)? {
-        return Ok(DiskInfo {
+    // Known extensions determine the format directly without sniffing raw images,
+    // matching how VM attach opens them and ensuring guest-written bytes inside a
+    // raw `.img`/`.raw` disk cannot alter inspection results. Unknown/missing
+    // extensions fall back to content signature inspection.
+    let detected = match ext.as_deref() {
+        Some("vhdx" | "avhdx") => DetectedFormat::Vhdx,
+        Some("vhd" | "avhd") => DetectedFormat::Vhd(parse_vhd1_metadata(path, file_size_bytes)?),
+        Some("iso") => DetectedFormat::Iso,
+        Some("img" | "raw" | "bin") => DetectedFormat::Raw,
+        _ => {
+            if file_has_vhdx_signature(path) {
+                DetectedFormat::Vhdx
+            } else if let Some(vhd) = parse_vhd1_metadata(path, file_size_bytes)? {
+                DetectedFormat::Vhd(Some(vhd))
+            } else if file_has_iso9660_signature(path, file_size_bytes) {
+                DetectedFormat::Iso
+            } else {
+                DetectedFormat::Raw
+            }
+        }
+    };
+
+    match detected {
+        DetectedFormat::Vhdx => {
+            if let Some(explicit) = explicit_img_bin.filter(|p| !p.as_os_str().is_empty())
+                && !explicit.is_file()
+            {
+                bail!(
+                    "configured openvmm-img binary not found at '{}'",
+                    explicit.display()
+                );
+            }
+            let img_bin = resolved_img_bin.with_context(|| {
+                format!(
+                    "cannot inspect VHDX metadata for {}: openvmm-img binary not found; configure openvmm_img_bin in host settings",
+                    path.display()
+                )
+            })?;
+            let output = Command::new(img_bin)
+                .arg("info")
+                .arg("--json")
+                .arg("--")
+                .arg(path)
+                .output()
+                .with_context(|| format!("running {}", img_bin.display()))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                bail!(
+                    "openvmm-img info failed ({}): {}{}",
+                    output.status,
+                    stderr.trim(),
+                    if stdout.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", stdout.trim())
+                    }
+                );
+            }
+            let val: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .context("parsing openvmm-img info JSON output")?;
+            let virtual_size_bytes = val["disk_size"]
+                .as_u64()
+                .context("missing disk_size in openvmm-img info JSON output")?;
+            let disk_type = val["type"].as_str().unwrap_or("vhdx").to_string();
+            let block_size_bytes = val["block_size"].as_u64().and_then(|v| u32::try_from(v).ok());
+            let sector_size_bytes = val["logical_sector_size"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok());
+            let parent_path = val["relative_path"]
+                .as_str()
+                .or_else(|| val["absolute_win32_path"].as_str())
+                .map(ToOwned::to_owned);
+            Ok(DiskInfo {
+                path: path.to_path_buf(),
+                format: "vhdx".to_string(),
+                disk_type,
+                virtual_size_bytes,
+                file_size_bytes,
+                block_size_bytes,
+                sector_size_bytes,
+                parent_path,
+                read_only,
+            })
+        }
+        DetectedFormat::Vhd(Some(vhd)) => Ok(DiskInfo {
             path: path.to_path_buf(),
             format: "vhd".to_string(),
             disk_type: vhd.disk_type,
@@ -571,35 +613,34 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
             sector_size_bytes: Some(512),
             parent_path: None,
             read_only,
-        });
-    }
-
-    if matches!(ext.as_deref(), Some("vhd" | "avhd")) {
-        bail!(
+        }),
+        DetectedFormat::Vhd(None) => bail!(
             "invalid or corrupt VHD1 image: missing valid VHD footer in {}",
             path.display()
-        );
+        ),
+        DetectedFormat::Iso => Ok(DiskInfo {
+            path: path.to_path_buf(),
+            format: "iso".to_string(),
+            disk_type: "read-only image".to_string(),
+            virtual_size_bytes: file_size_bytes,
+            file_size_bytes,
+            block_size_bytes: None,
+            sector_size_bytes: Some(512),
+            parent_path: None,
+            read_only,
+        }),
+        DetectedFormat::Raw => Ok(DiskInfo {
+            path: path.to_path_buf(),
+            format: "raw".to_string(),
+            disk_type: "sparse/flat".to_string(),
+            virtual_size_bytes: file_size_bytes,
+            file_size_bytes,
+            block_size_bytes: None,
+            sector_size_bytes: Some(512),
+            parent_path: None,
+            read_only,
+        }),
     }
-
-    let (format, disk_type) = if ext.as_deref() == Some("iso")
-        || file_has_iso9660_signature(path, file_size_bytes)
-    {
-        ("iso".to_string(), "read-only image".to_string())
-    } else {
-        ("raw".to_string(), "sparse/flat".to_string())
-    };
-
-    Ok(DiskInfo {
-        path: path.to_path_buf(),
-        format,
-        disk_type,
-        virtual_size_bytes: file_size_bytes,
-        file_size_bytes,
-        block_size_bytes: None,
-        sector_size_bytes: Some(512),
-        parent_path: None,
-        read_only,
-    })
 }
 
 #[cfg(test)]
@@ -897,7 +938,12 @@ mod tests {
             let raw_with_magic = dir.path().join("raw-with-magic.img");
             fs::write(&raw_with_magic, b"vhdxfileDUMMY").unwrap();
             assert_eq!(DiskFormat::from_path(&raw_with_magic), DiskFormat::Raw);
-            let inspected = inspect_disk(&raw_with_magic, Some(&vhdx_stub)).unwrap();
+            let inspected_raw = inspect_disk(&raw_with_magic, Some(&vhdx_stub)).unwrap();
+            assert_eq!(inspected_raw.format, "raw");
+
+            let unknown_with_magic = dir.path().join("unknown-with-magic.blob");
+            fs::write(&unknown_with_magic, b"vhdxfileDUMMY").unwrap();
+            let inspected = inspect_disk(&unknown_with_magic, Some(&vhdx_stub)).unwrap();
             assert_eq!(inspected.format, "vhdx");
         }
     }
@@ -1169,20 +1215,62 @@ mod tests {
         assert_eq!(dyn_info.file_size_bytes, dyn_bytes.len() as u64);
         assert_eq!(dyn_info.block_size_bytes, Some(2 * 1024 * 1024));
 
-        // Content detection works even when a VHD1 file is named `.img`.
-        let renamed_vhd = dir.path().join("disguised-vhd.img");
+        // Raw extensions (`.img`, `.raw`, `.bin`) are never sniffed even if containing VHD/VHDX magic.
+        let raw_with_vhd_magic = dir.path().join("raw-with-vhd.img");
+        fs::write(&raw_with_vhd_magic, &dyn_bytes).unwrap();
+        let raw_vhd_info = inspect_disk_with_explicit_tool(
+            &raw_with_vhd_magic,
+            Some(Path::new("/nonexistent/openvmm-img")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(raw_vhd_info.format, "raw");
+        assert_eq!(raw_vhd_info.virtual_size_bytes, dyn_bytes.len() as u64);
+
+        let raw_with_vhdx_magic = dir.path().join("raw-with-vhdx.img");
+        let mut vhdx_magic = b"vhdxfile".to_vec();
+        vhdx_magic.resize(4096, 0);
+        fs::write(&raw_with_vhdx_magic, &vhdx_magic).unwrap();
+        let raw_vhdx_info = inspect_disk_with_explicit_tool(
+            &raw_with_vhdx_magic,
+            Some(Path::new("/nonexistent/openvmm-img")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(raw_vhdx_info.format, "raw");
+
+        // Unknown/extensionless files still detect VHD1/ISO/VHDX by content.
+        let renamed_vhd = dir.path().join("disguised-vhd.blob");
         fs::write(&renamed_vhd, &dyn_bytes).unwrap();
-        let renamed_info = inspect_disk(&renamed_vhd, None).unwrap();
+        let renamed_info = inspect_disk_with_explicit_tool(
+            &renamed_vhd,
+            Some(Path::new("/nonexistent/openvmm-img")),
+            None,
+        )
+        .unwrap();
         assert_eq!(renamed_info.format, "vhd");
         assert_eq!(renamed_info.virtual_size_bytes, dyn_virtual);
+
+        // Inspecting non-VHDX fails only when inspecting an actual `.vhdx` with missing explicit tool.
+        let bad_explicit_vhdx = dir.path().join("needs-tool.vhdx");
+        fs::write(&bad_explicit_vhdx, &vhdx_magic).unwrap();
+        assert!(
+            inspect_disk_with_explicit_tool(
+                &bad_explicit_vhdx,
+                Some(Path::new("/nonexistent/openvmm-img")),
+                None,
+            )
+            .is_err()
+        );
 
         // Corrupt `.vhd` with invalid footer fails rather than pretending to be raw.
         let bad_vhd = dir.path().join("corrupt.vhd");
         fs::write(&bad_vhd, vec![0u8; 4096]).unwrap();
         assert!(inspect_disk(&bad_vhd, None).is_err());
 
-        // ISO9660 primary volume descriptor magic (`CD001` at 0x8001) detects ISO by content.
-        let iso_bin = dir.path().join("installer.bin");
+        // ISO9660 primary volume descriptor magic (`CD001` at 0x8001) detects ISO by content
+        // on extensionless/unknown-extension files.
+        let iso_bin = dir.path().join("installer.blob");
         let mut iso_bytes = vec![0u8; 0x9000];
         iso_bytes[0x8001..0x8006].copy_from_slice(b"CD001");
         fs::write(&iso_bin, &iso_bytes).unwrap();

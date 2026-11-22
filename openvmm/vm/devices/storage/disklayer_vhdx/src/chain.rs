@@ -18,6 +18,15 @@ use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
 
 #[cfg(unix)]
+fn is_unsupported_lock_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Unsupported
+        || matches!(
+            err.raw_os_error(),
+            Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS)
+        )
+}
+
+#[cfg(unix)]
 fn handle_disk_lock_result(
     res: Result<(), std::fs::TryLockError>,
     path: &Path,
@@ -31,9 +40,9 @@ fn handle_disk_lock_result(
                 path.display()
             );
         }
-        Err(std::fs::TryLockError::Error(err)) => {
+        Err(std::fs::TryLockError::Error(err)) if is_unsupported_lock_error(&err) => {
             // Match QEMU's fallback on filesystems without advisory lock support
-            // (e.g., ENOLCK / EOPNOTSUPP on NFS, CIFS, or 9p): warn and continue.
+            // (e.g., ENOLCK / EOPNOTSUPP / ENOSYS on NFS, CIFS, or 9p): warn and continue.
             tracing::warn!(
                 path = %path.display(),
                 read_only,
@@ -41,6 +50,9 @@ fn handle_disk_lock_result(
                 "disk locking unavailable on this filesystem; continuing without file lock"
             );
             Ok(())
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("acquiring file lock on {}", path.display()))
         }
     }
 }
@@ -516,13 +528,26 @@ mod tests {
             p,
             false,
         )
-        .expect("unsupported filesystem lock error must not fail open");
+        .expect("unsupported filesystem lock error should warn and continue without locking");
         handle_disk_lock_result(
-            Err(std::fs::TryLockError::Error(std::io::Error::other("ENOLCK"))),
+            Err(std::fs::TryLockError::Error(std::io::Error::from_raw_os_error(
+                libc::ENOLCK,
+            ))),
             p,
             true,
         )
-        .expect("non-WouldBlock lock error must not fail open");
+        .expect("ENOLCK filesystem lock error should warn and continue without locking");
+
+        for raw_err in [libc::EBADF, libc::EIO] {
+            handle_disk_lock_result(
+                Err(std::fs::TryLockError::Error(std::io::Error::from_raw_os_error(
+                    raw_err,
+                ))),
+                p,
+                false,
+            )
+            .expect_err("real I/O or bad-fd lock errors must fail");
+        }
 
         let err = handle_disk_lock_result(Err(std::fs::TryLockError::WouldBlock), p, false)
             .unwrap_err();

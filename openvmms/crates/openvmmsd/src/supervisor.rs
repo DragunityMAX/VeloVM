@@ -12,6 +12,7 @@ use openvmms_core::models::DiskInfo;
 use openvmms_core::models::DiskKind;
 use openvmms_core::models::FastDeskTransport;
 use openvmms_core::models::HostConfig;
+use openvmms_core::models::HostConfigPatch;
 use openvmms_core::models::HostInfo;
 use openvmms_core::models::IpProto;
 use openvmms_core::models::LiveVmProperties;
@@ -557,9 +558,36 @@ impl Supervisor {
 
     pub async fn update_host_config(
         self: &Arc<Self>,
+        new_cfg: HostConfig,
+    ) -> anyhow::Result<HostConfig> {
+        let sup = Arc::clone(self);
+        tokio::spawn(async move {
+            let _lock = sup.host_config_lock.lock().await;
+            sup.update_host_config_locked(new_cfg).await
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("update_host_config task failed: {e}"))?
+    }
+
+    pub async fn patch_host_config(
+        self: &Arc<Self>,
+        patch: HostConfigPatch,
+    ) -> anyhow::Result<HostConfig> {
+        let sup = Arc::clone(self);
+        tokio::spawn(async move {
+            let _lock = sup.host_config_lock.lock().await;
+            let mut live = sup.host_config();
+            patch.apply_to(&mut live);
+            sup.update_host_config_locked(live).await
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("patch_host_config task failed: {e}"))?
+    }
+
+    async fn update_host_config_locked(
+        self: &Arc<Self>,
         mut new_cfg: HostConfig,
     ) -> anyhow::Result<HostConfig> {
-        let _lock = self.host_config_lock.lock().await;
         let current_cfg = self.host_config();
         if new_cfg.data_dir.as_os_str().is_empty() {
             new_cfg.data_dir = self.store.data_dir().to_path_buf();
@@ -632,9 +660,7 @@ impl Supervisor {
         if let Some(listener) = new_listener
             && let Err(err) = self.serve_on_listener(listener)
         {
-            let store_rb = self.store.clone();
-            let prev_cfg = current_cfg.clone();
-            let _ = tokio::task::spawn_blocking(move || store_rb.save_host_config(&prev_cfg)).await;
+            self.rollback_host_config(current_cfg).await;
             return Err(err);
         }
 
@@ -889,7 +915,7 @@ impl Supervisor {
         cfg.normalize();
         cfg.validate().map_err(|e| err_bad_request(format!("{e:#}")))?;
         for d in &cfg.disks {
-            ensure_disk_format_safe(&d.path, d.format, false)?;
+            ensure_disk_format_safe(&d.path, d.format, false, true)?;
         }
         let cfg_disk_paths: Vec<PathBuf> = cfg.disks.iter().map(|d| d.path.clone()).collect();
         let all_paths = {
@@ -1026,6 +1052,18 @@ impl Supervisor {
         id_or_name: &str,
         payload: UpdateVmPayload,
     ) -> anyhow::Result<VmSummary> {
+        let sup = Arc::clone(self);
+        let id_or_name = id_or_name.to_string();
+        tokio::spawn(async move { sup.update_vm_inner(&id_or_name, payload).await })
+            .await
+            .map_err(|e| anyhow::anyhow!("update_vm task failed: {e}"))?
+    }
+
+    async fn update_vm_inner(
+        &self,
+        id_or_name: &str,
+        payload: UpdateVmPayload,
+    ) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
         let hp_lock = self.hotplug_lock(id)?;
         let _hp_guard = hp_lock.lock().await;
@@ -1048,6 +1086,7 @@ impl Supervisor {
         }
 
         let disks_updated = payload.disks.is_some();
+        let nics_updated = payload.nics.is_some();
         let (prev_cfg, updated, snap_gen, all_disk_paths) = {
             let guard = self.vms.read().unwrap();
             if let Some(new_name) = &payload.name {
@@ -1132,14 +1171,14 @@ impl Supervisor {
         };
 
         updated
-            .validate()
+            .validate_with_options(disks_updated, nics_updated)
             .map_err(|e| err_bad_request(format!("{e:#}")))?;
 
         let path_keys = if disks_updated {
             let disks_check = updated.disks.clone();
             tokio::task::spawn_blocking(move || {
                 for d in &disks_check {
-                    ensure_disk_format_safe(&d.path, d.format, true)?;
+                    ensure_disk_format_safe(&d.path, d.format, true, true)?;
                 }
                 Ok::<_, anyhow::Error>(precompute_disk_path_keys(all_disk_paths))
             })
@@ -1156,9 +1195,11 @@ impl Supervisor {
 
         let store = self.store.clone();
         let updated_to_save = updated.clone();
-        tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-            .await
-            .map_err(|e| anyhow::anyhow!("update_vm save task failed: {e}"))??;
+        tokio::task::spawn_blocking(move || {
+            store.save_vm_with_options(&updated_to_save, disks_updated, nics_updated)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("update_vm save task failed: {e}"))??;
 
         let commit_res: anyhow::Result<VmSummary> = (|| {
             let mut guard = self.vms.write().unwrap();
@@ -1205,8 +1246,7 @@ impl Supervisor {
         let summary = match commit_res {
             Ok(summary) => summary,
             Err(err) => {
-                let store_rb = self.store.clone();
-                let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg)).await;
+                self.rollback_vm_config(id, "update VM", prev_cfg).await;
                 return Err(err);
             }
         };
@@ -1219,6 +1259,18 @@ impl Supervisor {
 
     pub async fn delete_vm(
         self: &Arc<Self>,
+        id_or_name: &str,
+        delete_disks: bool,
+    ) -> anyhow::Result<()> {
+        let sup = Arc::clone(self);
+        let id_or_name = id_or_name.to_string();
+        tokio::spawn(async move { sup.delete_vm_inner(&id_or_name, delete_disks).await })
+            .await
+            .map_err(|e| anyhow::anyhow!("delete_vm task failed: {e}"))?
+    }
+
+    async fn delete_vm_inner(
+        &self,
         id_or_name: &str,
         delete_disks: bool,
     ) -> anyhow::Result<()> {
@@ -1506,7 +1558,14 @@ impl Supervisor {
                         d.path.display()
                     )));
                 }
-                ensure_disk_format_safe(&d.path, d.format, d.format != DiskFormat::Raw)?;
+                if !d.path.is_absolute() {
+                    warn!(
+                        vm_id = %id,
+                        path = %d.path.display(),
+                        "starting legacy VM with relative disk path"
+                    );
+                }
+                ensure_disk_format_safe(&d.path, d.format, d.format != DiskFormat::Raw, false)?;
             }
             let path_keys = precompute_disk_path_keys(all_disk_paths);
             let existed_before = runtime_dir_to_prepare.exists();
@@ -2570,7 +2629,7 @@ impl Supervisor {
         };
         let path_to_check = req.path.clone();
         let path_keys = tokio::task::spawn_blocking(move || {
-            ensure_disk_format_safe(&path_to_check, format, explicit_format)?;
+            ensure_disk_format_safe(&path_to_check, format, explicit_format, true)?;
             if !path_to_check.is_file() {
                 return Err(err_bad_request(format!(
                     "disk file not found: {}",
@@ -2625,9 +2684,11 @@ impl Supervisor {
             Err((attachment, prev_cfg, updated, snap_gen)) => {
                 let store = self.store.clone();
                 let updated_to_save = updated.clone();
-                tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("attach_disk save task failed: {e}"))??;
+                tokio::task::spawn_blocking(move || {
+                    store.save_vm_with_options(&updated_to_save, false, false)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("attach_disk save task failed: {e}"))??;
 
                 let mut should_rollback_disk_file = false;
                 let commit_res: anyhow::Result<VmSummary> = (|| {
@@ -2679,9 +2740,7 @@ impl Supervisor {
                     Ok(summary) => summary,
                     Err(err) => {
                         if should_rollback_disk_file {
-                            let store_rb = self.store.clone();
-                            let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg))
-                                .await;
+                            self.rollback_vm_config(id, "attach disk", prev_cfg).await;
                         }
                         return Err(err);
                     }
@@ -2758,11 +2817,12 @@ impl Supervisor {
 
                 let store = self.store.clone();
                 let updated_to_save = updated.clone();
-                if let Err(err) =
-                    tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("attach_disk save task failed: {e}"))
-                        .and_then(|r| r)
+                if let Err(err) = tokio::task::spawn_blocking(move || {
+                    store.save_vm_with_options(&updated_to_save, false, false)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("attach_disk save task failed: {e}"))
+                .and_then(|r| r)
                 {
                     rollback_hot_added_disk(&sock, id, lun).await;
                     return Err(err);
@@ -2814,9 +2874,7 @@ impl Supervisor {
                     Ok(summary) => summary,
                     Err(err) => {
                         if should_rollback_disk_file {
-                            let store_rb = self.store.clone();
-                            let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg))
-                                .await;
+                            self.rollback_vm_config(id, "attach disk", prev_cfg).await;
                         }
                         if rollback_on_same_vm {
                             rollback_hot_added_disk(&sock, id, lun).await;
@@ -2917,9 +2975,11 @@ impl Supervisor {
 
                 let store = self.store.clone();
                 let updated_to_save = updated.clone();
-                tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("detach_disk save task failed: {e}"))??;
+                tokio::task::spawn_blocking(move || {
+                    store.save_vm_with_options(&updated_to_save, false, false)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("detach_disk save task failed: {e}"))??;
 
                 let mut should_rollback_disk_file = false;
                 let commit_res: anyhow::Result<VmSummary> = (|| {
@@ -2969,9 +3029,7 @@ impl Supervisor {
                     Ok(summary) => summary,
                     Err(err) => {
                         if should_rollback_disk_file {
-                            let store_rb = self.store.clone();
-                            let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg))
-                                .await;
+                            self.rollback_vm_config(id, "detach disk", prev_cfg).await;
                         }
                         return Err(err);
                     }
@@ -3047,11 +3105,12 @@ impl Supervisor {
 
                 let store = self.store.clone();
                 let updated_to_save = updated.clone();
-                if let Err(err) =
-                    tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("detach_disk save task failed: {e}"))
-                        .and_then(|r| r)
+                if let Err(err) = tokio::task::spawn_blocking(move || {
+                    store.save_vm_with_options(&updated_to_save, false, false)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("detach_disk save task failed: {e}"))
+                .and_then(|r| r)
                 {
                     rollback_hot_removed_disk(&sock, id, lun, &existing).await;
                     return Err(err);
@@ -3101,9 +3160,7 @@ impl Supervisor {
                     Ok(summary) => summary,
                     Err(err) => {
                         if should_rollback_disk_file {
-                            let store_rb = self.store.clone();
-                            let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg))
-                                .await;
+                            self.rollback_vm_config(id, "detach disk", prev_cfg).await;
                         }
                         if rollback_on_same_vm {
                             rollback_hot_removed_disk(&sock, id, lun, &existing).await;
@@ -3146,7 +3203,7 @@ impl Supervisor {
         }
         let iso_path = req.path.clone();
         tokio::task::spawn_blocking(move || {
-            ensure_disk_format_safe(&iso_path, DiskFormat::Iso, true)?;
+            ensure_disk_format_safe(&iso_path, DiskFormat::Iso, true, true)?;
             if !iso_path.is_file() {
                 return Err(err_bad_request(format!(
                     "ISO image not found: {}",
@@ -3237,9 +3294,11 @@ impl Supervisor {
             Err((prev_cfg, updated, snap_gen)) => {
                 let store = self.store.clone();
                 let updated_to_save = updated.clone();
-                tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("mount_iso save task failed: {e}"))??;
+                tokio::task::spawn_blocking(move || {
+                    store.save_vm_with_options(&updated_to_save, false, false)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("mount_iso save task failed: {e}"))??;
 
                 let mut should_rollback_disk_file = false;
                 let commit_res: anyhow::Result<VmSummary> = (|| {
@@ -3284,9 +3343,7 @@ impl Supervisor {
                     Ok(summary) => summary,
                     Err(err) => {
                         if should_rollback_disk_file {
-                            let store_rb = self.store.clone();
-                            let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg))
-                                .await;
+                            self.rollback_vm_config(id, "mount ISO", prev_cfg).await;
                         }
                         return Err(err);
                     }
@@ -3456,9 +3513,11 @@ impl Supervisor {
             Err((prev_cfg, updated, snap_gen)) => {
                 let store = self.store.clone();
                 let updated_to_save = updated.clone();
-                tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("modify_port_forward save task failed: {e}"))??;
+                tokio::task::spawn_blocking(move || {
+                    store.save_vm_with_options(&updated_to_save, false, false)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("modify_port_forward save task failed: {e}"))??;
 
                 let mut should_rollback_disk_file = false;
                 let commit_res: anyhow::Result<VmSummary> = (|| {
@@ -3503,8 +3562,7 @@ impl Supervisor {
                     Ok(summary) => summary,
                     Err(err) => {
                         if should_rollback_disk_file {
-                            let store_rb = self.store.clone();
-                            let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg))
+                            self.rollback_vm_config(id, "modify port forwarding", prev_cfg)
                                 .await;
                         }
                         return Err(err);
@@ -3580,11 +3638,12 @@ impl Supervisor {
 
                 let store = self.store.clone();
                 let updated_to_save = updated.clone();
-                if let Err(err) =
-                    tokio::task::spawn_blocking(move || store.save_vm(&updated_to_save))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("modify_port_forward save task failed: {e}"))
-                        .and_then(|r| r)
+                if let Err(err) = tokio::task::spawn_blocking(move || {
+                    store.save_vm_with_options(&updated_to_save, false, false)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("modify_port_forward save task failed: {e}"))
+                .and_then(|r| r)
                 {
                     rollback_port_forward(&sock, id, nic_id, add, proto_port).await;
                     return Err(err);
@@ -3626,8 +3685,7 @@ impl Supervisor {
                     Ok(summary) => summary,
                     Err(err) => {
                         if should_rollback_disk_file {
-                            let store_rb = self.store.clone();
-                            let _ = tokio::task::spawn_blocking(move || store_rb.save_vm(&prev_cfg))
+                            self.rollback_vm_config(id, "modify port forwarding", prev_cfg)
                                 .await;
                         }
                         if rollback_on_same_vm {
@@ -3695,13 +3753,14 @@ impl Supervisor {
     }
 
     pub fn inspect_disk(&self, path: &Path) -> anyhow::Result<DiskInfo> {
-        validate_explicit_path(
-            self.host_config().openvmm_img_bin.as_deref(),
-            "openvmm-img binary",
-        )?;
+        let host_cfg = self.host_config();
         let paths = self.resolved_paths();
-        disk::inspect_disk(path, paths.openvmm_img_bin.as_deref())
-            .map_err(|e| err_bad_request(format!("{e:#}")))
+        disk::inspect_disk_with_explicit_tool(
+            path,
+            host_cfg.openvmm_img_bin.as_deref(),
+            paths.openvmm_img_bin.as_deref(),
+        )
+        .map_err(|e| err_bad_request(format!("{e:#}")))
     }
 
     pub fn vm_logs(&self, id_or_name: &str, tail: usize) -> anyhow::Result<String> {
@@ -3854,6 +3913,42 @@ impl Supervisor {
             self.emit(DaemonEvent::VmUpdated { vm: vm.summary() });
         }
     }
+
+    async fn rollback_vm_config(&self, vm_id: Uuid, action: &str, prev_cfg: VmConfig) {
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || store.save_vm_with_options(&prev_cfg, false, false))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(rb_err)) => warn!(
+                vm_id = %vm_id,
+                action,
+                error = %rb_err,
+                "failed to restore previous vm.toml after commit failure"
+            ),
+            Err(join_err) => warn!(
+                vm_id = %vm_id,
+                action,
+                error = %join_err,
+                "vm.toml rollback task failed after commit failure"
+            ),
+        }
+    }
+
+    async fn rollback_host_config(&self, prev_cfg: HostConfig) {
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || store.save_host_config(&prev_cfg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(rb_err)) => warn!(
+                error = %rb_err,
+                "failed to restore previous config.toml after listener switch failure"
+            ),
+            Err(join_err) => warn!(
+                error = %join_err,
+                "config.toml rollback task failed after listener switch failure"
+            ),
+        }
+    }
 }
 
 fn validate_explicit_path(path: Option<&Path>, label: &str) -> anyhow::Result<()> {
@@ -3872,11 +3967,12 @@ fn ensure_disk_format_safe(
     path: &Path,
     format: DiskFormat,
     explicit_format: bool,
+    require_absolute: bool,
 ) -> anyhow::Result<()> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         return Err(err_bad_request("disk path must specify a file name"));
     }
-    if !path.is_absolute() {
+    if require_absolute && !path.is_absolute() {
         return Err(err_bad_request(format!(
             "disk path must be absolute: '{}'",
             path.display()
