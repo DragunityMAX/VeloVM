@@ -1674,14 +1674,18 @@ mod tests {
         let saw_patch_srv = Arc::clone(&saw_patch);
         let saw_put_srv = Arc::clone(&saw_put);
 
+        let root = std::env::temp_dir().join("openvmms-patch-fallback-test");
+        let old_bin = root.join("old-openvmm");
+        let new_bin = root.join("new-openvmm");
+        let uefi_fw = root.join("uefi.fd");
         let initial_cfg = HostConfig {
-            data_dir: PathBuf::from("/tmp/openvmms-data"),
-            runtime_dir: PathBuf::from("/tmp/openvmms-run"),
+            data_dir: root.join("data"),
+            runtime_dir: root.join("run"),
             listen_addr: addr.to_string(),
-            openvmm_bin: Some(PathBuf::from("/usr/bin/old-openvmm")),
+            openvmm_bin: Some(old_bin),
             fastdesk_viewer_bin: None,
             openvmm_img_bin: None,
-            uefi_firmware_path: Some(PathBuf::from("/usr/share/uefi.fd")),
+            uefi_firmware_path: Some(uefi_fw),
         };
         let initial_cfg_srv = initial_cfg.clone();
 
@@ -1740,16 +1744,13 @@ mod tests {
 
         let client = ApiClient::new(format!("http://{addr}"), token).unwrap();
         let patch = HostConfigPatch {
-            openvmm_bin: Some(Some(PathBuf::from("/usr/local/bin/new-openvmm"))),
+            openvmm_bin: Some(Some(new_bin.clone())),
             ..Default::default()
         };
         let updated = client.patch_host_config(&patch).unwrap();
         assert!(saw_patch.load(Ordering::SeqCst));
         assert!(saw_put.load(Ordering::SeqCst));
-        assert_eq!(
-            updated.openvmm_bin,
-            Some(PathBuf::from("/usr/local/bin/new-openvmm"))
-        );
+        assert_eq!(updated.openvmm_bin, Some(new_bin));
         assert_eq!(updated.uefi_firmware_path, initial_cfg.uefi_firmware_path);
         srv.join().unwrap();
     }
