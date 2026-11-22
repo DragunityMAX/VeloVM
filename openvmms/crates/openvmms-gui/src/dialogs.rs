@@ -1,5 +1,6 @@
 use crate::controller::BackendHandle;
 use crate::controller::GuiRequest;
+use crate::controller::HostConfigPatch;
 use egui::Color32;
 use egui::RichText;
 use openvmms_core::models::CreateDiskPayload;
@@ -671,6 +672,16 @@ impl HostSettingsDialog {
             submitting: false,
             error: None,
         }
+    }
+
+    pub fn build_patch(&self) -> HostConfigPatch {
+        let mut edited = self.base_config.clone();
+        edited.listen_addr = self.listen_addr.trim().to_string();
+        edited.openvmm_bin = string_to_opt(&self.openvmm_bin);
+        edited.fastdesk_viewer_bin = string_to_opt(&self.fastdesk_viewer_bin);
+        edited.openvmm_img_bin = string_to_opt(&self.openvmm_img_bin);
+        edited.uefi_firmware_path = string_to_opt(&self.uefi_firmware_path);
+        HostConfigPatch::from_diff(&self.base_config, &edited)
     }
 }
 
@@ -1609,15 +1620,14 @@ pub fn render_host_settings_dialog(
                         "Save Host Settings"
                     };
                     if ui.add_enabled(!d.submitting, egui::Button::new(save_label)).clicked() {
-                        let mut cfg = d.base_config.clone();
-                        cfg.listen_addr = d.listen_addr.trim().to_string();
-                        cfg.openvmm_bin = string_to_opt(&d.openvmm_bin);
-                        cfg.fastdesk_viewer_bin = string_to_opt(&d.fastdesk_viewer_bin);
-                        cfg.openvmm_img_bin = string_to_opt(&d.openvmm_img_bin);
-                        cfg.uefi_firmware_path = string_to_opt(&d.uefi_firmware_path);
-                        d.error = None;
-                        d.submitting = true;
-                        backend.send(GuiRequest::SaveHostConfig(cfg));
+                        let patch = d.build_patch();
+                        if patch.is_empty() {
+                            close = true;
+                        } else {
+                            d.error = None;
+                            d.submitting = true;
+                            backend.send(GuiRequest::SaveHostConfig(patch));
+                        }
                     }
                     if ui.add_enabled(!d.submitting, egui::Button::new("Cancel")).clicked() {
                         close = true;

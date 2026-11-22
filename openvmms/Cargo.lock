@@ -2233,7 +2233,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
- "futures-util",
  "libc",
  "prost",
  "prost-build",

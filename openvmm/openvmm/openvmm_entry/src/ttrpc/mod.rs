@@ -2885,6 +2885,11 @@ async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDevic
         }
         .into_resource()
     } else {
+        // Intentional behavioral change from upstream: upstream ignored `disk.r#type`
+        // and always dispatched by file extension. `SCSI_DISK_TYPE_VHDX` is now
+        // explicitly honoured via `open_vhdx_disk` regardless of extension (e.g.
+        // `.avhdx`), so existing clients passing `DiskType=VHDX` for non-VHDX
+        // images must switch to `SCSI_DISK_TYPE_PHYSICAL` or `SCSI_DISK_TYPE_VHD1`.
         let disk_handle = match vmservice::DiskType::from_i32(disk.r#type) {
             Some(vmservice::DiskType::ScsiDiskTypeVhdx) => {
                 openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await

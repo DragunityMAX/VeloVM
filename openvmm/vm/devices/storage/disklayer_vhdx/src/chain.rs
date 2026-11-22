@@ -18,6 +18,34 @@ use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
 
 #[cfg(unix)]
+fn handle_disk_lock_result(
+    res: Result<(), std::fs::TryLockError>,
+    path: &Path,
+    read_only: bool,
+) -> anyhow::Result<()> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!(
+                "disk image '{}' is already locked for writing or in use by another process",
+                path.display()
+            );
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            // Match QEMU's fallback on filesystems without advisory lock support
+            // (e.g., ENOLCK / EOPNOTSUPP on NFS, CIFS, or 9p): warn and continue.
+            tracing::warn!(
+                path = %path.display(),
+                read_only,
+                error = %err,
+                "disk locking unavailable on this filesystem; continuing without file lock"
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
 fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
     if file.metadata().is_ok_and(|m| m.is_file()) {
         let res = if read_only {
@@ -25,19 +53,7 @@ fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyh
         } else {
             file.try_lock()
         };
-        match res {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                anyhow::bail!(
-                    "disk image '{}' is already locked for writing or in use by another process",
-                    path.display()
-                );
-            }
-            Err(std::fs::TryLockError::Error(err)) => {
-                return Err(err)
-                    .with_context(|| format!("failed to lock disk image {}", path.display()));
-            }
-        }
+        handle_disk_lock_result(res, path, read_only)?;
     }
     Ok(())
 }
@@ -487,5 +503,29 @@ mod tests {
             "{child_err:#}"
         );
         drop(base_rw);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_wouldblock_lock_error_warns_and_continues() {
+        let p = Path::new("/mnt/9p/base.vhdx");
+        handle_disk_lock_result(
+            Err(std::fs::TryLockError::Error(std::io::Error::from(
+                std::io::ErrorKind::Unsupported,
+            ))),
+            p,
+            false,
+        )
+        .expect("unsupported filesystem lock error must not fail open");
+        handle_disk_lock_result(
+            Err(std::fs::TryLockError::Error(std::io::Error::other("ENOLCK"))),
+            p,
+            true,
+        )
+        .expect("non-WouldBlock lock error must not fail open");
+
+        let err = handle_disk_lock_result(Err(std::fs::TryLockError::WouldBlock), p, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
     }
 }

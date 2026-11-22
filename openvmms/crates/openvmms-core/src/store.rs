@@ -259,13 +259,20 @@ impl RegistryStore {
     pub fn load_or_create_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
         if fs::symlink_metadata(&path).is_ok() {
-            check_and_repair_token_permissions(&path, true)?;
-            let token = fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?
-                .trim()
-                .to_string();
-            if !token.is_empty() {
-                return Ok(token);
+            let was_permissive = check_and_repair_token_permissions(&path, true)?;
+            if was_permissive {
+                tracing::warn!(
+                    path = %path.display(),
+                    "regenerating daemon.token after detecting overly permissive file permissions"
+                );
+            } else {
+                let token = fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?
+                    .trim()
+                    .to_string();
+                if !token.is_empty() {
+                    return Ok(token);
+                }
             }
         }
         let a = Uuid::new_v4().as_u128();
@@ -277,7 +284,7 @@ impl RegistryStore {
 
     pub fn read_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
-        check_and_repair_token_permissions(&path, false)
+        let _ = check_and_repair_token_permissions(&path, false)
             .with_context(|| format!("reading daemon token at {}", path.display()))?;
         let token = fs::read_to_string(&path)
             .with_context(|| format!("reading daemon token at {}", path.display()))?
@@ -340,20 +347,21 @@ impl RegistryStore {
         if !vm_dir.exists() {
             return Ok(());
         }
-        // Only remove OpenVMMS's own metadata, state, and log files so any
-        // user disk images residing inside vm_dir are preserved unless
-        // explicitly deleted by the caller.
-        for file_name in ["vm.toml", "state.vmgs"] {
+        // Remove logs and state before vm.toml so that if removing open log files
+        // fails (e.g. on Windows), vm.toml remains intact and the VM does not
+        // vanish on daemon restart with orphaned disks. User disk images inside
+        // vm_dir are preserved unless explicitly deleted by the caller.
+        let logs_dir = vm_dir.join("logs");
+        if logs_dir.is_dir() {
+            fs::remove_dir_all(&logs_dir)
+                .with_context(|| format!("removing {}", logs_dir.display()))?;
+        }
+        for file_name in ["state.vmgs", "vm.toml"] {
             let p = vm_dir.join(file_name);
             if p.is_file() {
                 fs::remove_file(&p)
                     .with_context(|| format!("removing {}", p.display()))?;
             }
-        }
-        let logs_dir = vm_dir.join("logs");
-        if logs_dir.is_dir() {
-            fs::remove_dir_all(&logs_dir)
-                .with_context(|| format!("removing {}", logs_dir.display()))?;
         }
         // Remove the VM directory only if it is now empty.
         let _ = fs::remove_dir(&vm_dir);
@@ -391,6 +399,19 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("persisting {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = fs::File::open(parent)
+            && let Err(err) = dir.sync_all()
+            && !matches!(
+                err.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::EROFS)
+            )
+        {
+            return Err(err)
+                .with_context(|| format!("syncing parent directory {}", parent.display()));
+        }
+    }
     Ok(())
 }
 
@@ -455,7 +476,7 @@ fn current_user_token_buf()
     Ok(buf)
 }
 
-fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Result<()> {
+fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Result<bool> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         bail!(
@@ -463,11 +484,13 @@ fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Resu
             path.display()
         );
     }
+    let mut was_permissive = false;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = meta.permissions().mode() & 0o777;
         if (mode & 0o077) != 0 {
+            was_permissive = true;
             if repair {
                 tracing::warn!(
                     path = %path.display(),
@@ -488,6 +511,7 @@ fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Resu
     #[cfg(windows)]
     {
         if !is_path_owner_only_windows(path)? {
+            was_permissive = true;
             if repair {
                 tracing::warn!(
                     path = %path.display(),
@@ -502,7 +526,7 @@ fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Resu
             }
         }
     }
-    Ok(())
+    Ok(was_permissive)
 }
 
 pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
@@ -786,15 +810,20 @@ mod tests {
         let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "pre-existing --data-dir permissions must not be overwritten");
 
-        let _ = store.load_or_create_token().unwrap();
+        let original_token = store.load_or_create_token().unwrap();
         let tok_mode = fs::metadata(store.token_path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(tok_mode, 0o600);
 
-        // Overly permissive existing daemon.token must be repaired back to 0600 on daemon load.
+        // Overly permissive existing daemon.token must be tightened to 0600 AND rotated.
         fs::set_permissions(store.token_path(), fs::Permissions::from_mode(0o644)).unwrap();
-        let _ = store.load_or_create_token().unwrap();
+        let rotated_token = store.load_or_create_token().unwrap();
         let repaired_mode = fs::metadata(store.token_path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(repaired_mode, 0o600);
+        assert_ne!(
+            rotated_token, original_token,
+            "daemon.token must be regenerated when loose permissions are detected"
+        );
+        assert_eq!(store.read_token().unwrap(), rotated_token);
 
         // Symlinked daemon.token must be rejected.
         let decoys = dir.path().join("decoy.token");
@@ -920,5 +949,44 @@ mod tests {
         for r in readers {
             r.join().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_vm_dir_preserves_vm_toml_when_log_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let vm = VmConfig::from_preset("KeepToml", VmPreset::Custom, dir.path());
+        store.save_vm(&vm).unwrap();
+
+        let logs_dir = store.vm_dir(vm.id).join("logs");
+        let log_file = logs_dir.join("openvmm.log");
+        fs::write(&log_file, b"still open").unwrap();
+        fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        struct RestoreLogsPerm(PathBuf);
+        impl Drop for RestoreLogsPerm {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = RestoreLogsPerm(logs_dir.clone());
+
+        // If running as non-root, deleting the non-empty read-only logs dir must fail
+        // BEFORE vm.toml is touched, so load_all_vms() still sees the VM.
+        if fs::remove_file(&log_file).is_err() {
+            let err = store.delete_vm_dir(vm.id).unwrap_err();
+            assert!(err.to_string().contains("removing"), "{err:#}");
+            assert!(store.vm_config_path(vm.id).is_file());
+            let loaded = store.load_all_vms().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].id, vm.id);
+        }
+
+        drop(_restore);
+        store.delete_vm_dir(vm.id).unwrap();
+        assert!(!store.vm_config_path(vm.id).exists());
     }
 }

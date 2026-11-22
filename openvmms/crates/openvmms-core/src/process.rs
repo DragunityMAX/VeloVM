@@ -42,28 +42,25 @@ impl AdoptedProcess {
     pub fn is_alive(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            if try_reap_child_nonblocking(self.pid) {
-                return false;
-            }
             if let Some(fd) = &self.pidfd {
                 let mut pfd = libc::pollfd {
                     fd: fd.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                // A pidfd becomes readable once the process exits and waits to
-                // be reaped (or has already been reaped).
+                // A pidfd becomes readable once the process exits and is ready to
+                // be reaped (or has already been reaped). Never call waitpid on
+                // adopted PIDs: if a PID is reused, waitpid could reap one of
+                // the daemon's own newly spawned children.
                 let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                if rc == 0 {
-                    return true;
-                }
                 if rc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
-                    let _ = try_reap_child_nonblocking(self.pid);
                     return false;
+                }
+                if rc == 0 {
+                    return !is_linux_zombie_or_dead(self.pid);
                 }
             }
             if is_linux_zombie_or_dead(self.pid) {
-                let _ = try_reap_child_nonblocking(self.pid);
                 return false;
             }
             if let Some(expected) = self.expected_start {
@@ -82,7 +79,7 @@ impl AdoptedProcess {
 
         #[cfg(all(unix, not(target_os = "linux")))]
         {
-            !try_reap_child_nonblocking(self.pid) && is_pid_alive_raw(self.pid)
+            is_pid_alive_raw(self.pid)
         }
     }
 
@@ -469,16 +466,6 @@ fn is_pid_alive_raw(pid: u32) -> bool {
     err == Some(libc::EPERM)
 }
 
-#[cfg(unix)]
-fn try_reap_child_nonblocking(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let mut status: libc::c_int = 0;
-    let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-    rc > 0
-}
-
 #[cfg(target_os = "linux")]
 fn is_linux_zombie_or_dead(pid: u32) -> bool {
     let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -621,13 +608,14 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let _ = child.try_wait();
-        let _ = child.kill();
-        let _ = child.wait();
         assert!(exited, "AdoptedProcess::is_alive stayed true after child exited");
         assert!(
             !proc_handle.is_alive(),
-            "AdoptedProcess::is_alive should remain false after exit/reap"
+            "AdoptedProcess::is_alive should remain false before reap"
+        );
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "AdoptedProcess::is_alive must not reap child processes"
         );
     }
 }

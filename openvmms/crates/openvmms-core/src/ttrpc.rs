@@ -114,6 +114,7 @@ impl CancelSocketGuard {
     fn trigger(&self) {
         self.cancelled.store(true, Ordering::Release);
         if let Some(sock) = self.active_sock.lock().unwrap().as_ref() {
+            let _ = sock.set_linger(Some(Duration::ZERO));
             let _ = sock.shutdown(Shutdown::Both);
         }
     }

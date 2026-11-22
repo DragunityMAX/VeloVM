@@ -1009,6 +1009,7 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
         return Ok(vec![NicAttachment::default_consomme()]);
     }
     if let Some(switch_id) = trimmed.strip_prefix("vmswitch:") {
+        let switch_id = switch_id.trim();
         let sid = if switch_id.is_empty() {
             "default".to_string()
         } else {
@@ -1025,7 +1026,8 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
         }]);
     }
     if let Some(tap_name) = trimmed.strip_prefix("tap:") {
-        if tap_name.trim().is_empty() {
+        let tap_name = tap_name.trim();
+        if tap_name.is_empty() {
             bail!("tap:<interface> requires an interface name");
         }
         return Ok(vec![NicAttachment {
@@ -1033,7 +1035,7 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
             name: format!("TAP ({tap_name})"),
             mac_address: generate_hyperv_mac(),
             backend: NicBackendConfig::Tap {
-                name: tap_name.trim().to_string(),
+                name: tap_name.to_string(),
             },
         }]);
     }

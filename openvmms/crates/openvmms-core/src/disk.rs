@@ -5,9 +5,7 @@ use anyhow::Context;
 use anyhow::bail;
 use std::fs;
 use std::io::Read;
-#[cfg(target_os = "linux")]
 use std::io::Seek;
-#[cfg(target_os = "linux")]
 use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
@@ -28,8 +26,8 @@ pub fn file_has_vhdx_signature(path: &Path) -> bool {
 }
 
 /// Validates that `path` has a file name and does not collide with another disk format's
-/// reserved extension.
-pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow::Result<()> {
+/// reserved extension (used on relative inputs before client path resolution).
+pub fn validate_disk_extension_for_format(path: &Path, format: DiskFormat) -> anyhow::Result<()> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         bail!("disk path must specify a file name");
     }
@@ -64,6 +62,18 @@ pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow:
     Ok(())
 }
 
+/// Validates that `path` is an absolute path with a file name and does not collide
+/// with another disk format's reserved extension.
+pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow::Result<()> {
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        bail!("disk path must specify a file name");
+    }
+    if !path.is_absolute() {
+        bail!("disk path '{}' must be an absolute path", path.display());
+    }
+    validate_disk_extension_for_format(path, format)
+}
+
 /// Adjusts mismatched disk extensions so GUI defaults match the requested disk format.
 pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
@@ -75,7 +85,7 @@ pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
         .map(|e| e.to_ascii_lowercase());
     let raw_ext = path.extension().and_then(|e| e.to_str());
     match format {
-        DiskFormat::Raw if validate_disk_path_for_format(path, format).is_ok() => return,
+        DiskFormat::Raw if validate_disk_extension_for_format(path, format).is_ok() => return,
         DiskFormat::Vhdx if raw_ext == Some("vhdx") => return,
         DiskFormat::Vhd if raw_ext == Some("vhd") => return,
         _ => {}
@@ -163,6 +173,8 @@ pub fn create_disk_cancellable(
                 allocate_fixed_raw(&mut file, req.size_bytes, cancelled)
                     .with_context(|| format!("allocating fixed raw disk {}", req.path.display()))
             } else {
+                #[cfg(windows)]
+                mark_file_sparse(&file);
                 file.set_len(req.size_bytes)
                     .with_context(|| format!("sizing raw disk {}", req.path.display()))
             };
@@ -176,20 +188,22 @@ pub fn create_disk_cancellable(
         Some(img_bin) => {
             drop(file);
             let mut cmd = Command::new(img_bin);
-            // `--force` overwrites only the placeholder this operation reserved above.
+            // `--force` overwrites only the placeholder this operation reserved above;
+            // `--` prevents paths starting with `-` from being parsed as CLI flags.
             cmd.arg("create")
-                .arg(&req.path)
                 .arg("--format")
                 .arg("vhdx")
                 .arg("--size")
                 .arg(req.size_bytes.to_string())
-                .arg("--force")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .arg("--force");
             if req.fixed {
                 cmd.arg("--format-options").arg("allocation=fixed");
             }
+            cmd.arg("--")
+                .arg(&req.path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(err) => {
@@ -338,7 +352,145 @@ fn write_fixed_raw_zeros(
     Ok(())
 }
 
+#[cfg(windows)]
+fn mark_file_sparse(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
+    let mut bytes_returned: u32 = 0;
+    // Best-effort: succeeds on NTFS/ReFS and leaves filesystems without sparse
+    // support (e.g. FAT32/exFAT) unaffected.
+    let _ = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+}
+
+struct Vhd1Meta {
+    disk_type: String,
+    virtual_size_bytes: u64,
+    block_size_bytes: Option<u32>,
+}
+
+fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Option<(u32, u64, u64)> {
+    if &footer[0..8] != b"conectix" {
+        return None;
+    }
+    let version = u32::from_be_bytes([footer[12], footer[13], footer[14], footer[15]]);
+    if version != 0x0001_0000 {
+        return None;
+    }
+    let stored_checksum = u32::from_be_bytes([footer[64], footer[65], footer[66], footer[67]]);
+    let sum: u32 = footer
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(64..68).contains(i))
+        .map(|(_, &b)| b as u32)
+        .sum();
+    if !sum != stored_checksum {
+        return None;
+    }
+    let disk_type = u32::from_be_bytes([footer[60], footer[61], footer[62], footer[63]]);
+    if !matches!(disk_type, 2..=4) {
+        return None;
+    }
+    let current_size = u64::from_be_bytes([
+        footer[48], footer[49], footer[50], footer[51], footer[52], footer[53], footer[54],
+        footer[55],
+    ]);
+    if disk_type == 2 && current_size > file_size_bytes.saturating_sub(512) {
+        return None;
+    }
+    let data_offset = u64::from_be_bytes([
+        footer[16], footer[17], footer[18], footer[19], footer[20], footer[21], footer[22],
+        footer[23],
+    ]);
+    Some((disk_type, current_size, data_offset))
+}
+
+fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Option<Vhd1Meta>> {
+    if file_size_bytes < 512 {
+        return Ok(None);
+    }
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("opening {} to inspect VHD1 footer", path.display()))?;
+
+    let mut footer = [0u8; 512];
+    file.seek(SeekFrom::End(-512))?;
+    file.read_exact(&mut footer)?;
+    let parsed = parse_vhd1_footer_bytes(&footer, file_size_bytes).or_else(|| {
+        if file.seek(SeekFrom::Start(0)).is_ok() && file.read_exact(&mut footer).is_ok() {
+            parse_vhd1_footer_bytes(&footer, file_size_bytes)
+        } else {
+            None
+        }
+    });
+    let Some((disk_type_code, virtual_size_bytes, data_offset)) = parsed else {
+        return Ok(None);
+    };
+
+    let disk_type = match disk_type_code {
+        2 => "fixed".to_string(),
+        3 => "dynamic".to_string(),
+        4 => "differencing".to_string(),
+        _ => unreachable!(),
+    };
+    let mut block_size_bytes = None;
+    if matches!(disk_type_code, 3 | 4)
+        && data_offset != u64::MAX
+        && data_offset
+            .checked_add(1024)
+            .is_some_and(|end| end <= file_size_bytes)
+    {
+        let mut dyn_hdr = [0u8; 1024];
+        if file.seek(SeekFrom::Start(data_offset)).is_ok()
+            && file.read_exact(&mut dyn_hdr).is_ok()
+            && &dyn_hdr[0..8] == b"cxsparse"
+        {
+            block_size_bytes = Some(u32::from_be_bytes([
+                dyn_hdr[28],
+                dyn_hdr[29],
+                dyn_hdr[30],
+                dyn_hdr[31],
+            ]));
+        }
+    }
+
+    Ok(Some(Vhd1Meta {
+        disk_type,
+        virtual_size_bytes,
+        block_size_bytes,
+    }))
+}
+
+fn file_has_iso9660_signature(path: &Path, file_size_bytes: u64) -> bool {
+    if file_size_bytes < 0x8006 {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(0x8001)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 5];
+    file.read_exact(&mut magic).is_ok() && &magic == b"CD001"
+}
+
 pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Result<DiskInfo> {
+    if !path.is_absolute() {
+        bail!("disk path '{}' must be an absolute path", path.display());
+    }
     let meta = fs::metadata(path)
         .with_context(|| format!("reading disk metadata for {}", path.display()))?;
     if !meta.is_file() {
@@ -351,7 +503,8 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
-    let is_vhdx = ext.as_deref() == Some("vhdx");
+    let is_vhdx =
+        matches!(ext.as_deref(), Some("vhdx" | "avhdx")) || file_has_vhdx_signature(path);
     if is_vhdx {
         let img_bin = openvmm_img_bin.with_context(|| {
             format!(
@@ -361,8 +514,9 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         })?;
         let output = Command::new(img_bin)
             .arg("info")
-            .arg(path)
             .arg("--json")
+            .arg("--")
+            .arg(path)
             .output()
             .with_context(|| format!("running {}", img_bin.display()))?;
         if !output.status.success() {
@@ -406,10 +560,33 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         });
     }
 
-    let (format, disk_type) = match ext.as_deref() {
-        Some("iso") => ("iso".to_string(), "read-only image".to_string()),
-        Some("vhd") => ("vhd".to_string(), "vhd".to_string()),
-        _ => ("raw".to_string(), "sparse/flat".to_string()),
+    if let Some(vhd) = parse_vhd1_metadata(path, file_size_bytes)? {
+        return Ok(DiskInfo {
+            path: path.to_path_buf(),
+            format: "vhd".to_string(),
+            disk_type: vhd.disk_type,
+            virtual_size_bytes: vhd.virtual_size_bytes,
+            file_size_bytes,
+            block_size_bytes: vhd.block_size_bytes,
+            sector_size_bytes: Some(512),
+            parent_path: None,
+            read_only,
+        });
+    }
+
+    if matches!(ext.as_deref(), Some("vhd" | "avhd")) {
+        bail!(
+            "invalid or corrupt VHD1 image: missing valid VHD footer in {}",
+            path.display()
+        );
+    }
+
+    let (format, disk_type) = if ext.as_deref() == Some("iso")
+        || file_has_iso9660_signature(path, file_size_bytes)
+    {
+        ("iso".to_string(), "read-only image".to_string())
+    } else {
+        ("raw".to_string(), "sparse/flat".to_string())
     };
 
     Ok(DiskInfo {
@@ -573,7 +750,13 @@ mod tests {
             sync_disk_path_extension(&mut p, format);
             assert_eq!(p, PathBuf::from(expected), "{input} as {format:?}");
             assert_eq!(DiskFormat::from_path(&p), format);
-            validate_disk_path_for_format(&p, format).unwrap();
+            validate_disk_extension_for_format(&p, format).unwrap();
+            assert!(
+                validate_disk_path_for_format(&p, format).is_err(),
+                "relative path {p:?} must be rejected by validate_disk_path_for_format"
+            );
+            let abs = std::env::temp_dir().join(&p);
+            validate_disk_path_for_format(&abs, format).unwrap();
         }
     }
 
@@ -627,7 +810,7 @@ mod tests {
             let stub_bin = dir.path().join("stub-openvmm-img.sh");
             fs::write(
                 &stub_bin,
-                "#!/bin/sh\nset -eu\ncmd=\"$1\"\npath=\"$2\"\nif [ \"$cmd\" = \"create\" ]; then\n  sleep 0.05\n  printf \"VHDX_WINNER_PAYLOAD\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
+                "#!/bin/sh\nset -eu\ncmd=\"$1\"\nshift\nsaw_sep=0\npath=\"\"\nfor arg in \"$@\"; do\n  if [ \"$saw_sep\" -eq 1 ]; then\n    path=\"$arg\"\n    break\n  fi\n  if [ \"$arg\" = \"--\" ]; then\n    saw_sep=1\n  fi\ndone\ntest \"$saw_sep\" -eq 1 && test -n \"$path\"\nif [ \"$cmd\" = \"create\" ]; then\n  sleep 0.05\n  printf \"VHDX_WINNER_PAYLOAD\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
             )
             .unwrap();
             fs::set_permissions(&stub_bin, fs::Permissions::from_mode(0o755)).unwrap();
@@ -669,12 +852,13 @@ mod tests {
             assert_eq!(vhdx_err, 7);
             assert_eq!(fs::read(&vhdx_path).unwrap(), b"VHDX_WINNER_PAYLOAD");
 
-            // Case-insensitive .VHDX succeeds as VHDX, .vhd classifies as Vhd, and .img
-            // starting with `vhdxfile` bytes stays Raw (never format-sniffed).
+            // Case-insensitive .VHDX succeeds as VHDX, .vhd classifies as Vhd, and VHDX magic
+            // in an .img file is detected by inspect_disk via content signature while
+            // DiskFormat::from_path still preserves extension classification.
             let vhdx_stub = dir.path().join("vhdx-stub-openvmm-img.sh");
             fs::write(
                 &vhdx_stub,
-                "#!/bin/sh\nset -eu\ncmd=\"$1\"\npath=\"$2\"\nif [ \"$cmd\" = \"create\" ]; then\n  printf \"vhdxfileDUMMY\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
+                "#!/bin/sh\nset -eu\ncmd=\"$1\"\nshift\nsaw_sep=0\npath=\"\"\nfor arg in \"$@\"; do\n  if [ \"$saw_sep\" -eq 1 ]; then\n    path=\"$arg\"\n    break\n  fi\n  if [ \"$arg\" = \"--\" ]; then\n    saw_sep=1\n  fi\ndone\ntest \"$saw_sep\" -eq 1 && test -n \"$path\"\nif [ \"$cmd\" = \"create\" ]; then\n  printf \"vhdxfileDUMMY\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
             )
             .unwrap();
             fs::set_permissions(&vhdx_stub, fs::Permissions::from_mode(0o755)).unwrap();
@@ -694,13 +878,27 @@ mod tests {
             assert_eq!(created.virtual_size_bytes, size_bytes);
             assert_eq!(DiskFormat::from_path(&upper_vhdx), DiskFormat::Vhdx);
 
+            // Leading-dash filenames must be passed safely after `--`.
+            let dash_vhdx = dir.path().join("-leading-dash.vhdx");
+            let dash_created = create_disk(
+                &CreateDiskPayload {
+                    path: dash_vhdx.clone(),
+                    size_bytes,
+                    format: DiskFormat::Vhdx,
+                    fixed: false,
+                },
+                Some(&vhdx_stub),
+            )
+            .unwrap();
+            assert_eq!(dash_created.format, "vhdx");
+
             assert_eq!(DiskFormat::from_path(Path::new("legacy.vhd")), DiskFormat::Vhd);
 
             let raw_with_magic = dir.path().join("raw-with-magic.img");
             fs::write(&raw_with_magic, b"vhdxfileDUMMY").unwrap();
             assert_eq!(DiskFormat::from_path(&raw_with_magic), DiskFormat::Raw);
             let inspected = inspect_disk(&raw_with_magic, Some(&vhdx_stub)).unwrap();
-            assert_eq!(inspected.format, "raw");
+            assert_eq!(inspected.format, "vhdx");
         }
     }
 
@@ -772,6 +970,18 @@ mod tests {
             None,
         )
         .unwrap();
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+            let attrs = fs::metadata(&sparse_path).unwrap().file_attributes();
+            assert_ne!(
+                attrs & FILE_ATTRIBUTE_SPARSE_FILE,
+                0,
+                "expected dynamic raw disk on Windows NTFS to have FILE_ATTRIBUTE_SPARSE_FILE (attrs={attrs:#x})"
+            );
+        }
 
         #[cfg(unix)]
         {
@@ -904,5 +1114,79 @@ mod tests {
         assert_eq!(fixed_info.virtual_size_bytes, 8 * 1024 * 1024);
         assert!(fixed_info.file_size_bytes >= 8 * 1024 * 1024);
         assert!(file_has_vhdx_signature(&fixed_path));
+    }
+
+    fn build_vhd1_footer(disk_type: u32, current_size: u64, data_offset: u64) -> [u8; 512] {
+        let mut footer = [0u8; 512];
+        footer[0..8].copy_from_slice(b"conectix");
+        footer[8..12].copy_from_slice(&0x0000_0002u32.to_be_bytes());
+        footer[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        footer[16..24].copy_from_slice(&data_offset.to_be_bytes());
+        footer[40..48].copy_from_slice(&current_size.to_be_bytes());
+        footer[48..56].copy_from_slice(&current_size.to_be_bytes());
+        footer[60..64].copy_from_slice(&disk_type.to_be_bytes());
+        let sum: u32 = footer.iter().map(|&b| b as u32).sum();
+        footer[64..68].copy_from_slice(&(!sum).to_be_bytes());
+        footer
+    }
+
+    #[test]
+    fn inspect_disk_reports_vhd1_virtual_sizes_and_detects_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Relative path must be rejected by inspect_disk.
+        assert!(inspect_disk(Path::new("relative.img"), None).is_err());
+
+        // Fixed VHD1: virtual_size_bytes must exclude the 512-byte trailing footer.
+        let fixed_vhd = dir.path().join("fixed.vhd");
+        let fixed_virtual = 64 * 1024u64;
+        let mut fixed_bytes = vec![0u8; fixed_virtual as usize];
+        fixed_bytes.extend_from_slice(&build_vhd1_footer(2, fixed_virtual, u64::MAX));
+        fs::write(&fixed_vhd, &fixed_bytes).unwrap();
+        let fixed_info = inspect_disk(&fixed_vhd, None).unwrap();
+        assert_eq!(fixed_info.format, "vhd");
+        assert_eq!(fixed_info.disk_type, "fixed");
+        assert_eq!(fixed_info.virtual_size_bytes, fixed_virtual);
+        assert_eq!(fixed_info.file_size_bytes, fixed_virtual + 512);
+
+        // Dynamic VHD1: virtual_size_bytes comes from footer.current_size (much larger than file size),
+        // and block_size_bytes comes from the dynamic header (`cxsparse`).
+        let dyn_vhd = dir.path().join("dynamic.vhd");
+        let dyn_virtual = 10 * 1024 * 1024 * 1024u64;
+        let footer = build_vhd1_footer(3, dyn_virtual, 512);
+        let mut dyn_hdr = [0u8; 1024];
+        dyn_hdr[0..8].copy_from_slice(b"cxsparse");
+        dyn_hdr[28..32].copy_from_slice(&(2 * 1024 * 1024u32).to_be_bytes());
+        let mut dyn_bytes = Vec::new();
+        dyn_bytes.extend_from_slice(&footer);
+        dyn_bytes.extend_from_slice(&dyn_hdr);
+        dyn_bytes.extend_from_slice(&footer);
+        fs::write(&dyn_vhd, &dyn_bytes).unwrap();
+        let dyn_info = inspect_disk(&dyn_vhd, None).unwrap();
+        assert_eq!(dyn_info.format, "vhd");
+        assert_eq!(dyn_info.disk_type, "dynamic");
+        assert_eq!(dyn_info.virtual_size_bytes, dyn_virtual);
+        assert_eq!(dyn_info.file_size_bytes, dyn_bytes.len() as u64);
+        assert_eq!(dyn_info.block_size_bytes, Some(2 * 1024 * 1024));
+
+        // Content detection works even when a VHD1 file is named `.img`.
+        let renamed_vhd = dir.path().join("disguised-vhd.img");
+        fs::write(&renamed_vhd, &dyn_bytes).unwrap();
+        let renamed_info = inspect_disk(&renamed_vhd, None).unwrap();
+        assert_eq!(renamed_info.format, "vhd");
+        assert_eq!(renamed_info.virtual_size_bytes, dyn_virtual);
+
+        // Corrupt `.vhd` with invalid footer fails rather than pretending to be raw.
+        let bad_vhd = dir.path().join("corrupt.vhd");
+        fs::write(&bad_vhd, vec![0u8; 4096]).unwrap();
+        assert!(inspect_disk(&bad_vhd, None).is_err());
+
+        // ISO9660 primary volume descriptor magic (`CD001` at 0x8001) detects ISO by content.
+        let iso_bin = dir.path().join("installer.bin");
+        let mut iso_bytes = vec![0u8; 0x9000];
+        iso_bytes[0x8001..0x8006].copy_from_slice(b"CD001");
+        fs::write(&iso_bin, &iso_bytes).unwrap();
+        let iso_info = inspect_disk(&iso_bin, None).unwrap();
+        assert_eq!(iso_info.format, "iso");
     }
 }

@@ -24,7 +24,7 @@ jobs:
   build-windows-x64:
     name: Build & Package Windows x64 (WHP)
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -161,9 +161,33 @@ jobs:
           if (Test-Path $autoDir) { Remove-Item -Recurse -Force $autoDir }
           New-Item -ItemType Directory -Force -Path $autoDir | Out-Null
           try {
-            $autoOut = & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --json vm list | Out-String
-            if ($LASTEXITCODE -ne 0 -or $autoOut -notmatch '\[\]') {
-              throw "openvmms auto-start stdout-capture check failed (exit $LASTEXITCODE):`n$autoOut"
+            $psi = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path ".\openvmms\target\release\openvmms.exe").Path)
+            $psi.Arguments = ('--data-dir "{0}" --json vm list' -f $autoDir)
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            try {
+              $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+              $stderrTask = $proc.StandardError.ReadToEndAsync()
+              $deadline = [DateTime]::UtcNow.AddSeconds(15)
+              if (-not $proc.WaitForExit(15000)) {
+                try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+                throw "openvmms auto-start stdout-capture check timed out after 15s"
+              }
+              $remainingMs = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+              $ioTask = [System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]($stdoutTask, $stderrTask))
+              if (-not $ioTask.Wait($remainingMs)) {
+                try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+                throw "openvmms auto-start stdout/stderr pipe remained open after 15s (inherited stdio handle leak)"
+              }
+              $autoOut = $stdoutTask.GetAwaiter().GetResult()
+              $autoErr = $stderrTask.GetAwaiter().GetResult()
+              if ($proc.ExitCode -ne 0 -or $autoOut -notmatch '\[\]') {
+                throw "openvmms auto-start stdout-capture check failed (exit $($proc.ExitCode)):`n$autoOut`n$autoErr"
+              }
+            } finally {
+              $proc.Dispose()
             }
           } finally {
             try {

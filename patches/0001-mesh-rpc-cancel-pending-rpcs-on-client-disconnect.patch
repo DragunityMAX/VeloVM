@@ -1,21 +1,19 @@
 diff --git a/openvmm/support/mesh/mesh_rpc/src/server.rs b/openvmm/support/mesh/mesh_rpc/src/server.rs
-index 24acaf8..63d481f 100644
+index 24acaf8..19b6690 100644
 --- a/openvmm/support/mesh/mesh_rpc/src/server.rs
 +++ b/openvmm/support/mesh/mesh_rpc/src/server.rs
-@@ -29,8 +29,12 @@
+@@ -29,8 +29,10 @@
  use mesh::MeshPayload;
  use mesh::local_node::Port;
  use pal_async::driver::Driver;
-+#[cfg(target_os = "linux")]
 +use pal_async::interest::PollEvents;
  use pal_async::socket::AsSockRef;
  use pal_async::socket::Listener;
-+#[cfg(target_os = "linux")]
 +use pal_async::socket::PollReadyExt;
  use pal_async::socket::PolledSocket;
  use std::collections::HashMap;
  use std::io::Read;
-@@ -168,44 +172,80 @@ pub async fn serve_connection(
+@@ -168,43 +170,70 @@ pub async fn serve_connection(
      ) -> anyhow::Result<()> {
          let (mut reader, mut writer) = stream.split();
          let (stream_send, mut stream_recv) = mesh::channel();
@@ -97,7 +95,7 @@ index 24acaf8..63d481f 100644
 +                        }
 +                    }
 +                    Ok(())
-+                }
+                 }
 +                .await
 +            };
 +            if res.is_err() {
@@ -108,29 +106,19 @@ index 24acaf8..63d481f 100644
 +            }
 +            // A clean read EOF can be either a half-close (`shutdown(SHUT_WR)`),
 +            // where the peer still expects replies, or a full socket close.
-+            // On Linux, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
-+            // so half-closed clients still receive in-flight replies while
-+            // full disconnects cancel pending RPCs immediately.
-+            #[cfg(target_os = "linux")]
-+            {
-+                futures::select! {
-+                    _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
-+                        peer_closed.store(true, std::sync::atomic::Ordering::Release);
-+                        cancel.lock().cancel();
-+                    }
-+                    _ = send_done_rx.fuse() => {}
-                 }
++            // Wait for peer disconnect vs `send_task` completing so half-closed
++            // clients still receive in-flight replies while full disconnects
++            // cancel pending RPCs across all platforms.
++            futures::select! {
++                _ = wait_for_peer_close(&mut reader).fuse() => {
++                    peer_closed.store(true, std::sync::atomic::Ordering::Release);
++                    cancel.lock().cancel();
++                }
++                _ = send_done_rx.fuse() => {}
              }
-+            #[cfg(not(target_os = "linux"))]
-+            {
-+                drop(send_done_rx);
-+                peer_closed.store(true, std::sync::atomic::Ordering::Release);
-+                cancel.lock().cancel();
-+            }
              Ok(())
          };
-         let send_task = async {
-@@ -239,16 +279,24 @@ enum Event<T> {
+@@ -239,16 +268,24 @@ enum Event<T> {
                          responses.push(recv);
                      }
                      Event::Response((stream_id, payload)) => {
@@ -162,7 +150,48 @@ index 24acaf8..63d481f 100644
              anyhow::Result::<_>::Ok(())
          };
          (recv_task, send_task).try_join().await?;
-@@ -626,6 +674,9 @@ mod tests {
+@@ -256,6 +293,40 @@ enum Event<T> {
+     }
+ }
+ 
++async fn wait_for_peer_close(reader: &mut pal_async::socket::ReadHalf<impl AsSockRef>) {
++    #[cfg(target_os = "linux")]
++    {
++        reader.wait_ready(PollEvents::HUP | PollEvents::ERR).await;
++    }
++    #[cfg(not(target_os = "linux"))]
++    {
++        loop {
++            let hup_ready = {
++                let mut hup = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse();
++                let mut timer_ctx = CancelContext::new()
++                    .with_timeout(std::time::Duration::from_millis(10));
++                let mut timer = timer_ctx.cancelled().fuse();
++                futures::select! {
++                    _ = hup => true,
++                    _ = timer => false,
++                }
++            };
++            if hup_ready {
++                break;
++            }
++            match (&*reader.get().as_sock_ref()).write(&[]) {
++                Ok(_) => {}
++                Err(err)
++                    if matches!(
++                        err.kind(),
++                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
++                    ) => {}
++                Err(_) => break,
++            }
++        }
++    }
++}
++
+ fn handle_message(message: ReadResult) -> Result<Request, Status> {
+     if message.stream_id % 2 != 1 {
+         return Err(status_from_err(
+@@ -626,6 +697,9 @@ mod tests {
      use crate::Client;
      use crate::Server;
      use crate::client::ExistingConnection;
@@ -172,7 +201,7 @@ index 24acaf8..63d481f 100644
      use crate::service::Code;
      use crate::service::ServiceRpc;
      use futures::StreamExt;
-@@ -702,4 +753,213 @@ fn client_server() {
+@@ -702,4 +776,211 @@ fn client_server() {
          client_thread.join().unwrap();
          server_thread.join().unwrap().unwrap();
      }
@@ -236,7 +265,6 @@ index 24acaf8..63d481f 100644
 +        server_thread.join().unwrap().unwrap();
 +    }
 +
-+    #[cfg(target_os = "linux")]
 +    #[test]
 +    fn client_half_close_receives_in_flight_reply() {
 +        use crate::message::MESSAGE_TYPE_RESPONSE;
@@ -320,7 +348,6 @@ index 24acaf8..63d481f 100644
 +        server_thread.join().unwrap().unwrap();
 +    }
 +
-+    #[cfg(target_os = "linux")]
 +    #[test]
 +    fn client_half_close_then_full_close_cancels_pending_rpc_context() {
 +        let (c, s) = unix_socket::UnixStream::pair().unwrap();
