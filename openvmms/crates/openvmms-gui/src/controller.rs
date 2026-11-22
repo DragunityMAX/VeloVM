@@ -108,6 +108,7 @@ pub enum GuiUpdate {
         base_url: String,
         host_info: HostInfo,
         host_config: HostConfig,
+        snapshot_seq: u64,
     },
     DialogFinished {
         kind: DialogKind,
@@ -338,10 +339,16 @@ impl BackendState {
                     guard.1 = host_info.daemon_instance_id;
                 }
             }
-            GuiUpdate::HostConfigUpdated { host_info, .. } => {
+            GuiUpdate::HostConfigUpdated {
+                host_info,
+                snapshot_seq,
+                ..
+            } => {
                 self.notified_connected.store(true, Ordering::Release);
-                if host_info.daemon_instance_id.is_some() {
-                    self.daemon_instance_id.lock().unwrap().1 = host_info.daemon_instance_id;
+                let mut guard = self.daemon_instance_id.lock().unwrap();
+                if *snapshot_seq >= guard.0 {
+                    guard.0 = *snapshot_seq;
+                    guard.1 = host_info.daemon_instance_id;
                 }
             }
             GuiUpdate::DaemonDisconnected(_) => {
@@ -993,6 +1000,7 @@ impl BackendState {
             }
             GuiRequest::SaveHostConfig(patch) => {
                 let _guard = self.host_cfg_lock.lock().unwrap();
+                let snapshot_seq = self.next_snapshot_seq();
                 let updated = client.patch_host_config(&patch)?;
                 // Follow only `daemon.addr` when the daemon rebinds; never connect to `updated.listen_addr`.
                 if let Some(next_client) = reload_client_from_runtime_addr(
@@ -1011,6 +1019,7 @@ impl BackendState {
                     base_url,
                     host_info,
                     host_config: updated,
+                    snapshot_seq,
                 });
                 Ok(())
             }

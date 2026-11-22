@@ -58,8 +58,12 @@ fn handle_disk_lock_result(
     }
 }
 
+/// Acquires a Unix advisory file lock on `file` when supported by the filesystem.
+///
+/// Logs a warning and returns `Ok(())` when the filesystem reports that locking
+/// is unsupported.
 #[cfg(unix)]
-fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
+pub fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
     if file.metadata().is_ok_and(|m| m.is_file()) {
         let res = if read_only {
             file.try_lock_shared()

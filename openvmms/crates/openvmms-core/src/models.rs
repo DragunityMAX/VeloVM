@@ -580,6 +580,17 @@ impl std::fmt::Display for PortForward {
     }
 }
 
+fn canonical_bind_ip(addr: &str) -> Option<std::net::IpAddr> {
+    match addr.trim().parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => Some(std::net::IpAddr::V4(v4)),
+        std::net::IpAddr::V6(v6) => Some(
+            v6.to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+        ),
+    }
+}
+
 impl PortForward {
     pub fn normalize(&mut self) {
         let trimmed = self.host_addr.trim();
@@ -591,9 +602,19 @@ impl PortForward {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.host_addr
+        let ip = self
+            .host_addr
             .parse::<std::net::IpAddr>()
             .with_context(|| format!("invalid port forward host address '{}'", self.host_addr))?;
+        if let std::net::IpAddr::V6(v6) = ip
+            && let Some(v4) = v6.to_ipv4_mapped()
+        {
+            bail!(
+                "IPv4-mapped IPv6 port forward host address '{}' is not supported; use IPv4 address '{}' instead",
+                self.host_addr,
+                v4
+            );
+        }
         if self.host_port == 0 {
             bail!("port forward host_port must be >= 1");
         }
@@ -608,13 +629,13 @@ impl PortForward {
             return false;
         }
         match (
-            self.host_addr.trim().parse::<std::net::IpAddr>(),
-            other.host_addr.trim().parse::<std::net::IpAddr>(),
+            canonical_bind_ip(&self.host_addr),
+            canonical_bind_ip(&other.host_addr),
         ) {
-            (Ok(std::net::IpAddr::V4(a)), Ok(std::net::IpAddr::V4(b))) => {
+            (Some(std::net::IpAddr::V4(a)), Some(std::net::IpAddr::V4(b))) => {
                 a == b || a.is_unspecified() || b.is_unspecified()
             }
-            (Ok(std::net::IpAddr::V6(a)), Ok(std::net::IpAddr::V6(b))) => {
+            (Some(std::net::IpAddr::V6(a)), Some(std::net::IpAddr::V6(b))) => {
                 a == b || a.is_unspecified() || b.is_unspecified()
             }
             _ => false,
@@ -626,10 +647,10 @@ impl PortForward {
             return false;
         }
         match (
-            self.host_addr.trim().parse::<std::net::IpAddr>(),
-            other.host_addr.trim().parse::<std::net::IpAddr>(),
+            canonical_bind_ip(&self.host_addr),
+            canonical_bind_ip(&other.host_addr),
         ) {
-            (Ok(a), Ok(b)) => a.is_ipv4() == b.is_ipv4(),
+            (Some(a), Some(b)) => a.is_ipv4() == b.is_ipv4(),
             _ => false,
         }
     }
@@ -2054,5 +2075,45 @@ mod tests {
         assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.vhd")), DiskFormat::Vhd);
         assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.avhd")), DiskFormat::Vhd);
         assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.AVHD")), DiskFormat::Vhd);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_port_forward_is_rejected_and_canonicalized_in_overlaps() {
+        let mapped_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::ffff:127.0.0.1".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let err = mapped_loopback.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("IPv4-mapped IPv6"),
+            "unexpected error: {err:#}"
+        );
+
+        let mapped_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::ffff:0.0.0.0".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        assert!(mapped_wild.validate().is_err());
+
+        let v4_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 8080,
+            guest_port: 81,
+        };
+        let v4_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "0.0.0.0".into(),
+            host_port: 8080,
+            guest_port: 82,
+        };
+        assert!(mapped_loopback.overlaps(&v4_loopback));
+        assert!(v4_loopback.overlaps(&mapped_loopback));
+        assert!(mapped_loopback.overlaps(&v4_wild));
+        assert!(v4_wild.overlaps(&mapped_loopback));
     }
 }

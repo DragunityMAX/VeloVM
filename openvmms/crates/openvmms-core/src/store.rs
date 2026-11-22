@@ -377,9 +377,15 @@ impl RegistryStore {
                 .with_context(|| format!("removing {}", vm_toml.display()))?;
         }
         let vmgs_path = vm_dir.join("state.vmgs");
-        if vmgs_path.is_file() {
-            fs::remove_file(&vmgs_path)
-                .with_context(|| format!("removing {}", vmgs_path.display()))?;
+        if vmgs_path.is_file()
+            && let Err(err) = fs::remove_file(&vmgs_path)
+        {
+            tracing::warn!(
+                vm_id = %id,
+                path = %vmgs_path.display(),
+                error = %err,
+                "failed to remove state.vmgs during VM deletion; continuing cleanup"
+            );
         }
         // Remove the VM directory only if it is now empty.
         let _ = fs::remove_dir(&vm_dir);

@@ -961,7 +961,6 @@ impl Supervisor {
                 let missing = collect_missing_disk_path_keys(&guard, None, &cfg.disks, &path_keys);
                 if missing.is_empty() {
                     ensure_disks_not_conflicting_with_keys(&guard, None, &cfg.disks, &path_keys)?;
-                    ensure_port_forwards_not_conflicting_across_vms(&guard, None, &cfg.nics)?;
                     break;
                 }
                 missing
@@ -1065,14 +1064,7 @@ impl Supervisor {
                             None,
                             &cfg.disks,
                             &post_keys,
-                        )
-                        .and_then(|()| {
-                            ensure_port_forwards_not_conflicting_across_vms(
-                                &guard,
-                                None,
-                                &cfg.nics,
-                            )
-                        }) {
+                        ) {
                             drop(guard);
                             let _ = self.store.delete_vm_dir(probe_id);
                             return Err(err);
@@ -1171,7 +1163,6 @@ impl Supervisor {
         }
 
         let disks_updated = payload.disks.is_some();
-        let nics_updated = payload.nics.is_some();
         let validation_opts = VmValidationOptions::for_update(&payload);
         let (prev_cfg, updated, snap_gen, all_disk_paths) = {
             let guard = self.vms.read().unwrap();
@@ -1243,9 +1234,6 @@ impl Supervisor {
             }
             updated.normalize();
             updated.updated_at = Utc::now();
-            if nics_updated {
-                ensure_port_forwards_not_conflicting_across_vms(&guard, Some(id), &updated.nics)?;
-            }
 
             let extra: Vec<PathBuf> = if disks_updated {
                 updated.disks.iter().map(|d| d.path.clone()).collect()
@@ -1349,15 +1337,6 @@ impl Supervisor {
                             "cannot edit hardware configuration while VM '{}' is {}",
                             vm.config.name, vm.runtime.status
                         )));
-                    }
-                    if nics_updated
-                        && let Err(err) = ensure_port_forwards_not_conflicting_across_vms(
-                            &guard,
-                            Some(id),
-                            &updated.nics,
-                        )
-                    {
-                        break 'commit Err(err);
                     }
                     if disks_updated {
                         let missing = collect_missing_disk_path_keys(
@@ -1503,9 +1482,9 @@ impl Supervisor {
         .map_err(|e| anyhow::anyhow!("delete_vm task failed: {e}"))?;
         if let Err(err) = del_res {
             if !vm_toml_exists {
-                // `vm.toml` was already removed before a subsequent cleanup step failed
-                // (e.g. `state.vmgs` locked on Windows). Drop the in-memory ghost entry
-                // and emit `VmDeleted` instead of stranding an unpersisted VM.
+                // `vm.toml` was already removed before an unexpected post-`vm.toml` cleanup
+                // step failed (`state.vmgs` removal is best-effort). Drop the in-memory ghost
+                // entry and emit `VmDeleted` instead of stranding an unpersisted VM.
                 deleting_guard.armed = false;
                 let revision = {
                     let mut guard = self.vms.write().unwrap();
@@ -1670,21 +1649,26 @@ impl Supervisor {
                     "cannot start VM while host runtime_dir is being updated",
                 ));
             }
-            let vm = guard
-                .get_mut(&id)
-                .ok_or_else(|| err_not_found("VM not found"))?;
-            if vm.deleting {
-                return Err(err_conflict(format!(
-                    "cannot start VM '{}' while it is being deleted",
-                    vm.config.name
-                )));
-            }
-            if !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
-                return Err(err_conflict(format!(
-                    "VM '{}' is already {}",
-                    vm.config.name, vm.runtime.status
-                )));
-            }
+            let vm_nics = {
+                let vm = guard
+                    .get(&id)
+                    .ok_or_else(|| err_not_found("VM not found"))?;
+                if vm.deleting {
+                    return Err(err_conflict(format!(
+                        "cannot start VM '{}' while it is being deleted",
+                        vm.config.name
+                    )));
+                }
+                if !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
+                    return Err(err_conflict(format!(
+                        "VM '{}' is already {}",
+                        vm.config.name, vm.runtime.status
+                    )));
+                }
+                vm.config.nics.clone()
+            };
+            ensure_port_forwards_not_conflicting_with_active_vms(&guard, id, &vm_nics)?;
+            let vm = guard.get_mut(&id).unwrap();
             vm.generation += 1;
             let start_gen = vm.generation;
             let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -3954,8 +3938,8 @@ impl Supervisor {
                 .ok_or_else(|| err_not_found("VM not found"))?;
             let sock_opt = vm.active_rpc_socket("modify port forwarding")?;
             validate_port_forward_change(&vm.config, nic_id, &port, add)?;
-            if add {
-                ensure_port_forward_not_conflicting_across_vms(&guard, id, &port)?;
+            if add && sock_opt.is_some() {
+                ensure_port_forward_not_conflicting_with_active_vms(&guard, id, &port)?;
             }
             match sock_opt {
                 Some(sock) => Ok((sock, vm.generation)),
@@ -4004,9 +3988,6 @@ impl Supervisor {
                         {
                             should_rollback_disk_file = true;
                             return Err(err);
-                        }
-                        if add {
-                            ensure_port_forward_not_conflicting_across_vms(&guard, id, &port)?;
                         }
                     }
                     let vm = guard
@@ -4070,7 +4051,7 @@ impl Supervisor {
                     }
                     validate_port_forward_change(&vm.config, nic_id, &port, add)?;
                     if add {
-                        ensure_port_forward_not_conflicting_across_vms(&guard, id, &port)?;
+                        ensure_port_forward_not_conflicting_with_active_vms(&guard, id, &port)?;
                     }
                     let prev = vm.config.clone();
                     let updated = apply_port_forward_change(&prev, nic_id, &port, add)?;
@@ -4125,7 +4106,7 @@ impl Supervisor {
                         should_rollback_disk_file = true;
                         validate_port_forward_change(&vm.config, nic_id, &port, add)?;
                         if add {
-                            ensure_port_forward_not_conflicting_across_vms(&guard, id, &port)?;
+                            ensure_port_forward_not_conflicting_with_active_vms(&guard, id, &port)?;
                         }
                     }
                     let vm = guard
@@ -4592,9 +4573,9 @@ fn ensure_disks_not_conflicting_with_keys(
     Ok(())
 }
 
-fn ensure_port_forwards_not_conflicting_across_vms(
+fn ensure_port_forwards_not_conflicting_with_active_vms(
     vms: &HashMap<Uuid, ManagedVm>,
-    self_id: Option<Uuid>,
+    self_id: Uuid,
     nics: &[NicAttachment],
 ) -> anyhow::Result<()> {
     let mut candidate_forwards: Vec<&PortForward> = Vec::new();
@@ -4607,7 +4588,7 @@ fn ensure_port_forwards_not_conflicting_across_vms(
         return Ok(());
     }
     for other in vms.values() {
-        if Some(other.config.id) == self_id {
+        if other.config.id == self_id || matches!(other.runtime.status, VmStatus::Off | VmStatus::Error) {
             continue;
         }
         for other_nic in &other.config.nics {
@@ -4616,7 +4597,7 @@ fn ensure_port_forwards_not_conflicting_across_vms(
                     for pf in &candidate_forwards {
                         if existing.overlaps(pf) {
                             return Err(err_conflict(format!(
-                                "port forward {pf} overlaps existing rule {existing} on VM '{}' (NIC {})",
+                                "port forward {pf} overlaps existing rule {existing} on active VM '{}' (NIC {})",
                                 other.config.name, other_nic.name
                             )));
                         }
@@ -4628,13 +4609,13 @@ fn ensure_port_forwards_not_conflicting_across_vms(
     Ok(())
 }
 
-fn ensure_port_forward_not_conflicting_across_vms(
+fn ensure_port_forward_not_conflicting_with_active_vms(
     vms: &HashMap<Uuid, ManagedVm>,
     self_id: Uuid,
     port: &PortForward,
 ) -> anyhow::Result<()> {
     for other in vms.values() {
-        if other.config.id == self_id {
+        if other.config.id == self_id || matches!(other.runtime.status, VmStatus::Off | VmStatus::Error) {
             continue;
         }
         for other_nic in &other.config.nics {
@@ -4642,7 +4623,7 @@ fn ensure_port_forward_not_conflicting_across_vms(
                 for existing in port_forwards {
                     if existing.overlaps(port) {
                         return Err(err_conflict(format!(
-                            "port forward {port} overlaps existing rule {existing} on VM '{}' (NIC {})",
+                            "port forward {port} overlaps existing rule {existing} on active VM '{}' (NIC {})",
                             other.config.name, other_nic.name
                         )));
                     }
@@ -6134,7 +6115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_vm_port_forward_conflicts_are_rejected() {
+    async fn cross_vm_port_forward_conflicts_are_rejected_only_against_active_vms() {
         let dir = tempfile::tempdir().unwrap();
         let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
 
@@ -6150,7 +6131,7 @@ mod tests {
             internal_dns: true,
             allow_host_local_access: false,
         };
-        let _vm_a = sup
+        let vm_a = sup
             .create_vm(CreateVmPayload {
                 name: "PortA-VM".into(),
                 preset: openvmms_core::models::VmPreset::Custom,
@@ -6161,63 +6142,67 @@ mod tests {
             })
             .unwrap();
 
-        // create_vm with overlapping exact or wildcard forward must fail.
-        for host_addr in ["127.0.0.1", "0.0.0.0"] {
-            let mut nic_conflict = NicAttachment::default_consomme();
-            nic_conflict.backend = NicBackendConfig::Consomme {
-                cidr: None,
-                port_forwards: vec![PortForward {
-                    protocol: IpProto::Tcp,
-                    host_addr: host_addr.into(),
-                    host_port: 8080,
-                    guest_port: 81,
-                }],
-                internal_dns: true,
-                allow_host_local_access: false,
-            };
-            assert!(
-                sup.create_vm(CreateVmPayload {
-                    name: "PortConflict-VM".into(),
-                    preset: openvmms_core::models::VmPreset::Custom,
-                    vcpus: Some(2),
-                    memory_mb: Some(512),
-                    nics: Some(vec![nic_conflict]),
-                    ..Default::default()
-                })
-                .is_err()
-            );
-        }
-
+        // Stopped VMs may share overlapping rules via create_vm and unrelated NIC edits.
+        let mut nic_b = NicAttachment::default_consomme();
+        nic_b.backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "0.0.0.0".into(),
+                host_port: 8080,
+                guest_port: 81,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
         let vm_b = sup
             .create_vm(CreateVmPayload {
                 name: "PortB-VM".into(),
                 preset: openvmms_core::models::VmPreset::Custom,
                 vcpus: Some(2),
                 memory_mb: Some(512),
+                nics: Some(vec![nic_b]),
                 ..Default::default()
             })
             .unwrap();
-        let nic_b_id = vm_b.config.nics[0].id;
 
-        // add_port_forward with overlapping rule must fail.
-        assert!(
-            sup.add_port_forward(
-                &vm_b.config.id.to_string(),
-                nic_b_id,
-                PortForward {
-                    protocol: IpProto::Tcp,
-                    host_addr: "127.0.0.1".into(),
-                    host_port: 8080,
-                    guest_port: 82,
-                },
-            )
+        let mut edited_b_nics = vm_b.config.nics.clone();
+        if let NicBackendConfig::Consomme { internal_dns, .. } = &mut edited_b_nics[0].backend {
+            *internal_dns = false;
+        }
+        sup.update_vm(
+            &vm_b.config.id.to_string(),
+            UpdateVmPayload {
+                nics: Some(edited_b_nics),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Stopped VM may also add an overlapping rule via offline add_port_forward and update_vm.
+        let vm_c = sup
+            .create_vm(CreateVmPayload {
+                name: "PortC-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            })
+            .unwrap();
+        let nic_c_id = vm_c.config.nics[0].id;
+        let exact_pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 8080,
+            guest_port: 82,
+        };
+        sup.add_port_forward(&vm_c.config.id.to_string(), nic_c_id, exact_pf.clone())
             .await
-            .is_err()
-        );
+            .unwrap();
 
-        // update_vm setting overlapping NIC forward must fail.
-        let mut bad_nics = vm_b.config.nics.clone();
-        bad_nics[0].backend = NicBackendConfig::Consomme {
+        let mut wild_nics = vm_c.config.nics.clone();
+        wild_nics[0].backend = NicBackendConfig::Consomme {
             cidr: None,
             port_forwards: vec![PortForward {
                 protocol: IpProto::Tcp,
@@ -6228,31 +6213,65 @@ mod tests {
             internal_dns: true,
             allow_host_local_access: false,
         };
-        assert!(
-            sup.update_vm(
-                &vm_b.config.id.to_string(),
-                UpdateVmPayload {
-                    nics: Some(bad_nics),
-                    ..Default::default()
-                },
-            )
-            .await
-            .is_err()
-        );
-
-        // Non-overlapping host_port succeeds.
-        sup.add_port_forward(
-            &vm_b.config.id.to_string(),
-            nic_b_id,
-            PortForward {
-                protocol: IpProto::Tcp,
-                host_addr: "127.0.0.1".into(),
-                host_port: 8081,
-                guest_port: 80,
+        sup.update_vm(
+            &vm_c.config.id.to_string(),
+            UpdateVmPayload {
+                nics: Some(wild_nics),
+                ..Default::default()
             },
         )
         .await
         .unwrap();
+
+        // Once PortA-VM is active, starting a VM with an overlapping wildcard or exact rule fails.
+        sup.vms
+            .write()
+            .unwrap()
+            .get_mut(&vm_a.config.id)
+            .unwrap()
+            .runtime
+            .status = VmStatus::Running;
+
+        let err_wild = sup
+            .start_vm(&vm_c.config.id.to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err_wild:#}").contains("overlaps existing rule"),
+            "unexpected error for wildcard start: {err_wild:#}"
+        );
+
+        let mut exact_nics = vm_c.config.nics.clone();
+        exact_nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![exact_pf],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        sup.update_vm(
+            &vm_c.config.id.to_string(),
+            UpdateVmPayload {
+                nics: Some(exact_nics),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let err_exact = sup
+            .start_vm(&vm_c.config.id.to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err_exact:#}").contains("overlaps existing rule"),
+            "unexpected error for exact start: {err_exact:#}"
+        );
+        assert_eq!(
+            sup.get_vm(&vm_c.config.id.to_string())
+                .unwrap()
+                .runtime
+                .status,
+            VmStatus::Off
+        );
     }
 
     #[cfg(unix)]
