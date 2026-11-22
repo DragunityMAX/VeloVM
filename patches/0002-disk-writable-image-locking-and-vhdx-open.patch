@@ -1,78 +1,11 @@
-diff --git a/openvmm/openvmm/openvmm_helpers/Cargo.toml b/openvmm/openvmm/openvmm_helpers/Cargo.toml
-index 5c1e14e..c618c2a 100644
---- a/openvmm/openvmm/openvmm_helpers/Cargo.toml
-+++ b/openvmm/openvmm/openvmm_helpers/Cargo.toml
-@@ -23,7 +23,7 @@ anyhow.workspace = true
- fs-err.workspace = true
- tracing.workspace = true
- 
--[target.'cfg(target_os = "linux")'.dependencies]
-+[target.'cfg(unix)'.dependencies]
- libc.workspace = true
- 
- [target.'cfg(windows)'.dependencies]
 diff --git a/openvmm/openvmm/openvmm_helpers/src/disk.rs b/openvmm/openvmm/openvmm_helpers/src/disk.rs
-index 4eab368..3e37830 100644
+index 4eab368..881eab6 100644
 --- a/openvmm/openvmm/openvmm_helpers/src/disk.rs
 +++ b/openvmm/openvmm/openvmm_helpers/src/disk.rs
-@@ -31,15 +31,156 @@ pub struct OpenDiskOptions {
+@@ -31,15 +31,102 @@ pub struct OpenDiskOptions {
      pub direct: bool,
  }
  
-+#[cfg(unix)]
-+fn is_unsupported_lock_error(err: &std::io::Error) -> bool {
-+    #[allow(unreachable_patterns)]
-+    let unsupported_errno = matches!(
-+        err.raw_os_error(),
-+        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS)
-+    );
-+    err.kind() == std::io::ErrorKind::Unsupported || unsupported_errno
-+}
-+
-+#[cfg(unix)]
-+fn handle_disk_lock_result(
-+    res: Result<(), std::fs::TryLockError>,
-+    path: &Path,
-+    read_only: bool,
-+) -> anyhow::Result<()> {
-+    match res {
-+        Ok(()) => Ok(()),
-+        Err(std::fs::TryLockError::WouldBlock) => {
-+            anyhow::bail!(
-+                "disk image '{}' is already locked for writing or in use by another process",
-+                path.display()
-+            );
-+        }
-+        Err(std::fs::TryLockError::Error(err)) if is_unsupported_lock_error(&err) => {
-+            // Match QEMU's fallback on filesystems without advisory lock support
-+            // (e.g., ENOLCK / EOPNOTSUPP / ENOTSUP / ENOSYS on NFS, CIFS, or 9p): warn and continue.
-+            tracing::warn!(
-+                path = %path.display(),
-+                read_only,
-+                error = %err,
-+                "disk locking unavailable on this filesystem; continuing without file lock"
-+            );
-+            Ok(())
-+        }
-+        Err(std::fs::TryLockError::Error(err)) => {
-+            Err(err).with_context(|| format!("acquiring file lock on {}", path.display()))
-+        }
-+    }
-+}
-+
-+#[cfg(unix)]
-+fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
-+    if file.metadata().is_ok_and(|m| m.is_file()) {
-+        let res = if read_only {
-+            file.try_lock_shared()
-+        } else {
-+            file.try_lock()
-+        };
-+        handle_disk_lock_result(res, path, read_only)?;
-+    }
-+    Ok(())
-+}
-+
 +fn open_disk_file_with_lock(
 +    path: &Path,
 +    read_only: bool,
@@ -116,7 +49,7 @@ index 4eab368..3e37830 100644
 +    };
 +
 +    #[cfg(unix)]
-+    acquire_disk_lock(&file, path, !writable)?;
++    disklayer_vhdx::chain::acquire_disk_lock(&file, path, !writable)?;
 +
 +    Ok(file)
 +}
@@ -163,8 +96,10 @@ index 4eab368..3e37830 100644
 +
  /// Opens the resources needed for using a disk from a file at `path`.
  ///
- /// If the file ends with .vhd and is a fixed VHD1, it will be opened using
- /// the user-mode VHD parser. Otherwise, if the file ends with .vhd, the
+-/// If the file ends with .vhd and is a fixed VHD1, it will be opened using
+-/// the user-mode VHD parser. Otherwise, if the file ends with .vhd, the
++/// If the file ends with .vhd or .avhd and is a fixed VHD1, it will be opened using
++/// the user-mode VHD parser. Otherwise, if the file ends with .vhd or .avhd, the
  /// file will be opened using the kernel-mode VHD parser (Windows only).
  ///
 -/// If the file ends with .vhdx, the kernel-mode VHD parser is used on
@@ -175,7 +110,7 @@ index 4eab368..3e37830 100644
  ///
  /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
  pub async fn open_disk_type(
-@@ -53,18 +194,18 @@ pub async fn open_disk_type(
+@@ -53,18 +140,18 @@ pub async fn open_disk_type(
          };
          Ok(())
      };
@@ -190,17 +125,18 @@ index 4eab368..3e37830 100644
              disk_vmdk::open_vmdk(path, read_only)
                  .with_context(|| disk_open_error(path, "failed to open"))?
          }
-         Some("vhd") => {
+-        Some("vhd") => {
 -            let file = std::fs::OpenOptions::new()
 -                .read(true)
 -                .write(!read_only)
 -                .open(path)
 -                .with_context(|| disk_open_error(path, "failed to open"))?;
++        Some("vhd" | "avhd") => {
 +            let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
  
              match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
                  Ok(vhd) => {
-@@ -90,23 +231,7 @@ pub async fn open_disk_type(
+@@ -90,23 +177,7 @@ pub async fn open_disk_type(
                  Err(err) => return Err(err.into()),
              }
          }
@@ -225,7 +161,7 @@ index 4eab368..3e37830 100644
          Some("iso") if !read_only => {
              anyhow::bail!("iso file cannot be opened as read/write")
          }
-@@ -114,11 +239,7 @@ pub async fn open_disk_type(
+@@ -114,11 +185,7 @@ pub async fn open_disk_type(
              ensure_no_direct(".vmgs")?;
              // VMGS files are fixed VHD1s. Don't bother to validate the footer
              // here; let the resource resolver do that later.
@@ -238,7 +174,7 @@ index 4eab368..3e37830 100644
  
              Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
          }
-@@ -132,19 +253,24 @@ pub fn create_disk_type(
+@@ -132,23 +199,31 @@ pub fn create_disk_type(
      size: u64,
      options: OpenDiskOptions,
  ) -> anyhow::Result<Resource<DiskHandleKind>> {
@@ -271,7 +207,14 @@ index 4eab368..3e37830 100644
              file.set_len(size)?;
              disk_vhd1::Vhd1Disk::make_fixed(&file)?;
              Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
-@@ -174,28 +300,15 @@ fn open_raw_disk(
+         }
++        Some("avhd") => {
++            anyhow::bail!("creating avhd not supported")
++        }
+         Some("vhdx") => {
+             anyhow::bail!("creating vhdx not supported")
+         }
+@@ -174,28 +249,15 @@ fn open_raw_disk(
      }
  
      let create = size.is_some();
@@ -302,7 +245,7 @@ index 4eab368..3e37830 100644
          file.set_len(size)?;
      }
  
-@@ -288,4 +401,242 @@ async fn rejects_vmdk_write_direct_io_and_creation() {
+@@ -288,4 +350,301 @@ async fn rejects_vmdk_write_direct_io_and_creation() {
              .is_err()
          );
      }
@@ -508,41 +451,100 @@ index 4eab368..3e37830 100644
 +        }
 +    }
 +
-+    #[cfg(unix)]
-+    #[test]
-+    fn unsupported_lock_error_warns_and_real_io_errors_fail() {
-+        let p = Path::new("/mnt/nfs/disk.img");
-+        handle_disk_lock_result(
-+            Err(std::fs::TryLockError::Error(std::io::Error::from(
-+                std::io::ErrorKind::Unsupported,
-+            ))),
-+            p,
-+            false,
-+        )
-+        .expect("unsupported filesystem lock error should warn and continue without locking");
-+        handle_disk_lock_result(
-+            Err(std::fs::TryLockError::Error(std::io::Error::from_raw_os_error(
-+                libc::ENOLCK,
-+            ))),
-+            p,
-+            true,
-+        )
-+        .expect("ENOLCK filesystem lock error should warn and continue without locking");
++    #[async_test]
++    async fn avhd_dispatches_to_vhd1_not_raw() {
++        let dir = tempfile::tempdir().unwrap();
 +
-+        for raw_err in [libc::EBADF, libc::EIO] {
-+            handle_disk_lock_result(
-+                Err(std::fs::TryLockError::Error(std::io::Error::from_raw_os_error(
-+                    raw_err,
-+                ))),
-+                p,
-+                false,
++        // Arbitrary bytes with `.avhd` or `.AVHD` extension must fail VHD1 validation rather than
++        // falling back to raw disk open.
++        for name in ["invalid.avhd", "Invalid.AVHD"] {
++            let bad_avhd = dir.path().join(name);
++            std::fs::write(&bad_avhd, b"not-a-valid-vhd1-payload").unwrap();
++            let err = open_disk_type(
++                &bad_avhd,
++                OpenDiskOptions {
++                    read_only: true,
++                    direct: false,
++                },
 +            )
-+            .expect_err("real I/O or bad-fd lock errors must fail");
++            .await
++            .unwrap_err();
++            assert!(
++                err.chain()
++                    .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
++                "expected VHD error for {name}, got: {err:#}"
++            );
 +        }
 +
-+        let err = handle_disk_lock_result(Err(std::fs::TryLockError::WouldBlock), p, false)
++        // Creating `.avhd` via create_disk_type must also be rejected instead of falling back to raw.
++        let create_err = create_disk_type(
++            &dir.path().join("new.avhd"),
++            64 * 1024,
++            OpenDiskOptions {
++                read_only: false,
++                direct: false,
++            },
++        )
++        .unwrap_err();
++        assert!(
++            create_err.to_string().contains("creating avhd not supported"),
++            "{create_err:#}"
++        );
++
++        // Valid fixed VHD1 image with `.avhd` extension opens cleanly.
++        let seed_vhd = dir.path().join("seed.vhd");
++        let created = create_disk_type(
++            &seed_vhd,
++            64 * 1024,
++            OpenDiskOptions {
++                read_only: false,
++                direct: false,
++            },
++        )
++        .unwrap();
++        drop(created);
++        let fixed_avhd = dir.path().join("fixed.avhd");
++        std::fs::rename(&seed_vhd, &fixed_avhd).unwrap();
++        let _opened = open_disk_type(
++            &fixed_avhd,
++            OpenDiskOptions {
++                read_only: true,
++                direct: false,
++            },
++        )
++        .await
++        .unwrap();
++
++        // On Linux, a dynamic/differencing VHD1 `.avhd` hits the non-fixed check instead of opening as raw.
++        #[cfg(not(windows))]
++        {
++            let mut footer = [0u8; 512];
++            footer[0..8].copy_from_slice(b"conectix");
++            footer[8..12].copy_from_slice(&0x0000_0002u32.to_be_bytes());
++            footer[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
++            footer[16..24].copy_from_slice(&512u64.to_be_bytes());
++            footer[40..48].copy_from_slice(&(64 * 1024u64).to_be_bytes());
++            footer[48..56].copy_from_slice(&(64 * 1024u64).to_be_bytes());
++            footer[60..64].copy_from_slice(&4u32.to_be_bytes());
++            let sum: u32 = footer.iter().map(|&b| b as u32).sum();
++            footer[64..68].copy_from_slice(&(!sum).to_be_bytes());
++
++            let diff_avhd = dir.path().join("diff.avhd");
++            std::fs::write(&diff_avhd, footer).unwrap();
++            let err = open_disk_type(
++                &diff_avhd,
++                OpenDiskOptions {
++                    read_only: true,
++                    direct: false,
++                },
++            )
++            .await
 +            .unwrap_err();
-+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
++            assert!(
++                err.to_string().contains("non-fixed VHD not supported on Linux"),
++                "{err:#}"
++            );
++        }
 +    }
  }
 diff --git a/openvmm/vm/devices/storage/disklayer_vhdx/Cargo.toml b/openvmm/vm/devices/storage/disklayer_vhdx/Cargo.toml
@@ -564,10 +566,10 @@ index 7330b00..c03826d 100644
  pal_async.workspace = true
  storage_tests.workspace = true
 diff --git a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
-index 3668d9c..d7e6c9d 100644
+index 3668d9c..ba0902a 100644
 --- a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
 +++ b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
-@@ -17,6 +17,101 @@
+@@ -17,6 +17,105 @@
  use vm_resource::Resource;
  use vm_resource::kind::DiskHandleKind;
  
@@ -612,8 +614,12 @@ index 3668d9c..d7e6c9d 100644
 +    }
 +}
 +
++/// Acquires a Unix advisory file lock on `file` when supported by the filesystem.
++///
++/// Logs a warning and returns `Ok(())` when the filesystem reports that locking
++/// is unsupported.
 +#[cfg(unix)]
-+fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
++pub fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
 +    if file.metadata().is_ok_and(|m| m.is_file()) {
 +        let res = if read_only {
 +            file.try_lock_shared()
@@ -669,7 +675,7 @@ index 3668d9c..d7e6c9d 100644
  /// Open a single VHDX file as a [`LayeredDiskHandle`] with one layer.
  ///
  /// Use this for base (non-differencing) VHDX files. For differencing chains,
-@@ -24,10 +119,7 @@
+@@ -24,10 +123,7 @@
  ///
  /// The file is opened for read+write unless `read_only` is true.
  pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
@@ -681,7 +687,7 @@ index 3668d9c..d7e6c9d 100644
  
      Ok(Resource::new(LayeredDiskHandle::single_layer(
          VhdxDiskLayerHandle { file, read_only },
-@@ -73,11 +165,7 @@ pub fn open_vhdx_chain_explicit(
+@@ -73,11 +169,7 @@ pub fn open_vhdx_chain_explicit(
              let is_leaf = i == 0;
              let layer_read_only = !is_leaf || read_only;
  
@@ -694,7 +700,7 @@ index 3668d9c..d7e6c9d 100644
  
              let handle = VhdxDiskLayerHandle {
                  file,
-@@ -358,4 +446,112 @@ async fn auto_walk_base_disk() {
+@@ -358,4 +450,112 @@ async fn auto_walk_base_disk() {
          let resource = open_vhdx_chain(&path, false).await.unwrap();
          let _ = resource;
      }

@@ -238,13 +238,14 @@ impl ApiClient {
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .send()
             .context("PATCH /api/v1/host/config")?;
-        if matches!(
-            resp.status(),
-            reqwest::StatusCode::METHOD_NOT_ALLOWED | reqwest::StatusCode::NOT_FOUND
-        ) {
+        if resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            tracing::warn!(
+                base_url = %self.base_url,
+                "daemon does not support PATCH /api/v1/host/config (405); falling back to non-atomic GET+PUT update"
+            );
             let mut live = self.host_config()?;
             resolved.apply_to(&mut live);
-            return self.update_host_config(&live);
+            return self.put("/api/v1/host/config", &live);
         }
         decode_json_response(resp)
     }
@@ -1683,7 +1684,7 @@ mod tests {
             runtime_dir: root.join("run"),
             listen_addr: addr.to_string(),
             openvmm_bin: Some(old_bin),
-            fastdesk_viewer_bin: None,
+            fastdesk_viewer_bin: Some(PathBuf::from("relative/viewer")),
             openvmm_img_bin: None,
             uefi_firmware_path: Some(uefi_fw),
         };
@@ -1752,6 +1753,82 @@ mod tests {
         assert!(saw_put.load(Ordering::SeqCst));
         assert_eq!(updated.openvmm_bin, Some(new_bin));
         assert_eq!(updated.uefi_firmware_path, initial_cfg.uefi_firmware_path);
+        assert_eq!(
+            updated.fastdesk_viewer_bin,
+            initial_cfg.fastdesk_viewer_bin,
+            "405 fallback must not re-resolve unedited relative paths against client CWD"
+        );
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn patch_host_config_does_not_fall_back_on_not_found() {
+        use crate::models::HostConfigPatch;
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "patch-404-token";
+        let saw_patch = Arc::new(AtomicBool::new(false));
+        let saw_get_or_put = Arc::new(AtomicBool::new(false));
+        let saw_patch_srv = Arc::clone(&saw_patch);
+        let saw_get_or_put_srv = Arc::clone(&saw_get_or_put);
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let mut stream = accept_with_timeout(&listener, Duration::from_secs(5));
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let headers = String::from_utf8_lossy(&buf[..n]);
+                let first_line = headers.lines().next().unwrap_or("");
+                let (status_line, resp_body) = if first_line.starts_with("GET /api/v1/health?") {
+                    let query = first_line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.split_once('?'))
+                        .map(|(_, q)| q)
+                        .unwrap_or("");
+                    let challenge = query
+                        .split('&')
+                        .filter_map(|kv| kv.split_once('='))
+                        .find(|(k, _)| *k == "challenge")
+                        .map(|(_, v)| v)
+                        .unwrap_or("");
+                    let proof = crate::models::compute_health_auth_proof(token, addr, challenge);
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#
+                        ),
+                    )
+                } else if first_line.starts_with("PATCH /api/v1/host/config ") {
+                    saw_patch_srv.store(true, Ordering::SeqCst);
+                    ("HTTP/1.1 404 Not Found", r#"{"error":"not found"}"#.to_string())
+                } else {
+                    saw_get_or_put_srv.store(true, Ordering::SeqCst);
+                    ("HTTP/1.1 500 Internal Server Error", r#"{"error":"unexpected fallback"}"#.to_string())
+                };
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = ApiClient::new(format!("http://{addr}"), token).unwrap();
+        let patch = HostConfigPatch {
+            listen_addr: Some("127.0.0.1:47621".to_string()),
+            ..Default::default()
+        };
+        let err = client.patch_host_config(&patch).unwrap_err();
+        assert!(err.to_string().contains("404"), "{err:#}");
+        assert!(saw_patch.load(Ordering::SeqCst));
+        assert!(!saw_get_or_put.load(Ordering::SeqCst));
         srv.join().unwrap();
     }
 }

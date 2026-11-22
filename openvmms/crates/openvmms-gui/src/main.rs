@@ -226,6 +226,9 @@ impl OpenVmmsApp {
                 self.connection_status = format!("Connected ({base_url})");
                 self.host_info = Some(host_info);
                 self.host_config = host_config;
+                if let Some(d) = self.host_settings_dlg.as_mut() {
+                    d.sync_from_config(&self.host_config);
+                }
                 self.switches = switches;
 
                 if same_daemon {
@@ -424,23 +427,32 @@ impl OpenVmmsApp {
                     if snapshot_seq > self.last_snapshot_seq {
                         self.last_snapshot_seq = snapshot_seq;
                     }
-                    let prev_id = self.daemon_instance_id;
-                    let daemon_changed = (prev_id.is_some() || host_info.daemon_instance_id.is_some())
-                        && prev_id != host_info.daemon_instance_id;
-                    if daemon_changed {
-                        self.vm_revisions.clear();
-                        self.deleted_vms.clear();
-                        self.attach_disk_in_flight.clear();
-                        self.mount_iso_in_flight.clear();
-                        self.logs_cache = None;
+                    if let Some(info) = host_info {
+                        let prev_id = self.daemon_instance_id;
+                        let daemon_changed = (prev_id.is_some()
+                            || info.daemon_instance_id.is_some())
+                            && prev_id != info.daemon_instance_id;
+                        if daemon_changed {
+                            self.vms.clear();
+                            self.selected_vm = None;
+                            self.vm_revisions.clear();
+                            self.deleted_vms.clear();
+                            self.attach_disk_in_flight.clear();
+                            self.mount_iso_in_flight.clear();
+                            self.logs_cache = None;
+                            self.backend.send(GuiRequest::RefreshAll);
+                        }
+                        self.daemon_instance_id = info.daemon_instance_id;
+                        self.host_info = Some(info);
                     }
-                    self.daemon_instance_id = host_info.daemon_instance_id;
                     self.connected_base_url = Some(base_url.clone());
                     self.connected = true;
                     self.host_config_loaded = true;
                     self.connection_status = format!("Connected ({base_url})");
-                    self.host_info = Some(host_info);
                     self.host_config = host_config;
+                    if let Some(d) = self.host_settings_dlg.as_mut() {
+                        d.sync_from_config(&self.host_config);
+                    }
                 }
                 GuiUpdate::DialogFinished { kind, error } => match (kind, error) {
                     (DialogKind::NewVmWizard(wid), None) => {
@@ -2326,22 +2338,25 @@ mod tests {
         });
         app.apply_update(GuiUpdate::HostConfigUpdated {
             base_url: "http://127.0.0.1:1".into(),
-            host_info: make_host_info(Some(daemon_1)),
+            host_info: Some(make_host_info(Some(daemon_1))),
             host_config: cfg_old,
             snapshot_seq: 2,
         });
         assert_eq!(app.host_config.openvmm_bin, cfg_new.openvmm_bin);
         assert_eq!(app.last_snapshot_seq, 5);
 
-        // Save response from a restarted daemon (daemon_2, seq=6) updates daemon_instance_id
-        // so subsequent VmUpdated events from daemon_2 are accepted instead of dropped.
+        // Save response from a restarted daemon (daemon_2, seq=6) updates daemon_instance_id,
+        // immediately clears the previous daemon's VM list, and accepts subsequent VmUpdated events
+        // from daemon_2.
         app.apply_update(GuiUpdate::HostConfigUpdated {
             base_url: "http://127.0.0.1:1".into(),
-            host_info: make_host_info(Some(daemon_2)),
+            host_info: Some(make_host_info(Some(daemon_2))),
             host_config: cfg_new,
             snapshot_seq: 6,
         });
         assert_eq!(app.daemon_instance_id, Some(daemon_2));
+        assert!(app.vms.is_empty());
+        assert_eq!(app.selected_vm, None);
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_id, "Alpha", VmStatus::Running, 1),
             select: false,

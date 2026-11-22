@@ -1473,13 +1473,26 @@ impl Supervisor {
         // Remove persisted VM metadata outside the global `vms` lock so a store
         // failure preserves `vm.toml` and does not block unrelated API calls.
         let store = self.store.clone();
-        let (del_res, vm_toml_exists) = tokio::task::spawn_blocking(move || {
+        let join_res = tokio::task::spawn_blocking(move || {
             let res = store.delete_vm_dir(id);
             let toml_exists = store.vm_config_path(id).is_file();
             (res, toml_exists)
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("delete_vm task failed: {e}"))?;
+        .await;
+        let (del_res, vm_toml_exists) = match join_res {
+            Ok(pair) => pair,
+            Err(join_err) => {
+                let store = self.store.clone();
+                let toml_exists =
+                    tokio::task::spawn_blocking(move || store.vm_config_path(id).is_file())
+                        .await
+                        .unwrap_or_else(|_| self.store.vm_config_path(id).is_file());
+                (
+                    Err(anyhow::anyhow!("delete_vm task failed: {join_err}")),
+                    toml_exists,
+                )
+            }
+        };
         if let Err(err) = del_res {
             if !vm_toml_exists {
                 // `vm.toml` was already removed before an unexpected post-`vm.toml` cleanup
@@ -1830,15 +1843,30 @@ impl Supervisor {
             })?;
             #[cfg(unix)]
             {
+                use std::os::unix::fs::PermissionsExt;
                 let is_managed_default =
                     openvmms_core::models::normalize_path_key(&runtime_dir_to_prepare)
                         == openvmms_core::models::normalize_path_key(&managed_default_runtime_dir);
                 if !existed_before || is_managed_default {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(
+                    if let Err(err) = fs::set_permissions(
                         &runtime_dir_to_prepare,
                         fs::Permissions::from_mode(0o700),
-                    );
+                    ) {
+                        warn!(
+                            path = %runtime_dir_to_prepare.display(),
+                            error = %err,
+                            "failed to set 0700 permissions on runtime_dir"
+                        );
+                    }
+                } else if let Ok(meta) = fs::metadata(&runtime_dir_to_prepare) {
+                    let mode = meta.permissions().mode();
+                    if (mode & 0o002) != 0 {
+                        warn!(
+                            path = %runtime_dir_to_prepare.display(),
+                            mode = format!("{:04o}", mode & 0o7777),
+                            "custom runtime_dir is world-writable; consider using a dedicated 0700 directory for VM sockets and SHM files"
+                        );
+                    }
                 }
             }
             Ok(path_keys)
@@ -4578,6 +4606,21 @@ fn ensure_port_forwards_not_conflicting_with_active_vms(
     self_id: Uuid,
     nics: &[NicAttachment],
 ) -> anyhow::Result<()> {
+    for nic in nics {
+        if let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend {
+            for (idx, pf) in port_forwards.iter().enumerate() {
+                if let Some(existing) = port_forwards[..idx]
+                    .iter()
+                    .find(|existing| existing.same_nic_guest_conflict(pf))
+                {
+                    return Err(err_conflict(format!(
+                        "port forward {pf} conflicts with existing rule {existing} on NIC {} (duplicate guest port for protocol and IP family)",
+                        nic.name
+                    )));
+                }
+            }
+        }
+    }
     let mut candidate_forwards: Vec<&PortForward> = Vec::new();
     for nic in nics {
         if let NicBackendConfig::Consomme { port_forwards, .. } = &nic.backend {
@@ -6342,5 +6385,93 @@ mod tests {
                 DaemonEvent::VmDeleted { id: del_id, .. } if del_id == id
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn start_vm_rejects_legacy_vm_with_duplicate_same_nic_guest_port_forwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let mut legacy = openvmms_core::models::VmConfig::from_preset(
+            "LegacySameNicPort-VM",
+            openvmms_core::models::VmPreset::Custom,
+            &store.vm_dir(Uuid::new_v4()),
+        );
+        legacy.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.2".into(),
+                    host_port: 8081,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        store.save_vm_unchecked(&legacy).unwrap();
+
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let err = sup.start_vm(&legacy.id.to_string()).await.unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::Conflict(_))),
+            "expected HTTP 409 conflict for duplicate same-NIC guest port, got: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("duplicate guest port for protocol and IP family"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            sup.get_vm(&legacy.id.to_string()).unwrap().runtime.status,
+            VmStatus::Off
+        );
+
+        // Two different adapters with the same guest port still pass the port-forward check.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = openvmms_core::store::RegistryStore::new(dir2.path()).unwrap();
+        let mut multi_nic = openvmms_core::models::VmConfig::from_preset(
+            "LegacyMultiNicPort-VM",
+            openvmms_core::models::VmPreset::Custom,
+            &store2.vm_dir(Uuid::new_v4()),
+        );
+        multi_nic.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8082,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        let mut nic2 = NicAttachment::default_consomme();
+        nic2.name = "NAT-2".into();
+        nic2.backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8083,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        multi_nic.nics.push(nic2);
+        store2.save_vm_unchecked(&multi_nic).unwrap();
+
+        let sup2 = Supervisor::new(dir2.path(), Some("127.0.0.1:0")).unwrap();
+        let err2 = sup2.start_vm(&multi_nic.id.to_string()).await.unwrap_err();
+        assert!(
+            !format!("{err2:#}").contains("duplicate guest port"),
+            "cross-NIC guest ports must not trigger same-NIC conflict: {err2:#}"
+        );
     }
 }

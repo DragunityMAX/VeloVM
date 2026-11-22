@@ -106,7 +106,7 @@ pub enum GuiUpdate {
     DiskCreated(DiskInfo),
     HostConfigUpdated {
         base_url: String,
-        host_info: HostInfo,
+        host_info: Option<HostInfo>,
         host_config: HostConfig,
         snapshot_seq: u64,
     },
@@ -139,6 +139,8 @@ impl Drop for BackendHandle {
 }
 
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const SSE_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const SSE_BACKOFF_MAX: Duration = Duration::from_secs(15);
 
 struct BackendState {
     data_dir: Option<PathBuf>,
@@ -157,8 +159,50 @@ struct BackendState {
     attach_disk_in_flight: Mutex<HashSet<(Option<Uuid>, Uuid)>>,
     mount_iso_in_flight: Mutex<HashSet<(Option<Uuid>, Uuid)>>,
     sse_read_timeout: Duration,
+    sse_backoff_initial: Duration,
+    sse_backoff_max: Duration,
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
+}
+
+fn storage_op_from_request(req: &GuiRequest) -> Option<(Uuid, StorageOpKind, u64)> {
+    match *req {
+        GuiRequest::AttachDisk { id, op_id, .. } => {
+            Some((id, StorageOpKind::AttachDisk, op_id))
+        }
+        GuiRequest::MountIso { id, op_id, .. } => Some((id, StorageOpKind::MountIso, op_id)),
+        _ => None,
+    }
+}
+
+struct DroppedStorageOpGuard {
+    state: Arc<BackendState>,
+    op: Option<(Uuid, StorageOpKind, u64)>,
+}
+
+impl DroppedStorageOpGuard {
+    fn new(state: Arc<BackendState>, req: &GuiRequest) -> Self {
+        Self {
+            state,
+            op: storage_op_from_request(req),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.op = None;
+    }
+}
+
+impl Drop for DroppedStorageOpGuard {
+    fn drop(&mut self) {
+        if let Some((vm_id, op, op_id)) = self.op.take() {
+            self.state.emit(GuiUpdate::StorageOpFinished {
+                vm_id,
+                op,
+                op_id,
+            });
+        }
+    }
 }
 
 fn is_idempotent_read(req: &GuiRequest) -> bool {
@@ -242,6 +286,24 @@ impl BackendHandle {
         repaint_ctx: egui::Context,
         sse_read_timeout: Duration,
     ) -> Self {
+        Self::spawn_with_sse_timing(
+            data_dir,
+            daemon_url,
+            repaint_ctx,
+            sse_read_timeout,
+            SSE_BACKOFF_INITIAL,
+            SSE_BACKOFF_MAX,
+        )
+    }
+
+    fn spawn_with_sse_timing(
+        data_dir: Option<PathBuf>,
+        daemon_url: Option<String>,
+        repaint_ctx: egui::Context,
+        sse_read_timeout: Duration,
+        sse_backoff_initial: Duration,
+        sse_backoff_max: Duration,
+    ) -> Self {
         let (upd_tx, upd_rx) = mpsc::channel::<GuiUpdate>();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -268,6 +330,8 @@ impl BackendHandle {
             attach_disk_in_flight: Mutex::new(HashSet::new()),
             mount_iso_in_flight: Mutex::new(HashSet::new()),
             sse_read_timeout,
+            sse_backoff_initial,
+            sse_backoff_max,
             upd_tx,
             repaint_ctx,
         });
@@ -299,6 +363,8 @@ impl BackendHandle {
             attach_disk_in_flight: Mutex::new(HashSet::new()),
             mount_iso_in_flight: Mutex::new(HashSet::new()),
             sse_read_timeout: SSE_READ_TIMEOUT,
+            sse_backoff_initial: SSE_BACKOFF_INITIAL,
+            sse_backoff_max: SSE_BACKOFF_MAX,
             upd_tx,
             repaint_ctx,
         });
@@ -310,12 +376,16 @@ impl BackendHandle {
     }
 
     pub fn send(&self, req: GuiRequest) {
+        let mut drop_guard = DroppedStorageOpGuard::new(Arc::clone(&self.state), &req);
         if self.state.shutdown.load(Ordering::Acquire) {
             return;
         }
         if let Some(rt) = &self.rt {
             let state = Arc::clone(&self.state);
-            rt.spawn_blocking(move || state.process_request(req));
+            rt.spawn_blocking(move || {
+                drop_guard.disarm();
+                state.process_request(req);
+            });
         }
     }
 
@@ -345,10 +415,12 @@ impl BackendState {
                 ..
             } => {
                 self.notified_connected.store(true, Ordering::Release);
-                let mut guard = self.daemon_instance_id.lock().unwrap();
-                if *snapshot_seq >= guard.0 {
-                    guard.0 = *snapshot_seq;
-                    guard.1 = host_info.daemon_instance_id;
+                if let Some(info) = host_info {
+                    let mut guard = self.daemon_instance_id.lock().unwrap();
+                    if *snapshot_seq >= guard.0 {
+                        guard.0 = *snapshot_seq;
+                        guard.1 = info.daemon_instance_id;
+                    }
                 }
             }
             GuiUpdate::DaemonDisconnected(_) => {
@@ -411,8 +483,19 @@ impl BackendState {
         }
     }
 
+    fn emit_storage_op_finished_for_request(&self, req: &GuiRequest) {
+        if let Some((vm_id, op, op_id)) = storage_op_from_request(req) {
+            self.emit(GuiUpdate::StorageOpFinished {
+                vm_id,
+                op,
+                op_id,
+            });
+        }
+    }
+
     fn process_request(self: &Arc<Self>, req: GuiRequest) {
         if self.shutdown.load(Ordering::Acquire) {
+            self.emit_storage_op_finished_for_request(&req);
             return;
         }
 
@@ -1012,9 +1095,21 @@ impl BackendState {
                     *client = next_client;
                     *self.client.write().unwrap() = Some(client.clone());
                 }
-                let host_info = client.host_info()?;
+                let (host_info, status_msg) = match client.host_info() {
+                    Ok(info) => (Some(info), "Saved host settings".to_string()),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "Host settings saved, but follow-up host_info refresh failed"
+                        );
+                        (
+                            None,
+                            "Saved host settings (host info refresh pending)".to_string(),
+                        )
+                    }
+                };
                 let base_url = client.base_url().to_string();
-                self.emit(GuiUpdate::StatusMessage("Saved host settings".to_string()));
+                self.emit(GuiUpdate::StatusMessage(status_msg));
                 self.emit(GuiUpdate::HostConfigUpdated {
                     base_url,
                     host_info,
@@ -1056,6 +1151,17 @@ fn maybe_switch_endpoint_on_disconnect(
     false
 }
 
+fn sleep_backoff(shutdown: &AtomicBool, dur: Duration) {
+    let deadline = std::time::Instant::now() + dur;
+    while !shutdown.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
 fn spawn_sse_listener(state: Arc<BackendState>) {
     thread::spawn(move || {
         let http = match reqwest::blocking::Client::builder()
@@ -1070,6 +1176,9 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
             }
         };
         let mut reported_initial_error = false;
+        let mut retry_delay = state.sse_backoff_initial;
+        let stable_threshold = state.sse_read_timeout.min(Duration::from_secs(5));
+        let next_delay = |d: Duration| d.saturating_mul(2).min(state.sse_backoff_max);
         while !state.shutdown.load(Ordering::Acquire) {
             let endpoint = state.shared_endpoint.read().unwrap().clone().or_else(|| {
                 reload_client_from_runtime_addr(
@@ -1080,7 +1189,8 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                 .map(|c| (c.base_url().to_string(), c.token().to_string()))
             });
             let Some((mut base_url, mut token)) = endpoint else {
-                thread::sleep(Duration::from_millis(500));
+                sleep_backoff(&state.shutdown, retry_delay);
+                retry_delay = next_delay(retry_delay);
                 continue;
             };
             // Verify health authentication challenge before transmitting token on the SSE request.
@@ -1090,6 +1200,9 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     state.daemon_url.as_deref(),
                     &state.shared_endpoint,
                 ) {
+                    if reloaded.base_url() != base_url {
+                        retry_delay = state.sse_backoff_initial;
+                    }
                     base_url = reloaded.base_url().to_string();
                     token = reloaded.token().to_string();
                 } else {
@@ -1104,7 +1217,8 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             break;
                         }
                     }
-                    thread::sleep(Duration::from_millis(500));
+                    sleep_backoff(&state.shutdown, retry_delay);
+                    retry_delay = next_delay(retry_delay);
                     continue;
                 }
             }
@@ -1146,10 +1260,13 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     break;
                                 }
                             }
-                            thread::sleep(Duration::from_millis(500));
+                            sleep_backoff(&state.shutdown, retry_delay);
+                            retry_delay = next_delay(retry_delay);
                             continue;
                         }
                     };
+                    let stream_started = std::time::Instant::now();
+                    let mut saw_meaningful_event = false;
                     let reader = std::io::BufReader::new(resp);
                     let mut skip_leading_resync = true;
                     let mut sse_send_closed = false;
@@ -1169,6 +1286,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         }
                         match event {
                             DaemonEvent::VmUpdated { vm } => {
+                                saw_meaningful_event = true;
                                 if !state.emit_checked(GuiUpdate::VmUpdated {
                                     vm,
                                     select: false,
@@ -1180,6 +1298,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 }
                             }
                             DaemonEvent::VmDeleted { id, revision } => {
+                                saw_meaningful_event = true;
                                 if !state.emit_checked(GuiUpdate::VmDeleted {
                                     id,
                                     revision,
@@ -1195,6 +1314,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                                 match reload_res {
                                     Ok((c, (host_info, host_config, switches, vms))) => {
+                                        saw_meaningful_event = true;
                                         sse_instance_id = host_info.daemon_instance_id;
                                         *state.client.write().unwrap() = Some(c);
                                         if !state.emit_checked(GuiUpdate::DaemonConnected {
@@ -1228,6 +1348,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                                 match reload_res {
                                     Ok((c, (host_info, host_config, switches, vms))) => {
+                                        saw_meaningful_event = true;
                                         sse_instance_id = host_info.daemon_instance_id;
                                         let new_base = c.base_url().to_string();
                                         *state.client.write().unwrap() = Some(c);
@@ -1268,50 +1389,71 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     if sse_send_closed {
                         break;
                     }
-                    if !state.shutdown.load(Ordering::Acquire) && !switched_endpoint {
+                    if switched_endpoint {
+                        retry_delay = state.sse_backoff_initial;
+                    } else if !state.shutdown.load(Ordering::Acquire) {
                         if saw_daemon_stopping {
-                            thread::sleep(Duration::from_millis(500));
+                            sleep_backoff(&state.shutdown, retry_delay);
+                            retry_delay = next_delay(retry_delay);
                             continue;
                         }
                         if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
+                            retry_delay = state.sse_backoff_initial;
                             continue;
+                        }
+                        if saw_meaningful_event || stream_started.elapsed() >= stable_threshold {
+                            retry_delay = state.sse_backoff_initial;
                         }
                         let healthy =
                             ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                        if !healthy
-                            && (state.notified_connected.swap(false, Ordering::AcqRel)
-                                || !reported_initial_error)
-                        {
-                            reported_initial_error = true;
+                        if !healthy {
                             *state.client.write().unwrap() = None;
-                            if !state.emit_checked(GuiUpdate::DaemonDisconnected(
-                                "Lost connection to openvmmsd".to_string(),
-                            )) {
-                                break;
+                            if state.notified_connected.swap(false, Ordering::AcqRel)
+                                || !reported_initial_error
+                            {
+                                reported_initial_error = true;
+                                if !state.emit_checked(GuiUpdate::DaemonDisconnected(
+                                    "Lost connection to openvmmsd".to_string(),
+                                )) {
+                                    break;
+                                }
                             }
                         }
-                        thread::sleep(Duration::from_millis(500));
+                        sleep_backoff(&state.shutdown, retry_delay);
+                        retry_delay = next_delay(retry_delay);
                     }
                 }
-                _ => {
+                sse_res => {
                     if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
+                        retry_delay = state.sse_backoff_initial;
                         continue;
                     }
                     let healthy =
                         ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                    if !healthy
-                        && (state.notified_connected.swap(false, Ordering::AcqRel)
-                            || !reported_initial_error)
+                    if !healthy {
+                        *state.client.write().unwrap() = None;
+                    }
+                    if state.notified_connected.swap(false, Ordering::AcqRel)
+                        || !reported_initial_error
                     {
                         reported_initial_error = true;
-                        *state.client.write().unwrap() = None;
-                        if !state.emit_checked(GuiUpdate::DaemonDisconnected(
-                            "Lost connection to openvmmsd".to_string(),
-                        )) {
+                        let reason = if !healthy {
+                            "Lost connection to openvmmsd".to_string()
+                        } else {
+                            match sse_res {
+                                Ok(resp) => format!(
+                                    "Event stream returned HTTP {}; retrying…",
+                                    resp.status()
+                                ),
+                                Err(err) => format!("Event stream error ({err}); retrying…"),
+                            }
+                        };
+                        if !state.emit_checked(GuiUpdate::DaemonDisconnected(reason)) {
                             break;
                         }
                     }
-                    thread::sleep(Duration::from_millis(500));
+                    sleep_backoff(&state.shutdown, retry_delay);
+                    retry_delay = next_delay(retry_delay);
                 }
             }
         }
@@ -3628,5 +3770,326 @@ mod tests {
         drop(backend);
         stop.store(true, Ordering::Release);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn sse_backs_off_and_reports_error_when_events_fail_on_healthy_daemon() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let events_times = Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let token = token.clone();
+            let events_times = Arc::clone(&events_times);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let events_times = Arc::clone(&events_times);
+                            let store_dir = store_dir.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let target = req_text
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("");
+                                let (status, body) = if target == "/api/v1/events" {
+                                    events_times.lock().unwrap().push(std::time::Instant::now());
+                                    (
+                                        "500 Internal Server Error",
+                                        r#"{"error":"events broken"}"#.to_string(),
+                                    )
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timing(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(2),
+            Duration::from_millis(40),
+            Duration::from_millis(320),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonDisconnected(_))
+        }) {
+            GuiUpdate::DaemonDisconnected(reason) => {
+                assert!(
+                    reason.contains("500"),
+                    "expected HTTP 500 error in DaemonDisconnected when daemon is healthy, got: {reason}"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if events_times.lock().unwrap().len() >= 4 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for 4 SSE retry attempts"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let times = events_times.lock().unwrap().clone();
+        // Delays before attempts 1..4 are 40ms, 80ms, 160ms; verify backoff grows past initial 40ms.
+        let gap1 = times[1].duration_since(times[0]);
+        let gap3 = times[3].duration_since(times[2]);
+        assert!(
+            gap3 >= Duration::from_millis(120) && gap3 > gap1,
+            "expected exponential SSE backoff (gap1={gap1:?}, gap3={gap3:?})"
+        );
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn save_host_config_succeeds_when_followup_host_info_fails() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let host_info_reqs = Arc::new(AtomicUsize::new(0));
+        let fail_followup_info = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let new_bin = dir.path().join("updated-openvmm");
+
+        let server = {
+            let token = token.clone();
+            let host_info_reqs = Arc::clone(&host_info_reqs);
+            let fail_followup_info = Arc::clone(&fail_followup_info);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            let new_bin = new_bin.clone();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let host_info_reqs = Arc::clone(&host_info_reqs);
+                            let fail_followup_info = Arc::clone(&fail_followup_info);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            let new_bin = new_bin.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let first = req_text.lines().next().unwrap_or("");
+                                let mut parts = first.split_whitespace();
+                                let method = parts.next().unwrap_or("");
+                                let target = parts.next().unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    while !stop.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keepalive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/host/info" {
+                                    host_info_reqs.fetch_add(1, Ordering::SeqCst);
+                                    if fail_followup_info.load(Ordering::Acquire) {
+                                        (
+                                            "500 Internal Server Error",
+                                            r#"{"error":"transient host_info error"}"#.to_string(),
+                                        )
+                                    } else {
+                                        mock_common_endpoint(target, &token, addr, &store_dir)
+                                            .unwrap()
+                                    }
+                                } else if method == "PATCH" && target == "/api/v1/host/config" {
+                                    let mut cfg = HostConfig::default();
+                                    cfg.openvmm_bin = Some(new_bin);
+                                    ("200 OK", serde_json::to_string(&cfg).unwrap())
+                                } else if target == "/api/v1/vms" {
+                                    ("200 OK", "[]".to_string())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        });
+
+        fail_followup_info.store(true, Ordering::Release);
+        let before_reqs = host_info_reqs.load(Ordering::Acquire);
+        let patch = HostConfigPatch {
+            openvmm_bin: Some(Some(new_bin.clone())),
+            ..Default::default()
+        };
+        backend.send(GuiRequest::SaveHostConfig(patch));
+
+        let mut saw_host_cfg = false;
+        let mut saw_dialog_ok = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && (!saw_host_cfg || !saw_dialog_ok) {
+            while let Some(upd) = backend.try_recv() {
+                match upd {
+                    GuiUpdate::ErrorMessage(err) => {
+                        panic!("unexpected GuiUpdate::ErrorMessage after PATCH succeeded: {err}");
+                    }
+                    GuiUpdate::HostConfigUpdated {
+                        host_info,
+                        host_config,
+                        ..
+                    } => {
+                        assert!(host_info.is_none());
+                        assert_eq!(host_config.openvmm_bin, Some(new_bin.clone()));
+                        saw_host_cfg = true;
+                    }
+                    GuiUpdate::DialogFinished {
+                        kind: DialogKind::HostSettings,
+                        error,
+                    } => {
+                        assert_eq!(error, None);
+                        saw_dialog_ok = true;
+                    }
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_host_cfg && saw_dialog_ok);
+        assert!(host_info_reqs.load(Ordering::Acquire) > before_reqs);
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_emits_storage_op_finished_for_dropped_attach_and_mount() {
+        let backend = BackendHandle::spawn(None, None, egui::Context::default());
+        backend.state.shutdown.store(true, Ordering::Release);
+
+        let vm_id = Uuid::new_v4();
+        backend.send(GuiRequest::AttachDisk {
+            id: vm_id,
+            op_id: 41,
+            payload: AttachDiskPayload {
+                path: PathBuf::from("/tmp/disk.vhdx"),
+                lun: None,
+                read_only: false,
+                format: None,
+            },
+        });
+        backend.send(GuiRequest::MountIso {
+            id: vm_id,
+            op_id: 42,
+            payload: MountIsoPayload {
+                path: PathBuf::from("/tmp/install.iso"),
+                lun: None,
+            },
+        });
+
+        let _ = recv_until(&backend, Duration::from_secs(2), |u| {
+            matches!(
+                u,
+                GuiUpdate::StorageOpFinished {
+                    vm_id: id,
+                    op: StorageOpKind::AttachDisk,
+                    op_id: 41
+                } if *id == vm_id
+            )
+        });
+        let _ = recv_until(&backend, Duration::from_secs(2), |u| {
+            matches!(
+                u,
+                GuiUpdate::StorageOpFinished {
+                    vm_id: id,
+                    op: StorageOpKind::MountIso,
+                    op_id: 42
+                } if *id == vm_id
+            )
+        });
     }
 }

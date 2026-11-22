@@ -258,21 +258,14 @@ impl RegistryStore {
 
     pub fn load_or_create_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
-        if fs::symlink_metadata(&path).is_ok() {
-            let was_permissive = check_token_permissions(&path)?;
+        if let Some((token, was_permissive)) = open_and_read_token(&path)? {
             if was_permissive {
                 tracing::warn!(
                     path = %path.display(),
                     "regenerating daemon.token after detecting overly permissive file permissions"
                 );
-            } else {
-                let token = fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?
-                    .trim()
-                    .to_string();
-                if !token.is_empty() {
-                    return Ok(token);
-                }
+            } else if !token.is_empty() {
+                return Ok(token);
             }
         }
         let a = Uuid::new_v4().as_u128();
@@ -284,12 +277,12 @@ impl RegistryStore {
 
     pub fn read_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
-        let _ = check_token_permissions(&path)
-            .with_context(|| format!("reading daemon token at {}", path.display()))?;
-        let token = fs::read_to_string(&path)
+        let Some((token, _was_permissive)) = open_and_read_token(&path)
             .with_context(|| format!("reading daemon token at {}", path.display()))?
-            .trim()
-            .to_string();
+        else {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                .with_context(|| format!("reading daemon token at {}", path.display()));
+        };
         if token.is_empty() {
             bail!("daemon token file {} is empty", path.display());
         }
@@ -507,18 +500,61 @@ fn current_user_token_buf()
     Ok(buf)
 }
 
-fn check_token_permissions(path: &Path) -> anyhow::Result<bool> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        bail!(
-            "refusing to use non-regular or symlinked daemon token file {}",
-            path.display()
-        );
-    }
-    let mut was_permissive = false;
+fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
+    use std::io::Read;
+
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
+
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let mut file = match opts.open(path) {
+            Ok(f) => f,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err)
+                if err.raw_os_error() == Some(libc::ELOOP) || {
+                    #[cfg(any(
+                        target_os = "freebsd",
+                        target_os = "dragonfly",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                        target_os = "macos"
+                    ))]
+                    {
+                        err.raw_os_error() == Some(libc::EMLINK)
+                    }
+                    #[cfg(not(any(
+                        target_os = "freebsd",
+                        target_os = "dragonfly",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                        target_os = "macos"
+                    )))]
+                    {
+                        false
+                    }
+                } =>
+            {
+                bail!(
+                    "refusing to use non-regular or symlinked daemon token file {}",
+                    path.display()
+                );
+            }
+            Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+        };
+        let meta = file
+            .metadata()
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        if !meta.file_type().is_file() {
+            bail!(
+                "refusing to use non-regular or symlinked daemon token file {}",
+                path.display()
+            );
+        }
+        let mut was_permissive = false;
         let mode = meta.permissions().mode() & 0o777;
         if (mode & 0o077) != 0 {
             was_permissive = true;
@@ -528,18 +564,63 @@ fn check_token_permissions(path: &Path) -> anyhow::Result<bool> {
                 "daemon.token has overly permissive permissions (expected 0600)"
             );
         }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(Some((content.trim().to_string(), was_permissive)))
     }
     #[cfg(windows)]
     {
-        if !is_path_owner_only_windows(path)? {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        let sym_meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", path.display()));
+            }
+        };
+        if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+            bail!(
+                "refusing to use non-regular or symlinked daemon token file {}",
+                path.display()
+            );
+        }
+
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let mut file = match opts.open(path) {
+            Ok(f) => f,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+        };
+        let meta = file
+            .metadata()
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        if !meta.file_type().is_file()
+            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        {
+            bail!(
+                "refusing to use non-regular or symlinked daemon token file {}",
+                path.display()
+            );
+        }
+        let mut was_permissive = false;
+        if !is_handle_owner_only_windows(&file, path)? {
             was_permissive = true;
             tracing::warn!(
                 path = %path.display(),
                 "daemon.token has overly permissive Windows ACL (expected owner-only)"
             );
         }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(Some((content.trim().to_string(), was_permissive)))
     }
-    Ok(was_permissive)
 }
 
 pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
@@ -574,10 +655,10 @@ pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
 }
 
 #[cfg(windows)]
-fn is_path_owner_only_windows(path: &Path) -> anyhow::Result<bool> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
@@ -597,16 +678,11 @@ fn is_path_owner_only_windows(path: &Path) -> anyhow::Result<bool> {
         }
     }
 
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let err = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
+        GetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -618,7 +694,7 @@ fn is_path_owner_only_windows(path: &Path) -> anyhow::Result<bool> {
     };
     if err != ERROR_SUCCESS {
         return Err(std::io::Error::from_raw_os_error(err as i32))
-            .with_context(|| format!("GetNamedSecurityInfoW failed for {}", path.display()));
+            .with_context(|| format!("GetSecurityInfo failed for {}", path.display()));
     }
     let _sd_guard = LocalFreeSd(sd);
 
@@ -838,11 +914,17 @@ mod tests {
         );
         assert_eq!(store.read_token().unwrap(), rotated_token);
 
-        // Symlinked daemon.token must be rejected.
+        // Symlinked daemon.token (both live and dangling) must be rejected.
         let decoys = dir.path().join("decoy.token");
         fs::write(&decoys, "deadbeef").unwrap();
         fs::remove_file(store.token_path()).unwrap();
         std::os::unix::fs::symlink(&decoys, store.token_path()).unwrap();
+        assert!(store.load_or_create_token().is_err());
+        assert!(store.read_token().is_err());
+
+        fs::remove_file(store.token_path()).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing-target.token"), store.token_path())
+            .unwrap();
         assert!(store.load_or_create_token().is_err());
         assert!(store.read_token().is_err());
     }

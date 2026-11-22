@@ -121,8 +121,8 @@ pub fn open_raw_disk_file(
 
 /// Opens the resources needed for using a disk from a file at `path`.
 ///
-/// If the file ends with .vhd and is a fixed VHD1, it will be opened using
-/// the user-mode VHD parser. Otherwise, if the file ends with .vhd, the
+/// If the file ends with .vhd or .avhd and is a fixed VHD1, it will be opened using
+/// the user-mode VHD parser. Otherwise, if the file ends with .vhd or .avhd, the
 /// file will be opened using the kernel-mode VHD parser (Windows only).
 ///
 /// If the file ends with .vhdx (case-insensitively), the VHDX backend is used
@@ -150,7 +150,7 @@ pub async fn open_disk_type(
             disk_vmdk::open_vmdk(path, read_only)
                 .with_context(|| disk_open_error(path, "failed to open"))?
         }
-        Some("vhd") => {
+        Some("vhd" | "avhd") => {
             let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
 
             match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
@@ -220,6 +220,9 @@ pub fn create_disk_type(
             file.set_len(size)?;
             disk_vhd1::Vhd1Disk::make_fixed(&file)?;
             Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
+        }
+        Some("avhd") => {
+            anyhow::bail!("creating avhd not supported")
         }
         Some("vhdx") => {
             anyhow::bail!("creating vhdx not supported")
@@ -546,6 +549,102 @@ mod tests {
             assert!(err.to_string().contains("already locked for writing"), "{err:#}");
             drop(open_guard);
             assert_eq!(std::fs::read(&path).unwrap(), payload);
+        }
+    }
+
+    #[async_test]
+    async fn avhd_dispatches_to_vhd1_not_raw() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Arbitrary bytes with `.avhd` or `.AVHD` extension must fail VHD1 validation rather than
+        // falling back to raw disk open.
+        for name in ["invalid.avhd", "Invalid.AVHD"] {
+            let bad_avhd = dir.path().join(name);
+            std::fs::write(&bad_avhd, b"not-a-valid-vhd1-payload").unwrap();
+            let err = open_disk_type(
+                &bad_avhd,
+                OpenDiskOptions {
+                    read_only: true,
+                    direct: false,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.chain()
+                    .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
+                "expected VHD error for {name}, got: {err:#}"
+            );
+        }
+
+        // Creating `.avhd` via create_disk_type must also be rejected instead of falling back to raw.
+        let create_err = create_disk_type(
+            &dir.path().join("new.avhd"),
+            64 * 1024,
+            OpenDiskOptions {
+                read_only: false,
+                direct: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            create_err.to_string().contains("creating avhd not supported"),
+            "{create_err:#}"
+        );
+
+        // Valid fixed VHD1 image with `.avhd` extension opens cleanly.
+        let seed_vhd = dir.path().join("seed.vhd");
+        let created = create_disk_type(
+            &seed_vhd,
+            64 * 1024,
+            OpenDiskOptions {
+                read_only: false,
+                direct: false,
+            },
+        )
+        .unwrap();
+        drop(created);
+        let fixed_avhd = dir.path().join("fixed.avhd");
+        std::fs::rename(&seed_vhd, &fixed_avhd).unwrap();
+        let _opened = open_disk_type(
+            &fixed_avhd,
+            OpenDiskOptions {
+                read_only: true,
+                direct: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // On Linux, a dynamic/differencing VHD1 `.avhd` hits the non-fixed check instead of opening as raw.
+        #[cfg(not(windows))]
+        {
+            let mut footer = [0u8; 512];
+            footer[0..8].copy_from_slice(b"conectix");
+            footer[8..12].copy_from_slice(&0x0000_0002u32.to_be_bytes());
+            footer[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+            footer[16..24].copy_from_slice(&512u64.to_be_bytes());
+            footer[40..48].copy_from_slice(&(64 * 1024u64).to_be_bytes());
+            footer[48..56].copy_from_slice(&(64 * 1024u64).to_be_bytes());
+            footer[60..64].copy_from_slice(&4u32.to_be_bytes());
+            let sum: u32 = footer.iter().map(|&b| b as u32).sum();
+            footer[64..68].copy_from_slice(&(!sum).to_be_bytes());
+
+            let diff_avhd = dir.path().join("diff.avhd");
+            std::fs::write(&diff_avhd, footer).unwrap();
+            let err = open_disk_type(
+                &diff_avhd,
+                OpenDiskOptions {
+                    read_only: true,
+                    direct: false,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("non-fixed VHD not supported on Linux"),
+                "{err:#}"
+            );
         }
     }
 }

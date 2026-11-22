@@ -431,16 +431,19 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
     let mut footer = [0u8; 512];
     file.seek(SeekFrom::End(-512))?;
     file.read_exact(&mut footer)?;
-    let parsed = parse_vhd1_footer_bytes(&footer, file_size_bytes).or_else(|| {
-        if file.seek(SeekFrom::Start(0)).is_ok() && file.read_exact(&mut footer).is_ok() {
-            // Only dynamic/differencing VHDs carry a backup footer copy at offset 0.
-            parse_vhd1_footer_bytes(&footer, file_size_bytes)
-                .filter(|(disk_type, _, _)| matches!(disk_type, 3 | 4))
-        } else {
-            None
+    let Some((disk_type_code, virtual_size_bytes, data_offset)) =
+        parse_vhd1_footer_bytes(&footer, file_size_bytes)
+    else {
+        if file.seek(SeekFrom::Start(0)).is_ok()
+            && file.read_exact(&mut footer).is_ok()
+            && parse_vhd1_footer_bytes(&footer, file_size_bytes)
+                .is_some_and(|(disk_type, _, _)| matches!(disk_type, 3 | 4))
+        {
+            bail!(
+                "invalid or corrupt VHD1 image: corrupt trailing footer in {} (backup header copy at offset 0 exists; repair the image before attaching)",
+                path.display()
+            );
         }
-    });
-    let Some((disk_type_code, virtual_size_bytes, data_offset)) = parsed else {
         return Ok(None);
     };
 
@@ -1261,15 +1264,18 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(dyn_info.warning, None);
 
-        // Dynamic VHD1 with corrupted trailing footer falls back to offset-0 header copy.
+        // Dynamic VHD1 with corrupted trailing footer must fail rather than silently falling back
+        // to the offset-0 backup copy and reporting healthy.
         let dyn_offset0_vhd = dir.path().join("dynamic-offset0.vhd");
         let mut dyn_offset0_bytes = dyn_bytes.clone();
         let tail_start = dyn_offset0_bytes.len() - 512;
         dyn_offset0_bytes[tail_start..].fill(0);
         fs::write(&dyn_offset0_vhd, &dyn_offset0_bytes).unwrap();
-        let dyn_offset0_info = inspect_disk(&dyn_offset0_vhd, None).unwrap();
-        assert_eq!(dyn_offset0_info.disk_type, "dynamic");
-        assert_eq!(dyn_offset0_info.block_size_bytes, Some(2 * 1024 * 1024));
+        let dyn_offset0_err = inspect_disk(&dyn_offset0_vhd, None).unwrap_err();
+        assert!(
+            dyn_offset0_err.to_string().contains("corrupt trailing footer"),
+            "{dyn_offset0_err:#}"
+        );
 
         // Dynamic header with bad checksum or bad version ignores block_size_bytes.
         let mut bad_csum_bytes = dyn_bytes.clone();
