@@ -79,6 +79,8 @@ impl AdoptedProcess {
 
         #[cfg(all(unix, not(target_os = "linux")))]
         {
+            // Non-Linux Unix process adoption is currently unsupported (`verify_linux_or_unix_identity`
+            // returns `false`), so this fallback path is unreachable via `open_verified_pid`.
             is_pid_alive_raw(self.pid)
         }
     }
@@ -179,6 +181,22 @@ impl AdoptedProcess {
             return false;
         }
         verify_linux_or_unix_identity(self.pid, self.expected_bin.as_deref())
+    }
+}
+
+/// Configures process-group isolation and an owner-only `umask(0o077)` on Unix
+/// worker commands so runtime files (such as `<id>.sock`) are created owner-only
+/// even inside shared or custom `runtime_dir` paths.
+#[cfg(unix)]
+pub fn configure_worker_command(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+    // SAFETY: `libc::umask` is async-signal-safe per POSIX.1-2008.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
     }
 }
 
@@ -583,7 +601,9 @@ mod tests {
         assert!(open_verified_pid(&pid_path, None).is_none());
     }
 
-    #[cfg(unix)]
+    // Non-Linux Unix adoption is unsupported (`verify_linux_or_unix_identity` returns `false`),
+    // so `AdoptedProcess::is_alive` only handles zombies on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn adopted_process_is_alive_returns_false_when_child_exits_unreaped() {
         let mut child = std::process::Command::new("/bin/sh")

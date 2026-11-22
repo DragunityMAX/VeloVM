@@ -229,7 +229,11 @@ impl Server {
             // a half-close (`shutdown(SHUT_WR)` -> `RDHUP`) where the peer still
             // expects in-flight replies, rather than a full disconnect (`HUP`/`ERR`).
             // Keep pending RPCs alive until either full disconnect or `send_task`
-            // finishes draining responses.
+            // finishes draining responses. Note: this assumes `AF_UNIX` stream
+            // sockets (used by OpenVMM's ttrpc transport) — on Unix TCP sockets, a
+            // peer `close()` only sends `FIN` and won't trigger `HUP`, and
+            // `pal_async`'s `kqueue` backend never sets `PollEvents::ERR` (relying
+            // on `EV_EOF` -> `PollEvents::HUP`).
             #[cfg(unix)]
             futures::select! {
                 _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {

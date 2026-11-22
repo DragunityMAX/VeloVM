@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub const DEFAULT_DAEMON_PORT: u16 = 47620;
 pub const DEFAULT_DAEMON_LISTEN: &str = "127.0.0.1:47620";
 pub const MAX_VM_MEMORY_MB: u64 = 16 * 1024 * 1024;
+pub const EVENT_REVISION_HEADER: &str = "x-openvmms-event-revision";
 
 /// Parses and validates a loopback HTTP listen address (e.g. `127.0.0.1:47620`,
 /// `[::1]:47620`, or `http://localhost:47620`), rejecting arbitrary hostnames and
@@ -247,7 +248,11 @@ pub fn parse_mac_bytes(mac: &str) -> anyhow::Result<[u8; 6]> {
         bail!("invalid MAC address '{mac}' (expected 6 hex octets separated by '-' or ':')");
     };
     let parts: Vec<&str> = mac.split(sep).collect();
-    if parts.len() != 6 || parts.iter().any(|p| p.len() != 2) {
+    if parts.len() != 6
+        || parts
+            .iter()
+            .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
         bail!("invalid MAC address '{mac}' (expected 6 hex octets)");
     }
     let mut bytes = [0u8; 6];
@@ -1857,5 +1862,10 @@ mod tests {
         });
         assert!(cfg.validate().is_err());
         cfg.validate_with_options(false, true).unwrap();
+
+        // parse_mac_bytes rejects leading '+' signs in hex octets.
+        assert!(parse_mac_bytes("+0:+1:+2:+3:+4:+5").is_err());
+        assert!(parse_mac_bytes("+2:00:00:00:00:01").is_err());
+        assert!(parse_mac_bytes("02-00-00-00-00-01").is_ok());
     }
 }

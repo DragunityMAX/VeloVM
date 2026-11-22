@@ -2493,6 +2493,95 @@ async fn test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_p
     daemon_adopted.shutdown().await;
 }
 
+async fn test_online_hotplug_save_failure_does_not_rollback_restarted_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let fw_path = dir.path().join("MSVM.fd");
+    fs::write(&fw_path, b"FAKE_UEFI").unwrap();
+
+    let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let client = test_http_client();
+    let runtime_dir = configure_stub_host(&client, &daemon, dir.path(), &fw_path).await;
+    write_stub_mode(&runtime_dir, "slow_modify_resource", &[]);
+
+    let created = create_stub_vm(&client, &daemon, "HotplugRestartRace-VM").await;
+    let vm_id = created.config.id;
+    let vm_id_str = vm_id.to_string();
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/{vm_id_str}/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let disk_path = dir.path().join("race-disk.img");
+    fs::write(&disk_path, vec![0u8; 65536]).unwrap();
+
+    // Start online attach_disk(LUN 2) while ModifyResource pauses 350ms on generation 1.
+    let sup = Arc::clone(&daemon.supervisor);
+    let attach_id = vm_id_str.clone();
+    let attach_disk_path = disk_path.clone();
+    let attach_task = tokio::spawn(async move {
+        sup.attach_disk(
+            &attach_id,
+            AttachDiskPayload {
+                path: attach_disk_path,
+                lun: Some(2),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+    });
+
+    wait_for_file(&runtime_dir.join("modify_resource_entered")).await;
+
+    // Stop generation 1 and immediately start generation 2 (normal mode) on the same `<id>.sock`
+    // while generation 1's attach_disk is still in flight.
+    write_stub_mode(&runtime_dir, "normal", &[]);
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/{vm_id_str}/stop", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let _ = fs::remove_file(runtime_dir.join("modify_resource.log"));
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/vms/{vm_id_str}/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let attach_res = attach_task.await.unwrap();
+    assert!(
+        attach_res.is_err(),
+        "stale gen-1 attach must fail after VM restarted: {attach_res:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let gen2_mod_log = fs::read_to_string(runtime_dir.join("modify_resource.log")).unwrap_or_default();
+    assert!(
+        gen2_mod_log.trim().is_empty(),
+        "gen-1 attach rollback must NOT send ModifyResource to restarted gen-2 VM, got: {gen2_mod_log:?}"
+    );
+
+    daemon.shutdown().await;
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--noop-exit") {
@@ -2578,6 +2667,10 @@ fn main() {
         (
             "adopted_vm_stop_preserves_state_when_unterminated_and_terminates_peer",
             Box::pin(test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_peer()),
+        ),
+        (
+            "online_hotplug_save_failure_does_not_rollback_restarted_vm",
+            Box::pin(test_online_hotplug_save_failure_does_not_rollback_restarted_vm()),
         ),
     ];
 

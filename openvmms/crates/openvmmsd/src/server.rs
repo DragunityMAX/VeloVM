@@ -387,8 +387,15 @@ async fn inspect_disk(
         .map_err(ApiError::map_anyhow)
 }
 
-async fn list_vms(State(state): State<AppState>) -> Json<Vec<VmSummary>> {
-    Json(state.supervisor.list_vms())
+async fn list_vms(State(state): State<AppState>) -> impl IntoResponse {
+    let (vms, rev) = state.supervisor.list_vms_with_revision();
+    (
+        [(
+            axum::http::HeaderName::from_static(openvmms_core::models::EVENT_REVISION_HEADER),
+            rev.to_string(),
+        )],
+        Json(vms),
+    )
 }
 
 async fn create_vm(
@@ -3097,6 +3104,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(vhdx_resp.status(), 400);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_vms_returns_atomic_event_revision_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let created: VmSummary = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "RevHeader-VM".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let vms_resp = client
+            .get(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vms_resp.status(), 200);
+        let hdr_rev: u64 = vms_resp
+            .headers()
+            .get(openvmms_core::models::EVENT_REVISION_HEADER)
+            .expect("missing x-openvmms-event-revision header")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(hdr_rev, created.runtime.revision);
+
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let (api_vms, api_rev) = tokio::task::spawn_blocking(move || {
+            openvmms_core::api_client::ApiClient::new(&base_url, &token)?.list_vms_with_revision()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(api_vms.len(), 1);
+        assert_eq!(api_rev, Some(created.runtime.revision));
+
+        daemon.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_default_runtime_dir_trailing_slash_gets_0700_and_worker_umask_is_0077() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let fake_uefi = dir.path().join("MSVM.fd");
+        fs::write(&fake_uefi, b"uefi").unwrap();
+
+        // 1. Default runtime_dir specified with a trailing slash (pre-existing 0o755) must still get 0o700.
+        let default_rt = openvmms_core::models::default_runtime_dir(dir.path());
+        fs::create_dir_all(&default_rt).unwrap();
+        fs::set_permissions(&default_rt, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let exit_script = dir.path().join("exit-script.sh");
+        fs::write(&exit_script, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&exit_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        cfg.runtime_dir = std::path::PathBuf::from(format!("{}/", default_rt.display()));
+        cfg.openvmm_bin = Some(exit_script);
+        cfg.uefi_firmware_path = Some(fake_uefi);
+        assert_eq!(
+            client
+                .put(format!("{}/api/v1/host/config", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&cfg)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        let vm_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Umask-VM".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vm_resp.status(), 201);
+
+        let _ = client
+            .post(format!("{}/api/v1/vms/Umask-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        let default_mode = fs::metadata(&default_rt).unwrap().permissions().mode() & 0o777;
+        assert_eq!(default_mode, 0o700);
+
+        // 2. Custom 0o755 runtime_dir keeps 0o755, while the spawned child creates files with umask 0o077.
+        let custom_rt = dir.path().join("custom-umask-rt");
+        fs::create_dir_all(&custom_rt).unwrap();
+        fs::set_permissions(&custom_rt, fs::Permissions::from_mode(0o755)).unwrap();
+        let probe_file = custom_rt.join("worker-created.probe");
+        let probe_script = dir.path().join("probe-script.sh");
+        fs::write(
+            &probe_script,
+            format!("#!/bin/sh\n: > '{}'\nexit 1\n", probe_file.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&probe_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        cfg.runtime_dir = custom_rt.clone();
+        cfg.openvmm_bin = Some(probe_script);
+        assert_eq!(
+            client
+                .put(format!("{}/api/v1/host/config", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&cfg)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        let _ = client
+            .post(format!("{}/api/v1/vms/Umask-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        let custom_mode = fs::metadata(&custom_rt).unwrap().permissions().mode() & 0o777;
+        assert_eq!(custom_mode, 0o755);
+        let probe_mode = fs::metadata(&probe_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            probe_mode & 0o077,
+            0,
+            "child worker must run with umask 0o077 (got {probe_mode:o})"
+        );
 
         daemon.shutdown().await;
     }

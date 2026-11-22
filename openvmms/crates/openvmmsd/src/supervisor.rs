@@ -473,13 +473,16 @@ impl Supervisor {
     }
 
     /// Spawns an HTTP API server on `listener` and shuts down any previously active listener.
-    pub fn serve_on_listener(
+    pub async fn serve_on_listener(
         self: &Arc<Self>,
         listener: tokio::net::TcpListener,
     ) -> anyhow::Result<SocketAddr> {
         let bound_addr = listener.local_addr()?;
-        self.store
-            .write_runtime_listen_addr(&bound_addr.to_string())?;
+        let store = self.store.clone();
+        let addr_str = bound_addr.to_string();
+        tokio::task::spawn_blocking(move || store.write_runtime_listen_addr(&addr_str))
+            .await
+            .map_err(|e| anyhow::anyhow!("writing runtime listen address failed: {e}"))??;
         let app = crate::server::build_router(Arc::clone(self), self.auth_token.clone(), bound_addr);
         let mut shutdown_rx = self.subscribe_shutdown();
         let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -649,26 +652,32 @@ impl Supervisor {
             None
         };
 
-        // Persist config.toml BEFORE switching the live listener so a failed save
-        // leaves the daemon serving on the existing port matching config.toml.
+        // Persist config.toml BEFORE updating in-memory host_config or switching the live listener
+        // so a failed save leaves the daemon serving on the existing port matching config.toml.
         let store = self.store.clone();
         let cfg_to_save = new_cfg.clone();
         tokio::task::spawn_blocking(move || store.save_host_config(&cfg_to_save))
             .await
             .map_err(|e| anyhow::anyhow!("saving host config task failed: {e}"))??;
 
-        if let Some(listener) = new_listener
-            && let Err(err) = self.serve_on_listener(listener)
-        {
-            self.rollback_host_config(current_cfg).await;
-            return Err(err);
-        }
-
         if changing_runtime_dir {
             let _vms_guard = self.vms.write().unwrap();
             *self.host_config.write().unwrap() = new_cfg.clone();
         } else {
             *self.host_config.write().unwrap() = new_cfg.clone();
+        }
+
+        if let Some(listener) = new_listener
+            && let Err(err) = self.serve_on_listener(listener).await
+        {
+            if changing_runtime_dir {
+                let _vms_guard = self.vms.write().unwrap();
+                *self.host_config.write().unwrap() = current_cfg.clone();
+            } else {
+                *self.host_config.write().unwrap() = current_cfg.clone();
+            }
+            self.rollback_host_config(current_cfg).await;
+            return Err(err);
         }
         drop(_runtime_dir_guard);
         self.emit(DaemonEvent::HostConfigUpdated);
@@ -718,8 +727,16 @@ impl Supervisor {
     }
 
     pub fn list_vms(&self) -> Vec<VmSummary> {
-        let guard = self.vms.read().unwrap();
-        let mut items: Vec<VmSummary> = guard.values().map(ManagedVm::summary).collect();
+        self.list_vms_with_revision().0
+    }
+
+    pub fn list_vms_with_revision(&self) -> (Vec<VmSummary>, u64) {
+        let (mut items, event_revision) = {
+            let guard = self.vms.read().unwrap();
+            let rev = self.event_seq.load(Ordering::SeqCst).saturating_sub(1);
+            let items: Vec<VmSummary> = guard.values().map(ManagedVm::summary).collect();
+            (items, rev)
+        };
         items.sort_by(|a, b| {
             a.config
                 .name
@@ -727,7 +744,7 @@ impl Supervisor {
                 .cmp(&b.config.name.to_lowercase())
                 .then(a.config.id.cmp(&b.config.id))
         });
-        items
+        (items, event_revision)
     }
 
     pub fn get_vm(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {
@@ -922,18 +939,31 @@ impl Supervisor {
             let guard = self.vms.read().unwrap();
             collect_all_vm_disk_paths(&guard, &cfg_disk_paths)
         };
-        let path_keys = precompute_disk_path_keys(all_paths);
-        {
-            let guard = self.vms.read().unwrap();
-            if guard
-                .values()
-                .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
-            {
-                return Err(err_conflict(format!(
-                    "a VM named '{trimmed_name}' already exists"
-                )));
+        let mut path_keys = precompute_disk_path_keys(all_paths);
+        for attempt in 0..=MAX_PATH_KEY_RETRIES {
+            let missing = {
+                let guard = self.vms.read().unwrap();
+                if guard
+                    .values()
+                    .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
+                {
+                    return Err(err_conflict(format!(
+                        "a VM named '{trimmed_name}' already exists"
+                    )));
+                }
+                let missing = collect_missing_disk_path_keys(&guard, None, &cfg.disks, &path_keys);
+                if missing.is_empty() {
+                    ensure_disks_not_conflicting_with_keys(&guard, None, &cfg.disks, &path_keys)?;
+                    break;
+                }
+                missing
+            };
+            if attempt == MAX_PATH_KEY_RETRIES {
+                return Err(err_conflict(
+                    "concurrent disk configuration changes while creating VM; please retry",
+                ));
             }
-            ensure_disks_not_conflicting_with_keys(&guard, None, &cfg.disks, &path_keys)?;
+            path_keys.extend(precompute_disk_path_keys(missing));
         }
 
         if let Some(ref disk_req) = pending_disk_req {
@@ -978,56 +1008,95 @@ impl Supervisor {
                 }
                 collect_all_vm_disk_paths(&guard, &cfg_disk_paths)
             };
-            let post_keys = precompute_disk_path_keys(post_create_paths);
-            {
-                let guard = self.vms.read().unwrap();
-                ensure_disks_not_conflicting_with_keys(&guard, None, &cfg.disks, &post_keys)?;
+            let mut post_keys = precompute_disk_path_keys(post_create_paths);
+            for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                let missing = {
+                    let guard = self.vms.read().unwrap();
+                    let missing =
+                        collect_missing_disk_path_keys(&guard, None, &cfg.disks, &post_keys);
+                    if missing.is_empty() {
+                        ensure_disks_not_conflicting_with_keys(
+                            &guard,
+                            None,
+                            &cfg.disks,
+                            &post_keys,
+                        )?;
+                        break;
+                    }
+                    missing
+                };
+                if attempt == MAX_PATH_KEY_RETRIES {
+                    return Err(err_conflict(
+                        "concurrent disk configuration changes while creating VM; please retry",
+                    ));
+                }
+                post_keys.extend(precompute_disk_path_keys(missing));
             }
 
             // Persist vm.toml outside the global `vms` lock.
             self.store.save_vm(&cfg)?;
 
-            let mut guard = self.vms.write().unwrap();
-            if guard
-                .values()
-                .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
-            {
-                drop(guard);
-                let _ = self.store.delete_vm_dir(probe_id);
-                return Err(err_conflict(format!(
-                    "a VM named '{trimmed_name}' already exists"
-                )));
-            }
-            if let Err(err) =
-                ensure_disks_not_conflicting_with_keys(&guard, None, &cfg.disks, &post_keys)
-            {
-                drop(guard);
-                let _ = self.store.delete_vm_dir(probe_id);
-                return Err(err);
-            }
+            for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                let missing = {
+                    let mut guard = self.vms.write().unwrap();
+                    if guard
+                        .values()
+                        .any(|m| m.config.name.eq_ignore_ascii_case(&trimmed_name))
+                    {
+                        drop(guard);
+                        let _ = self.store.delete_vm_dir(probe_id);
+                        return Err(err_conflict(format!(
+                            "a VM named '{trimmed_name}' already exists"
+                        )));
+                    }
+                    let missing =
+                        collect_missing_disk_path_keys(&guard, None, &cfg.disks, &post_keys);
+                    if missing.is_empty() {
+                        if let Err(err) = ensure_disks_not_conflicting_with_keys(
+                            &guard,
+                            None,
+                            &cfg.disks,
+                            &post_keys,
+                        ) {
+                            drop(guard);
+                            let _ = self.store.delete_vm_dir(probe_id);
+                            return Err(err);
+                        }
 
-            let managed = ManagedVm {
-                config: cfg,
-                runtime: VmRuntimeState {
-                    revision: self.next_revision(),
-                    ..Default::default()
-                },
-                child: None,
-                adopted_proc: None,
-                monitor_cancel: None,
-                monitor_handle: None,
-                generation: 0,
-                start_cancel: None,
-                stop_wait: None,
-                prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
-                power_op_lock: Arc::new(tokio::sync::Mutex::new(())),
-                hotplug_lock: Arc::new(tokio::sync::Mutex::new(())),
-                detach_on_drop: false,
-                deleting: false,
-            };
-            let summary = managed.summary();
-            guard.insert(summary.config.id, managed);
-            Ok(summary)
+                        let managed = ManagedVm {
+                            config: cfg,
+                            runtime: VmRuntimeState {
+                                revision: self.next_revision(),
+                                ..Default::default()
+                            },
+                            child: None,
+                            adopted_proc: None,
+                            monitor_cancel: None,
+                            monitor_handle: None,
+                            generation: 0,
+                            start_cancel: None,
+                            stop_wait: None,
+                            prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
+                            power_op_lock: Arc::new(tokio::sync::Mutex::new(())),
+                            hotplug_lock: Arc::new(tokio::sync::Mutex::new(())),
+                            detach_on_drop: false,
+                            deleting: false,
+                        };
+                        let summary = managed.summary();
+                        guard.insert(summary.config.id, managed);
+                        return Ok(summary);
+                    }
+                    missing
+                };
+                if attempt == MAX_PATH_KEY_RETRIES {
+                    let _ = self.store.delete_vm_dir(probe_id);
+                    return Err(err_conflict(
+                        "concurrent disk configuration changes while creating VM; please retry",
+                    ));
+                }
+                post_keys.extend(precompute_disk_path_keys(missing));
+            }
+            unreachable!()
         })();
 
         let summary = match persist_res {
@@ -1174,7 +1243,7 @@ impl Supervisor {
             .validate_with_options(disks_updated, nics_updated)
             .map_err(|e| err_bad_request(format!("{e:#}")))?;
 
-        let path_keys = if disks_updated {
+        let mut path_keys = if disks_updated {
             let disks_check = updated.disks.clone();
             tokio::task::spawn_blocking(move || {
                 for d in &disks_check {
@@ -1189,8 +1258,33 @@ impl Supervisor {
         };
 
         if disks_updated {
-            let guard = self.vms.read().unwrap();
-            ensure_disks_not_conflicting_with_keys(&guard, Some(id), &updated.disks, &path_keys)?;
+            for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                let missing = {
+                    let guard = self.vms.read().unwrap();
+                    let missing = collect_missing_disk_path_keys(
+                        &guard,
+                        Some(id),
+                        &updated.disks,
+                        &path_keys,
+                    );
+                    if missing.is_empty() {
+                        ensure_disks_not_conflicting_with_keys(
+                            &guard,
+                            Some(id),
+                            &updated.disks,
+                            &path_keys,
+                        )?;
+                        break;
+                    }
+                    missing
+                };
+                if attempt == MAX_PATH_KEY_RETRIES {
+                    return Err(err_conflict(
+                        "concurrent disk configuration changes while updating VM; please retry",
+                    ));
+                }
+                extend_disk_path_keys(&mut path_keys, missing, "update_vm").await?;
+            }
         }
 
         let store = self.store.clone();
@@ -1201,52 +1295,86 @@ impl Supervisor {
         .await
         .map_err(|e| anyhow::anyhow!("update_vm save task failed: {e}"))??;
 
-        let commit_res: anyhow::Result<VmSummary> = (|| {
-            let mut guard = self.vms.write().unwrap();
-            if guard
-                .values()
-                .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(&updated.name))
-            {
-                return Err(err_conflict(format!(
-                    "another VM is already named '{}'",
-                    updated.name
-                )));
+        let mut should_rollback_disk_file;
+        let commit_res: anyhow::Result<VmSummary> = 'commit: {
+            for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                let missing = {
+                    let mut guard = self.vms.write().unwrap();
+                    let Some(vm) = guard.get(&id) else {
+                        should_rollback_disk_file = false;
+                        break 'commit Err(err_not_found("VM not found"));
+                    };
+                    if vm.deleting {
+                        should_rollback_disk_file = false;
+                        break 'commit Err(err_conflict(format!(
+                            "cannot update VM '{}' while it is being deleted",
+                            vm.config.name
+                        )));
+                    }
+                    should_rollback_disk_file = true;
+                    if guard
+                        .values()
+                        .any(|m| m.config.id != id && m.config.name.eq_ignore_ascii_case(&updated.name))
+                    {
+                        break 'commit Err(err_conflict(format!(
+                            "another VM is already named '{}'",
+                            updated.name
+                        )));
+                    }
+                    if hardware_change
+                        && (vm.generation != snap_gen
+                            || !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error))
+                    {
+                        break 'commit Err(err_conflict(format!(
+                            "cannot edit hardware configuration while VM '{}' is {}",
+                            vm.config.name, vm.runtime.status
+                        )));
+                    }
+                    if disks_updated {
+                        let missing = collect_missing_disk_path_keys(
+                            &guard,
+                            Some(id),
+                            &updated.disks,
+                            &path_keys,
+                        );
+                        if !missing.is_empty() {
+                            missing
+                        } else if let Err(err) = ensure_disks_not_conflicting_with_keys(
+                            &guard,
+                            Some(id),
+                            &updated.disks,
+                            &path_keys,
+                        ) {
+                            break 'commit Err(err);
+                        } else {
+                            let vm = guard.get_mut(&id).unwrap();
+                            vm.config = updated;
+                            vm.runtime.revision = self.next_revision();
+                            break 'commit Ok(vm.summary());
+                        }
+                    } else {
+                        let vm = guard.get_mut(&id).unwrap();
+                        vm.config = updated;
+                        vm.runtime.revision = self.next_revision();
+                        break 'commit Ok(vm.summary());
+                    }
+                };
+                if attempt == MAX_PATH_KEY_RETRIES {
+                    break 'commit Err(err_conflict(
+                        "concurrent disk configuration changes while updating VM; please retry",
+                    ));
+                }
+                extend_disk_path_keys(&mut path_keys, missing, "update_vm").await?;
             }
-            if disks_updated {
-                ensure_disks_not_conflicting_with_keys(
-                    &guard,
-                    Some(id),
-                    &updated.disks,
-                    &path_keys,
-                )?;
-            }
-            let vm = guard
-                .get_mut(&id)
-                .ok_or_else(|| err_not_found("VM not found"))?;
-            if vm.deleting {
-                return Err(err_conflict(format!(
-                    "cannot update VM '{}' while it is being deleted",
-                    vm.config.name
-                )));
-            }
-            if hardware_change
-                && (vm.generation != snap_gen
-                    || !matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error))
-            {
-                return Err(err_conflict(format!(
-                    "cannot edit hardware configuration while VM '{}' is {}",
-                    vm.config.name, vm.runtime.status
-                )));
-            }
-            vm.config = updated;
-            vm.runtime.revision = self.next_revision();
-            Ok(vm.summary())
-        })();
+            unreachable!()
+        };
 
         let summary = match commit_res {
             Ok(summary) => summary,
             Err(err) => {
-                self.rollback_vm_config(id, "update VM", prev_cfg).await;
+                if should_rollback_disk_file {
+                    self.rollback_vm_config(id, "update VM", prev_cfg).await;
+                }
                 return Err(err);
             }
         };
@@ -1309,62 +1437,135 @@ impl Supervisor {
             (vm_disks, all_paths)
         };
 
+        struct ClearDeletingGuard<'a> {
+            vms: &'a RwLock<HashMap<Uuid, ManagedVm>>,
+            id: Uuid,
+            armed: bool,
+        }
+
+        impl Drop for ClearDeletingGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed
+                    && let Ok(mut guard) = self.vms.write()
+                    && let Some(vm) = guard.get_mut(&self.id)
+                {
+                    vm.deleting = false;
+                }
+            }
+        }
+
+        let mut deleting_guard = ClearDeletingGuard {
+            vms: &self.vms,
+            id,
+            armed: true,
+        };
+
         // Remove persisted VM metadata outside the global `vms` lock so a store
         // failure preserves `vm.toml` and does not block unrelated API calls.
         let store = self.store.clone();
-        let del_res = tokio::task::spawn_blocking(move || store.delete_vm_dir(id))
-            .await
-            .map_err(|e| anyhow::anyhow!("delete_vm task failed: {e}"))?;
+        let (del_res, vm_toml_exists) = tokio::task::spawn_blocking(move || {
+            let res = store.delete_vm_dir(id);
+            let toml_exists = store.vm_config_path(id).is_file();
+            (res, toml_exists)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("delete_vm task failed: {e}"))?;
         if let Err(err) = del_res {
-            if let Some(vm) = self.vms.write().unwrap().get_mut(&id) {
-                vm.deleting = false;
+            if !vm_toml_exists {
+                // `vm.toml` was already removed before a subsequent cleanup step failed
+                // (e.g. `state.vmgs` locked on Windows). Drop the in-memory ghost entry
+                // and emit `VmDeleted` instead of stranding an unpersisted VM.
+                deleting_guard.armed = false;
+                let revision = {
+                    let mut guard = self.vms.write().unwrap();
+                    guard.remove(&id);
+                    self.next_revision()
+                };
+                self.emit(DaemonEvent::VmDeleted { id, revision });
             }
             return Err(err);
         }
 
-        let path_keys = if delete_disks {
-            tokio::task::spawn_blocking(move || precompute_disk_path_keys(all_paths))
-                .await
-                .map_err(|e| anyhow::anyhow!("delete_vm disk key task failed: {e}"))?
-        } else {
-            HashMap::new()
-        };
+        // `vm.toml` is gone: keep the entry in `self.vms` with `deleting = true`
+        // until disk file deletion completes so disk reservations remain intact.
+        deleting_guard.armed = false;
 
-        let (disks_to_delete, revision) = {
-            let mut guard = self.vms.write().unwrap();
-            let disks = if delete_disks {
-                let referenced_by_others: HashSet<PathBuf> = guard
-                    .values()
-                    .filter(|other| other.config.id != id)
-                    .flat_map(|other| other.config.disks.iter())
-                    .map(|d| lookup_path_key(&path_keys, &d.path))
-                    .collect();
-                let mut seen = HashSet::new();
-                let mut candidates = Vec::new();
-                for d in &vm_disks {
-                    if d.kind == DiskKind::HardDisk && !d.read_only {
-                        let key = lookup_path_key(&path_keys, &d.path);
-                        if referenced_by_others.contains(&key) {
+        let disks_to_delete = if delete_disks && !vm_disks.is_empty() {
+            match tokio::task::spawn_blocking(move || precompute_disk_path_keys(all_paths)).await {
+                Ok(mut path_keys) => {
+                    let mut candidates = Vec::new();
+                    for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                        let missing = {
+                            let guard = self.vms.read().unwrap();
+                            let missing = collect_missing_disk_path_keys(
+                                &guard,
+                                Some(id),
+                                &vm_disks,
+                                &path_keys,
+                            );
+                            if missing.is_empty() {
+                                let referenced_by_others: HashSet<PathBuf> = guard
+                                    .values()
+                                    .filter(|other| other.config.id != id)
+                                    .flat_map(|other| other.config.disks.iter())
+                                    .filter_map(|d| path_keys.get(&d.path).cloned())
+                                    .collect();
+                                let mut seen = HashSet::new();
+                                for d in &vm_disks {
+                                    if d.kind == DiskKind::HardDisk
+                                        && !d.read_only
+                                        && let Some(key) = path_keys.get(&d.path)
+                                    {
+                                        if referenced_by_others.contains(key) {
+                                            warn!(
+                                                vm_id = %id,
+                                                path = %d.path.display(),
+                                                "refusing to delete disk referenced by another VM"
+                                            );
+                                        } else if seen.insert(key.clone()) {
+                                            candidates.push(d.path.clone());
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            missing
+                        };
+                        if attempt == MAX_PATH_KEY_RETRIES {
                             warn!(
                                 vm_id = %id,
-                                path = %d.path.display(),
-                                "refusing to delete disk referenced by another VM"
+                                "exhausted retries resolving canonical disk keys during delete_vm; skipping disk file deletion"
                             );
-                        } else if seen.insert(key) {
-                            candidates.push(d.path.clone());
+                            break;
+                        }
+                        if let Err(err) =
+                            extend_disk_path_keys(&mut path_keys, missing, "delete_vm").await
+                        {
+                            warn!(
+                                vm_id = %id,
+                                error = %err,
+                                "delete_vm disk key task failed; skipping disk file deletion"
+                            );
+                            break;
                         }
                     }
+                    candidates
                 }
-                candidates
-            } else {
-                Vec::new()
-            };
-            guard.remove(&id);
-            (disks, self.next_revision())
+                Err(err) => {
+                    warn!(
+                        vm_id = %id,
+                        error = %err,
+                        "delete_vm disk key task failed; skipping disk file deletion"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
         };
 
-        if !disks_to_delete.is_empty() {
-            let _ = tokio::task::spawn_blocking(move || {
+        if !disks_to_delete.is_empty()
+            && let Err(err) = tokio::task::spawn_blocking(move || {
                 for path in disks_to_delete {
                     if path.is_file()
                         && let Err(err) = fs::remove_file(&path)
@@ -1373,8 +1574,16 @@ impl Supervisor {
                     }
                 }
             })
-            .await;
+            .await
+        {
+            warn!(vm_id = %id, error = %err, "delete_vm disk removal task failed");
         }
+
+        let revision = {
+            let mut guard = self.vms.write().unwrap();
+            guard.remove(&id);
+            self.next_revision()
+        };
         self.emit(DaemonEvent::VmDeleted { id, revision });
         Ok(())
     }
@@ -1544,7 +1753,7 @@ impl Supervisor {
         let managed_default_runtime_dir =
             openvmms_core::models::default_runtime_dir(self.store.data_dir());
 
-        let path_keys = tokio::task::spawn_blocking(move || {
+        let mut path_keys = tokio::task::spawn_blocking(move || {
             if !uefi_to_check.is_file() {
                 return Err(err_bad_request(format!(
                     "UEFI firmware not found at {}",
@@ -1574,7 +1783,10 @@ impl Supervisor {
             })?;
             #[cfg(unix)]
             {
-                if !existed_before || runtime_dir_to_prepare == managed_default_runtime_dir {
+                let is_managed_default =
+                    openvmms_core::models::normalize_path_key(&runtime_dir_to_prepare)
+                        == openvmms_core::models::normalize_path_key(&managed_default_runtime_dir);
+                if !existed_before || is_managed_default {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = fs::set_permissions(
                         &runtime_dir_to_prepare,
@@ -1587,12 +1799,29 @@ impl Supervisor {
         .await
         .map_err(|e| anyhow::anyhow!("VM startup preflight task failed: {e}"))??;
 
-        ensure_disks_not_conflicting_with_keys(
-            &self.vms.read().unwrap(),
-            Some(id),
-            &cfg.disks,
-            &path_keys,
-        )?;
+        for attempt in 0..=MAX_PATH_KEY_RETRIES {
+            let missing = {
+                let guard = self.vms.read().unwrap();
+                let missing =
+                    collect_missing_disk_path_keys(&guard, Some(id), &cfg.disks, &path_keys);
+                if missing.is_empty() {
+                    ensure_disks_not_conflicting_with_keys(
+                        &guard,
+                        Some(id),
+                        &cfg.disks,
+                        &path_keys,
+                    )?;
+                    break;
+                }
+                missing
+            };
+            if attempt == MAX_PATH_KEY_RETRIES {
+                return Err(err_conflict(
+                    "concurrent disk configuration changes while starting VM; please retry",
+                ));
+            }
+            extend_disk_path_keys(&mut path_keys, missing, "start_vm").await?;
+        }
 
         if *cancel_rx.borrow()
             || self.is_shutting_down()
@@ -1702,8 +1931,7 @@ impl Supervisor {
 
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
+            openvmms_core::process::configure_worker_command(&mut cmd);
         }
 
         #[cfg(windows)]
@@ -2627,8 +2855,9 @@ impl Supervisor {
             let guard = self.vms.read().unwrap();
             collect_all_vm_disk_paths(&guard, std::slice::from_ref(&req.path))
         };
-        let path_to_check = req.path.clone();
-        let path_keys = tokio::task::spawn_blocking(move || {
+        let req_path = req.path;
+        let path_to_check = req_path.clone();
+        let mut path_keys = tokio::task::spawn_blocking(move || {
             ensure_disk_format_safe(&path_to_check, format, explicit_format, true)?;
             if !path_to_check.is_file() {
                 return Err(err_bad_request(format!(
@@ -2641,43 +2870,67 @@ impl Supervisor {
         .await
         .map_err(|e| anyhow::anyhow!("attach_disk preflight task failed: {e}"))??;
 
-        let plan = {
-            let guard = self.vms.read().unwrap();
-            let vm = guard
-                .get(&id)
-                .ok_or_else(|| err_not_found("VM not found"))?;
-            let active_sock = vm.active_rpc_socket("attach disk")?;
-            let lun = req.lun.unwrap_or_else(|| vm.config.next_free_lun());
-            if lun > 255 {
-                return Err(err_bad_request(format!(
-                    "SCSI LUN must be 0..=255 (got {lun})"
-                )));
-            }
-            if vm.config.disks.iter().any(|d| d.lun == lun) {
-                return Err(err_conflict(format!("SCSI LUN {lun} is already occupied")));
-            }
-            let attachment = DiskAttachment {
-                lun,
-                kind,
-                path: req.path,
-                read_only: req.read_only || kind == DiskKind::Dvd,
-                format,
-            };
-            let mut candidate_disks = vm.config.disks.clone();
-            candidate_disks.push(attachment.clone());
-            candidate_disks.sort_by_key(|d| d.lun);
-            ensure_disks_not_conflicting_with_keys(&guard, Some(id), &candidate_disks, &path_keys)?;
-
-            match active_sock {
-                Some(sock) => Ok((attachment, sock, vm.generation)),
-                None => {
-                    let prev_cfg = vm.config.clone();
-                    let mut updated = prev_cfg.clone();
-                    updated.disks = candidate_disks;
-                    updated.updated_at = Utc::now();
-                    Err((attachment, prev_cfg, updated, vm.generation))
+        let plan = 'plan: {
+            for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                let missing = {
+                    let guard = self.vms.read().unwrap();
+                    let vm = guard
+                        .get(&id)
+                        .ok_or_else(|| err_not_found("VM not found"))?;
+                    let active_sock = vm.active_rpc_socket("attach disk")?;
+                    let lun = req.lun.unwrap_or_else(|| vm.config.next_free_lun());
+                    if lun > 255 {
+                        return Err(err_bad_request(format!(
+                            "SCSI LUN must be 0..=255 (got {lun})"
+                        )));
+                    }
+                    if vm.config.disks.iter().any(|d| d.lun == lun) {
+                        return Err(err_conflict(format!("SCSI LUN {lun} is already occupied")));
+                    }
+                    let attachment = DiskAttachment {
+                        lun,
+                        kind,
+                        path: req_path.clone(),
+                        read_only: req.read_only || kind == DiskKind::Dvd,
+                        format,
+                    };
+                    let mut candidate_disks = vm.config.disks.clone();
+                    candidate_disks.push(attachment.clone());
+                    candidate_disks.sort_by_key(|d| d.lun);
+                    let missing = collect_missing_disk_path_keys(
+                        &guard,
+                        Some(id),
+                        &candidate_disks,
+                        &path_keys,
+                    );
+                    if missing.is_empty() {
+                        ensure_disks_not_conflicting_with_keys(
+                            &guard,
+                            Some(id),
+                            &candidate_disks,
+                            &path_keys,
+                        )?;
+                        break 'plan match active_sock {
+                            Some(sock) => Ok((attachment, sock, vm.generation)),
+                            None => {
+                                let prev_cfg = vm.config.clone();
+                                let mut updated = prev_cfg.clone();
+                                updated.disks = candidate_disks;
+                                updated.updated_at = Utc::now();
+                                Err((attachment, prev_cfg, updated, vm.generation))
+                            }
+                        };
+                    }
+                    missing
+                };
+                if attempt == MAX_PATH_KEY_RETRIES {
+                    return Err(err_conflict(
+                        "concurrent disk configuration changes while attaching disk; please retry",
+                    ));
                 }
+                extend_disk_path_keys(&mut path_keys, missing, "attach_disk").await?;
             }
+            unreachable!()
         };
 
         let summary = match plan {
@@ -2690,51 +2943,71 @@ impl Supervisor {
                 .await
                 .map_err(|e| anyhow::anyhow!("attach_disk save task failed: {e}"))??;
 
-                let mut should_rollback_disk_file = false;
-                let commit_res: anyhow::Result<VmSummary> = (|| {
-                    let mut guard = self.vms.write().unwrap();
-                    {
-                        let vm = guard
-                            .get(&id)
-                            .ok_or_else(|| err_not_found("VM not found"))?;
-                        if vm.deleting {
-                            return Err(err_conflict(format!(
-                                "cannot attach disk while VM '{}' is being deleted",
-                                vm.config.name
-                            )));
-                        }
-                        if vm.generation != snap_gen || vm.active_rpc_socket("attach disk")?.is_some()
-                        {
+                let mut should_rollback_disk_file;
+                let commit_res: anyhow::Result<VmSummary> = 'commit: {
+                    for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                        let missing = {
+                            let mut guard = self.vms.write().unwrap();
+                            let Some(vm) = guard.get(&id) else {
+                                should_rollback_disk_file = false;
+                                break 'commit Err(err_not_found("VM not found"));
+                            };
+                            if vm.deleting {
+                                should_rollback_disk_file = false;
+                                break 'commit Err(err_conflict(format!(
+                                    "cannot attach disk while VM '{}' is being deleted",
+                                    vm.config.name
+                                )));
+                            }
                             should_rollback_disk_file = true;
-                            return Err(err_conflict(format!(
-                                "cannot complete offline disk attach because VM '{}' changed state",
-                                vm.config.name
-                            )));
+                            if vm.generation != snap_gen
+                                || match vm.active_rpc_socket("attach disk") {
+                                    Ok(sock) => sock.is_some(),
+                                    Err(err) => break 'commit Err(err),
+                                }
+                            {
+                                break 'commit Err(err_conflict(format!(
+                                    "cannot complete offline disk attach because VM '{}' changed state",
+                                    vm.config.name
+                                )));
+                            }
+                            if vm.config.disks.iter().any(|d| d.lun == attachment.lun) {
+                                break 'commit Err(err_conflict(format!(
+                                    "SCSI LUN {} is already occupied",
+                                    attachment.lun
+                                )));
+                            }
+                            let missing = collect_missing_disk_path_keys(
+                                &guard,
+                                Some(id),
+                                &updated.disks,
+                                &path_keys,
+                            );
+                            if !missing.is_empty() {
+                                missing
+                            } else if let Err(err) = ensure_disks_not_conflicting_with_keys(
+                                &guard,
+                                Some(id),
+                                &updated.disks,
+                                &path_keys,
+                            ) {
+                                break 'commit Err(err);
+                            } else {
+                                let vm = guard.get_mut(&id).unwrap();
+                                vm.config = updated;
+                                vm.runtime.revision = self.next_revision();
+                                break 'commit Ok(vm.summary());
+                            }
+                        };
+                        if attempt == MAX_PATH_KEY_RETRIES {
+                            break 'commit Err(err_conflict(
+                                "concurrent disk configuration changes while attaching disk; please retry",
+                            ));
                         }
-                        if vm.config.disks.iter().any(|d| d.lun == attachment.lun) {
-                            should_rollback_disk_file = true;
-                            return Err(err_conflict(format!(
-                                "SCSI LUN {} is already occupied",
-                                attachment.lun
-                            )));
-                        }
-                        if let Err(err) = ensure_disks_not_conflicting_with_keys(
-                            &guard,
-                            Some(id),
-                            &updated.disks,
-                            &path_keys,
-                        ) {
-                            should_rollback_disk_file = true;
-                            return Err(err);
-                        }
+                        extend_disk_path_keys(&mut path_keys, missing, "attach_disk").await?;
                     }
-                    let vm = guard
-                        .get_mut(&id)
-                        .ok_or_else(|| err_not_found("VM not found"))?;
-                    vm.config = updated;
-                    vm.runtime.revision = self.next_revision();
-                    Ok(vm.summary())
-                })();
+                    unreachable!()
+                };
 
                 match commit_res {
                     Ok(summary) => summary,
@@ -2758,57 +3031,66 @@ impl Supervisor {
                     .context("hot-adding SCSI disk to running VM")?;
 
                 let lun = attachment.lun;
-                let plan_online: anyhow::Result<(VmConfig, VmConfig)> = (|| {
-                    let guard = self.vms.read().unwrap();
-                    let vm = guard
-                        .get(&id)
-                        .ok_or_else(|| err_not_found("VM not found"))?;
-                    if vm.deleting
-                        || vm.generation != rpc_gen
-                        || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
-                    {
-                        return Err(err_conflict(format!(
-                            "cannot complete disk attach because VM '{}' changed state to {}",
-                            vm.config.name, vm.runtime.status
-                        )));
+                let plan_online: anyhow::Result<(VmConfig, VmConfig)> = 'plan_online: {
+                    for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                        let missing = {
+                            let guard = self.vms.read().unwrap();
+                            let Some(vm) = guard.get(&id) else {
+                                break 'plan_online Err(err_not_found("VM not found"));
+                            };
+                            if let Err(err) = ensure_same_live_vm(vm, rpc_gen, "disk attach") {
+                                break 'plan_online Err(err);
+                            }
+                            if vm.config.disks.iter().any(|d| d.lun == attachment.lun) {
+                                break 'plan_online Err(err_conflict(format!(
+                                    "SCSI LUN {} is already occupied",
+                                    attachment.lun
+                                )));
+                            }
+                            let mut candidate_disks = vm.config.disks.clone();
+                            candidate_disks.push(attachment.clone());
+                            candidate_disks.sort_by_key(|d| d.lun);
+                            let missing = collect_missing_disk_path_keys(
+                                &guard,
+                                Some(id),
+                                &candidate_disks,
+                                &path_keys,
+                            );
+                            if missing.is_empty() {
+                                if let Err(err) = ensure_disks_not_conflicting_with_keys(
+                                    &guard,
+                                    Some(id),
+                                    &candidate_disks,
+                                    &path_keys,
+                                ) {
+                                    break 'plan_online Err(err);
+                                }
+                                let prev_cfg = vm.config.clone();
+                                let mut updated = prev_cfg.clone();
+                                updated.disks = candidate_disks;
+                                updated.updated_at = Utc::now();
+                                break 'plan_online Ok((prev_cfg, updated));
+                            }
+                            missing
+                        };
+                        if attempt == MAX_PATH_KEY_RETRIES {
+                            break 'plan_online Err(err_conflict(
+                                "concurrent disk configuration changes while attaching disk; please retry",
+                            ));
+                        }
+                        if let Err(err) =
+                            extend_disk_path_keys(&mut path_keys, missing, "attach_disk").await
+                        {
+                            break 'plan_online Err(err);
+                        }
                     }
-                    if vm.config.disks.iter().any(|d| d.lun == attachment.lun) {
-                        return Err(err_conflict(format!(
-                            "SCSI LUN {} is already occupied",
-                            attachment.lun
-                        )));
-                    }
-                    let mut candidate_disks = vm.config.disks.clone();
-                    candidate_disks.push(attachment.clone());
-                    candidate_disks.sort_by_key(|d| d.lun);
-                    ensure_disks_not_conflicting_with_keys(
-                        &guard,
-                        Some(id),
-                        &candidate_disks,
-                        &path_keys,
-                    )?;
-                    let prev_cfg = vm.config.clone();
-                    let mut updated = prev_cfg.clone();
-                    updated.disks = candidate_disks;
-                    updated.updated_at = Utc::now();
-                    Ok((prev_cfg, updated))
-                })();
+                    unreachable!()
+                };
 
                 let (prev_cfg, updated) = match plan_online {
                     Ok(pair) => pair,
                     Err(err) => {
-                        let same_vm = {
-                            let guard = self.vms.read().unwrap();
-                            guard.get(&id).is_some_and(|vm| {
-                                !vm.deleting
-                                    && vm.generation == rpc_gen
-                                    && matches!(
-                                        vm.runtime.status,
-                                        VmStatus::Running | VmStatus::Paused
-                                    )
-                            })
-                        };
-                        if same_vm {
+                        if self.is_same_live_vm(id, rpc_gen) {
                             rollback_hot_added_disk(&sock, id, lun).await;
                         }
                         return Err(err);
@@ -2824,51 +3106,70 @@ impl Supervisor {
                 .map_err(|e| anyhow::anyhow!("attach_disk save task failed: {e}"))
                 .and_then(|r| r)
                 {
-                    rollback_hot_added_disk(&sock, id, lun).await;
+                    if self.is_same_live_vm(id, rpc_gen) {
+                        rollback_hot_added_disk(&sock, id, lun).await;
+                    }
                     return Err(err);
                 }
 
-                let mut rollback_on_same_vm = false;
-                let mut should_rollback_disk_file = false;
-                let commit_res: anyhow::Result<VmSummary> = (|| {
-                    let mut guard = self.vms.write().unwrap();
-                    {
-                        let vm = guard
-                            .get(&id)
-                            .ok_or_else(|| err_not_found("VM not found"))?;
-                        if vm.deleting
-                            || vm.generation != rpc_gen
-                            || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
-                        {
-                            if !vm.deleting {
-                                should_rollback_disk_file = true;
+                let mut rollback_on_same_vm;
+                let mut should_rollback_disk_file;
+                let commit_res: anyhow::Result<VmSummary> = 'commit: {
+                    for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                        let missing = {
+                            let mut guard = self.vms.write().unwrap();
+                            let Some(vm) = guard.get(&id) else {
+                                should_rollback_disk_file = false;
+                                rollback_on_same_vm = false;
+                                break 'commit Err(err_not_found("VM not found"));
+                            };
+                            if let Err(err) = ensure_same_live_vm(vm, rpc_gen, "disk attach") {
+                                should_rollback_disk_file = !vm.deleting;
+                                rollback_on_same_vm = false;
+                                break 'commit Err(err);
                             }
-                            return Err(err_conflict(format!(
-                                "cannot complete disk attach because VM '{}' changed state to {}",
-                                vm.config.name, vm.runtime.status
-                            )));
+                            rollback_on_same_vm = true;
+                            should_rollback_disk_file = true;
+                            if vm.config.disks.iter().any(|d| d.lun == lun) {
+                                break 'commit Err(err_conflict(format!(
+                                    "SCSI LUN {lun} is already occupied"
+                                )));
+                            }
+                            let missing = collect_missing_disk_path_keys(
+                                &guard,
+                                Some(id),
+                                &updated.disks,
+                                &path_keys,
+                            );
+                            if !missing.is_empty() {
+                                missing
+                            } else if let Err(err) = ensure_disks_not_conflicting_with_keys(
+                                &guard,
+                                Some(id),
+                                &updated.disks,
+                                &path_keys,
+                            ) {
+                                break 'commit Err(err);
+                            } else {
+                                let vm = guard.get_mut(&id).unwrap();
+                                vm.config = updated;
+                                vm.runtime.revision = self.next_revision();
+                                break 'commit Ok(vm.summary());
+                            }
+                        };
+                        if attempt == MAX_PATH_KEY_RETRIES {
+                            break 'commit Err(err_conflict(
+                                "concurrent disk configuration changes while attaching disk; please retry",
+                            ));
                         }
-                        rollback_on_same_vm = true;
-                        should_rollback_disk_file = true;
-                        if vm.config.disks.iter().any(|d| d.lun == lun) {
-                            return Err(err_conflict(format!(
-                                "SCSI LUN {lun} is already occupied"
-                            )));
+                        if let Err(err) =
+                            extend_disk_path_keys(&mut path_keys, missing, "attach_disk").await
+                        {
+                            break 'commit Err(err);
                         }
-                        ensure_disks_not_conflicting_with_keys(
-                            &guard,
-                            Some(id),
-                            &updated.disks,
-                            &path_keys,
-                        )?;
                     }
-                    let vm = guard
-                        .get_mut(&id)
-                        .ok_or_else(|| err_not_found("VM not found"))?;
-                    vm.config = updated;
-                    vm.runtime.revision = self.next_revision();
-                    Ok(vm.summary())
-                })();
+                    unreachable!()
+                };
 
                 match commit_res {
                     Ok(summary) => summary,
@@ -2876,7 +3177,7 @@ impl Supervisor {
                         if should_rollback_disk_file {
                             self.rollback_vm_config(id, "attach disk", prev_cfg).await;
                         }
-                        if rollback_on_same_vm {
+                        if rollback_on_same_vm && self.is_same_live_vm(id, rpc_gen) {
                             rollback_hot_added_disk(&sock, id, lun).await;
                         }
                         return Err(err);
@@ -2958,7 +3259,7 @@ impl Supervisor {
             })
             .await
             .map_err(|e| anyhow::anyhow!("detach_disk path key task failed: {e}"))?;
-            if lookup_path_key(&keys, &existing.path) != lookup_path_key(&keys, exp) {
+            if keys.get(&existing.path) != keys.get(exp) {
                 return Err(err_conflict(format!(
                     "disk at SCSI LUN {lun} changed (expected '{}', found '{}')",
                     exp.display(),
@@ -2994,9 +3295,9 @@ impl Supervisor {
                                 vm.config.name
                             )));
                         }
+                        should_rollback_disk_file = true;
                         if vm.generation != snap_gen || vm.active_rpc_socket("detach disk")?.is_some()
                         {
-                            should_rollback_disk_file = true;
                             return Err(err_conflict(format!(
                                 "cannot complete offline disk detach because VM '{}' changed state",
                                 vm.config.name
@@ -3085,18 +3386,7 @@ impl Supervisor {
                 let (prev_cfg, updated) = match plan_online {
                     Ok(pair) => pair,
                     Err(err) => {
-                        let same_vm = {
-                            let guard = self.vms.read().unwrap();
-                            guard.get(&id).is_some_and(|vm| {
-                                !vm.deleting
-                                    && vm.generation == rpc_gen
-                                    && matches!(
-                                        vm.runtime.status,
-                                        VmStatus::Running | VmStatus::Paused
-                                    )
-                            })
-                        };
-                        if same_vm {
+                        if self.is_same_live_vm(id, rpc_gen) {
                             rollback_hot_removed_disk(&sock, id, lun, &existing).await;
                         }
                         return Err(err);
@@ -3112,7 +3402,9 @@ impl Supervisor {
                 .map_err(|e| anyhow::anyhow!("detach_disk save task failed: {e}"))
                 .and_then(|r| r)
                 {
-                    rollback_hot_removed_disk(&sock, id, lun, &existing).await;
+                    if self.is_same_live_vm(id, rpc_gen) {
+                        rollback_hot_removed_disk(&sock, id, lun, &existing).await;
+                    }
                     return Err(err);
                 }
 
@@ -3162,7 +3454,7 @@ impl Supervisor {
                         if should_rollback_disk_file {
                             self.rollback_vm_config(id, "detach disk", prev_cfg).await;
                         }
-                        if rollback_on_same_vm {
+                        if rollback_on_same_vm && self.is_same_live_vm(id, rpc_gen) {
                             rollback_hot_removed_disk(&sock, id, lun, &existing).await;
                         }
                         return Err(err);
@@ -3229,65 +3521,89 @@ impl Supervisor {
             let guard = self.vms.read().unwrap();
             collect_all_vm_disk_paths(&guard, std::slice::from_ref(&req.path))
         };
-        let path_keys = tokio::task::spawn_blocking(move || precompute_disk_path_keys(all_paths))
+        let mut path_keys = tokio::task::spawn_blocking(move || precompute_disk_path_keys(all_paths))
             .await
             .map_err(|e| anyhow::anyhow!("mount_iso path key task failed: {e}"))?;
 
-        let active_plan = {
-            let guard = self.vms.read().unwrap();
-            let vm = guard
-                .get(&id)
-                .ok_or_else(|| err_not_found("VM not found"))?;
-            let active_sock = vm.active_rpc_socket("mount ISO")?;
-            let (target_lun, previous_dvd) = match req.lun {
-                Some(l) => match vm.config.disks.iter().find(|d| d.lun == l) {
-                    Some(d) if d.kind != DiskKind::Dvd => {
-                        return Err(err_conflict(format!(
-                            "SCSI LUN {l} is occupied by a non-DVD disk ({}); specify a different LUN or omit --lun",
-                            d.path.display()
+        let active_plan = 'plan: {
+            for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                let missing = {
+                    let guard = self.vms.read().unwrap();
+                    let vm = guard
+                        .get(&id)
+                        .ok_or_else(|| err_not_found("VM not found"))?;
+                    let active_sock = vm.active_rpc_socket("mount ISO")?;
+                    let (target_lun, previous_dvd) = match req.lun {
+                        Some(l) => match vm.config.disks.iter().find(|d| d.lun == l) {
+                            Some(d) if d.kind != DiskKind::Dvd => {
+                                return Err(err_conflict(format!(
+                                    "SCSI LUN {l} is occupied by a non-DVD disk ({}); specify a different LUN or omit --lun",
+                                    d.path.display()
+                                )));
+                            }
+                            Some(d) => (d.lun, Some(d.clone())),
+                            None => (l, None),
+                        },
+                        None => match vm.config.disks.iter().find(|d| d.kind == DiskKind::Dvd) {
+                            Some(d) => (d.lun, Some(d.clone())),
+                            None => (vm.config.next_free_lun(), None),
+                        },
+                    };
+                    if target_lun > 255 {
+                        return Err(err_bad_request(format!(
+                            "SCSI LUN must be 0..=255 (got {target_lun})"
                         )));
                     }
-                    Some(d) => (d.lun, Some(d.clone())),
-                    None => (l, None),
-                },
-                None => match vm.config.disks.iter().find(|d| d.kind == DiskKind::Dvd) {
-                    Some(d) => (d.lun, Some(d.clone())),
-                    None => (vm.config.next_free_lun(), None),
-                },
-            };
-            if target_lun > 255 {
-                return Err(err_bad_request(format!(
-                    "SCSI LUN must be 0..=255 (got {target_lun})"
-                )));
-            }
 
-            let new_dvd = DiskAttachment {
-                lun: target_lun,
-                kind: DiskKind::Dvd,
-                path: req.path.clone(),
-                read_only: true,
-                format: DiskFormat::Iso,
-            };
-            let mut candidate_disks: Vec<DiskAttachment> = vm
-                .config
-                .disks
-                .iter()
-                .filter(|d| d.lun != target_lun)
-                .cloned()
-                .collect();
-            candidate_disks.push(new_dvd);
-            candidate_disks.sort_by_key(|d| d.lun);
-            ensure_disks_not_conflicting_with_keys(&guard, Some(id), &candidate_disks, &path_keys)?;
-
-            if active_sock.is_none() {
-                let prev_cfg = vm.config.clone();
-                let mut updated = prev_cfg.clone();
-                updated.disks = candidate_disks;
-                updated.updated_at = Utc::now();
-                Err((prev_cfg, updated, vm.generation))
-            } else {
-                Ok((target_lun, previous_dvd))
+                    let new_dvd = DiskAttachment {
+                        lun: target_lun,
+                        kind: DiskKind::Dvd,
+                        path: req.path.clone(),
+                        read_only: true,
+                        format: DiskFormat::Iso,
+                    };
+                    let mut candidate_disks: Vec<DiskAttachment> = vm
+                        .config
+                        .disks
+                        .iter()
+                        .filter(|d| d.lun != target_lun)
+                        .cloned()
+                        .collect();
+                    candidate_disks.push(new_dvd);
+                    candidate_disks.sort_by_key(|d| d.lun);
+                    let missing = collect_missing_disk_path_keys(
+                        &guard,
+                        Some(id),
+                        &candidate_disks,
+                        &path_keys,
+                    );
+                    if missing.is_empty() {
+                        ensure_disks_not_conflicting_with_keys(
+                            &guard,
+                            Some(id),
+                            &candidate_disks,
+                            &path_keys,
+                        )?;
+                        break 'plan if active_sock.is_none() {
+                            let prev_cfg = vm.config.clone();
+                            let mut updated = prev_cfg.clone();
+                            updated.disks = candidate_disks;
+                            updated.updated_at = Utc::now();
+                            Err((prev_cfg, updated, vm.generation))
+                        } else {
+                            Ok((target_lun, previous_dvd))
+                        };
+                    }
+                    missing
+                };
+                if attempt == MAX_PATH_KEY_RETRIES {
+                    return Err(err_conflict(
+                        "concurrent disk configuration changes while mounting ISO; please retry",
+                    ));
+                }
+                extend_disk_path_keys(&mut path_keys, missing, "mount_iso").await?;
             }
+            unreachable!()
         };
 
         let (target_lun, previous_dvd) = match active_plan {
@@ -3300,44 +3616,65 @@ impl Supervisor {
                 .await
                 .map_err(|e| anyhow::anyhow!("mount_iso save task failed: {e}"))??;
 
-                let mut should_rollback_disk_file = false;
-                let commit_res: anyhow::Result<VmSummary> = (|| {
-                    let mut guard = self.vms.write().unwrap();
-                    {
-                        let vm = guard
-                            .get(&id)
-                            .ok_or_else(|| err_not_found("VM not found"))?;
-                        if vm.deleting {
-                            return Err(err_conflict(format!(
-                                "cannot mount ISO while VM '{}' is being deleted",
-                                vm.config.name
-                            )));
-                        }
-                        if vm.generation != snap_gen || vm.active_rpc_socket("mount ISO")?.is_some()
-                        {
+                let mut should_rollback_disk_file;
+                let commit_res: anyhow::Result<VmSummary> = 'commit: {
+                    for attempt in 0..=MAX_PATH_KEY_RETRIES {
+                        let missing = {
+                            let mut guard = self.vms.write().unwrap();
+                            let Some(vm) = guard.get(&id) else {
+                                should_rollback_disk_file = false;
+                                break 'commit Err(err_not_found("VM not found"));
+                            };
+                            if vm.deleting {
+                                should_rollback_disk_file = false;
+                                break 'commit Err(err_conflict(format!(
+                                    "cannot mount ISO while VM '{}' is being deleted",
+                                    vm.config.name
+                                )));
+                            }
                             should_rollback_disk_file = true;
-                            return Err(err_conflict(format!(
-                                "cannot complete offline ISO mount because VM '{}' changed state",
-                                vm.config.name
-                            )));
+                            if vm.generation != snap_gen
+                                || match vm.active_rpc_socket("mount ISO") {
+                                    Ok(sock) => sock.is_some(),
+                                    Err(err) => break 'commit Err(err),
+                                }
+                            {
+                                break 'commit Err(err_conflict(format!(
+                                    "cannot complete offline ISO mount because VM '{}' changed state",
+                                    vm.config.name
+                                )));
+                            }
+                            let missing = collect_missing_disk_path_keys(
+                                &guard,
+                                Some(id),
+                                &updated.disks,
+                                &path_keys,
+                            );
+                            if !missing.is_empty() {
+                                missing
+                            } else if let Err(err) = ensure_disks_not_conflicting_with_keys(
+                                &guard,
+                                Some(id),
+                                &updated.disks,
+                                &path_keys,
+                            ) {
+                                break 'commit Err(err);
+                            } else {
+                                let vm = guard.get_mut(&id).unwrap();
+                                vm.config = updated;
+                                vm.runtime.revision = self.next_revision();
+                                break 'commit Ok(vm.summary());
+                            }
+                        };
+                        if attempt == MAX_PATH_KEY_RETRIES {
+                            break 'commit Err(err_conflict(
+                                "concurrent disk configuration changes while mounting ISO; please retry",
+                            ));
                         }
-                        if let Err(err) = ensure_disks_not_conflicting_with_keys(
-                            &guard,
-                            Some(id),
-                            &updated.disks,
-                            &path_keys,
-                        ) {
-                            should_rollback_disk_file = true;
-                            return Err(err);
-                        }
+                        extend_disk_path_keys(&mut path_keys, missing, "mount_iso").await?;
                     }
-                    let vm = guard
-                        .get_mut(&id)
-                        .ok_or_else(|| err_not_found("VM not found"))?;
-                    vm.config = updated;
-                    vm.runtime.revision = self.next_revision();
-                    Ok(vm.summary())
-                })();
+                    unreachable!()
+                };
 
                 let summary = match commit_res {
                     Ok(summary) => summary,
@@ -3532,12 +3869,12 @@ impl Supervisor {
                                 vm.config.name
                             )));
                         }
+                        should_rollback_disk_file = true;
                         if vm.generation != snap_gen
                             || vm
                                 .active_rpc_socket("modify port forwarding")?
                                 .is_some()
                         {
-                            should_rollback_disk_file = true;
                             return Err(err_conflict(format!(
                                 "cannot complete offline port forward update because VM '{}' changed state",
                                 vm.config.name
@@ -3618,18 +3955,7 @@ impl Supervisor {
                 let (prev_cfg, updated) = match plan_online {
                     Ok(pair) => pair,
                     Err(err) => {
-                        let same_vm = {
-                            let guard = self.vms.read().unwrap();
-                            guard.get(&id).is_some_and(|vm| {
-                                !vm.deleting
-                                    && vm.generation == rpc_gen
-                                    && matches!(
-                                        vm.runtime.status,
-                                        VmStatus::Running | VmStatus::Paused
-                                    )
-                            })
-                        };
-                        if same_vm {
+                        if self.is_same_live_vm(id, rpc_gen) {
                             rollback_port_forward(&sock, id, nic_id, add, proto_port).await;
                         }
                         return Err(err);
@@ -3645,7 +3971,9 @@ impl Supervisor {
                 .map_err(|e| anyhow::anyhow!("modify_port_forward save task failed: {e}"))
                 .and_then(|r| r)
                 {
-                    rollback_port_forward(&sock, id, nic_id, add, proto_port).await;
+                    if self.is_same_live_vm(id, rpc_gen) {
+                        rollback_port_forward(&sock, id, nic_id, add, proto_port).await;
+                    }
                     return Err(err);
                 }
 
@@ -3688,7 +4016,7 @@ impl Supervisor {
                             self.rollback_vm_config(id, "modify port forwarding", prev_cfg)
                                 .await;
                         }
-                        if rollback_on_same_vm {
+                        if rollback_on_same_vm && self.is_same_live_vm(id, rpc_gen) {
                             rollback_port_forward(&sock, id, nic_id, add, proto_port).await;
                         }
                         return Err(err);
@@ -3871,6 +4199,14 @@ impl Supervisor {
         }
     }
 
+    fn is_same_live_vm(&self, id: Uuid, rpc_gen: u64) -> bool {
+        self.vms.read().unwrap().get(&id).is_some_and(|vm| {
+            !vm.deleting
+                && vm.generation == rpc_gen
+                && matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
+        })
+    }
+
     fn require_running_socket(&self, id: Uuid) -> anyhow::Result<PathBuf> {
         self.require_socket_with_generation(id, &[VmStatus::Running])
             .map(|(sock, _)| sock)
@@ -4002,6 +4338,21 @@ fn ensure_disk_format_safe(
     Ok(())
 }
 
+const MAX_PATH_KEY_RETRIES: usize = 8;
+
+fn ensure_same_live_vm(vm: &ManagedVm, rpc_gen: u64, action: &str) -> anyhow::Result<()> {
+    if vm.deleting
+        || vm.generation != rpc_gen
+        || !matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused)
+    {
+        return Err(err_conflict(format!(
+            "cannot complete {action} because VM '{}' changed state to {}",
+            vm.config.name, vm.runtime.status
+        )));
+    }
+    Ok(())
+}
+
 fn collect_all_vm_disk_paths(vms: &HashMap<Uuid, ManagedVm>, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(
         vms.values().map(|v| v.config.disks.len()).sum::<usize>() + extra.len(),
@@ -4026,34 +4377,45 @@ fn precompute_disk_path_keys(paths: Vec<PathBuf>) -> HashMap<PathBuf, PathBuf> {
     keys
 }
 
-fn lexical_path_key(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut normalized = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(comp.as_os_str());
-                }
-            }
-            other => normalized.push(other.as_os_str()),
+fn collect_missing_disk_path_keys(
+    vms: &HashMap<Uuid, ManagedVm>,
+    self_id: Option<Uuid>,
+    extra_disks: &[DiskAttachment],
+    path_keys: &HashMap<PathBuf, PathBuf>,
+) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for d in extra_disks {
+        if !path_keys.contains_key(&d.path) && seen.insert(d.path.clone()) {
+            missing.push(d.path.clone());
         }
     }
-    #[cfg(windows)]
-    {
-        PathBuf::from(normalized.to_string_lossy().to_ascii_lowercase())
+    for other in vms.values() {
+        if Some(other.config.id) == self_id {
+            continue;
+        }
+        for d in &other.config.disks {
+            if !path_keys.contains_key(&d.path) && seen.insert(d.path.clone()) {
+                missing.push(d.path.clone());
+            }
+        }
     }
-    #[cfg(not(windows))]
-    {
-        normalized
-    }
+    missing
 }
 
-fn lookup_path_key(keys: &HashMap<PathBuf, PathBuf>, path: &Path) -> PathBuf {
-    keys.get(path)
-        .cloned()
-        .unwrap_or_else(|| lexical_path_key(path))
+async fn extend_disk_path_keys(
+    path_keys: &mut HashMap<PathBuf, PathBuf>,
+    missing: Vec<PathBuf>,
+    label: &str,
+) -> anyhow::Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let computed = tokio::task::spawn_blocking(move || precompute_disk_path_keys(missing))
+        .await
+        .map_err(|e| anyhow::anyhow!("{label} path key task failed: {e}"))?;
+    path_keys.extend(computed);
+    Ok(())
 }
 
 fn ensure_disks_not_conflicting_with_keys(
@@ -4064,7 +4426,12 @@ fn ensure_disks_not_conflicting_with_keys(
 ) -> anyhow::Result<()> {
     let mut seen_paths: HashMap<PathBuf, u32> = HashMap::new();
     for d in disks {
-        let key = lookup_path_key(path_keys, &d.path);
+        let key = path_keys.get(&d.path).ok_or_else(|| {
+            err_internal(format!(
+                "missing canonical disk path key for '{}'",
+                d.path.display()
+            ))
+        })?;
         if let Some(prev_lun) = seen_paths.insert(key.clone(), d.lun) {
             return Err(err_conflict(format!(
                 "disk image '{}' is attached multiple times to the same VM (LUNs {prev_lun} and {})",
@@ -4077,9 +4444,13 @@ fn ensure_disks_not_conflicting_with_keys(
                 continue;
             }
             for other_disk in &other.config.disks {
-                if lookup_path_key(path_keys, &other_disk.path) == key
-                    && (!d.read_only || !other_disk.read_only)
-                {
+                let other_key = path_keys.get(&other_disk.path).ok_or_else(|| {
+                    err_internal(format!(
+                        "missing canonical disk path key for '{}'",
+                        other_disk.path.display()
+                    ))
+                })?;
+                if other_key == key && (!d.read_only || !other_disk.read_only) {
                     return Err(err_conflict(format!(
                         "disk image '{}' is already attached to VM '{}' (LUN {}); detach it first or attach both read-only",
                         d.path.display(),
@@ -5024,5 +5395,356 @@ mod tests {
         assert_eq!(fd.listen_addr, "127.0.0.1:5905");
         assert_eq!(fd.vsock_port, Some(6005));
         assert_eq!(fd.shm_path.as_deref(), Some(shm_path.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_disk_conflict_and_delete_protection_never_mix_canonical_and_lexical_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        let link_dir = dir.path().join("link");
+        fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let real_disk = real_dir.join("shared.img");
+        let link_disk = link_dir.join("shared.img");
+        fs::write(&real_disk, vec![0u8; 4096]).unwrap();
+
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let vm1 = sup
+            .create_vm(CreateVmPayload {
+                name: "RealPath-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                disks: vec![DiskAttachment {
+                    lun: 0,
+                    kind: DiskKind::HardDisk,
+                    path: real_disk.clone(),
+                    read_only: false,
+                    format: DiskFormat::Raw,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Creating or updating another VM with a symlinked path to the same RW disk must conflict.
+        assert!(
+            sup.create_vm(CreateVmPayload {
+                name: "SymlinkPath-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                disks: vec![DiskAttachment {
+                    lun: 0,
+                    kind: DiskKind::HardDisk,
+                    path: link_disk.clone(),
+                    read_only: false,
+                    format: DiskFormat::Raw,
+                }],
+                ..Default::default()
+            })
+            .is_err()
+        );
+
+        let vm2 = sup
+            .create_vm(CreateVmPayload {
+                name: "LinkTarget-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            sup.attach_disk(
+                &vm2.config.id.to_string(),
+                AttachDiskPayload {
+                    path: link_disk.clone(),
+                    lun: Some(0),
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        // If `path_keys` is missing an entry, `ensure_disks_not_conflicting_with_keys` refuses
+        // to compare against a lexical key (and `collect_missing_disk_path_keys` flags it).
+        {
+            let guard = sup.vms.read().unwrap();
+            let empty_keys = HashMap::new();
+            let missing =
+                collect_missing_disk_path_keys(&guard, Some(vm2.config.id), &vm1.config.disks, &empty_keys);
+            assert!(missing.contains(&real_disk));
+            assert!(
+                ensure_disks_not_conflicting_with_keys(
+                    &guard,
+                    Some(vm2.config.id),
+                    &vm1.config.disks,
+                    &empty_keys,
+                )
+                .is_err()
+            );
+        }
+
+        // Seed a second supervisor where one VM holds `real_disk` and another holds `link_disk`;
+        // deleting the first with `delete_disks=true` must NOT delete `real_disk`.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = RegistryStore::new(dir2.path()).unwrap();
+        let mut seed_a = VmConfig::from_preset(
+            "Seed-Real",
+            openvmms_core::models::VmPreset::Custom,
+            &store2.vm_dir(Uuid::new_v4()),
+        );
+        seed_a.disks = vec![DiskAttachment {
+            lun: 0,
+            kind: DiskKind::HardDisk,
+            path: real_disk.clone(),
+            read_only: false,
+            format: DiskFormat::Raw,
+        }];
+        store2.save_vm(&seed_a).unwrap();
+
+        let mut seed_b = VmConfig::from_preset(
+            "Seed-Link",
+            openvmms_core::models::VmPreset::Custom,
+            &store2.vm_dir(Uuid::new_v4()),
+        );
+        seed_b.disks = vec![DiskAttachment {
+            lun: 0,
+            kind: DiskKind::HardDisk,
+            path: link_disk,
+            read_only: false,
+            format: DiskFormat::Raw,
+        }];
+        store2.save_vm(&seed_b).unwrap();
+
+        let sup2 = Supervisor::new(dir2.path(), Some("127.0.0.1:0")).unwrap();
+        sup2.delete_vm(&seed_a.id.to_string(), true).await.unwrap();
+        assert!(
+            real_disk.exists(),
+            "disk referenced via symlink by another VM must not be deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_vm_clears_deleting_on_failure_and_drops_ghost_when_toml_gone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+
+        // 1. Failing delete while `vm.toml` remains intact must clear `deleting = false`.
+        let keep_vm = sup
+            .create_vm(CreateVmPayload {
+                name: "KeepOnErr-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let keep_logs = sup.store.vm_dir(keep_vm.config.id).join("logs");
+        let keep_log_file = keep_logs.join("openvmm.log");
+        fs::write(&keep_log_file, b"lock").unwrap();
+        fs::set_permissions(&keep_logs, fs::Permissions::from_mode(0o555)).unwrap();
+
+        struct RestorePerm(PathBuf);
+        impl Drop for RestorePerm {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let restore_keep = RestorePerm(keep_logs.clone());
+
+        if fs::remove_file(&keep_log_file).is_err() {
+            assert!(sup.delete_vm(&keep_vm.config.id.to_string(), false).await.is_err());
+            assert!(
+                !sup.vms.read().unwrap()[&keep_vm.config.id].deleting,
+                "failed delete must reset vm.deleting to false"
+            );
+            drop(restore_keep);
+            sup.delete_vm(&keep_vm.config.id.to_string(), false)
+                .await
+                .unwrap();
+        } else {
+            drop(restore_keep);
+        }
+
+        // 2. Partial failure where `vm.toml` is already removed must drop the ghost VM and emit VmDeleted.
+        let ghost_vm = sup
+            .create_vm(CreateVmPayload {
+                name: "GhostDrop-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let ghost_logs = sup.store.vm_dir(ghost_vm.config.id).join("logs");
+        let ghost_log_file = ghost_logs.join("openvmm.log");
+        fs::write(&ghost_log_file, b"lock").unwrap();
+        fs::set_permissions(&ghost_logs, fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore_ghost = RestorePerm(ghost_logs.clone());
+
+        if fs::remove_file(&ghost_log_file).is_err() {
+            fs::remove_file(sup.store.vm_config_path(ghost_vm.config.id)).unwrap();
+            let mut rx = sup.subscribe();
+            assert!(
+                sup.delete_vm(&ghost_vm.config.id.to_string(), false)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                sup.get_vm(&ghost_vm.config.id.to_string()).is_err(),
+                "partial delete after vm.toml removal must not leave a ghost VM in memory"
+            );
+            let evt = rx.try_recv().unwrap();
+            assert!(matches!(
+                evt,
+                DaemonEvent::VmDeleted { id, revision } if id == ghost_vm.config.id && revision > 0
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_vm_orders_vm_deleted_revision_after_disk_removal_and_is_same_live_vm_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let disk_path = dir.path().join("owned.img");
+        fs::write(&disk_path, vec![0u8; 4096]).unwrap();
+
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "OrderAndGuard-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                disks: vec![DiskAttachment {
+                    lun: 0,
+                    kind: DiskKind::HardDisk,
+                    path: disk_path.clone(),
+                    read_only: false,
+                    format: DiskFormat::Raw,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let id = vm.config.id;
+
+        // Verify `is_same_live_vm` rejects wrong status, wrong generation, and `deleting = true`.
+        let gen0 = sup.generation_for_test(id);
+        assert!(!sup.is_same_live_vm(id, gen0));
+        sup.set_vm_status_for_test(id, VmStatus::Running);
+        assert!(sup.is_same_live_vm(id, gen0));
+        sup.set_vm_status_for_test(id, VmStatus::Paused);
+        assert!(sup.is_same_live_vm(id, gen0));
+        sup.vms.write().unwrap().get_mut(&id).unwrap().deleting = true;
+        assert!(!sup.is_same_live_vm(id, gen0));
+        sup.vms.write().unwrap().get_mut(&id).unwrap().deleting = false;
+        sup.advance_lifecycle_for_test(id, VmStatus::Running);
+        assert!(!sup.is_same_live_vm(id, gen0));
+        sup.set_vm_status_for_test(id, VmStatus::Off);
+
+        let mut rx = sup.subscribe();
+        sup.delete_vm(&id.to_string(), true).await.unwrap();
+        assert!(!disk_path.exists());
+        let evt = rx.try_recv().unwrap();
+        match evt {
+            DaemonEvent::VmDeleted {
+                id: del_id,
+                revision,
+            } => {
+                assert_eq!(del_id, id);
+                assert_eq!(revision, sup.host_info().event_revision);
+                assert!(revision > vm.runtime.revision);
+            }
+            other => panic!("expected VmDeleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_hotplug_conflict_on_starting_always_rolls_back_vm_toml_and_deleting_update_never_resurrects() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Arc::new(Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap());
+        let disk_path = dir.path().join("extra.img");
+        fs::write(&disk_path, vec![0u8; 4096]).unwrap();
+
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "RollbackGuard-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+
+        // 1. Race offline attach_disk against a transition to VmStatus::Starting across several
+        //    microsecond offsets to cover both plan-time and commit-time active_rpc_socket errors.
+        for delay_us in [0u64, 50, 150, 300, 600, 1200] {
+            sup.set_vm_status_for_test(id, VmStatus::Off);
+            let sup_a = Arc::clone(&sup);
+            let disk = disk_path.clone();
+            let attach_fut = tokio::spawn(async move {
+                sup_a
+                    .attach_disk(
+                        &id.to_string(),
+                        AttachDiskPayload {
+                            path: disk,
+                            lun: Some(0),
+                            read_only: false,
+                            format: Some(DiskFormat::Raw),
+                        },
+                    )
+                    .await
+            });
+            if delay_us > 0 {
+                tokio::time::sleep(Duration::from_micros(delay_us)).await;
+            }
+            sup.set_vm_status_for_test(id, VmStatus::Starting);
+            let res = attach_fut.await.unwrap();
+            sup.set_vm_status_for_test(id, VmStatus::Off);
+
+            if res.is_ok() {
+                sup.detach_disk(&id.to_string(), 0).await.unwrap();
+            } else {
+                let on_disk = sup
+                    .store
+                    .load_all_vms()
+                    .unwrap()
+                    .into_iter()
+                    .find(|v| v.id == id)
+                    .unwrap();
+                assert!(
+                    on_disk.disks.is_empty(),
+                    "failed attach_disk at delay {delay_us}us left unattached disk in vm.toml"
+                );
+            }
+        }
+
+        // 2. update_vm while deleting = true must reject and never resurrect a removed vm.toml.
+        sup.vms.write().unwrap().get_mut(&id).unwrap().deleting = true;
+        fs::remove_file(sup.store.vm_config_path(id)).unwrap();
+        let upd_err = sup
+            .update_vm(
+                &id.to_string(),
+                UpdateVmPayload {
+                    description: Some("should-not-resurrect".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{upd_err:#}").contains("being deleted"));
+        assert!(
+            !sup.store.vm_config_path(id).exists(),
+            "update_vm on deleting VM must not write or resurrect vm.toml"
+        );
+        sup.vms.write().unwrap().get_mut(&id).unwrap().deleting = false;
     }
 }

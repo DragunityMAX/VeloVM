@@ -4,6 +4,7 @@ use crate::models::CreateDiskPayload;
 use crate::models::CreateVmPayload;
 use crate::models::DEFAULT_DAEMON_LISTEN;
 use crate::models::DiskInfo;
+use crate::models::EVENT_REVISION_HEADER;
 use crate::models::HostConfig;
 use crate::models::HostConfigPatch;
 use crate::models::HostInfo;
@@ -233,7 +234,25 @@ impl ApiClient {
     }
 
     pub fn list_vms(&self) -> anyhow::Result<Vec<VmSummary>> {
-        self.get("/api/v1/vms")
+        self.list_vms_with_revision().map(|(vms, _)| vms)
+    }
+
+    pub fn list_vms_with_revision(&self) -> anyhow::Result<(Vec<VmSummary>, Option<u64>)> {
+        self.ensure_verified()?;
+        let resp = self
+            .client
+            .get(format!("{}/api/v1/vms", self.base_url))
+            .bearer_auth(&self.token)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .send()
+            .context("GET /api/v1/vms")?;
+        let rev = resp
+            .headers()
+            .get(EVENT_REVISION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let vms = decode_json_response(resp)?;
+        Ok((vms, rev))
     }
 
     pub fn get_vm(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {

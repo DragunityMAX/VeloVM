@@ -408,13 +408,18 @@ fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Option<(
         footer[48], footer[49], footer[50], footer[51], footer[52], footer[53], footer[54],
         footer[55],
     ]);
-    if disk_type == 2 && current_size > file_size_bytes.saturating_sub(512) {
+    if current_size == 0 || !current_size.is_multiple_of(512) {
         return None;
     }
     let data_offset = u64::from_be_bytes([
         footer[16], footer[17], footer[18], footer[19], footer[20], footer[21], footer[22],
         footer[23],
     ]);
+    if disk_type == 2
+        && (data_offset != u64::MAX || current_size > file_size_bytes.saturating_sub(512))
+    {
+        return None;
+    }
     Some((disk_type, current_size, data_offset))
 }
 
@@ -430,7 +435,9 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
     file.read_exact(&mut footer)?;
     let parsed = parse_vhd1_footer_bytes(&footer, file_size_bytes).or_else(|| {
         if file.seek(SeekFrom::Start(0)).is_ok() && file.read_exact(&mut footer).is_ok() {
+            // Only dynamic/differencing VHDs carry a backup footer copy at offset 0.
             parse_vhd1_footer_bytes(&footer, file_size_bytes)
+                .filter(|(disk_type, _, _)| matches!(disk_type, 3 | 4))
         } else {
             None
         }
@@ -457,12 +464,22 @@ fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Opti
             && file.read_exact(&mut dyn_hdr).is_ok()
             && &dyn_hdr[0..8] == b"cxsparse"
         {
-            block_size_bytes = Some(u32::from_be_bytes([
-                dyn_hdr[28],
-                dyn_hdr[29],
-                dyn_hdr[30],
-                dyn_hdr[31],
-            ]));
+            let hdr_version = u32::from_be_bytes([dyn_hdr[24], dyn_hdr[25], dyn_hdr[26], dyn_hdr[27]]);
+            let stored_checksum =
+                u32::from_be_bytes([dyn_hdr[36], dyn_hdr[37], dyn_hdr[38], dyn_hdr[39]]);
+            let sum: u32 = dyn_hdr
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !(36..40).contains(i))
+                .map(|(_, &b)| b as u32)
+                .sum();
+            if hdr_version == 0x0001_0000 && !sum == stored_checksum {
+                let block_size =
+                    u32::from_be_bytes([dyn_hdr[32], dyn_hdr[33], dyn_hdr[34], dyn_hdr[35]]);
+                if block_size > 0 {
+                    block_size_bytes = Some(block_size);
+                }
+            }
         }
     }
 
@@ -1196,13 +1213,25 @@ mod tests {
         assert_eq!(fixed_info.file_size_bytes, fixed_virtual + 512);
 
         // Dynamic VHD1: virtual_size_bytes comes from footer.current_size (much larger than file size),
-        // and block_size_bytes comes from the dynamic header (`cxsparse`).
+        // and block_size_bytes comes from the dynamic header (`cxsparse`) at bytes 32..36 (while
+        // bytes 28..32 store Max Table Entries).
+        let build_dyn_hdr = |version: u32, max_table_entries: u32, block_size: u32| {
+            let mut dyn_hdr = [0u8; 1024];
+            dyn_hdr[0..8].copy_from_slice(b"cxsparse");
+            dyn_hdr[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+            dyn_hdr[16..24].copy_from_slice(&1536u64.to_be_bytes());
+            dyn_hdr[24..28].copy_from_slice(&version.to_be_bytes());
+            dyn_hdr[28..32].copy_from_slice(&max_table_entries.to_be_bytes());
+            dyn_hdr[32..36].copy_from_slice(&block_size.to_be_bytes());
+            let sum: u32 = dyn_hdr.iter().map(|&b| b as u32).sum();
+            dyn_hdr[36..40].copy_from_slice(&(!sum).to_be_bytes());
+            dyn_hdr
+        };
+
         let dyn_vhd = dir.path().join("dynamic.vhd");
         let dyn_virtual = 10 * 1024 * 1024 * 1024u64;
         let footer = build_vhd1_footer(3, dyn_virtual, 512);
-        let mut dyn_hdr = [0u8; 1024];
-        dyn_hdr[0..8].copy_from_slice(b"cxsparse");
-        dyn_hdr[28..32].copy_from_slice(&(2 * 1024 * 1024u32).to_be_bytes());
+        let dyn_hdr = build_dyn_hdr(0x0001_0000, 5120, 2 * 1024 * 1024);
         let mut dyn_bytes = Vec::new();
         dyn_bytes.extend_from_slice(&footer);
         dyn_bytes.extend_from_slice(&dyn_hdr);
@@ -1214,6 +1243,52 @@ mod tests {
         assert_eq!(dyn_info.virtual_size_bytes, dyn_virtual);
         assert_eq!(dyn_info.file_size_bytes, dyn_bytes.len() as u64);
         assert_eq!(dyn_info.block_size_bytes, Some(2 * 1024 * 1024));
+
+        // Dynamic VHD1 with corrupted trailing footer falls back to offset-0 header copy.
+        let dyn_offset0_vhd = dir.path().join("dynamic-offset0.vhd");
+        let mut dyn_offset0_bytes = dyn_bytes.clone();
+        let tail_start = dyn_offset0_bytes.len() - 512;
+        dyn_offset0_bytes[tail_start..].fill(0);
+        fs::write(&dyn_offset0_vhd, &dyn_offset0_bytes).unwrap();
+        let dyn_offset0_info = inspect_disk(&dyn_offset0_vhd, None).unwrap();
+        assert_eq!(dyn_offset0_info.disk_type, "dynamic");
+        assert_eq!(dyn_offset0_info.block_size_bytes, Some(2 * 1024 * 1024));
+
+        // Dynamic header with bad checksum or bad version ignores block_size_bytes.
+        let mut bad_csum_bytes = dyn_bytes.clone();
+        bad_csum_bytes[512 + 36] ^= 0xff;
+        let bad_csum_vhd = dir.path().join("dynamic-bad-csum.vhd");
+        fs::write(&bad_csum_vhd, &bad_csum_bytes).unwrap();
+        assert_eq!(inspect_disk(&bad_csum_vhd, None).unwrap().block_size_bytes, None);
+
+        let mut bad_ver_bytes = Vec::new();
+        bad_ver_bytes.extend_from_slice(&footer);
+        bad_ver_bytes.extend_from_slice(&build_dyn_hdr(0x0002_0000, 5120, 2 * 1024 * 1024));
+        bad_ver_bytes.extend_from_slice(&footer);
+        let bad_ver_vhd = dir.path().join("dynamic-bad-ver.vhd");
+        fs::write(&bad_ver_vhd, &bad_ver_bytes).unwrap();
+        assert_eq!(inspect_disk(&bad_ver_vhd, None).unwrap().block_size_bytes, None);
+
+        // Fixed VHD1 at offset 0 only, with non-MAX data_offset, zero size, or unaligned size is rejected.
+        let fixed_offset0_vhd = dir.path().join("fixed-offset0.vhd");
+        let mut fixed_offset0_bytes = build_vhd1_footer(2, 64 * 1024, u64::MAX).to_vec();
+        fixed_offset0_bytes.extend_from_slice(&vec![0u8; 64 * 1024]);
+        fs::write(&fixed_offset0_vhd, &fixed_offset0_bytes).unwrap();
+        assert!(inspect_disk(&fixed_offset0_vhd, None).is_err());
+
+        let fixed_bad_offset_vhd = dir.path().join("fixed-bad-offset.vhd");
+        let mut fixed_bad_offset_bytes = vec![0u8; 64 * 1024];
+        fixed_bad_offset_bytes.extend_from_slice(&build_vhd1_footer(2, 64 * 1024, 512));
+        fs::write(&fixed_bad_offset_vhd, &fixed_bad_offset_bytes).unwrap();
+        assert!(inspect_disk(&fixed_bad_offset_vhd, None).is_err());
+
+        let zero_size_vhd = dir.path().join("zero-size.vhd");
+        fs::write(&zero_size_vhd, build_vhd1_footer(3, 0, 512)).unwrap();
+        assert!(inspect_disk(&zero_size_vhd, None).is_err());
+
+        let unaligned_vhd = dir.path().join("unaligned.vhd");
+        fs::write(&unaligned_vhd, build_vhd1_footer(3, 1000, 512)).unwrap();
+        assert!(inspect_disk(&unaligned_vhd, None).is_err());
 
         // Raw extensions (`.img`, `.raw`, `.bin`) are never sniffed even if containing VHD/VHDX magic.
         let raw_with_vhd_magic = dir.path().join("raw-with-vhd.img");

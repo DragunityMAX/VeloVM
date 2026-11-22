@@ -1,5 +1,5 @@
 diff --git a/openvmm/support/mesh/mesh_rpc/src/server.rs b/openvmm/support/mesh/mesh_rpc/src/server.rs
-index 24acaf8..e76b3c5 100644
+index 24acaf8..549fc90 100644
 --- a/openvmm/support/mesh/mesh_rpc/src/server.rs
 +++ b/openvmm/support/mesh/mesh_rpc/src/server.rs
 @@ -29,8 +29,12 @@
@@ -15,7 +15,7 @@ index 24acaf8..e76b3c5 100644
  use pal_async::socket::PolledSocket;
  use std::collections::HashMap;
  use std::io::Read;
-@@ -168,43 +172,82 @@ pub async fn serve_connection(
+@@ -168,43 +172,86 @@ pub async fn serve_connection(
      ) -> anyhow::Result<()> {
          let (mut reader, mut writer) = stream.split();
          let (stream_send, mut stream_recv) = mesh::channel();
@@ -110,7 +110,11 @@ index 24acaf8..e76b3c5 100644
 +            // a half-close (`shutdown(SHUT_WR)` -> `RDHUP`) where the peer still
 +            // expects in-flight replies, rather than a full disconnect (`HUP`/`ERR`).
 +            // Keep pending RPCs alive until either full disconnect or `send_task`
-+            // finishes draining responses.
++            // finishes draining responses. Note: this assumes `AF_UNIX` stream
++            // sockets (used by OpenVMM's ttrpc transport) — on Unix TCP sockets, a
++            // peer `close()` only sends `FIN` and won't trigger `HUP`, and
++            // `pal_async`'s `kqueue` backend never sets `PollEvents::ERR` (relying
++            // on `EV_EOF` -> `PollEvents::HUP`).
 +            #[cfg(unix)]
 +            futures::select! {
 +                _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
@@ -132,7 +136,7 @@ index 24acaf8..e76b3c5 100644
              }
              Ok(())
          };
-@@ -239,16 +282,24 @@ enum Event<T> {
+@@ -239,16 +286,24 @@ enum Event<T> {
                          responses.push(recv);
                      }
                      Event::Response((stream_id, payload)) => {
@@ -164,7 +168,7 @@ index 24acaf8..e76b3c5 100644
              anyhow::Result::<_>::Ok(())
          };
          (recv_task, send_task).try_join().await?;
-@@ -626,6 +677,9 @@ mod tests {
+@@ -626,6 +681,9 @@ mod tests {
      use crate::Client;
      use crate::Server;
      use crate::client::ExistingConnection;
@@ -174,7 +178,7 @@ index 24acaf8..e76b3c5 100644
      use crate::service::Code;
      use crate::service::ServiceRpc;
      use futures::StreamExt;
-@@ -702,4 +756,213 @@ fn client_server() {
+@@ -702,4 +760,213 @@ fn client_server() {
          client_thread.join().unwrap();
          server_thread.join().unwrap().unwrap();
      }

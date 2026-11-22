@@ -50,13 +50,13 @@ pub enum GuiRequest {
     ResumeVm { id: Uuid },
     ResetVm { id: Uuid },
     ConnectViewer { id: Uuid, no_shm: bool },
-    AttachDisk { id: Uuid, payload: AttachDiskPayload },
+    AttachDisk { id: Uuid, op_id: u64, payload: AttachDiskPayload },
     DetachDisk {
         id: Uuid,
         lun: u32,
         expected_path: Option<PathBuf>,
     },
-    MountIso { id: Uuid, payload: MountIsoPayload },
+    MountIso { id: Uuid, op_id: u64, payload: MountIsoPayload },
     EjectIso { id: Uuid, lun: Option<u32> },
     AddPortForward { id: Uuid, nic_id: Uuid, port: PortForward },
     RemovePortForward { id: Uuid, nic_id: Uuid, port: PortForward },
@@ -114,6 +114,7 @@ pub enum GuiUpdate {
     StorageOpFinished {
         vm_id: Uuid,
         op: StorageOpKind,
+        op_id: u64,
     },
     StatusMessage(String),
     ErrorMessage(String),
@@ -142,6 +143,7 @@ struct BackendState {
     client: RwLock<Option<ApiClient>>,
     shared_endpoint: SharedEndpoint,
     sse_active: AtomicBool,
+    notified_connected: AtomicBool,
     shutdown: AtomicBool,
     connect_in_flight: AtomicBool,
     snapshot_seq: std::sync::atomic::AtomicU64,
@@ -168,16 +170,17 @@ fn is_idempotent_read(req: &GuiRequest) -> bool {
 struct InFlightUuidGuard<'a> {
     set: &'a Mutex<HashSet<Uuid>>,
     id: Uuid,
-    notify: Option<(&'a BackendState, StorageOpKind)>,
+    notify: Option<(&'a BackendState, StorageOpKind, u64)>,
 }
 
 impl Drop for InFlightUuidGuard<'_> {
     fn drop(&mut self) {
         self.set.lock().unwrap().remove(&self.id);
-        if let Some((backend, op)) = self.notify {
+        if let Some((backend, op, op_id)) = self.notify {
             backend.emit(GuiUpdate::StorageOpFinished {
                 vm_id: self.id,
                 op,
+                op_id,
             });
         }
     }
@@ -231,6 +234,7 @@ impl BackendHandle {
             client: RwLock::new(None),
             shared_endpoint: Arc::new(RwLock::new(None)),
             sse_active: AtomicBool::new(false),
+            notified_connected: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             connect_in_flight: AtomicBool::new(false),
             snapshot_seq: std::sync::atomic::AtomicU64::new(0),
@@ -260,6 +264,7 @@ impl BackendHandle {
             client: RwLock::new(None),
             shared_endpoint: Arc::new(RwLock::new(None)),
             sse_active: AtomicBool::new(false),
+            notified_connected: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             connect_in_flight: AtomicBool::new(false),
             snapshot_seq: std::sync::atomic::AtomicU64::new(0),
@@ -295,9 +300,25 @@ impl BackendHandle {
 }
 
 impl BackendState {
-    fn emit(&self, msg: GuiUpdate) {
-        let _ = self.upd_tx.send(msg);
+    fn emit_checked(&self, msg: GuiUpdate) -> bool {
+        match &msg {
+            GuiUpdate::DaemonConnected { .. } | GuiUpdate::HostConfigUpdated { .. } => {
+                self.notified_connected.store(true, Ordering::Release);
+            }
+            GuiUpdate::DaemonDisconnected(_) => {
+                self.notified_connected.store(false, Ordering::Release);
+            }
+            _ => {}
+        }
+        if self.upd_tx.send(msg).is_err() {
+            return false;
+        }
         self.repaint_ctx.request_repaint();
+        true
+    }
+
+    fn emit(&self, msg: GuiUpdate) {
+        let _ = self.emit_checked(msg);
     }
 
     fn next_snapshot_seq(&self) -> u64 {
@@ -340,24 +361,34 @@ impl BackendState {
                     notify: None,
                 })
             }
-            GuiRequest::AttachDisk { id, .. } => {
+            GuiRequest::AttachDisk { id, op_id, .. } => {
                 if !self.attach_disk_in_flight.lock().unwrap().insert(*id) {
+                    self.emit(GuiUpdate::StorageOpFinished {
+                        vm_id: *id,
+                        op: StorageOpKind::AttachDisk,
+                        op_id: *op_id,
+                    });
                     return;
                 }
                 Some(InFlightUuidGuard {
                     set: &self.attach_disk_in_flight,
                     id: *id,
-                    notify: Some((self.as_ref(), StorageOpKind::AttachDisk)),
+                    notify: Some((self.as_ref(), StorageOpKind::AttachDisk, *op_id)),
                 })
             }
-            GuiRequest::MountIso { id, .. } => {
+            GuiRequest::MountIso { id, op_id, .. } => {
                 if !self.mount_iso_in_flight.lock().unwrap().insert(*id) {
+                    self.emit(GuiUpdate::StorageOpFinished {
+                        vm_id: *id,
+                        op: StorageOpKind::MountIso,
+                        op_id: *op_id,
+                    });
                     return;
                 }
                 Some(InFlightUuidGuard {
                     set: &self.mount_iso_in_flight,
                     id: *id,
-                    notify: Some((self.as_ref(), StorageOpKind::MountIso)),
+                    notify: Some((self.as_ref(), StorageOpKind::MountIso, *op_id)),
                 })
             }
             _ => None,
@@ -616,10 +647,13 @@ fn sync_client_before_request(
 pub fn fetch_full_snapshot(
     client: &ApiClient,
 ) -> anyhow::Result<(HostInfo, HostConfig, Vec<VirtualSwitchInfo>, Vec<VmSummary>)> {
-    let host_info = client.host_info()?;
+    let mut host_info = client.host_info()?;
     let host_config = client.host_config()?;
     let switches = client.list_switches()?;
-    let vms = client.list_vms()?;
+    let (vms, vms_rev) = client.list_vms_with_revision()?;
+    if let Some(rev) = vms_rev {
+        host_info.event_revision = rev;
+    }
     Ok((host_info, host_config, switches, vms))
 }
 
@@ -790,7 +824,7 @@ impl BackendState {
                 )));
                 Ok(())
             }
-            GuiRequest::AttachDisk { id, payload } => {
+            GuiRequest::AttachDisk { id, payload, .. } => {
                 let vm = client.attach_disk(&id.to_string(), &payload)?;
                 self.emit(GuiUpdate::StatusMessage("Attached disk".to_string()));
                 self.emit(GuiUpdate::VmUpdated {
@@ -820,7 +854,7 @@ impl BackendState {
                 });
                 Ok(())
             }
-            GuiRequest::MountIso { id, payload } => {
+            GuiRequest::MountIso { id, payload, .. } => {
                 let vm = client.mount_iso(&id.to_string(), &payload)?;
                 self.emit(GuiUpdate::StatusMessage("Mounted ISO image".to_string()));
                 self.emit(GuiUpdate::VmUpdated {
@@ -916,27 +950,26 @@ fn resolve_updated_client(
 
 fn maybe_switch_endpoint_on_disconnect(
     current_base_url: &str,
-    data_dir: Option<&Path>,
-    daemon_url: Option<&str>,
-    shared_endpoint: &SharedEndpoint,
-    snapshot_seq: &std::sync::atomic::AtomicU64,
-    upd_tx: &mpsc::Sender<GuiUpdate>,
-    repaint_ctx: &egui::Context,
+    state: &BackendState,
 ) -> bool {
-    if let Some(c) = reload_client_from_runtime_addr(data_dir, daemon_url, shared_endpoint)
-        && c.base_url() != current_base_url
+    if let Some(c) = reload_client_from_runtime_addr(
+        state.data_dir.as_deref(),
+        state.daemon_url.as_deref(),
+        &state.shared_endpoint,
+    ) && c.base_url() != current_base_url
     {
-        let seq = snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let snapshot_seq = state.next_snapshot_seq();
         if let Ok((host_info, host_config, switches, vms)) = fetch_full_snapshot(&c) {
-            let _ = upd_tx.send(GuiUpdate::DaemonConnected {
-                base_url: c.base_url().to_string(),
+            let base_url = c.base_url().to_string();
+            *state.client.write().unwrap() = Some(c);
+            let _ = state.emit_checked(GuiUpdate::DaemonConnected {
+                base_url,
                 host_info,
                 host_config,
                 switches,
                 vms,
-                snapshot_seq: seq,
+                snapshot_seq,
             });
-            repaint_ctx.request_repaint();
         }
         return true;
     }
@@ -956,7 +989,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                 return;
             }
         };
-        let mut notified_connected = true;
         while !state.shutdown.load(Ordering::Acquire) {
             let endpoint = state.shared_endpoint.read().unwrap().clone().or_else(|| {
                 reload_client_from_runtime_addr(
@@ -980,19 +1012,13 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     base_url = reloaded.base_url().to_string();
                     token = reloaded.token().to_string();
                 } else {
-                    if notified_connected {
-                        notified_connected = false;
+                    if state.notified_connected.swap(false, Ordering::AcqRel) {
                         *state.client.write().unwrap() = None;
-                        if state
-                            .upd_tx
-                            .send(GuiUpdate::DaemonDisconnected(
-                                "Lost connection or failed daemon verification".to_string(),
-                            ))
-                            .is_err()
-                        {
+                        if !state.emit_checked(GuiUpdate::DaemonDisconnected(
+                            "Lost connection or failed daemon verification".to_string(),
+                        )) {
                             break;
                         }
-                        state.repaint_ctx.request_repaint();
                     }
                     thread::sleep(Duration::from_millis(500));
                     continue;
@@ -1008,39 +1034,27 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
                     match sync_res {
                         Ok((c, (host_info, host_config, switches, vms))) => {
-                            notified_connected = true;
                             *state.client.write().unwrap() = Some(c);
-                            if state
-                                .upd_tx
-                                .send(GuiUpdate::DaemonConnected {
-                                    base_url: base_url.clone(),
-                                    host_info,
-                                    host_config,
-                                    switches,
-                                    vms,
-                                    snapshot_seq,
-                                })
-                                .is_err()
-                            {
+                            if !state.emit_checked(GuiUpdate::DaemonConnected {
+                                base_url: base_url.clone(),
+                                host_info,
+                                host_config,
+                                switches,
+                                vms,
+                                snapshot_seq,
+                            }) {
                                 break;
                             }
-                            state.repaint_ctx.request_repaint();
                         }
                         Err(_) => {
                             drop(resp);
-                            if notified_connected {
-                                notified_connected = false;
+                            if state.notified_connected.swap(false, Ordering::AcqRel) {
                                 *state.client.write().unwrap() = None;
-                                if state
-                                    .upd_tx
-                                    .send(GuiUpdate::DaemonDisconnected(
-                                        "Failed to reload daemon state; retrying…".to_string(),
-                                    ))
-                                    .is_err()
-                                {
+                                if !state.emit_checked(GuiUpdate::DaemonDisconnected(
+                                    "Failed to reload daemon state; retrying…".to_string(),
+                                )) {
                                     break;
                                 }
-                                state.repaint_ctx.request_repaint();
                             }
                             thread::sleep(Duration::from_millis(500));
                             continue;
@@ -1048,196 +1062,147 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     }
                     let reader = std::io::BufReader::new(resp);
                     let mut skip_leading_resync = true;
+                    let mut sse_send_closed = false;
                     for line in reader.lines().map_while(Result::ok) {
                         if state.shutdown.load(Ordering::Acquire) {
                             break;
                         }
-                        if line.is_empty() {
+                        let Some(json_str) = line.strip_prefix("data: ") else {
+                            continue;
+                        };
+                        let was_leading = std::mem::replace(&mut skip_leading_resync, false);
+                        let Ok(event) = serde_json::from_str::<DaemonEvent>(json_str) else {
+                            continue;
+                        };
+                        if was_leading && matches!(event, DaemonEvent::Resync) {
                             continue;
                         }
-                        if skip_leading_resync {
-                            skip_leading_resync = false;
-                            if let Some(json_str) = line.strip_prefix("data: ")
-                                && matches!(
-                                    serde_json::from_str::<DaemonEvent>(json_str),
-                                    Ok(DaemonEvent::Resync)
-                                )
-                            {
-                                continue;
-                            }
-                        }
-                        if let Some(json_str) = line.strip_prefix("data: ")
-                            && let Ok(event) = serde_json::from_str::<DaemonEvent>(json_str)
-                        {
-                            match event {
-                                DaemonEvent::VmUpdated { vm } => {
-                                    if state
-                                        .upd_tx
-                                        .send(GuiUpdate::VmUpdated {
-                                            vm,
-                                            select: false,
-                                            is_details_fetch: false,
-                                        })
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    state.repaint_ctx.request_repaint();
-                                }
-                                DaemonEvent::VmDeleted { id, revision } => {
-                                    if state
-                                        .upd_tx
-                                        .send(GuiUpdate::VmDeleted { id, revision })
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    state.repaint_ctx.request_repaint();
-                                }
-                                DaemonEvent::Resync => {
-                                    if let Ok(c) = ApiClient::new(&base_url, &token) {
-                                        let snapshot_seq = state.next_snapshot_seq();
-                                        if let Ok((host_info, host_config, switches, vms)) =
-                                            fetch_full_snapshot(&c)
-                                        {
-                                            *state.client.write().unwrap() = Some(c);
-                                            if state
-                                                .upd_tx
-                                                .send(GuiUpdate::DaemonConnected {
-                                                    base_url: base_url.clone(),
-                                                    host_info,
-                                                    host_config,
-                                                    switches,
-                                                    vms,
-                                                    snapshot_seq,
-                                                })
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                            state.repaint_ctx.request_repaint();
-                                        }
-                                    }
-                                }
-                                DaemonEvent::HostConfigUpdated => {
-                                    if let Some(c) = resolve_updated_client(
-                                        &base_url,
-                                        &token,
-                                        state.data_dir.as_deref(),
-                                        state.daemon_url.as_deref(),
-                                        &state.shared_endpoint,
-                                    ) {
-                                        let snapshot_seq = state.next_snapshot_seq();
-                                        if let Ok((host_info, host_config, switches, vms)) =
-                                            fetch_full_snapshot(&c)
-                                        {
-                                            let new_base = c.base_url().to_string();
-                                            *state.client.write().unwrap() = Some(c);
-                                            if state
-                                                .upd_tx
-                                                .send(GuiUpdate::DaemonConnected {
-                                                    base_url: new_base.clone(),
-                                                    host_info,
-                                                    host_config,
-                                                    switches,
-                                                    vms,
-                                                    snapshot_seq,
-                                                })
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                            state.repaint_ctx.request_repaint();
-                                            if new_base != base_url {
-                                                switched_endpoint = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                DaemonEvent::DaemonStopping => {
-                                    notified_connected = false;
-                                    saw_daemon_stopping = true;
-                                    *state.client.write().unwrap() = None;
-                                    if state
-                                        .upd_tx
-                                        .send(GuiUpdate::DaemonDisconnected(
-                                            "Daemon stopped".to_string(),
-                                        ))
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    state.repaint_ctx.request_repaint();
+                        match event {
+                            DaemonEvent::VmUpdated { vm } => {
+                                if !state.emit_checked(GuiUpdate::VmUpdated {
+                                    vm,
+                                    select: false,
+                                    is_details_fetch: false,
+                                }) {
+                                    sse_send_closed = true;
                                     break;
                                 }
                             }
+                            DaemonEvent::VmDeleted { id, revision } => {
+                                if !state.emit_checked(GuiUpdate::VmDeleted { id, revision }) {
+                                    sse_send_closed = true;
+                                    break;
+                                }
+                            }
+                            DaemonEvent::Resync => {
+                                let reload_res = ApiClient::new(&base_url, &token)
+                                    .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
+                                match reload_res {
+                                    Ok((c, (host_info, host_config, switches, vms))) => {
+                                        *state.client.write().unwrap() = Some(c);
+                                        if !state.emit_checked(GuiUpdate::DaemonConnected {
+                                            base_url: base_url.clone(),
+                                            host_info,
+                                            host_config,
+                                            switches,
+                                            vms,
+                                            snapshot_seq: state.next_snapshot_seq(),
+                                        }) {
+                                            sse_send_closed = true;
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Drop the stream so the outer loop runs the retryable reconnect sync path.
+                                        break;
+                                    }
+                                }
+                            }
+                            DaemonEvent::HostConfigUpdated => {
+                                let reload_res = resolve_updated_client(
+                                    &base_url,
+                                    &token,
+                                    state.data_dir.as_deref(),
+                                    state.daemon_url.as_deref(),
+                                    &state.shared_endpoint,
+                                )
+                                .ok_or_else(|| anyhow::anyhow!("failed to resolve daemon client"))
+                                .and_then(|c| fetch_full_snapshot(&c).map(|snap| (c, snap)));
+                                match reload_res {
+                                    Ok((c, (host_info, host_config, switches, vms))) => {
+                                        let new_base = c.base_url().to_string();
+                                        *state.client.write().unwrap() = Some(c);
+                                        if !state.emit_checked(GuiUpdate::DaemonConnected {
+                                            base_url: new_base.clone(),
+                                            host_info,
+                                            host_config,
+                                            switches,
+                                            vms,
+                                            snapshot_seq: state.next_snapshot_seq(),
+                                        }) {
+                                            sse_send_closed = true;
+                                            break;
+                                        }
+                                        if new_base != base_url {
+                                            switched_endpoint = true;
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Drop the stream so the outer loop runs the retryable reconnect sync path.
+                                        break;
+                                    }
+                                }
+                            }
+                            DaemonEvent::DaemonStopping => {
+                                saw_daemon_stopping = true;
+                                *state.client.write().unwrap() = None;
+                                if !state.emit_checked(GuiUpdate::DaemonDisconnected(
+                                    "Daemon stopped".to_string(),
+                                )) {
+                                    sse_send_closed = true;
+                                }
+                                break;
+                            }
                         }
+                    }
+                    if sse_send_closed {
+                        break;
                     }
                     if !state.shutdown.load(Ordering::Acquire) && !switched_endpoint {
                         if saw_daemon_stopping {
                             thread::sleep(Duration::from_millis(500));
                             continue;
                         }
-                        if maybe_switch_endpoint_on_disconnect(
-                            &base_url,
-                            state.data_dir.as_deref(),
-                            state.daemon_url.as_deref(),
-                            &state.shared_endpoint,
-                            &state.snapshot_seq,
-                            &state.upd_tx,
-                            &state.repaint_ctx,
-                        ) {
-                            notified_connected = true;
+                        if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
                             continue;
                         }
                         let healthy =
                             ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                        if !healthy && notified_connected {
-                            notified_connected = false;
+                        if !healthy && state.notified_connected.swap(false, Ordering::AcqRel) {
                             *state.client.write().unwrap() = None;
-                            if state
-                                .upd_tx
-                                .send(GuiUpdate::DaemonDisconnected(
-                                    "Lost connection to openvmmsd".to_string(),
-                                ))
-                                .is_err()
-                            {
+                            if !state.emit_checked(GuiUpdate::DaemonDisconnected(
+                                "Lost connection to openvmmsd".to_string(),
+                            )) {
                                 break;
                             }
-                            state.repaint_ctx.request_repaint();
                         }
                         thread::sleep(Duration::from_millis(500));
                     }
                 }
                 _ => {
-                    if maybe_switch_endpoint_on_disconnect(
-                        &base_url,
-                        state.data_dir.as_deref(),
-                        state.daemon_url.as_deref(),
-                        &state.shared_endpoint,
-                        &state.snapshot_seq,
-                        &state.upd_tx,
-                        &state.repaint_ctx,
-                    ) {
-                        notified_connected = true;
+                    if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
                         continue;
                     }
                     let healthy =
                         ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                    if !healthy && notified_connected {
-                        notified_connected = false;
+                    if !healthy && state.notified_connected.swap(false, Ordering::AcqRel) {
                         *state.client.write().unwrap() = None;
-                        if state
-                            .upd_tx
-                            .send(GuiUpdate::DaemonDisconnected(
-                                "Lost connection to openvmmsd".to_string(),
-                            ))
-                            .is_err()
-                        {
+                        if !state.emit_checked(GuiUpdate::DaemonDisconnected(
+                            "Lost connection to openvmmsd".to_string(),
+                        )) {
                             break;
                         }
-                        state.repaint_ctx.request_repaint();
                     }
                     thread::sleep(Duration::from_millis(500));
                 }
@@ -2826,7 +2791,7 @@ mod tests {
                                     .unwrap_or("");
                                 if target == "/api/v1/events" {
                                     let _ = stream.write_all(
-                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\ndata: {\"event\":\"resync\"}\n\n",
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n: keep-alive\n\ndata: {\"event\":\"resync\"}\n\n",
                                     );
                                     let _ = stream.flush();
                                     let mut sent_second = false;
@@ -2895,6 +2860,383 @@ mod tests {
             matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 3)
         });
         assert_eq!(vms_reqs.load(Ordering::Acquire), 3);
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn midstream_resync_and_host_config_snapshot_failures_reconnect_and_recover() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let sse_count = Arc::new(AtomicUsize::new(0));
+        let fail_vms = Arc::new(AtomicBool::new(false));
+        let send_resync = Arc::new(AtomicBool::new(false));
+        let send_host_cfg = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut recovered_cfg = openvmms_core::models::VmConfig::from_preset(
+            "MidstreamRecovered-VM",
+            VmPreset::Custom,
+            &dir.path().join("vm"),
+        );
+        recovered_cfg.id = Uuid::new_v4();
+
+        let server = {
+            let token = token.clone();
+            let sse_count = Arc::clone(&sse_count);
+            let fail_vms = Arc::clone(&fail_vms);
+            let send_resync = Arc::clone(&send_resync);
+            let send_host_cfg = Arc::clone(&send_host_cfg);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let sse_count = Arc::clone(&sse_count);
+                            let fail_vms = Arc::clone(&fail_vms);
+                            let send_resync = Arc::clone(&send_resync);
+                            let send_host_cfg = Arc::clone(&send_host_cfg);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            let recovered_cfg = recovered_cfg.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let target = req_text
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let idx = sse_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\ndata: {\"event\":\"resync\"}\n\n",
+                                    );
+                                    let _ = stream.flush();
+                                    let mut sent_mid = false;
+                                    while !stop.load(Ordering::Acquire) {
+                                        if idx == 1
+                                            && !sent_mid
+                                            && send_resync.load(Ordering::Acquire)
+                                        {
+                                            sent_mid = true;
+                                            if stream
+                                                .write_all(b"data: {\"event\":\"resync\"}\n\n")
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            let _ = stream.flush();
+                                        } else if idx == 2
+                                            && !sent_mid
+                                            && send_host_cfg.load(Ordering::Acquire)
+                                        {
+                                            sent_mid = true;
+                                            if stream
+                                                .write_all(
+                                                    b"data: {\"event\":\"host_config_updated\"}\n\n",
+                                                )
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            let _ = stream.flush();
+                                        } else {
+                                            if stream.write_all(b": keep-alive\n\n").is_err() {
+                                                break;
+                                            }
+                                            let _ = stream.flush();
+                                        }
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/vms" {
+                                    if fail_vms.swap(false, Ordering::AcqRel) {
+                                        (
+                                            "500 Internal Server Error",
+                                            r#"{"error":"transient vms failure"}"#.to_string(),
+                                        )
+                                    } else if sse_count.load(Ordering::Acquire) >= 3 {
+                                        let vm_summary = VmSummary {
+                                            config: recovered_cfg,
+                                            runtime: openvmms_core::models::VmRuntimeState {
+                                                status: VmStatus::Running,
+                                                revision: 9,
+                                                ..Default::default()
+                                            },
+                                        };
+                                        (
+                                            "200 OK",
+                                            serde_json::to_string(&vec![vm_summary]).unwrap(),
+                                        )
+                                    } else {
+                                        ("200 OK", "[]".to_string())
+                                    }
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timeout(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(5),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 2, .. })
+        });
+
+        // 1. Mid-stream Resync fails snapshot -> must drop stream and reconnect (sse_count == 2),
+        //    emitting DaemonConnected on the new SSE stream.
+        fail_vms.store(true, Ordering::Release);
+        send_resync.store(true, Ordering::Release);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 3, .. })
+        });
+        assert_eq!(sse_count.load(Ordering::Acquire), 2);
+
+        // 2. On sse_count == 2, mid-stream HostConfigUpdated fails snapshot -> drops stream, reconnects at sse_count == 3,
+        //    and loads MidstreamRecovered-VM.
+        fail_vms.store(true, Ordering::Release);
+        send_host_cfg.store(true, Ordering::Release);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::DaemonConnected { vms, .. }
+                    if vms.iter().any(|v| v.config.name == "MidstreamRecovered-VM")
+            )
+        });
+        assert!(sse_count.load(Ordering::Acquire) >= 3);
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn duplicate_storage_op_emits_finished_for_rejected_op_id_and_refresh_reconnect_resets_disconnect_tracking() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let health_fail = Arc::new(AtomicBool::new(false));
+        let sse_fail = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let vm_id = Uuid::new_v4();
+        let mut vm_cfg = openvmms_core::models::VmConfig::from_preset(
+            "OpId-VM",
+            VmPreset::Custom,
+            &dir.path().join("vm"),
+        );
+        vm_cfg.id = vm_id;
+
+        let server = {
+            let token = token.clone();
+            let health_fail = Arc::clone(&health_fail);
+            let sse_fail = Arc::clone(&sse_fail);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let health_fail = Arc::clone(&health_fail);
+                            let sse_fail = Arc::clone(&sse_fail);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            let vm_cfg = vm_cfg.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let first = req_text.lines().next().unwrap_or("");
+                                let mut parts = first.split_whitespace();
+                                let method = parts.next().unwrap_or("");
+                                let target = parts.next().unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    if sse_fail.load(Ordering::Acquire) {
+                                        let resp = mock_http_response("503 Service Unavailable", "{}");
+                                        let _ = stream.write_all(resp.as_bytes());
+                                        return;
+                                    }
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    while !stop.load(Ordering::Acquire) && !sse_fail.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keep-alive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+                                if target.starts_with("/api/v1/health?") && health_fail.load(Ordering::Acquire) {
+                                    let resp = mock_http_response("503 Service Unavailable", "{}");
+                                    let _ = stream.write_all(resp.as_bytes());
+                                    return;
+                                }
+                                if method == "POST" && target.ends_with("/disks") {
+                                    thread::sleep(Duration::from_millis(250));
+                                    let summary = VmSummary {
+                                        config: vm_cfg,
+                                        runtime: Default::default(),
+                                    };
+                                    let resp = mock_http_response(
+                                        "200 OK",
+                                        &serde_json::to_string(&summary).unwrap(),
+                                    );
+                                    let _ = stream.write_all(resp.as_bytes());
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/vms" {
+                                    ("200 OK", "[]".to_string())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timeout(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_millis(300),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        });
+
+        // 1. Duplicate AttachDisk while op 11 is in flight must emit StorageOpFinished for op_id=12 immediately.
+        backend.send(GuiRequest::AttachDisk {
+            id: vm_id,
+            op_id: 11,
+            payload: AttachDiskPayload {
+                path: dir.path().join("d.img"),
+                lun: None,
+                read_only: false,
+                format: None,
+            },
+        });
+        thread::sleep(Duration::from_millis(40));
+        backend.send(GuiRequest::AttachDisk {
+            id: vm_id,
+            op_id: 12,
+            payload: AttachDiskPayload {
+                path: dir.path().join("d.img"),
+                lun: None,
+                read_only: false,
+                format: None,
+            },
+        });
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::StorageOpFinished {
+                    vm_id: id,
+                    op: StorageOpKind::AttachDisk,
+                    op_id: 12
+                } if *id == vm_id
+            )
+        });
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(
+                u,
+                GuiUpdate::StorageOpFinished {
+                    vm_id: id,
+                    op: StorageOpKind::AttachDisk,
+                    op_id: 11
+                } if *id == vm_id
+            )
+        });
+
+        // 2. Drop health so SSE emits DaemonDisconnected, then keep SSE failing while
+        //    RefreshAll succeeds and reconnects, then drop health again -> SSE must still emit DaemonDisconnected.
+        health_fail.store(true, Ordering::Release);
+        sse_fail.store(true, Ordering::Release);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonDisconnected(_))
+        });
+
+        health_fail.store(false, Ordering::Release);
+        backend.send(GuiRequest::RefreshAll);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        });
+
+        health_fail.store(true, Ordering::Release);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonDisconnected(_))
+        });
 
         drop(backend);
         stop.store(true, Ordering::Release);

@@ -6,7 +6,7 @@
 
 ### `0001-mesh-rpc-cancel-pending-rpcs-on-client-disconnect.patch`
 - **Target:** `openvmm/support/mesh/mesh_rpc/src/server.rs`
-- **Summary:** Cancels the connection `CancelContext` and skips writing responses in `mesh_rpc::Server::serve_connection` when the ttrpc client socket disconnects. On Unix (`#[cfg(unix)]`, where Linux `epoll` and macOS/BSD `kqueue` distinguish `RDHUP` half-close from `HUP`/`ERR` full close), after read EOF it races `wait_ready(PollEvents::HUP | PollEvents::ERR)` against `send_task` completion so half-closed `shutdown(SHUT_WR)` clients still receive in-flight replies while full disconnects cancel pending RPCs promptly. On non-Unix targets (Windows `afunix.sys` / AFD, where both `shutdown(SD_SEND)` and graceful `closesocket()` emit `AFD_POLL_DISCONNECT` rather than `AFD_POLL_ABORT`), it cancels immediately on read EOF.
+- **Summary:** Cancels the connection `CancelContext` and skips writing responses in `mesh_rpc::Server::serve_connection` when the ttrpc client socket disconnects. On Unix (`#[cfg(unix)]`, where Linux `epoll` and macOS/BSD `kqueue` distinguish `RDHUP` half-close from `HUP`/`ERR` full close), after read EOF it races `wait_ready(PollEvents::HUP | PollEvents::ERR)` against `send_task` completion so half-closed `shutdown(SHUT_WR)` clients still receive in-flight replies while full disconnects cancel pending RPCs promptly. This Unix `HUP | ERR` wait assumes `AF_UNIX` stream sockets (used by OpenVMM's ttrpc transport): on Unix TCP sockets, a peer `close()` only sends `FIN` and won't trigger `HUP`, and `pal_async`'s `kqueue` backend never sets `PollEvents::ERR` (relying on `EV_EOF` -> `PollEvents::HUP`). On non-Unix targets (Windows `afunix.sys` / AFD, where both `shutdown(SD_SEND)` and graceful `closesocket()` emit `AFD_POLL_DISCONNECT` rather than `AFD_POLL_ABORT`), it cancels immediately on read EOF.
 - **Behavioral impact:** Affects every ttrpc service hosted by `mesh_rpc::Server`—on Unix, half-closed (`shutdown(SHUT_WR)`) clients continue receiving in-flight replies while full disconnects cancel pending RPCs and drop their responses; on Windows, any client read EOF (full close or half-close) cancels pending RPCs and drops responses so disconnected waiters release immediately. In particular, if `openvmmsd` restarts or disconnects while a `SaveVm`, `RestoreVm`, or `ShutdownVm` RPC is running, that operation is cancelled instead of finishing.
 - **Why carried:** Required for `openvmmsd` daemon restarts without stopping VMs (`WaitVM` holds a single per-VM waiter slot in `VmService`, so closing `openvmmsd`'s socket must release `WaitVM` for the next daemon to re-adopt the VM cleanly).
 
@@ -45,6 +45,8 @@ git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/openvmm/openvmm_hel
 git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto openvmm/openvmm/openvmm_entry/src/lib.rs openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs openvmm/workers/fastdesk_worker/src/lib.rs openvmm/workers/fastdesk_worker_defs/src/lib.rs \
   > patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
 
-# Apply to a clean checkout of the pre-OpenVMMS baseline:
+# Apply to a clean checkout of the pre-OpenVMMS baseline (then refresh `openvmm/Cargo.lock`
+# because `0002` adds `libc` and `tracing` dependencies to `disklayer_vhdx` before `cargo build --locked`):
 for p in patches/*.patch; do git apply "$p"; done
+cargo update --manifest-path openvmm/Cargo.toml -p disklayer_vhdx
 ```

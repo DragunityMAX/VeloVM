@@ -160,6 +160,12 @@ jobs:
           $autoDir = Join-Path $env:RUNNER_TEMP "openvmms-autostart-win"
           if (Test-Path $autoDir) { Remove-Item -Recurse -Force $autoDir }
           New-Item -ItemType Directory -Force -Path $autoDir | Out-Null
+          $killAutoDaemon = {
+            $pattern = [regex]::Escape($autoDir)
+            Get-CimInstance Win32_Process -Filter "Name = 'openvmmsd.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -and $_.CommandLine -match $pattern } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          }
           try {
             $psi = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path ".\openvmms\target\release\openvmms.exe").Path)
             $psi.Arguments = ('--data-dir "{0}" --json vm list' -f $autoDir)
@@ -172,13 +178,14 @@ jobs:
               $stderrTask = $proc.StandardError.ReadToEndAsync()
               $deadline = [DateTime]::UtcNow.AddSeconds(15)
               if (-not $proc.WaitForExit(15000)) {
-                try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+                try { $proc.Kill($true); $proc.WaitForExit(5000) | Out-Null } catch { try { $proc.Kill(); $proc.WaitForExit(5000) | Out-Null } catch {} }
+                & $killAutoDaemon
                 throw "openvmms auto-start stdout-capture check timed out after 15s"
               }
-              $remainingMs = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+              $remainingMs = [Math]::Max(2000, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
               $ioTask = [System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]($stdoutTask, $stderrTask))
               if (-not $ioTask.Wait($remainingMs)) {
-                try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+                & $killAutoDaemon
                 throw "openvmms auto-start stdout/stderr pipe remained open after 15s (inherited stdio handle leak)"
               }
               $autoOut = $stdoutTask.GetAwaiter().GetResult()
@@ -194,6 +201,8 @@ jobs:
               & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --no-auto-start daemon stop | Out-Null
             } catch {}
             Start-Sleep -Milliseconds 300
+            & $killAutoDaemon
+            Start-Sleep -Milliseconds 150
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $autoDir
           }
 

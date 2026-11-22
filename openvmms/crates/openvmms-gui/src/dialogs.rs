@@ -655,33 +655,57 @@ pub struct HostSettingsDialog {
     pub fastdesk_viewer_bin: String,
     pub openvmm_img_bin: String,
     pub uefi_firmware_path: String,
-    pub base_config: HostConfig,
+    pub initial_listen_addr: String,
+    pub initial_openvmm_bin: String,
+    pub initial_fastdesk_viewer_bin: String,
+    pub initial_openvmm_img_bin: String,
+    pub initial_uefi_firmware_path: String,
     pub submitting: bool,
     pub error: Option<String>,
 }
 
 impl HostSettingsDialog {
     pub fn from_config(cfg: &HostConfig) -> Self {
+        let listen_addr = cfg.listen_addr.clone();
+        let openvmm_bin = opt_to_string(cfg.openvmm_bin.as_deref());
+        let fastdesk_viewer_bin = opt_to_string(cfg.fastdesk_viewer_bin.as_deref());
+        let openvmm_img_bin = opt_to_string(cfg.openvmm_img_bin.as_deref());
+        let uefi_firmware_path = opt_to_string(cfg.uefi_firmware_path.as_deref());
         Self {
-            listen_addr: cfg.listen_addr.clone(),
-            openvmm_bin: opt_to_string(cfg.openvmm_bin.as_deref()),
-            fastdesk_viewer_bin: opt_to_string(cfg.fastdesk_viewer_bin.as_deref()),
-            openvmm_img_bin: opt_to_string(cfg.openvmm_img_bin.as_deref()),
-            uefi_firmware_path: opt_to_string(cfg.uefi_firmware_path.as_deref()),
-            base_config: cfg.clone(),
+            initial_listen_addr: listen_addr.clone(),
+            initial_openvmm_bin: openvmm_bin.clone(),
+            initial_fastdesk_viewer_bin: fastdesk_viewer_bin.clone(),
+            initial_openvmm_img_bin: openvmm_img_bin.clone(),
+            initial_uefi_firmware_path: uefi_firmware_path.clone(),
+            listen_addr,
+            openvmm_bin,
+            fastdesk_viewer_bin,
+            openvmm_img_bin,
+            uefi_firmware_path,
             submitting: false,
             error: None,
         }
     }
 
     pub fn build_patch(&self) -> HostConfigPatch {
-        let mut edited = self.base_config.clone();
-        edited.listen_addr = self.listen_addr.trim().to_string();
-        edited.openvmm_bin = string_to_opt(&self.openvmm_bin);
-        edited.fastdesk_viewer_bin = string_to_opt(&self.fastdesk_viewer_bin);
-        edited.openvmm_img_bin = string_to_opt(&self.openvmm_img_bin);
-        edited.uefi_firmware_path = string_to_opt(&self.uefi_firmware_path);
-        HostConfigPatch::from_diff(&self.base_config, &edited)
+        let trimmed_listen = self.listen_addr.trim();
+        let listen_addr = (trimmed_listen != self.initial_listen_addr.trim())
+            .then(|| trimmed_listen.to_string());
+        let diff_path =
+            |cur: &str, init: &str| (cur.trim() != init.trim()).then(|| string_to_opt(cur));
+        HostConfigPatch {
+            listen_addr,
+            openvmm_bin: diff_path(&self.openvmm_bin, &self.initial_openvmm_bin),
+            fastdesk_viewer_bin: diff_path(
+                &self.fastdesk_viewer_bin,
+                &self.initial_fastdesk_viewer_bin,
+            ),
+            openvmm_img_bin: diff_path(&self.openvmm_img_bin, &self.initial_openvmm_img_bin),
+            uefi_firmware_path: diff_path(
+                &self.uefi_firmware_path,
+                &self.initial_uefi_firmware_path,
+            ),
+        }
     }
 }
 
@@ -2342,5 +2366,30 @@ mod tests {
             });
         });
         assert!(ok_rect.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_settings_dialog_does_not_emit_spurious_diff_for_non_utf8_unix_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8_path = PathBuf::from(OsStr::from_bytes(b"/tmp/openvmm-\xff\xfe/bin"));
+        let cfg = HostConfig {
+            listen_addr: "127.0.0.1:47620".into(),
+            openvmm_bin: Some(non_utf8_path),
+            ..Default::default()
+        };
+
+        let mut dlg = HostSettingsDialog::from_config(&cfg);
+        assert!(
+            dlg.build_patch().is_empty(),
+            "untouched non-UTF-8 path must not produce a spurious diff"
+        );
+
+        dlg.listen_addr = "127.0.0.1:47621".into();
+        let patch = dlg.build_patch();
+        assert_eq!(patch.listen_addr.as_deref(), Some("127.0.0.1:47621"));
+        assert!(patch.openvmm_bin.is_none());
     }
 }

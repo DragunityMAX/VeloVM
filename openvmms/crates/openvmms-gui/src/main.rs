@@ -104,8 +104,9 @@ struct OpenVmmsApp {
     // Inline inputs in bottom inspector tabs
     attach_disk_input: String,
     mount_iso_input: String,
-    attach_disk_in_flight: std::collections::HashSet<Uuid>,
-    mount_iso_in_flight: std::collections::HashSet<Uuid>,
+    attach_disk_in_flight: std::collections::HashMap<Uuid, u64>,
+    mount_iso_in_flight: std::collections::HashMap<Uuid, u64>,
+    next_storage_op_id: u64,
     pf_proto: IpProto,
     pf_host_addr: String,
     pf_host_port: u16,
@@ -162,8 +163,9 @@ impl OpenVmmsApp {
             error_banner: None,
             attach_disk_input: String::new(),
             mount_iso_input: String::new(),
-            attach_disk_in_flight: std::collections::HashSet::new(),
-            mount_iso_in_flight: std::collections::HashSet::new(),
+            attach_disk_in_flight: std::collections::HashMap::new(),
+            mount_iso_in_flight: std::collections::HashMap::new(),
+            next_storage_op_id: 1,
             pf_proto: IpProto::Tcp,
             pf_host_addr: "127.0.0.1".to_string(),
             pf_host_port: 3389,
@@ -228,8 +230,7 @@ impl OpenVmmsApp {
                         }
                         let snap_rev = vm.runtime.revision;
                         let known_rev = self.vm_revisions.get(&id).copied().unwrap_or(0);
-                        if snap_rev > 0
-                            && snap_rev < known_rev
+                        if snap_rev < known_rev
                             && let Some(existing) = existing_by_id.get(&id)
                         {
                             merged.push(existing.clone());
@@ -251,6 +252,15 @@ impl OpenVmmsApp {
                             .unwrap_or(existing.runtime.revision);
                         if known_rev > snap_rev_watermark {
                             merged.push(existing);
+                        } else {
+                            let del_entry = self.deleted_vms.entry(id).or_insert(0);
+                            *del_entry = (*del_entry).max(snap_rev_watermark);
+                            let rev_entry = self.vm_revisions.entry(id).or_insert(0);
+                            *rev_entry = (*rev_entry).max(snap_rev_watermark);
+                            if matches!(&self.logs_cache, Some((cached_id, _)) if *cached_id == id)
+                            {
+                                self.logs_cache = None;
+                            }
                         }
                     }
                     merged.sort_by(|a, b| {
@@ -265,6 +275,7 @@ impl OpenVmmsApp {
                     self.deleted_vms.clear();
                     self.attach_disk_in_flight.clear();
                     self.mount_iso_in_flight.clear();
+                    self.logs_cache = None;
                     for vm in &vms {
                         if vm.runtime.revision > 0 {
                             self.vm_revisions.insert(vm.config.id, vm.runtime.revision);
@@ -284,8 +295,6 @@ impl OpenVmmsApp {
             }
             GuiUpdate::DaemonDisconnected(reason) => {
                 self.connected = false;
-                self.attach_disk_in_flight.clear();
-                self.mount_iso_in_flight.clear();
                 self.connection_status = "Disconnected".to_string();
                 self.error_banner = Some(reason);
             }
@@ -299,14 +308,12 @@ impl OpenVmmsApp {
                     return;
                 }
                 let rev = vm.runtime.revision;
-                if rev > 0 {
-                    let prev_rev = self.vm_revisions.get(&id).copied().unwrap_or(0);
-                    if rev < prev_rev {
-                        if select && self.vms.iter().any(|v| v.config.id == id) {
-                            self.selected_vm = Some(id);
-                        }
-                        return;
+                let prev_rev = self.vm_revisions.get(&id).copied().unwrap_or(0);
+                if rev < prev_rev {
+                    if select && self.vms.iter().any(|v| v.config.id == id) {
+                        self.selected_vm = Some(id);
                     }
+                    return;
                 }
                 if let Some(slot) = self.vms.iter_mut().find(|v| v.config.id == id) {
                     if rev > 0 {
@@ -434,14 +441,15 @@ impl OpenVmmsApp {
                         }
                     }
                 },
-                GuiUpdate::StorageOpFinished { vm_id, op } => match op {
-                    controller::StorageOpKind::AttachDisk => {
-                        self.attach_disk_in_flight.remove(&vm_id);
+                GuiUpdate::StorageOpFinished { vm_id, op, op_id } => {
+                    let map = match op {
+                        controller::StorageOpKind::AttachDisk => &mut self.attach_disk_in_flight,
+                        controller::StorageOpKind::MountIso => &mut self.mount_iso_in_flight,
+                    };
+                    if op_id == 0 || map.get(&vm_id) == Some(&op_id) {
+                        map.remove(&vm_id);
                     }
-                    controller::StorageOpKind::MountIso => {
-                        self.mount_iso_in_flight.remove(&vm_id);
-                    }
-                },
+                }
                 GuiUpdate::StatusMessage(msg) => {
                     self.status_line = msg;
                     self.error_banner = None;
@@ -1098,16 +1106,19 @@ impl OpenVmmsApp {
                     vec!["vhdx", "vhd", "img", "raw"],
                 ));
             }
-            let attach_busy = self.attach_disk_in_flight.contains(&id);
+            let attach_busy = self.attach_disk_in_flight.contains_key(&id);
             let attach_label = if attach_busy { "Attaching…" } else { "Attach" };
             let can_attach = !attach_busy && !self.attach_disk_input.trim().is_empty();
             if ui
                 .add_enabled(can_attach, egui::Button::new(attach_label))
                 .clicked()
             {
-                self.attach_disk_in_flight.insert(id);
+                let op_id = self.next_storage_op_id;
+                self.next_storage_op_id += 1;
+                self.attach_disk_in_flight.insert(id, op_id);
                 self.backend.send(GuiRequest::AttachDisk {
                     id,
+                    op_id,
                     payload: AttachDiskPayload {
                         path: PathBuf::from(self.attach_disk_input.trim()),
                         lun: None,
@@ -1129,7 +1140,7 @@ impl OpenVmmsApp {
                     vec!["iso"],
                 ));
             }
-            let mount_busy = self.mount_iso_in_flight.contains(&id);
+            let mount_busy = self.mount_iso_in_flight.contains_key(&id);
             let mount_label = if mount_busy {
                 "Mounting…"
             } else {
@@ -1140,9 +1151,12 @@ impl OpenVmmsApp {
                 .add_enabled(can_mount, egui::Button::new(mount_label))
                 .clicked()
             {
-                self.mount_iso_in_flight.insert(id);
+                let op_id = self.next_storage_op_id;
+                self.next_storage_op_id += 1;
+                self.mount_iso_in_flight.insert(id, op_id);
                 self.backend.send(GuiRequest::MountIso {
                     id,
+                    op_id,
                     payload: MountIsoPayload {
                         path: PathBuf::from(self.mount_iso_input.trim()),
                         lun: None,
@@ -1491,6 +1505,7 @@ fn run_self_test() -> anyhow::Result<()> {
     std::fs::write(&iso_path, vec![0u8; 4096])?;
     app.backend.send(GuiRequest::MountIso {
         id: vm_id,
+        op_id: 1,
         payload: MountIsoPayload {
             path: iso_path.clone(),
             lun: None,
@@ -1810,20 +1825,22 @@ mod tests {
         let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
         let vm_id = Uuid::new_v4();
 
-        app.attach_disk_in_flight.insert(vm_id);
-        app.mount_iso_in_flight.insert(vm_id);
+        app.attach_disk_in_flight.insert(vm_id, 1);
+        app.mount_iso_in_flight.insert(vm_id, 2);
         app.apply_update(GuiUpdate::StorageOpFinished {
             vm_id,
             op: controller::StorageOpKind::AttachDisk,
+            op_id: 1,
         });
-        assert!(!app.attach_disk_in_flight.contains(&vm_id));
-        assert!(app.mount_iso_in_flight.contains(&vm_id));
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_id));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_id));
 
         app.apply_update(GuiUpdate::StorageOpFinished {
             vm_id,
             op: controller::StorageOpKind::MountIso,
+            op_id: 2,
         });
-        assert!(!app.mount_iso_in_flight.contains(&vm_id));
+        assert!(!app.mount_iso_in_flight.contains_key(&vm_id));
     }
 
     #[test]
@@ -1956,6 +1973,8 @@ mod tests {
         );
 
         // Fresher snapshot (watermark 6 >= Beta's revision 5) omits Beta -> Beta was deleted, so drop it.
+        app.selected_vm = Some(vm_b);
+        app.logs_cache = Some((vm_b, "stale beta logs".into()));
         let mut fresh_info = make_host_info(Some(daemon_id));
         fresh_info.event_revision = 6;
         app.apply_update(GuiUpdate::DaemonConnected {
@@ -1969,6 +1988,50 @@ mod tests {
         assert!(
             !app.vms.iter().any(|v| v.config.id == vm_b),
             "VM omitted from fresher snapshot at rev 6 must be dropped"
+        );
+        assert!(
+            app.deleted_vms.contains_key(&vm_b),
+            "VM omitted from fresher snapshot must be recorded in deleted_vms"
+        );
+        assert!(
+            app.logs_cache.is_none(),
+            "logs_cache for snapshot-dropped VM must be cleared"
+        );
+
+        // Late VmUpdated at prev_rev (or even rev 6) must not resurrect the snapshot-dropped VM.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_b, "Beta", VmStatus::Off, 5),
+            select: false,
+            is_details_fetch: false,
+        });
+        assert!(!app.vms.iter().any(|v| v.config.id == vm_b));
+
+        // Stale rev=0 snapshot and stale rev=0 VmUpdated must not overwrite a VM at known_rev > 0.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_a, "Alpha", VmStatus::Running, 7),
+            select: false,
+            is_details_fetch: false,
+        });
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_a, "Alpha", VmStatus::Off, 0),
+            select: false,
+            is_details_fetch: false,
+        });
+        assert_eq!(
+            app.vms.iter().find(|v| v.config.id == vm_a).unwrap().runtime.status,
+            VmStatus::Running
+        );
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Off, 0)],
+            snapshot_seq: 4,
+        });
+        assert_eq!(
+            app.vms.iter().find(|v| v.config.id == vm_a).unwrap().runtime.status,
+            VmStatus::Running
         );
     }
 
@@ -1988,8 +2051,8 @@ mod tests {
             vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Running, 1)],
             snapshot_seq: 1,
         });
-        app.attach_disk_in_flight.insert(vm_a);
-        app.mount_iso_in_flight.insert(vm_a);
+        app.attach_disk_in_flight.insert(vm_a, 1);
+        app.mount_iso_in_flight.insert(vm_a, 2);
 
         // Same-daemon snapshot arrives mid-operation -> keep buttons disabled.
         app.apply_update(GuiUpdate::DaemonConnected {
@@ -2000,8 +2063,13 @@ mod tests {
             vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Running, 2)],
             snapshot_seq: 2,
         });
-        assert!(app.attach_disk_in_flight.contains(&vm_a));
-        assert!(app.mount_iso_in_flight.contains(&vm_a));
+        assert!(app.attach_disk_in_flight.contains_key(&vm_a));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_a));
+
+        // Transient DaemonDisconnected on same daemon must keep buttons disabled until worker finishes.
+        app.apply_update(GuiUpdate::DaemonDisconnected("transient drop".into()));
+        assert!(app.attach_disk_in_flight.contains_key(&vm_a));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_a));
 
         // Different daemon instance -> clear stale in-flight flags.
         app.apply_update(GuiUpdate::DaemonConnected {
@@ -2012,7 +2080,22 @@ mod tests {
             vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Running, 1)],
             snapshot_seq: 3,
         });
-        assert!(!app.attach_disk_in_flight.contains(&vm_a));
-        assert!(!app.mount_iso_in_flight.contains(&vm_a));
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_a));
+        assert!(!app.mount_iso_in_flight.contains_key(&vm_a));
+
+        // Stale StorageOpFinished with old op_id must not clear a newer op_id.
+        app.attach_disk_in_flight.insert(vm_a, 10);
+        app.apply_update(GuiUpdate::StorageOpFinished {
+            vm_id: vm_a,
+            op: controller::StorageOpKind::AttachDisk,
+            op_id: 1,
+        });
+        assert_eq!(app.attach_disk_in_flight.get(&vm_a), Some(&10));
+        app.apply_update(GuiUpdate::StorageOpFinished {
+            vm_id: vm_a,
+            op: controller::StorageOpKind::AttachDisk,
+            op_id: 10,
+        });
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_a));
     }
 }

@@ -259,7 +259,7 @@ impl RegistryStore {
     pub fn load_or_create_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
         if fs::symlink_metadata(&path).is_ok() {
-            let was_permissive = check_and_repair_token_permissions(&path, true)?;
+            let was_permissive = check_token_permissions(&path)?;
             if was_permissive {
                 tracing::warn!(
                     path = %path.display(),
@@ -284,7 +284,7 @@ impl RegistryStore {
 
     pub fn read_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
-        let _ = check_and_repair_token_permissions(&path, false)
+        let _ = check_token_permissions(&path)
             .with_context(|| format!("reading daemon token at {}", path.display()))?;
         let token = fs::read_to_string(&path)
             .with_context(|| format!("reading daemon token at {}", path.display()))?
@@ -414,10 +414,14 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
     {
         if let Ok(dir) = fs::File::open(parent)
             && let Err(err) = dir.sync_all()
-            && !matches!(
-                err.raw_os_error(),
-                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::EROFS)
-            )
+            && {
+                #[allow(unreachable_patterns)]
+                let ignored = matches!(
+                    err.raw_os_error(),
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTSUP | libc::EROFS)
+                );
+                !ignored
+            }
         {
             return Err(err)
                 .with_context(|| format!("syncing parent directory {}", parent.display()));
@@ -487,7 +491,7 @@ fn current_user_token_buf()
     Ok(buf)
 }
 
-fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Result<bool> {
+fn check_token_permissions(path: &Path) -> anyhow::Result<bool> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         bail!(
@@ -502,39 +506,21 @@ fn check_and_repair_token_permissions(path: &Path, repair: bool) -> anyhow::Resu
         let mode = meta.permissions().mode() & 0o777;
         if (mode & 0o077) != 0 {
             was_permissive = true;
-            if repair {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:04o}"),
-                    "daemon.token has overly permissive permissions; tightening to 0600"
-                );
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                    .with_context(|| format!("tightening permissions on {}", path.display()))?;
-            } else {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:04o}"),
-                    "daemon.token has overly permissive permissions (expected 0600)"
-                );
-            }
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{mode:04o}"),
+                "daemon.token has overly permissive permissions (expected 0600)"
+            );
         }
     }
     #[cfg(windows)]
     {
         if !is_path_owner_only_windows(path)? {
             was_permissive = true;
-            if repair {
-                tracing::warn!(
-                    path = %path.display(),
-                    "daemon.token has overly permissive Windows ACL; tightening to owner-only"
-                );
-                set_path_owner_only_windows(path)?;
-            } else {
-                tracing::warn!(
-                    path = %path.display(),
-                    "daemon.token has overly permissive Windows ACL (expected owner-only)"
-                );
-            }
+            tracing::warn!(
+                path = %path.display(),
+                "daemon.token has overly permissive Windows ACL (expected owner-only)"
+            );
         }
     }
     Ok(was_permissive)
@@ -843,6 +829,44 @@ mod tests {
         std::os::unix::fs::symlink(&decoys, store.token_path()).unwrap();
         assert!(store.load_or_create_token().is_err());
         assert!(store.read_token().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_token_rotation_does_not_tighten_old_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let original_token = store.load_or_create_token().unwrap();
+
+        fs::set_permissions(store.token_path(), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+
+        struct RestoreDirPerm(PathBuf);
+        impl Drop for RestoreDirPerm {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = RestoreDirPerm(dir.path().to_path_buf());
+
+        // Skip permission-denial check when running as root (CAP_DAC_OVERRIDE bypasses 0500).
+        if fs::File::create(dir.path().join("probe")).is_err() {
+            assert!(store.load_or_create_token().is_err());
+            let mode = fs::metadata(store.token_path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o644,
+                "failed rotation must leave permissive mode intact so next restart still rotates"
+            );
+            assert_eq!(fs::read_to_string(store.token_path()).unwrap(), original_token);
+
+            drop(_restore);
+            let rotated = store.load_or_create_token().unwrap();
+            assert_ne!(rotated, original_token);
+            let new_mode = fs::metadata(store.token_path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(new_mode, 0o600);
+        }
     }
 
     #[cfg(windows)]

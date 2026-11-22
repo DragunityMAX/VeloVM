@@ -37,7 +37,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
     // Adopt running VMs only after listen validation and TCP bind have succeeded so a failed
     // startup never alters or cleans up running VM runtime files.
     supervisor.adopt_running_vms();
-    let bound_addr = supervisor.serve_on_listener(listener)?;
+    let bound_addr = supervisor.serve_on_listener(listener).await?;
     info!(address = %bound_addr, data_dir = %opts.data_dir.display(), "openvmmsd listening");
 
     tokio::select! {
@@ -154,7 +154,7 @@ impl TestDaemonHandle {
         let token = supervisor.auth_token().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         supervisor.adopt_running_vms();
-        let bound_addr = supervisor.serve_on_listener(listener)?;
+        let bound_addr = supervisor.serve_on_listener(listener).await?;
 
         let shutdown_sup = supervisor.clone();
         let task = tokio::spawn(async move {
