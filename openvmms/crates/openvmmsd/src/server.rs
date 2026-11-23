@@ -2605,6 +2605,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_host_config_in_use_listen_addr_returns_409_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap().to_string();
+
+        let resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({ "listen_addr": occupied_addr }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::CONFLICT,
+            "occupied listen_addr must return 409 Conflict instead of 500"
+        );
+
+        drop(occupied);
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn relative_disk_paths_are_rejected_across_disk_and_vm_endpoints() {
         let dir = tempfile::tempdir().unwrap();
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
