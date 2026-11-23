@@ -90,6 +90,27 @@ pub struct TtrpcRpcError {
     pub message: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}")]
+struct TtrpcConnectError(anyhow::Error);
+
+/// Returns `true` when `err` came from an explicit remote ttrpc error status
+/// returned by the server (as opposed to a transport/timeout failure).
+pub fn is_ttrpc_remote_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<TtrpcRpcError>().is_some())
+}
+
+/// Returns `true` when `err` guarantees the server did not apply the RPC:
+/// either the connection failed before any request bytes were sent, or the
+/// server returned an explicit ttrpc error status.
+pub fn is_ttrpc_definite_not_applied(err: &anyhow::Error) -> bool {
+    is_ttrpc_remote_error(err)
+        || err
+            .chain()
+            .any(|c| c.downcast_ref::<TtrpcConnectError>().is_some())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitVmOutcome {
     Exited,
@@ -825,7 +846,8 @@ fn call_blocking_cancellable(
     let addr = SockAddr::unix(socket_path)
         .with_context(|| format!("invalid AF_UNIX path {}", socket_path.display()))?;
     connect_cancellable(&sock, &addr, cancelled, connect_deadline)
-        .with_context(|| format!("connecting to OpenVMM RPC socket {}", socket_path.display()))?;
+        .with_context(|| format!("connecting to OpenVMM RPC socket {}", socket_path.display()))
+        .map_err(|e| anyhow!(TtrpcConnectError(e)))?;
 
     let sock = Arc::new(sock);
     {
