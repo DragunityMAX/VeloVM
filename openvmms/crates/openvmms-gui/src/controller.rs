@@ -1306,6 +1306,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
             }
         };
         let mut reported_initial_error = false;
+        let mut reported_token_security_error = false;
         let mut retry_delay = state.sse_backoff_initial;
         let next_delay = |d: Duration| d.saturating_mul(2).min(state.sse_backoff_max);
         while !state.shutdown.load(Ordering::Acquire) {
@@ -1330,10 +1331,15 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     continue;
                 }
                 Err(err) => {
+                    let is_token_sec = openvmms_core::store::is_token_security_error(&err);
                     if state.notified_connected.swap(false, Ordering::AcqRel)
                         || !reported_initial_error
+                        || (is_token_sec && !reported_token_security_error)
                     {
                         reported_initial_error = true;
+                        if is_token_sec {
+                            reported_token_security_error = true;
+                        }
                         *state.client.write().unwrap() = None;
                         if !state.emit_checked(GuiUpdate::DaemonDisconnected(format!("{err:#}"))) {
                             break;
@@ -1381,10 +1387,15 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         continue;
                     }
                     Err(err) => {
+                        let is_token_sec = openvmms_core::store::is_token_security_error(&err);
                         if state.notified_connected.swap(false, Ordering::AcqRel)
                             || !reported_initial_error
+                            || (is_token_sec && !reported_token_security_error)
                         {
                             reported_initial_error = true;
+                            if is_token_sec {
+                                reported_token_security_error = true;
+                            }
                             *state.client.write().unwrap() = None;
                             if !state.emit_checked(GuiUpdate::DaemonDisconnected(format!(
                                 "{err:#}"
@@ -1413,6 +1424,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         Ok((c, (host_info, host_config, switches, vms))) => {
                             let inst_id = host_info.daemon_instance_id;
                             reported_initial_error = false;
+                            reported_token_security_error = false;
                             *state.client.write().unwrap() = Some(c);
                             if !state.emit_checked(GuiUpdate::DaemonConnected {
                                 base_url: base_url.clone(),
@@ -1595,10 +1607,17 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
                         if !healthy || switch_err.is_some() {
                             *state.client.write().unwrap() = None;
+                            let is_token_sec = switch_err
+                                .as_ref()
+                                .is_some_and(openvmms_core::store::is_token_security_error);
                             if state.notified_connected.swap(false, Ordering::AcqRel)
                                 || !reported_initial_error
+                                || (is_token_sec && !reported_token_security_error)
                             {
                                 reported_initial_error = true;
+                                if is_token_sec {
+                                    reported_token_security_error = true;
+                                }
                                 let reason = switch_err
                                     .map(|e| format!("{e:#}"))
                                     .unwrap_or_else(|| "Lost connection to openvmmsd".to_string());
@@ -1625,13 +1644,20 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     };
                     let healthy =
                         ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                    if !healthy {
+                    if !healthy || switch_err.is_some() {
                         *state.client.write().unwrap() = None;
                     }
+                    let is_token_sec = switch_err
+                        .as_ref()
+                        .is_some_and(openvmms_core::store::is_token_security_error);
                     if state.notified_connected.swap(false, Ordering::AcqRel)
                         || !reported_initial_error
+                        || (is_token_sec && !reported_token_security_error)
                     {
                         reported_initial_error = true;
+                        if is_token_sec {
+                            reported_token_security_error = true;
+                        }
                         let reason = if let Some(err) = switch_err {
                             format!("{err:#}")
                         } else if !healthy {
