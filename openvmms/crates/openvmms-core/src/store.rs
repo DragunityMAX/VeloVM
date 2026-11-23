@@ -949,7 +949,9 @@ impl Drop for LocalFreeAcl {
 }
 
 #[cfg(windows)]
-fn build_owner_only_dacl_windows() -> anyhow::Result<LocalFreeAcl> {
+fn build_owner_only_dacl_windows(
+    user_sid: *mut core::ffi::c_void,
+) -> anyhow::Result<LocalFreeAcl> {
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_ALL};
     use windows_sys::Win32::Security::ACL;
     use windows_sys::Win32::Security::Authorization::{
@@ -957,10 +959,6 @@ fn build_owner_only_dacl_windows() -> anyhow::Result<LocalFreeAcl> {
         TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::NO_INHERITANCE;
-
-    let token_buf = current_user_token_buf()?;
-    let token_user = unsafe { token_buf[0].assume_init_ref() };
-    let user_sid = token_user.User.Sid;
 
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: GENERIC_ALL,
@@ -994,17 +992,24 @@ fn create_owner_only_temp_file_windows(parent: &Path) -> anyhow::Result<(PathBuf
     use windows_sys::Win32::Security::{
         InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
         SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        SetSecurityDescriptorOwner,
     };
     use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
 
     const SECURITY_DESCRIPTOR_REVISION_1: u32 = 1;
 
-    let dacl = build_owner_only_dacl_windows()?;
+    let token_buf = current_user_token_buf()?;
+    let token_user = unsafe { token_buf[0].assume_init_ref() };
+    let user_sid = token_user.User.Sid;
+    let dacl = build_owner_only_dacl_windows(user_sid)?;
     let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
     let sd_ptr: PSECURITY_DESCRIPTOR = (&raw mut sd).cast();
     if unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION_1) } == 0 {
         return Err(std::io::Error::last_os_error())
             .context("InitializeSecurityDescriptor failed");
+    }
+    if unsafe { SetSecurityDescriptorOwner(sd_ptr, user_sid, 0) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("SetSecurityDescriptorOwner failed");
     }
     if unsafe { SetSecurityDescriptorDacl(sd_ptr, 1, dacl.0.cast_const(), 0) } == 0 {
         return Err(std::io::Error::last_os_error()).context("SetSecurityDescriptorDacl failed");
@@ -1147,7 +1152,8 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED,
     };
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -1163,14 +1169,15 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
         }
     }
 
+    let mut owner_sid: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let err = unsafe {
         GetSecurityInfo(
             file.as_raw_handle() as HANDLE,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner_sid,
             std::ptr::null_mut(),
             &mut dacl,
             std::ptr::null_mut(),
@@ -1182,6 +1189,12 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
             .with_context(|| format!("GetSecurityInfo failed for {}", path.display()));
     }
     let _sd_guard = LocalFreeSd(sd);
+
+    let token_buf = current_user_token_buf()?;
+    let token_user = unsafe { token_buf[0].assume_init_ref() };
+    if owner_sid.is_null() || unsafe { EqualSid(owner_sid, token_user.User.Sid) } == 0 {
+        return Ok(false);
+    }
 
     let mut control = 0u16;
     let mut rev = 0u32;
@@ -1223,8 +1236,6 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
     let ace_sid = (&raw const ace.SidStart)
         .cast::<core::ffi::c_void>()
         .cast_mut();
-    let token_buf = current_user_token_buf()?;
-    let token_user = unsafe { token_buf[0].assume_init_ref() };
     Ok(unsafe { EqualSid(ace_sid, token_user.User.Sid) } != 0)
 }
 
@@ -1237,7 +1248,9 @@ pub(crate) fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
         DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    let dacl_guard = build_owner_only_dacl_windows()?;
+    let token_buf = current_user_token_buf()?;
+    let token_user = unsafe { token_buf[0].assume_init_ref() };
+    let dacl_guard = build_owner_only_dacl_windows(token_user.User.Sid)?;
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -1787,5 +1800,30 @@ mod tests {
         .unwrap();
         assert!(!rotated);
         assert_eq!(fs::read_to_string(store.token_path()).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_try_rotate_token_if_owner_only_enforced_rotates_on_ntfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::open(dir.path());
+        let token_path = store.token_path();
+        fs::write(&token_path, "old-token").unwrap();
+
+        let rotated =
+            try_rotate_token_if_owner_only_enforced_windows(&token_path, "rotated-token").unwrap();
+        assert!(
+            rotated,
+            "expected owner-only ACL enforcement on Windows tempdir"
+        );
+        assert_eq!(fs::read_to_string(&token_path).unwrap(), "rotated-token");
+        let file = fs::File::open(&token_path).unwrap();
+        assert!(is_handle_owner_only_windows(&file, &token_path).unwrap());
+
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["daemon.token".to_string()]);
     }
 }
