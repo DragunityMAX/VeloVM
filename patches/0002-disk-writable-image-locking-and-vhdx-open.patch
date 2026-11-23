@@ -598,16 +598,19 @@ index 7330b00..c03826d 100644
  pal_async.workspace = true
  storage_tests.workspace = true
 diff --git a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
-index 3668d9c..7312e11 100644
+index 3668d9c..3cfd187 100644
 --- a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
 +++ b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
-@@ -17,6 +17,105 @@
+@@ -17,6 +17,108 @@
  use vm_resource::Resource;
  use vm_resource::kind::DiskHandleKind;
  
 +#[cfg(unix)]
 +fn is_unsupported_lock_error(err: &std::io::Error) -> bool {
-+    #[cfg_attr(target_os = "linux", expect(unreachable_patterns))]
++    #[cfg_attr(
++        any(target_os = "linux", target_os = "android", target_os = "freebsd"),
++        expect(unreachable_patterns)
++    )]
 +    let unsupported_errno = matches!(
 +        err.raw_os_error(),
 +        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS)
@@ -707,7 +710,7 @@ index 3668d9c..7312e11 100644
  /// Open a single VHDX file as a [`LayeredDiskHandle`] with one layer.
  ///
  /// Use this for base (non-differencing) VHDX files. For differencing chains,
-@@ -24,10 +123,7 @@
+@@ -24,10 +126,7 @@
  ///
  /// The file is opened for read+write unless `read_only` is true.
  pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
@@ -719,7 +722,7 @@ index 3668d9c..7312e11 100644
  
      Ok(Resource::new(LayeredDiskHandle::single_layer(
          VhdxDiskLayerHandle { file, read_only },
-@@ -73,11 +169,7 @@ pub fn open_vhdx_chain_explicit(
+@@ -73,11 +172,7 @@ pub fn open_vhdx_chain_explicit(
              let is_leaf = i == 0;
              let layer_read_only = !is_leaf || read_only;
  
@@ -732,7 +735,7 @@ index 3668d9c..7312e11 100644
  
              let handle = VhdxDiskLayerHandle {
                  file,
-@@ -358,4 +450,112 @@ async fn auto_walk_base_disk() {
+@@ -358,4 +453,112 @@ async fn auto_walk_base_disk() {
          let resource = open_vhdx_chain(&path, false).await.unwrap();
          let _ = resource;
      }
