@@ -498,6 +498,30 @@ fn handle_daemon(cli: &Cli, action: &DaemonCmd) -> anyhow::Result<()> {
     }
 }
 
+fn resolve_optional_client_path(path: &Path) -> Option<PathBuf> {
+    if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(resolve_client_path(path))
+    }
+}
+
+fn build_host_config_patch(
+    listen_addr: Option<&String>,
+    openvmm_bin: Option<&PathBuf>,
+    viewer_bin: Option<&PathBuf>,
+    img_bin: Option<&PathBuf>,
+    uefi_firmware: Option<&PathBuf>,
+) -> HostConfigPatch {
+    HostConfigPatch {
+        listen_addr: listen_addr.cloned(),
+        openvmm_bin: openvmm_bin.map(|p| resolve_optional_client_path(p)),
+        fastdesk_viewer_bin: viewer_bin.map(|p| resolve_optional_client_path(p)),
+        openvmm_img_bin: img_bin.map(|p| resolve_optional_client_path(p)),
+        uefi_firmware_path: uefi_firmware.map(|p| resolve_optional_client_path(p)),
+    }
+}
+
 fn handle_host(cli: &Cli, action: &HostCmd) -> anyhow::Result<()> {
     let client = get_client(cli)?;
     match action {
@@ -538,13 +562,13 @@ fn handle_host(cli: &Cli, action: &HostCmd) -> anyhow::Result<()> {
             uefi_firmware,
             listen_addr,
         } => {
-            let patch = HostConfigPatch {
-                listen_addr: listen_addr.clone(),
-                openvmm_bin: openvmm_bin.as_ref().map(|p| Some(resolve_client_path(p))),
-                fastdesk_viewer_bin: viewer_bin.as_ref().map(|p| Some(resolve_client_path(p))),
-                openvmm_img_bin: img_bin.as_ref().map(|p| Some(resolve_client_path(p))),
-                uefi_firmware_path: uefi_firmware.as_ref().map(|p| Some(resolve_client_path(p))),
-            };
+            let patch = build_host_config_patch(
+                listen_addr.as_ref(),
+                openvmm_bin.as_ref(),
+                viewer_bin.as_ref(),
+                img_bin.as_ref(),
+                uefi_firmware.as_ref(),
+            );
             let out = if !patch.is_empty() {
                 client.patch_host_config(&patch)?
             } else {
@@ -1399,5 +1423,21 @@ mod tests {
             } => assert!(format.is_none()),
             other => panic!("unexpected parsed command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn host_config_empty_path_flags_produce_clear_patch() {
+        let empty = PathBuf::from("");
+        let patch = build_host_config_patch(
+            None,
+            Some(&empty),
+            Some(&empty),
+            Some(&empty),
+            Some(&empty),
+        );
+        assert_eq!(patch.openvmm_bin, Some(None));
+        assert_eq!(patch.fastdesk_viewer_bin, Some(None));
+        assert_eq!(patch.openvmm_img_bin, Some(None));
+        assert_eq!(patch.uefi_firmware_path, Some(None));
     }
 }

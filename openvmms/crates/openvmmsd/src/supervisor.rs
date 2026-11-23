@@ -647,6 +647,19 @@ impl Supervisor {
         listen_addr_explicit: bool,
     ) -> anyhow::Result<HostConfig> {
         let current_cfg = self.host_config();
+        for path_opt in [
+            &mut new_cfg.openvmm_bin,
+            &mut new_cfg.fastdesk_viewer_bin,
+            &mut new_cfg.openvmm_img_bin,
+            &mut new_cfg.uefi_firmware_path,
+        ] {
+            if path_opt
+                .as_ref()
+                .is_some_and(|p| p.as_os_str().is_empty())
+            {
+                *path_opt = None;
+            }
+        }
         if new_cfg.data_dir.as_os_str().is_empty() {
             new_cfg.data_dir = self.store.data_dir().to_path_buf();
         }
