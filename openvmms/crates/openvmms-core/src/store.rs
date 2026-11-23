@@ -438,8 +438,12 @@ impl RegistryStore {
 
     pub fn delete_vm_dir(&self, id: Uuid) -> anyhow::Result<()> {
         let vm_dir = self.vm_dir(id);
-        if !vm_dir.exists() {
-            return Ok(());
+        match fs::symlink_metadata(&vm_dir) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspecting {}", vm_dir.display()));
+            }
         }
         // Remove logs first so that if removing open log files fails (e.g. on
         // Windows), vm.toml and state.vmgs remain intact and the VM does not
@@ -498,8 +502,19 @@ impl RegistryStore {
             if Uuid::parse_str(name).is_err() {
                 continue;
             }
-            if dir_path.join("vm.toml").exists() {
-                continue;
+            let vm_toml = dir_path.join("vm.toml");
+            match fs::symlink_metadata(&vm_toml) {
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        vm_id = %name,
+                        path = %vm_toml.display(),
+                        error = %err,
+                        "skipping orphaned state.vmgs cleanup because vm.toml metadata could not be inspected"
+                    );
+                    continue;
+                }
             }
             let vmgs_path = dir_path.join("state.vmgs");
             if vmgs_path.is_file() {
@@ -1689,6 +1704,56 @@ mod tests {
         assert!(!validate_token_uid(1000, 0, false));
         assert!(validate_token_uid(1000, 0, true));
         assert!(!validate_token_uid(1000, 1001, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_orphaned_vmgs_preserves_state_on_dangling_vm_toml_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let vm_id = Uuid::new_v4();
+        let vm_dir = store.vm_dir(vm_id);
+        fs::create_dir_all(&vm_dir).unwrap();
+        let vmgs = vm_dir.join("state.vmgs");
+        fs::write(&vmgs, b"tpm-state").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing-vm.toml"), vm_dir.join("vm.toml"))
+            .unwrap();
+
+        store.cleanup_orphaned_vmgs();
+
+        assert!(
+            vmgs.is_file(),
+            "state.vmgs should be preserved when vm.toml is a dangling symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_vm_dir_propagates_permission_error_on_unreadable_vms_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let vm_id = Uuid::new_v4();
+        let vm_dir = store.vm_dir(vm_id);
+        fs::create_dir_all(&vm_dir).unwrap();
+        fs::write(vm_dir.join("vm.toml"), b"id = \"test\"").unwrap();
+
+        let vms_dir = store.vms_dir();
+        let orig_mode = fs::metadata(&vms_dir).unwrap().permissions().mode();
+        fs::set_permissions(&vms_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let res = store.delete_vm_dir(vm_id);
+        fs::set_permissions(&vms_dir, fs::Permissions::from_mode(orig_mode)).unwrap();
+
+        assert!(
+            res.is_err(),
+            "delete_vm_dir must propagate EACCES instead of returning Ok(())"
+        );
+        assert!(vm_dir.join("vm.toml").is_file());
     }
 
     #[cfg(windows)]
