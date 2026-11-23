@@ -7290,7 +7290,7 @@ mod tests {
             #[derive(Clone, PartialEq, prost::Oneof)]
             pub enum Result {
                 #[prost(message, tag = "1")]
-                Status(super::TtrpcStatus),
+                Status(openvmms_core::ttrpc::TtrpcStatus),
                 #[prost(bytes, tag = "2")]
                 Payload(Vec<u8>),
             }
@@ -7452,7 +7452,7 @@ mod tests {
             #[derive(Clone, PartialEq, prost::Oneof)]
             pub enum Result {
                 #[prost(message, tag = "1")]
-                Status(super::TtrpcStatus),
+                Status(openvmms_core::ttrpc::TtrpcStatus),
                 #[prost(bytes, tag = "2")]
                 Payload(Vec<u8>),
             }
