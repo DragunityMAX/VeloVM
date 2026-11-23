@@ -91,6 +91,12 @@ pub(crate) fn err_internal(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ApiErrorKind::Internal(msg.into()))
 }
 
+#[derive(Clone)]
+enum StopOutcome {
+    Pending,
+    Done(Option<VmSummary>),
+}
+
 struct ManagedVm {
     config: VmConfig,
     runtime: VmRuntimeState,
@@ -100,7 +106,7 @@ struct ManagedVm {
     monitor_handle: Option<tokio::task::JoinHandle<()>>,
     generation: u64,
     start_cancel: Option<watch::Sender<bool>>,
-    stop_wait: Option<watch::Receiver<bool>>,
+    stop_wait: Option<watch::Receiver<StopOutcome>>,
     prepare_lock: Arc<tokio::sync::Mutex<()>>,
     power_op_lock: Arc<tokio::sync::Mutex<()>>,
     hotplug_lock: Arc<tokio::sync::Mutex<()>>,
@@ -2462,7 +2468,7 @@ impl Supervisor {
             if vm.generation != run_gen || vm.runtime.status == VmStatus::Stopping {
                 return;
             }
-            let (stop_done_tx, stop_done_rx) = watch::channel(false);
+            let (stop_done_tx, stop_done_rx) = watch::channel(StopOutcome::Pending);
             vm.runtime.status = VmStatus::Stopping;
             vm.monitor_cancel = None;
             vm.monitor_handle = None;
@@ -2537,11 +2543,11 @@ impl Supervisor {
         let summary = {
             let mut guard = self.vms.write().unwrap();
             let Some(vm) = guard.get_mut(&id) else {
-                let _ = stop_done_tx.send(true);
+                let _ = stop_done_tx.send(StopOutcome::Done(None));
                 return;
             };
             if vm.generation != run_gen {
-                let _ = stop_done_tx.send(true);
+                let _ = stop_done_tx.send(StopOutcome::Done(None));
                 return;
             }
             if !stopped {
@@ -2589,7 +2595,13 @@ impl Supervisor {
             vm.summary()
         };
 
-        let _ = stop_done_tx.send(true);
+        let done_summary = matches!(summary.runtime.status, VmStatus::Off | VmStatus::Error).then(|| {
+            let mut stopped = summary.clone();
+            stopped.runtime.status = VmStatus::Off;
+            stopped.runtime.last_error = None;
+            stopped
+        });
+        let _ = stop_done_tx.send(StopOutcome::Done(done_summary));
         self.emit(DaemonEvent::VmUpdated { vm: summary });
     }
 
@@ -2640,7 +2652,7 @@ impl Supervisor {
                 if let Some(cancel_tx) = vm.start_cancel.take() {
                     let _ = cancel_tx.send(true);
                 }
-                let (stop_done_tx, stop_done_rx) = watch::channel(false);
+                let (stop_done_tx, stop_done_rx) = watch::channel(StopOutcome::Pending);
                 vm.stop_wait = Some(stop_done_rx.clone());
                 vm.runtime.status = VmStatus::Stopping;
                 vm.runtime.revision = self.next_revision();
@@ -2764,7 +2776,7 @@ impl Supervisor {
                             None
                         }
                     };
-                    let _ = stop_done_tx.send(true);
+                    let _ = stop_done_tx.send(StopOutcome::Done(None));
                     if let Some(summary) = summary {
                         sup.emit(DaemonEvent::VmUpdated { vm: summary });
                     }
@@ -2772,7 +2784,7 @@ impl Supervisor {
                 }
 
                 cleanup_runtime_files(sock_opt, shm_opt);
-                let summary = {
+                let (done_summary, emit_summary) = {
                     let mut guard = sup.vms.write().unwrap();
                     if let Some(vm) = guard.get_mut(&id) {
                         if vm.generation == stop_gen {
@@ -2787,25 +2799,37 @@ impl Supervisor {
                             vm.pending_disks.clear();
                             vm.pending_port_forwards.clear();
                             vm.runtime.revision = sup.next_revision();
-                            (!vm.deleting).then(|| vm.summary())
+                            let stopped_summary = vm.summary();
+                            let emit_summary = (!vm.deleting).then(|| stopped_summary.clone());
+                            (Some(stopped_summary), emit_summary)
                         } else {
-                            None
+                            (None, None)
                         }
                     } else {
-                        None
+                        (None, None)
                     }
                 };
-                let _ = stop_done_tx.send(true);
-                if let Some(summary) = summary {
+                let _ = stop_done_tx.send(StopOutcome::Done(done_summary));
+                if let Some(summary) = emit_summary {
                     sup.emit(DaemonEvent::VmUpdated { vm: summary });
                 }
             });
         }
 
+        let mut done_summary = None;
         if let Some(mut rx) = wait_rx {
-            while !*rx.borrow_and_update() {
-                if rx.changed().await.is_err() {
-                    break;
+            loop {
+                let outcome = rx.borrow_and_update().clone();
+                match outcome {
+                    StopOutcome::Pending => {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    StopOutcome::Done(s) => {
+                        done_summary = s;
+                        break;
+                    }
                 }
             }
         }
@@ -2813,37 +2837,51 @@ impl Supervisor {
         let mut emit_normalized = None;
         let summary = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard
-                .get_mut(&id)
-                .ok_or_else(|| err_not_found("VM not found"))?;
-            if vm.deleting {
-                return Err(err_conflict(format!(
-                    "cannot stop VM '{}' while it is being deleted",
-                    vm.config.name
-                )));
-            }
-            if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
-                let changed = vm.runtime.status == VmStatus::Error || vm.runtime.last_error.is_some();
-                vm.runtime.status = VmStatus::Off;
-                vm.runtime.last_error = None;
-                vm.pending_disks.clear();
-                vm.pending_port_forwards.clear();
-                if changed {
-                    vm.runtime.revision = self.next_revision();
+            match guard.get_mut(&id) {
+                Some(vm) => {
+                    if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) && vm.deleting {
+                        Ok(done_summary.unwrap_or_else(|| {
+                            let mut s = vm.summary();
+                            s.runtime.status = VmStatus::Off;
+                            s.runtime.last_error = None;
+                            s
+                        }))
+                    } else if vm.deleting {
+                        return Err(err_conflict(format!(
+                            "cannot stop VM '{}' while it is being deleted",
+                            vm.config.name
+                        )));
+                    } else if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
+                        let changed = vm.runtime.status != VmStatus::Off
+                            || vm.runtime.last_error.is_some();
+                        vm.runtime.status = VmStatus::Off;
+                        vm.runtime.last_error = None;
+                        vm.pending_disks.clear();
+                        vm.pending_port_forwards.clear();
+                        if changed {
+                            vm.runtime.revision = self.next_revision();
+                        }
+                        let s = vm.summary();
+                        if changed {
+                            emit_normalized = Some(s.clone());
+                        }
+                        Ok(s)
+                    } else if let Some(s) = done_summary {
+                        Ok(s)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "{}",
+                            vm.runtime
+                                .last_error
+                                .as_deref()
+                                .unwrap_or("failed to stop adopted VM")
+                        ))
+                    }
                 }
-                let s = vm.summary();
-                if changed {
-                    emit_normalized = Some(s.clone());
-                }
-                Ok(s)
-            } else {
-                Err(anyhow::anyhow!(
-                    "{}",
-                    vm.runtime
-                        .last_error
-                        .as_deref()
-                        .unwrap_or("failed to stop adopted VM")
-                ))
+                None => match done_summary {
+                    Some(s) if s.runtime.status == VmStatus::Off => Ok(s),
+                    _ => return Err(err_not_found("VM not found")),
+                },
             }
         };
         if let Some(s) = emit_normalized {
@@ -4129,7 +4167,7 @@ impl Supervisor {
         }
         for mut rx in stopping_waits {
             let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                while !*rx.borrow_and_update() {
+                while matches!(*rx.borrow_and_update(), StopOutcome::Pending) {
                     if rx.changed().await.is_err() {
                         break;
                     }
@@ -6824,6 +6862,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_vm_returns_ok_when_deleting_starts_after_stop_reaches_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "StopThenDeleting-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let (stop_tx, stop_rx) = watch::channel(StopOutcome::Pending);
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Stopping;
+            vm.stop_wait = Some(stop_rx);
+        }
+
+        let sup_clone = Arc::clone(&sup);
+        let handle = tokio::spawn(async move { sup_clone.stop_vm(&id.to_string()).await });
+        tokio::task::yield_now().await;
+
+        let stopped_summary = {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Off;
+            vm.stop_wait = None;
+            vm.deleting = true;
+            vm.summary()
+        };
+        let _ = stop_tx.send(StopOutcome::Done(Some(stopped_summary)));
+
+        let res = handle.await.unwrap().unwrap();
+        assert_eq!(res.runtime.status, VmStatus::Off);
+    }
+
+    #[tokio::test]
+    async fn stop_vm_returns_ok_when_vm_deleted_after_stop_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "StopThenRemoved-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let (stop_tx, stop_rx) = watch::channel(StopOutcome::Pending);
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Stopping;
+            vm.stop_wait = Some(stop_rx);
+        }
+
+        let sup_clone = Arc::clone(&sup);
+        let handle = tokio::spawn(async move { sup_clone.stop_vm(&id.to_string()).await });
+        tokio::task::yield_now().await;
+
+        let stopped_summary = {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Off;
+            vm.stop_wait = None;
+            let s = vm.summary();
+            guard.remove(&id);
+            s
+        };
+        let _ = stop_tx.send(StopOutcome::Done(Some(stopped_summary)));
+
+        let res = handle.await.unwrap().unwrap();
+        assert_eq!(res.runtime.status, VmStatus::Off);
+    }
+
+    #[tokio::test]
     async fn patch_listen_addr_compares_with_live_port_and_preserves_port_zero_in_config() {
         let dir = tempfile::tempdir().unwrap();
         let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
@@ -7183,7 +7302,7 @@ mod tests {
             })
             .unwrap();
         let vm_id = vm.config.id;
-        let (stop_tx, stop_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(StopOutcome::Pending);
         {
             let mut guard = sup.vms.write().unwrap();
             let entry = guard.get_mut(&vm_id).unwrap();
@@ -7198,13 +7317,243 @@ mod tests {
             let mut guard = sup.vms.write().unwrap();
             guard.remove(&vm_id);
         }
-        let _ = stop_tx.send(true);
+        let _ = stop_tx.send(StopOutcome::Done(None));
 
         let err = handle.await.unwrap().unwrap_err();
         assert!(
             matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::NotFound(_))),
             "expected NotFound (404) when VM is removed while stop_vm waits, got: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_vm_returns_ok_when_monitor_exits_to_error_before_concurrent_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "MonitorErrThenDelete-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let (stop_tx, stop_rx) = watch::channel(StopOutcome::Pending);
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Stopping;
+            vm.stop_wait = Some(stop_rx);
+        }
+
+        let sup_clone = Arc::clone(&sup);
+        let stop_handle = tokio::spawn(async move { sup_clone.stop_vm(&id.to_string()).await });
+        tokio::task::yield_now().await;
+
+        let done_summary = {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Error;
+            vm.runtime.last_error = Some("crashed".into());
+            vm.stop_wait = None;
+            vm.deleting = true;
+            let mut s = vm.summary();
+            s.runtime.status = VmStatus::Off;
+            s.runtime.last_error = None;
+            s
+        };
+        let _ = stop_tx.send(StopOutcome::Done(Some(done_summary)));
+
+        let res = stop_handle.await.unwrap().unwrap();
+        assert_eq!(res.runtime.status, VmStatus::Off);
+        assert!(res.runtime.last_error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn monitor_vm_error_exit_sends_normalized_off_done_summary() {
+        use openvmms_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "MonitorErrDoneSummary-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let run_gen = 1u64;
+        let sock_path = sup.host_config().runtime_dir.join(format!("{id}.mon.sock"));
+        fs::create_dir_all(sock_path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let (allow_finish_tx, allow_finish_rx) = std::sync::mpsc::channel::<()>();
+
+        let srv_sock = sock_path.clone();
+        let srv = std::thread::spawn(move || {
+            // 1. Initial PropertiesVm -> Running
+            if let Ok((mut s, _)) = listener.accept()
+                && let Ok((stream_id, _, _)) = read_frame(&mut s)
+            {
+                let payload = vmservice::PropertiesVmResponse {
+                    state: vmservice::VmState::Running as i32,
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let resp = TestWireResponse {
+                    result: Some(test_wire_response::Result::Payload(payload)),
+                };
+                if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                    let _ = s.write_all(&frame);
+                    let _ = s.flush();
+                }
+            }
+            // 2. WaitVM -> fail with RPC error
+            if let Ok((mut s, _)) = listener.accept()
+                && let Ok((stream_id, _, _)) = read_frame(&mut s)
+            {
+                let resp = TestWireResponse {
+                    result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                        code: 13,
+                        message: "unexpected vm crash".into(),
+                        details: Vec::new(),
+                    })),
+                };
+                if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                    let _ = s.write_all(&frame);
+                    let _ = s.flush();
+                }
+            }
+            // 3. PropertiesVm -> return non-live Uninitialized state (not Halted) so monitor transitions to Error
+            if let Ok((mut s, _)) = listener.accept()
+                && let Ok((stream_id, _, _)) = read_frame(&mut s)
+            {
+                let payload = vmservice::PropertiesVmResponse {
+                    state: vmservice::VmState::Uninitialized as i32,
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let resp = TestWireResponse {
+                    result: Some(test_wire_response::Result::Payload(payload)),
+                };
+                if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                    let _ = s.write_all(&frame);
+                    let _ = s.flush();
+                }
+            }
+            // 4. TeardownVm -> hold connection until test reads vm.stop_wait, then drop listener & socket
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = read_frame(&mut s);
+                let _ = allow_finish_rx.recv_timeout(Duration::from_secs(5));
+                drop(s);
+            }
+            drop(listener);
+            let _ = fs::remove_file(&srv_sock);
+        });
+
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.generation = run_gen;
+            vm.runtime.status = VmStatus::Running;
+            vm.runtime.rpc_socket_path = Some(sock_path.clone());
+        }
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mon_sup = Arc::clone(&sup);
+        let mon_handle = tokio::spawn(async move {
+            mon_sup.monitor_vm(id, run_gen, sock_path, cancel_rx).await;
+        });
+
+        let mut mon_stop_rx = None;
+        for _ in 0..200 {
+            if let Some(rx) = sup.vms.read().unwrap().get(&id).and_then(|vm| vm.stop_wait.clone()) {
+                mon_stop_rx = Some(rx);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut mon_stop_rx =
+            mon_stop_rx.expect("monitor_vm should install stop_wait before teardown");
+        let _ = allow_finish_tx.send(());
+        mon_handle.await.unwrap();
+        srv.join().unwrap();
+
+        match mon_stop_rx.borrow_and_update().clone() {
+            StopOutcome::Done(Some(s)) => {
+                assert_eq!(s.runtime.status, VmStatus::Off);
+                assert!(s.runtime.last_error.is_none());
+            }
+            _ => panic!("expected monitor exit to Error to emit normalized Off done_summary"),
+        }
+        assert_eq!(
+            sup.vms.read().unwrap().get(&id).unwrap().runtime.status,
+            VmStatus::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_vm_returns_ok_when_restarted_before_post_wait_relock() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "StopThenRestart-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let (stop_tx, stop_rx) = watch::channel(StopOutcome::Pending);
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Stopping;
+            vm.stop_wait = Some(stop_rx);
+        }
+
+        let sup_clone = Arc::clone(&sup);
+        let handle = tokio::spawn(async move { sup_clone.stop_vm(&id.to_string()).await });
+        tokio::task::yield_now().await;
+
+        let stopped_summary = {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.runtime.status = VmStatus::Off;
+            vm.stop_wait = None;
+            let s = vm.summary();
+            vm.runtime.status = VmStatus::Running;
+            s
+        };
+        let _ = stop_tx.send(StopOutcome::Done(Some(stopped_summary)));
+
+        let res = handle.await.unwrap().unwrap();
+        assert_eq!(res.runtime.status, VmStatus::Off);
     }
 
     #[tokio::test]
