@@ -705,7 +705,18 @@ impl Supervisor {
         {
             let listener = tokio::net::TcpListener::bind(target_addr)
                 .await
-                .with_context(|| format!("binding openvmmsd HTTP server on {target_addr}"))?;
+                .map_err(|err| match err.kind() {
+                    std::io::ErrorKind::AddrInUse => err_conflict(format!(
+                        "listen address {target_addr} is already in use: {err}"
+                    )),
+                    std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput => err_bad_request(format!(
+                        "cannot bind openvmmsd HTTP server on {target_addr}: {err}"
+                    )),
+                    _ => anyhow::Error::new(err)
+                        .context(format!("binding openvmmsd HTTP server on {target_addr}")),
+                })?;
             Some(listener)
         } else {
             None
@@ -810,14 +821,19 @@ impl Supervisor {
     pub fn get_vm(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
         let guard = self.vms.read().unwrap();
-        Ok(guard.get(&id).context("VM not found")?.summary())
+        Ok(guard
+            .get(&id)
+            .ok_or_else(|| err_not_found("VM not found"))?
+            .summary())
     }
 
     pub async fn get_vm_with_live_properties(&self, id_or_name: &str) -> anyhow::Result<VmSummary> {
         let id = self.resolve_vm_id(id_or_name)?;
         let (status, sock_path, rpc_gen) = {
             let guard = self.vms.read().unwrap();
-            let vm = guard.get(&id).context("VM not found")?;
+            let vm = guard
+                .get(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             (
                 vm.runtime.status,
                 vm.runtime.rpc_socket_path.clone(),
@@ -2820,7 +2836,9 @@ impl Supervisor {
         let mut emit_normalized = None;
         let summary = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM not found")?;
+            let vm = guard
+                .get_mut(&id)
+                .ok_or_else(|| err_not_found("VM not found"))?;
             if vm.deleting {
                 return Err(err_conflict(format!(
                     "cannot stop VM '{}' while it is being deleted",
@@ -7276,5 +7294,43 @@ mod tests {
             drop(restore);
         }
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn stop_vm_returns_not_found_when_vm_removed_while_waiting_for_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "stop-race-delete".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm_id = vm.config.id;
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let entry = guard.get_mut(&vm_id).unwrap();
+            entry.runtime.status = VmStatus::Stopping;
+            entry.stop_wait = Some(stop_rx);
+        }
+
+        let sup_clone = Arc::clone(&sup);
+        let handle = tokio::spawn(async move { sup_clone.stop_vm(&vm_id.to_string()).await });
+        tokio::task::yield_now().await;
+        {
+            let mut guard = sup.vms.write().unwrap();
+            guard.remove(&vm_id);
+        }
+        let _ = stop_tx.send(true);
+
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::NotFound(_))),
+            "expected NotFound (404) when VM is removed while stop_vm waits, got: {err:#}"
+        );
     }
 }
