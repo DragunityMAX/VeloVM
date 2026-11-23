@@ -281,7 +281,10 @@ impl Supervisor {
         self.event_seq.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn spawn_tracked_mutation<F>(self: &Arc<Self>, fut: F) -> tokio::task::JoinHandle<F::Output>
+    fn spawn_tracked_mutation<F>(
+        self: &Arc<Self>,
+        fut: F,
+    ) -> anyhow::Result<tokio::task::JoinHandle<F::Output>>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
@@ -289,31 +292,35 @@ impl Supervisor {
         struct MutationFlightGuard(Arc<Supervisor>);
         impl Drop for MutationFlightGuard {
             fn drop(&mut self) {
-                if self.0.in_flight_mutations.fetch_sub(1, Ordering::AcqRel) == 1 {
+                if self.0.in_flight_mutations.fetch_sub(1, Ordering::SeqCst) == 1 {
                     self.0.mutations_drained.notify_waiters();
                 }
             }
         }
-        self.in_flight_mutations.fetch_add(1, Ordering::AcqRel);
+        self.in_flight_mutations.fetch_add(1, Ordering::SeqCst);
         let guard = MutationFlightGuard(Arc::clone(self));
-        tokio::spawn(async move {
+        if self.shutting_down.load(Ordering::SeqCst) || *self.shutdown_watch.borrow() {
+            drop(guard);
+            return Err(err_conflict("daemon is shutting down"));
+        }
+        Ok(tokio::spawn(async move {
             let _guard = guard;
             fut.await
-        })
+        }))
     }
 
     pub async fn wait_for_in_flight_mutations(&self, timeout: Duration) {
         let wait = async {
             loop {
                 let notified = self.mutations_drained.notified();
-                if self.in_flight_mutations.load(Ordering::Acquire) == 0 {
+                if self.in_flight_mutations.load(Ordering::SeqCst) == 0 {
                     return;
                 }
                 notified.await;
             }
         };
         if tokio::time::timeout(timeout, wait).await.is_err() {
-            let remaining = self.in_flight_mutations.load(Ordering::Acquire);
+            let remaining = self.in_flight_mutations.load(Ordering::SeqCst);
             warn!(
                 remaining,
                 "timed out after {timeout:?} waiting for in-flight mutations before shutdown"
@@ -372,6 +379,26 @@ impl Supervisor {
                                 .exists()
                                 .then(|| shm_candidate.to_string_lossy().into_owned())
                         });
+                        let surviving_pending: Vec<DiskAttachment> =
+                            openvmms_core::store::load_pending_disks_journal(
+                                &sock_path.with_extension("pending-disks.json"),
+                            )
+                            .into_iter()
+                            .filter(|pd| {
+                                !vm.config
+                                    .disks
+                                    .iter()
+                                    .any(|d| d.lun == pd.lun && d.path == pd.path)
+                            })
+                            .collect();
+                        if !surviving_pending.is_empty() {
+                            warn!(
+                                vm_id = %id,
+                                count = surviving_pending.len(),
+                                "restoring surviving pending disk reservations from runtime journal for re-adopted VM"
+                            );
+                            vm.pending_disks.extend(surviving_pending);
+                        }
                         vm.runtime.revision = self.next_revision();
                         vm.generation = 1;
                         adopted_vms.push((id, sock_path));
@@ -413,7 +440,27 @@ impl Supervisor {
                             vm.runtime.shm_path = shm_candidate
                                 .exists()
                                 .then(|| shm_candidate.to_string_lossy().into_owned());
-                            vm.runtime.revision = self.next_revision();
+                            let surviving_pending: Vec<DiskAttachment> =
+                            openvmms_core::store::load_pending_disks_journal(
+                                &sock_path.with_extension("pending-disks.json"),
+                            )
+                            .into_iter()
+                            .filter(|pd| {
+                                !vm.config
+                                    .disks
+                                    .iter()
+                                    .any(|d| d.lun == pd.lun && d.path == pd.path)
+                            })
+                            .collect();
+                        if !surviving_pending.is_empty() {
+                            warn!(
+                                vm_id = %id,
+                                count = surviving_pending.len(),
+                                "restoring surviving pending disk reservations from runtime journal for re-adopted VM"
+                            );
+                            vm.pending_disks.extend(surviving_pending);
+                        }
+                        vm.runtime.revision = self.next_revision();
                             vm.generation = 1;
                             adopted_vms.push((id, sock_path));
                             warn!(
@@ -480,7 +527,7 @@ impl Supervisor {
     pub fn mark_shutting_down(&self) {
         {
             let guard = self.vms.write().unwrap();
-            self.shutting_down.store(true, Ordering::Release);
+            self.shutting_down.store(true, Ordering::SeqCst);
             for vm in guard.values() {
                 if vm.runtime.status == VmStatus::Starting
                     && let Some(tx) = vm.start_cancel.as_ref()
@@ -643,7 +690,7 @@ impl Supervisor {
         self.spawn_tracked_mutation(async move {
             let _lock = sup.host_config_lock.lock().await;
             sup.update_host_config_locked(new_cfg, false).await
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("update_host_config task failed: {e}"))?
     }
@@ -660,7 +707,7 @@ impl Supervisor {
             patch.apply_to(&mut live);
             sup.update_host_config_locked(live, listen_addr_explicit)
                 .await
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("patch_host_config task failed: {e}"))?
     }
@@ -1242,7 +1289,7 @@ impl Supervisor {
     ) -> anyhow::Result<VmSummary> {
         let sup = Arc::clone(self);
         let id_or_name = id_or_name.to_string();
-        self.spawn_tracked_mutation(async move { sup.update_vm_inner(&id_or_name, payload).await })
+        self.spawn_tracked_mutation(async move { sup.update_vm_inner(&id_or_name, payload).await })?
             .await
             .map_err(|e| anyhow::anyhow!("update_vm task failed: {e}"))?
     }
@@ -1479,7 +1526,7 @@ impl Supervisor {
         let id_or_name = id_or_name.to_string();
         self.spawn_tracked_mutation(
             async move { sup.delete_vm_inner(&id_or_name, delete_disks).await },
-        )
+        )?
         .await
         .map_err(|e| anyhow::anyhow!("delete_vm task failed: {e}"))?
     }
@@ -2973,7 +3020,7 @@ impl Supervisor {
             let (sock, rpc_gen) = sup.require_socket_with_generation(id, &[VmStatus::Running])?;
             TtrpcClient::new(sock).pause_vm().await?;
             sup.commit_power_transition(id, rpc_gen, "pause", VmStatus::Paused)
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("VM pause task failed: {e}"))?
     }
@@ -2989,7 +3036,7 @@ impl Supervisor {
                 sup.require_socket_with_generation(id, &[VmStatus::Running, VmStatus::Paused])?;
             TtrpcClient::new(sock).resume_vm().await?;
             sup.commit_power_transition(id, rpc_gen, "resume", VmStatus::Running)
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("VM resume task failed: {e}"))?
     }
@@ -3038,7 +3085,7 @@ impl Supervisor {
             let sock = sup.require_active_socket(id)?;
             TtrpcClient::new(sock).reset_vm().await?;
             sup.get_vm(&id.to_string())
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("VM reset task failed: {e}"))?
     }
@@ -3050,7 +3097,7 @@ impl Supervisor {
     ) -> anyhow::Result<VmSummary> {
         let sup = Arc::clone(self);
         let id_or_name = id_or_name.to_string();
-        self.spawn_tracked_mutation(async move { sup.attach_disk_inner(&id_or_name, req).await })
+        self.spawn_tracked_mutation(async move { sup.attach_disk_inner(&id_or_name, req).await })?
             .await
             .map_err(|e| anyhow::anyhow!("attach_disk task failed: {e}"))?
     }
@@ -3107,6 +3154,39 @@ impl Supervisor {
         .await
         .map_err(|e| anyhow::anyhow!("attach_disk preflight task failed: {e}"))??;
 
+        struct PendingDiskGuard<'a> {
+            vms: &'a RwLock<HashMap<Uuid, ManagedVm>>,
+            vm_id: Uuid,
+            lun: u32,
+            path: PathBuf,
+            journal_path: PathBuf,
+            armed: bool,
+        }
+        impl PendingDiskGuard<'_> {
+            fn disarm(&mut self) {
+                self.armed = false;
+            }
+        }
+        impl Drop for PendingDiskGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed
+                    && let Ok(mut guard) = self.vms.write()
+                    && let Some(vm) = guard.get_mut(&self.vm_id)
+                    && let Some(pos) = vm
+                        .pending_disks
+                        .iter()
+                        .position(|d| d.lun == self.lun && d.path == self.path)
+                {
+                    vm.pending_disks.remove(pos);
+                    let remaining = vm.pending_disks.clone();
+                    drop(guard);
+                    let _ = openvmms_core::store::save_pending_disks_journal(
+                        &self.journal_path,
+                        &remaining,
+                    );
+                }
+            }
+        }
         let plan = 'plan: {
             for attempt in 0..=MAX_PATH_KEY_RETRIES {
                 let missing = {
@@ -3179,25 +3259,28 @@ impl Supervisor {
                         let vm_gen = vm.generation;
                         break 'plan match active_sock {
                             Some(sock) => {
-                                guard
-                                    .get_mut(&id)
-                                    .unwrap()
-                                    .pending_disks
-                                    .push(attachment.clone());
-                                let pending_guard = PendingReservationGuard::new(&self.vms, id, {
-                                    let lun = attachment.lun;
-                                    let path = attachment.path.clone();
-                                    move |vm| {
-                                        if let Some(pos) = vm
-                                            .pending_disks
-                                            .iter()
-                                            .position(|d| d.lun == lun && d.path == path)
-                                        {
-                                            vm.pending_disks.remove(pos);
-                                        }
-                                    }
-                                });
-                                Ok((attachment, sock, vm_gen, pending_guard))
+                                let journal_path = sock.with_extension("pending-disks.json");
+                                let pending_snapshot = {
+                                    let vm_mut = guard.get_mut(&id).unwrap();
+                                    vm_mut.pending_disks.push(attachment.clone());
+                                    vm_mut.pending_disks.clone()
+                                };
+                                let pending_guard = PendingDiskGuard {
+                                    vms: &self.vms,
+                                    vm_id: id,
+                                    lun: attachment.lun,
+                                    path: attachment.path.clone(),
+                                    journal_path: journal_path.clone(),
+                                    armed: true,
+                                };
+                                Ok((
+                                    attachment,
+                                    sock,
+                                    vm_gen,
+                                    pending_guard,
+                                    journal_path,
+                                    pending_snapshot,
+                                ))
                             }
                             None => {
                                 let prev_cfg = vm.config.clone();
@@ -3265,7 +3348,16 @@ impl Supervisor {
                 )
                 .await?
             }
-            Ok((attachment, sock, rpc_gen, mut pending_guard)) => {
+            Ok((attachment, sock, rpc_gen, mut pending_guard, journal_path, pending_snapshot)) => {
+                let journal_for_save = journal_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    openvmms_core::store::save_pending_disks_journal(
+                        &journal_for_save,
+                        &pending_snapshot,
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("attach_disk journal save task failed: {e}"))??;
                 if let Err(err) = TtrpcClient::new(sock.clone())
                     .modify_resource(vmservice::ModifyResourceRequest {
                         r#type: vmservice::ModifyType::Add as i32,
@@ -3375,6 +3467,38 @@ impl Supervisor {
                 match res {
                     Ok(summary) => {
                         pending_guard.disarm();
+                        let remaining_pending = self
+                            .vms
+                            .read()
+                            .unwrap()
+                            .get(&id)
+                            .map(|vm| vm.pending_disks.clone())
+                            .unwrap_or_default();
+                        let journal_for_clear = journal_path;
+                        let clear_res = tokio::task::spawn_blocking(move || {
+                            openvmms_core::store::save_pending_disks_journal(
+                                &journal_for_clear,
+                                &remaining_pending,
+                            )
+                        })
+                        .await;
+                        match clear_res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(journal_err)) => {
+                                warn!(
+                                    vm_id = %id,
+                                    error = %journal_err,
+                                    "failed to clear pending disk journal after commit"
+                                );
+                            }
+                            Err(join_err) => {
+                                warn!(
+                                    vm_id = %id,
+                                    error = %join_err,
+                                    "pending disk journal clear task failed after commit"
+                                );
+                            }
+                        }
                         summary
                     }
                     Err((err, retain_reservation)) => {
@@ -3413,7 +3537,7 @@ impl Supervisor {
         self.spawn_tracked_mutation(async move {
             sup.detach_disk_inner(&id_or_name, lun, expected_path.as_deref())
                 .await
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("detach_disk task failed: {e}"))?
     }
@@ -3588,7 +3712,7 @@ impl Supervisor {
     ) -> anyhow::Result<VmSummary> {
         let sup = Arc::clone(self);
         let id_or_name = id_or_name.to_string();
-        self.spawn_tracked_mutation(async move { sup.mount_iso_inner(&id_or_name, req).await })
+        self.spawn_tracked_mutation(async move { sup.mount_iso_inner(&id_or_name, req).await })?
             .await
             .map_err(|e| anyhow::anyhow!("mount_iso task failed: {e}"))?
     }
@@ -3845,7 +3969,7 @@ impl Supervisor {
                 }
             };
             sup.detach_disk_locked(id, target_lun, None).await
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("eject_iso task failed: {e}"))?
     }
@@ -3882,7 +4006,7 @@ impl Supervisor {
         self.spawn_tracked_mutation(async move {
             sup.modify_port_forward_inner(&id_or_name, nic_id, port, add)
                 .await
-        })
+        })?
         .await
         .map_err(|e| anyhow::anyhow!("modify_port_forward task failed: {e}"))?
     }
@@ -4736,6 +4860,12 @@ impl<F: FnOnce(&mut ManagedVm)> Drop for PendingReservationGuard<'_, F> {
     }
 }
 
+/// Drain window during daemon shutdown, sized above `TtrpcClient`'s default
+/// 30s RPC timeout so an in-flight `modify_resource` + `vm.toml` save can finish
+/// cleanly before `detach_all_vms()`.
+pub const SHUTDOWN_MUTATION_DRAIN_TIMEOUT: Duration =
+    Duration::from_secs(openvmms_core::ttrpc::DEFAULT_TIMEOUT.as_secs() + 5);
+
 fn ensure_same_live_vm(vm: &ManagedVm, rpc_gen: u64, action: &str) -> anyhow::Result<()> {
     if vm.deleting
         || vm.generation != rpc_gen
@@ -5321,6 +5451,7 @@ fn reclaim_or_verify_inactive_socket(
 fn cleanup_runtime_files(sock_path: Option<PathBuf>, shm_path: Option<String>) {
     if let Some(sock) = sock_path {
         let _ = fs::remove_file(sock.with_extension("pid"));
+        let _ = fs::remove_file(sock.with_extension("pending-disks.json"));
         let _ = fs::remove_file(sock);
     }
     if let Some(shm) = shm_path {
@@ -7198,11 +7329,13 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let finished_flag = Arc::clone(&finished);
 
-        let task = sup.spawn_tracked_mutation(async move {
-            started_tx.notify_one();
-            release_rx.notified().await;
-            finished_flag.store(true, Ordering::Release);
-        });
+        let task = sup
+            .spawn_tracked_mutation(async move {
+                started_tx.notify_one();
+                release_rx.notified().await;
+                finished_flag.store(true, Ordering::Release);
+            })
+            .unwrap();
 
         started.notified().await;
         let sup_wait = Arc::clone(&sup);
@@ -8391,5 +8524,192 @@ mod tests {
         let final_summary = sup.get_vm(&vm_id.to_string()).unwrap();
         assert!(final_summary.runtime.orphaned_disks.is_empty());
         assert!(final_summary.runtime.orphaned_port_forwards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_tracked_mutation_rejects_after_mark_shutting_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_flag = Arc::clone(&ran);
+
+        sup.mark_shutting_down();
+        let res = sup.spawn_tracked_mutation(async move {
+            ran_flag.store(true, Ordering::Release);
+        });
+        let err = res.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ApiErrorKind>(),
+                Some(ApiErrorKind::Conflict(_))
+            ),
+            "expected Conflict on shutdown mutation rejection, got: {err:#}"
+        );
+        assert_eq!(sup.in_flight_mutations.load(Ordering::SeqCst), 0);
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_slow_in_flight_mutation_before_detach_all_vms() {
+        assert!(
+            SHUTDOWN_MUTATION_DRAIN_TIMEOUT
+                >= openvmms_core::ttrpc::DEFAULT_TIMEOUT + Duration::from_secs(5)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::clone(&finished);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_tx = Arc::clone(&started);
+
+        let task = sup
+            .spawn_tracked_mutation(async move {
+                started_tx.notify_one();
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                finished_flag.store(true, Ordering::Release);
+            })
+            .unwrap();
+
+        started.notified().await;
+        sup.mark_shutting_down();
+        sup.wait_for_in_flight_mutations(SHUTDOWN_MUTATION_DRAIN_TIMEOUT)
+            .await;
+        assert!(finished.load(Ordering::Acquire));
+        sup.detach_all_vms().await;
+        task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopt_running_vms_loads_surviving_pending_disk_journal_and_blocks_second_vm() {
+        use openvmms_core::ttrpc::{encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared_disk = dir.path().join("adopted-journal.img");
+        fs::write(&shared_disk, vec![0u8; 4096]).unwrap();
+
+        let (vm1_id, vm2_id, sock_path) = {
+            let sup1 = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+            let vm1 = sup1
+                .create_vm(CreateVmPayload {
+                    name: "VM1-AdoptJournal".into(),
+                    preset: openvmms_core::models::VmPreset::Custom,
+                    vcpus: Some(2),
+                    memory_mb: Some(1024),
+                    ..Default::default()
+                })
+                .unwrap();
+            let vm2 = sup1
+                .create_vm(CreateVmPayload {
+                    name: "VM2-AdoptJournal".into(),
+                    preset: openvmms_core::models::VmPreset::Custom,
+                    vcpus: Some(2),
+                    memory_mb: Some(1024),
+                    ..Default::default()
+                })
+                .unwrap();
+            let sock = sup1
+                .host_config()
+                .runtime_dir
+                .join(format!("{}.sock", vm1.config.id));
+            fs::create_dir_all(sock.parent().unwrap()).unwrap();
+            (vm1.config.id, vm2.config.id, sock)
+        };
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let stop_srv = Arc::new(AtomicBool::new(false));
+        let stop_srv_flag = Arc::clone(&stop_srv);
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            while !stop_srv_flag.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        if let Ok((stream_id, _, _)) = read_frame(&mut stream) {
+                            let payload = vmservice::PropertiesVmResponse {
+                                state: vmservice::VmState::Running as i32,
+                                ..Default::default()
+                            }
+                            .encode_to_vec();
+                            let resp = TestWireResponse {
+                                result: Some(test_wire_response::Result::Payload(payload)),
+                            };
+                            if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                                let _ = stream.write_all(&frame);
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let pending_entry = DiskAttachment {
+            lun: 3,
+            path: shared_disk.clone(),
+            read_only: false,
+            kind: DiskKind::HardDisk,
+            format: DiskFormat::Raw,
+        };
+        openvmms_core::store::save_pending_disks_journal(
+            &sock_path.with_extension("pending-disks.json"),
+            &[pending_entry],
+        )
+        .unwrap();
+
+        let sup2 = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        sup2.adopt_running_vms();
+        {
+            let guard = sup2.vms.read().unwrap();
+            let m1 = guard.get(&vm1_id).unwrap();
+            assert_eq!(m1.runtime.status, VmStatus::Running);
+            assert_eq!(m1.pending_disks.len(), 1);
+            assert_eq!(m1.pending_disks[0].path, shared_disk);
+        }
+
+        let err = sup2
+            .attach_disk(
+                &vm2_id.to_string(),
+                AttachDiskPayload {
+                    lun: Some(1),
+                    path: shared_disk,
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::Conflict(_))),
+            "expected 409 Conflict against adopted pending disk journal, got: {err:#}"
+        );
+
+        stop_srv.store(true, Ordering::Release);
+        sup2.detach_all_vms().await;
+        server.join().unwrap();
     }
 }

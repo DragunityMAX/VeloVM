@@ -891,6 +891,34 @@ fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<O
     }
 }
 
+pub fn save_pending_disks_journal(
+    path: &Path,
+    disks: &[crate::models::DiskAttachment],
+) -> anyhow::Result<()> {
+    if disks.is_empty() {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| format!("removing {}", path.display()));
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating runtime directory {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec(disks).context("serializing pending disk journal")?;
+    atomic_write(path, &bytes, false)
+}
+
+pub fn load_pending_disks_journal(path: &Path) -> Vec<crate::models::DiskAttachment> {
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
 pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && (meta.file_type().is_symlink() || !meta.file_type().is_file())
