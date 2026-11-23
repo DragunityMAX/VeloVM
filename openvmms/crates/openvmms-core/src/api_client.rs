@@ -201,16 +201,14 @@ impl ApiClient {
         if !resolved.runtime_dir.as_os_str().is_empty() {
             resolved.runtime_dir = resolve_client_path(&resolved.runtime_dir);
         }
-        resolved.openvmm_bin = resolved.openvmm_bin.as_deref().map(resolve_client_path);
-        resolved.fastdesk_viewer_bin = resolved
-            .fastdesk_viewer_bin
-            .as_deref()
-            .map(resolve_client_path);
-        resolved.openvmm_img_bin = resolved.openvmm_img_bin.as_deref().map(resolve_client_path);
-        resolved.uefi_firmware_path = resolved
-            .uefi_firmware_path
-            .as_deref()
-            .map(resolve_client_path);
+        let resolve_opt = |path: Option<&std::path::Path>| {
+            path.filter(|p| !p.as_os_str().is_empty())
+                .map(resolve_client_path)
+        };
+        resolved.openvmm_bin = resolve_opt(resolved.openvmm_bin.as_deref());
+        resolved.fastdesk_viewer_bin = resolve_opt(resolved.fastdesk_viewer_bin.as_deref());
+        resolved.openvmm_img_bin = resolve_opt(resolved.openvmm_img_bin.as_deref());
+        resolved.uefi_firmware_path = resolve_opt(resolved.uefi_firmware_path.as_deref());
         self.put("/api/v1/host/config", &resolved)
     }
 
@@ -223,7 +221,11 @@ impl ApiClient {
             &mut resolved.uefi_firmware_path,
         ] {
             if let Some(Some(p)) = path_opt {
-                *p = resolve_client_path(p);
+                if p.as_os_str().is_empty() {
+                    *path_opt = Some(None);
+                } else {
+                    *p = resolve_client_path(p);
+                }
             }
         }
         self.ensure_verified()?;
@@ -1763,6 +1765,127 @@ mod tests {
             "405 fallback must not re-resolve unedited relative paths against client CWD"
         );
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn patch_host_config_405_fallback_clears_empty_path_to_null() {
+        use crate::models::{HostConfig, HostConfigPatch};
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "patch-fallback-clear-token";
+        let put_body_json = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let put_body_srv = Arc::clone(&put_body_json);
+
+        let root = std::env::temp_dir().join("openvmms-patch-fallback-clear-test");
+        let initial_cfg = HostConfig {
+            data_dir: root.join("data"),
+            runtime_dir: root.join("run"),
+            listen_addr: addr.to_string(),
+            openvmm_bin: Some(root.join("old-openvmm")),
+            fastdesk_viewer_bin: None,
+            openvmm_img_bin: None,
+            uefi_firmware_path: None,
+        };
+        let initial_cfg_srv = initial_cfg.clone();
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let mut stream = accept_with_timeout(&listener, Duration::from_secs(5));
+                let mut buf = Vec::with_capacity(4096);
+                let mut tmp = [0u8; 1024];
+                let header_end = loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_len {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let body = &buf[header_end..buf.len().min(header_end + content_len)];
+                let first_line = headers.lines().next().unwrap_or("");
+                let (status_line, resp_body) = if first_line.starts_with("GET /api/v1/health?") {
+                    let query = first_line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.split_once('?'))
+                        .map(|(_, q)| q)
+                        .unwrap_or("");
+                    let challenge = query
+                        .split('&')
+                        .filter_map(|kv| kv.split_once('='))
+                        .find(|(k, _)| *k == "challenge")
+                        .map(|(_, v)| v)
+                        .unwrap_or("");
+                    let proof = crate::models::compute_health_auth_proof(token, addr, challenge);
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#
+                        ),
+                    )
+                } else if first_line.starts_with("PATCH /api/v1/host/config ") {
+                    (
+                        "HTTP/1.1 405 Method Not Allowed",
+                        r#"{"error":"method not allowed"}"#.to_string(),
+                    )
+                } else if first_line.starts_with("GET /api/v1/host/config ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        serde_json::to_string(&initial_cfg_srv).unwrap(),
+                    )
+                } else if first_line.starts_with("PUT /api/v1/host/config ") {
+                    let json_val: serde_json::Value = serde_json::from_slice(body).unwrap();
+                    *put_body_srv.lock().unwrap() = Some(json_val);
+                    let cfg: HostConfig = serde_json::from_slice(body).unwrap();
+                    ("HTTP/1.1 200 OK", serde_json::to_string(&cfg).unwrap())
+                } else {
+                    panic!("unexpected HTTP request: {first_line}");
+                };
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = ApiClient::new(format!("http://{addr}"), token).unwrap();
+        let patch = HostConfigPatch {
+            openvmm_bin: Some(Some(PathBuf::from(""))),
+            ..Default::default()
+        };
+        let updated = client.patch_host_config(&patch).unwrap();
+        assert_eq!(updated.openvmm_bin, None);
+        srv.join().unwrap();
+
+        let put_json = put_body_json.lock().unwrap().clone().unwrap();
+        assert_eq!(put_json["openvmm_bin"], serde_json::Value::Null);
     }
 
     #[test]

@@ -115,20 +115,25 @@ impl HostConfigPatch {
     }
 
     pub fn apply_to(&self, cfg: &mut HostConfig) {
+        let normalize = |val: &Option<PathBuf>| {
+            val.as_ref()
+                .filter(|p| !p.as_os_str().is_empty())
+                .cloned()
+        };
         if let Some(addr) = &self.listen_addr {
             cfg.listen_addr = addr.clone();
         }
         if let Some(val) = &self.openvmm_bin {
-            cfg.openvmm_bin = val.clone();
+            cfg.openvmm_bin = normalize(val);
         }
         if let Some(val) = &self.fastdesk_viewer_bin {
-            cfg.fastdesk_viewer_bin = val.clone();
+            cfg.fastdesk_viewer_bin = normalize(val);
         }
         if let Some(val) = &self.openvmm_img_bin {
-            cfg.openvmm_img_bin = val.clone();
+            cfg.openvmm_img_bin = normalize(val);
         }
         if let Some(val) = &self.uefi_firmware_path {
-            cfg.uefi_firmware_path = val.clone();
+            cfg.uefi_firmware_path = normalize(val);
         }
     }
 
@@ -2265,6 +2270,26 @@ mod tests {
 
         let unknown = serde_json::from_str::<HostConfigPatch>(r#"{"runtime_dir": "/tmp/x"}"#);
         assert!(unknown.is_err());
+
+        let mut cfg = HostConfig {
+            openvmm_bin: Some(PathBuf::from("/usr/local/bin/openvmm")),
+            fastdesk_viewer_bin: Some(PathBuf::from("/usr/local/bin/viewer")),
+            openvmm_img_bin: Some(PathBuf::from("/usr/local/bin/img")),
+            uefi_firmware_path: Some(PathBuf::from("/usr/share/OVMF.fd")),
+            ..Default::default()
+        };
+        let empty_patch = HostConfigPatch {
+            listen_addr: None,
+            openvmm_bin: Some(Some(PathBuf::from(""))),
+            fastdesk_viewer_bin: Some(Some(PathBuf::from(""))),
+            openvmm_img_bin: Some(Some(PathBuf::from(""))),
+            uefi_firmware_path: Some(Some(PathBuf::from(""))),
+        };
+        empty_patch.apply_to(&mut cfg);
+        assert_eq!(cfg.openvmm_bin, None);
+        assert_eq!(cfg.fastdesk_viewer_bin, None);
+        assert_eq!(cfg.openvmm_img_bin, None);
+        assert_eq!(cfg.uefi_firmware_path, None);
     }
 
     #[test]

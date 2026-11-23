@@ -647,6 +647,19 @@ impl Supervisor {
         listen_addr_explicit: bool,
     ) -> anyhow::Result<HostConfig> {
         let current_cfg = self.host_config();
+        for path_opt in [
+            &mut new_cfg.openvmm_bin,
+            &mut new_cfg.fastdesk_viewer_bin,
+            &mut new_cfg.openvmm_img_bin,
+            &mut new_cfg.uefi_firmware_path,
+        ] {
+            if path_opt
+                .as_ref()
+                .is_some_and(|p| p.as_os_str().is_empty())
+            {
+                *path_opt = None;
+            }
+        }
         if new_cfg.data_dir.as_os_str().is_empty() {
             new_cfg.data_dir = self.store.data_dir().to_path_buf();
         }
@@ -7192,5 +7205,22 @@ mod tests {
             matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::NotFound(_))),
             "expected NotFound (404) when VM is removed while stop_vm waits, got: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn update_host_config_locked_clears_empty_optional_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let mut cfg = sup.host_config();
+        cfg.openvmm_bin = Some(PathBuf::from(""));
+        cfg.fastdesk_viewer_bin = Some(PathBuf::from(""));
+        cfg.openvmm_img_bin = Some(PathBuf::from(""));
+        cfg.uefi_firmware_path = Some(PathBuf::from(""));
+
+        let updated = sup.update_host_config_locked(cfg, false).await.unwrap();
+        assert_eq!(updated.openvmm_bin, None);
+        assert_eq!(updated.fastdesk_viewer_bin, None);
+        assert_eq!(updated.openvmm_img_bin, None);
+        assert_eq!(updated.uefi_firmware_path, None);
     }
 }
