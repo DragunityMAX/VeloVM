@@ -416,7 +416,10 @@ fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Option<(
         footer[16], footer[17], footer[18], footer[19], footer[20], footer[21], footer[22],
         footer[23],
     ]);
-    if disk_type == 2 && current_size > file_size_bytes.saturating_sub(512) {
+    if disk_type == 2
+        && (!file_size_bytes.is_multiple_of(512)
+            || current_size > file_size_bytes.saturating_sub(512))
+    {
         return None;
     }
     Some((disk_type, current_size, data_offset))
@@ -1295,6 +1298,17 @@ mod tests {
         let avhd_info = inspect_disk(&avhd_path, None).unwrap();
         assert_eq!(avhd_info.format, "vhd");
         assert_eq!(avhd_info.disk_type, "fixed");
+
+        // Fixed VHD1 whose total file size is not a multiple of 512 bytes must be rejected
+        // (Vhd1Disk::open_fixed requires file size alignment).
+        let unaligned_fixed_vhd = dir.path().join("unaligned-fixed.vhd");
+        let mut unaligned_fixed_bytes = vec![0u8; fixed_virtual as usize + 1];
+        unaligned_fixed_bytes.extend_from_slice(&build_vhd1_footer(2, fixed_virtual, u64::MAX));
+        fs::write(&unaligned_fixed_vhd, &unaligned_fixed_bytes).unwrap();
+        assert!(
+            inspect_disk(&unaligned_fixed_vhd, None).is_err(),
+            "unaligned fixed VHD1 must be rejected by inspect_disk"
+        );
 
         // Dynamic VHD1: virtual_size_bytes comes from footer.current_size (much larger than file size),
         // and block_size_bytes comes from the dynamic header (`cxsparse`) at bytes 32..36 (while

@@ -1426,16 +1426,20 @@ mod tests {
             .unwrap();
         assert_eq!(put_resp.status(), 200);
         let updated: openvmms_core::models::HostConfig = put_resp.json().await.unwrap();
-        let new_url = format!("http://{}", updated.listen_addr);
-        assert_ne!(new_url, daemon.base_url);
+        assert_eq!(updated.listen_addr, "127.0.0.1:0");
 
         // ApiClient::from_data_dir resolves the persisted new listen_addr and talks to the SAME daemon.
         let data_dir = dir.path().to_path_buf();
+        let old_base_url = daemon.base_url.clone();
         let (health_ok, vm_names): (bool, Vec<String>) = tokio::task::spawn_blocking(move || {
             let api = openvmms_core::api_client::ApiClient::from_data_dir(Some(&data_dir), None)
                 .unwrap();
-            assert_eq!(api.base_url(), new_url);
+            assert_ne!(api.base_url(), old_base_url);
             api.health().unwrap();
+            assert_eq!(
+                format!("http://{}", api.host_info().unwrap().listen_addr),
+                api.base_url()
+            );
             let vms = api.list_vms().unwrap();
             (
                 true,

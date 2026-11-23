@@ -273,9 +273,20 @@ impl RegistryStore {
         F: FnOnce(&fs::File) -> std::io::Result<Option<u32>>,
     {
         let path = self.token_path();
-        if let Some((token, was_permissive)) = open_and_read_token(&path)? {
-            if was_permissive {
-                if !token.is_empty() {
+        if let Some(read) = open_and_read_token(&path, false)? {
+            if read.has_hard_links {
+                let a = Uuid::new_v4().as_u128();
+                let b = Uuid::new_v4().as_u128();
+                let new_token = format!("{a:032x}{b:032x}");
+                tracing::warn!(
+                    path = %path.display(),
+                    "rotating daemon.token after detecting hard-linked token file"
+                );
+                atomic_write(&path, new_token.as_bytes(), true)?;
+                return Ok(new_token);
+            }
+            if read.was_permissive {
+                if !read.token.is_empty() {
                     let a = Uuid::new_v4().as_u128();
                     let b = Uuid::new_v4().as_u128();
                     let new_token = format!("{a:032x}{b:032x}");
@@ -290,14 +301,14 @@ impl RegistryStore {
                         path = %path.display(),
                         "filesystem does not enforce 0600 permissions on daemon.token; keeping existing token"
                     );
-                    return Ok(token);
+                    return Ok(read.token);
                 }
                 tracing::warn!(
                     path = %path.display(),
                     "regenerating daemon.token after detecting overly permissive file permissions"
                 );
-            } else if !token.is_empty() {
-                return Ok(token);
+            } else if !read.token.is_empty() {
+                return Ok(read.token);
             }
         }
         let a = Uuid::new_v4().as_u128();
@@ -310,10 +321,10 @@ impl RegistryStore {
     #[cfg(not(unix))]
     fn load_or_create_token_default(&self) -> anyhow::Result<String> {
         let path = self.token_path();
-        if let Some((token, was_permissive)) = open_and_read_token(&path)? {
-            if was_permissive {
+        if let Some(read) = open_and_read_token(&path, false)? {
+            if read.was_permissive {
                 #[cfg(windows)]
-                if !token.is_empty() {
+                if !read.token.is_empty() {
                     let a = Uuid::new_v4().as_u128();
                     let b = Uuid::new_v4().as_u128();
                     let new_token = format!("{a:032x}{b:032x}");
@@ -328,14 +339,14 @@ impl RegistryStore {
                         path = %path.display(),
                         "filesystem does not enforce owner-only ACLs on daemon.token; keeping existing token"
                     );
-                    return Ok(token);
+                    return Ok(read.token);
                 }
                 tracing::warn!(
                     path = %path.display(),
                     "regenerating daemon.token after detecting overly permissive file permissions"
                 );
-            } else if !token.is_empty() {
-                return Ok(token);
+            } else if !read.token.is_empty() {
+                return Ok(read.token);
             }
         }
         let a = Uuid::new_v4().as_u128();
@@ -347,16 +358,22 @@ impl RegistryStore {
 
     pub fn read_token(&self) -> anyhow::Result<String> {
         let path = self.token_path();
-        let Some((token, _was_permissive)) = open_and_read_token(&path)
+        let Some(read) = open_and_read_token(&path, true)
             .with_context(|| format!("reading daemon token at {}", path.display()))?
         else {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound))
                 .with_context(|| format!("reading daemon token at {}", path.display()));
         };
-        if token.is_empty() {
+        if read.has_hard_links {
+            bail!(
+                "refusing to use hard-linked daemon token file {}",
+                path.display()
+            );
+        }
+        if read.token.is_empty() {
             bail!("daemon token file {} is empty", path.display());
         }
-        Ok(token)
+        Ok(read.token)
     }
 
     pub fn load_all_vms(&self) -> anyhow::Result<Vec<VmConfig>> {
@@ -431,25 +448,29 @@ impl RegistryStore {
         // orphaned state.vmgs left by a transient failure is cleaned up on the
         // next daemon startup via `cleanup_orphaned_vmgs`.
         let logs_dir = vm_dir.join("logs");
-        if logs_dir.is_dir() {
-            fs::remove_dir_all(&logs_dir)
-                .with_context(|| format!("removing {}", logs_dir.display()))?;
+        match fs::remove_dir_all(&logs_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("removing {}", logs_dir.display())),
         }
         let vm_toml = vm_dir.join("vm.toml");
-        if vm_toml.is_file() {
-            fs::remove_file(&vm_toml)
-                .with_context(|| format!("removing {}", vm_toml.display()))?;
+        match fs::remove_file(&vm_toml) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("removing {}", vm_toml.display())),
         }
         let vmgs_path = vm_dir.join("state.vmgs");
-        if vmgs_path.is_file()
-            && let Err(err) = fs::remove_file(&vmgs_path)
-        {
-            tracing::warn!(
-                vm_id = %id,
-                path = %vmgs_path.display(),
-                error = %err,
-                "failed to remove state.vmgs during VM deletion; continuing cleanup"
-            );
+        match fs::remove_file(&vmgs_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    vm_id = %id,
+                    path = %vmgs_path.display(),
+                    error = %err,
+                    "failed to remove state.vmgs during VM deletion; continuing cleanup"
+                );
+            }
         }
         // Remove the VM directory only if it is now empty.
         let _ = fs::remove_dir(&vm_dir);
@@ -582,6 +603,24 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
         .context("target path has no parent directory")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating directory {}", parent.display()))?;
+    #[cfg(windows)]
+    if owner_only {
+        let mut tmp_guard = TempPathGuard(None);
+        let (tmp_path, mut tmp_file) = create_owner_only_temp_file_windows(parent)
+            .with_context(|| format!("creating owner-only temp file in {}", parent.display()))?;
+        tmp_guard.0 = Some(tmp_path.clone());
+        tmp_file
+            .write_all(data)
+            .with_context(|| format!("writing temp file for {}", path.display()))?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("syncing temp file for {}", path.display()))?;
+        drop(tmp_file);
+        persist_temp_file_windows(&tmp_path, path)
+            .with_context(|| format!("persisting {}", path.display()))?;
+        tmp_guard.0 = None;
+        return Ok(());
+    }
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("creating temp file in {}", parent.display()))?;
     #[cfg(unix)]
@@ -590,11 +629,6 @@ pub fn atomic_write(path: &Path, data: &[u8], owner_only: bool) -> anyhow::Resul
         tmp.as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))
             .context("setting owner-only permissions")?;
-    }
-    #[cfg(windows)]
-    if owner_only {
-        set_path_owner_only_windows(tmp.path())
-            .context("setting owner-only Windows DACL")?;
     }
     #[cfg(not(any(unix, windows)))]
     let _ = owner_only;
@@ -672,7 +706,18 @@ fn current_user_token_buf()
     Ok(buf)
 }
 
-fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
+struct TokenRead {
+    token: String,
+    was_permissive: bool,
+    has_hard_links: bool,
+}
+
+#[cfg(unix)]
+fn validate_token_uid(file_uid: u32, euid: u32, allow_root: bool) -> bool {
+    file_uid == euid || (allow_root && euid == 0)
+}
+
+fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<Option<TokenRead>> {
     use std::io::Read;
 
     #[cfg(unix)]
@@ -728,7 +773,7 @@ fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
             );
         }
         let euid = unsafe { libc::geteuid() };
-        if meta.uid() != euid {
+        if !validate_token_uid(meta.uid(), euid, allow_root_reader) {
             bail!(
                 "refusing to use daemon token file {} owned by uid {} (expected {})",
                 path.display(),
@@ -736,13 +781,7 @@ fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
                 euid
             );
         }
-        if meta.nlink() > 1 {
-            bail!(
-                "refusing to use hard-linked daemon token file {} (nlink={})",
-                path.display(),
-                meta.nlink()
-            );
-        }
+        let has_hard_links = meta.nlink() > 1;
         let mut was_permissive = false;
         let mode = meta.permissions().mode() & 0o777;
         if (mode & 0o077) != 0 {
@@ -756,12 +795,17 @@ fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
         let mut content = String::new();
         file.read_to_string(&mut content)
             .with_context(|| format!("reading {}", path.display()))?;
-        Ok(Some((content.trim().to_string(), was_permissive)))
+        Ok(Some(TokenRead {
+            token: content.trim().to_string(),
+            was_permissive,
+            has_hard_links,
+        }))
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
+        let _ = allow_root_reader;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
@@ -808,7 +852,11 @@ fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
         let mut content = String::new();
         file.read_to_string(&mut content)
             .with_context(|| format!("reading {}", path.display()))?;
-        Ok(Some((content.trim().to_string(), was_permissive)))
+        Ok(Some(TokenRead {
+            token: content.trim().to_string(),
+            was_permissive,
+            has_hard_links: false,
+        }))
     }
 }
 
@@ -844,22 +892,195 @@ pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
 }
 
 #[cfg(windows)]
+struct TempPathGuard(Option<PathBuf>);
+
+#[cfg(windows)]
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct LocalFreeAcl(*mut windows_sys::Win32::Security::ACL);
+
+#[cfg(windows)]
+impl Drop for LocalFreeAcl {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.0.cast());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn build_owner_only_dacl_windows() -> anyhow::Result<LocalFreeAcl> {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_ALL};
+    use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SetEntriesInAclW, TRUSTEE_IS_SID,
+        TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::NO_INHERITANCE;
+
+    let token_buf = current_user_token_buf()?;
+    let token_user = unsafe { token_buf[0].assume_init_ref() };
+    let user_sid = token_user.User.Sid;
+
+    let ea = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: GENERIC_ALL,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: user_sid.cast(),
+        },
+    };
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let err = unsafe { SetEntriesInAclW(1, &ea, std::ptr::null(), &mut new_dacl) };
+    if err != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(err as i32))
+            .context("SetEntriesInAclW failed");
+    }
+    Ok(LocalFreeAcl(new_dacl))
+}
+
+#[cfg(windows)]
+fn create_owner_only_temp_file_windows(parent: &Path) -> anyhow::Result<(PathBuf, fs::File)> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::{
+        InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+        SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
+
+    const SECURITY_DESCRIPTOR_REVISION_1: u32 = 1;
+
+    let dacl = build_owner_only_dacl_windows()?;
+    let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let sd_ptr: PSECURITY_DESCRIPTOR = (&raw mut sd).cast();
+    if unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION_1) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("InitializeSecurityDescriptor failed");
+    }
+    if unsafe { SetSecurityDescriptorDacl(sd_ptr, 1, dacl.0.cast_const(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("SetSecurityDescriptorDacl failed");
+    }
+    if unsafe { SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("SetSecurityDescriptorControl failed");
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd_ptr,
+        bInheritHandle: 0,
+    };
+
+    for _ in 0..8 {
+        let tmp_path = parent.join(format!(".openvmms-tmp-{}", Uuid::new_v4()));
+        let wide: Vec<u16> = tmp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                &sa,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            let file = unsafe { fs::File::from_raw_handle(handle as RawHandle) };
+            return Ok((tmp_path, file));
+        }
+        let err = std::io::Error::last_os_error();
+        if matches!(
+            err.raw_os_error(),
+            Some(code) if code == ERROR_FILE_EXISTS as i32 || code == ERROR_ALREADY_EXISTS as i32
+        ) {
+            continue;
+        }
+        return Err(err).with_context(|| format!("CreateFileW failed for {}", tmp_path.display()));
+    }
+    bail!(
+        "exhausted retries creating unique temp file in {}",
+        parent.display()
+    );
+}
+
+#[cfg(windows)]
+fn persist_temp_file_windows(tmp_path: &Path, dest: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+
+    let src_wide: Vec<u16> = tmp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let dst_wide: Vec<u16> = dest
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { MoveFileExW(src_wide.as_ptr(), dst_wide.as_ptr(), MOVEFILE_REPLACE_EXISTING) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("MoveFileExW failed for {}", dest.display()));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn try_rotate_token_if_owner_only_enforced_windows(
     path: &Path,
     new_token: &str,
 ) -> anyhow::Result<bool> {
-    try_rotate_token_if_owner_only_enforced_windows_with(path, new_token, |tmp_path, tmp_file| {
-        if set_path_owner_only_windows(tmp_path).is_err() {
-            return Ok(false);
-        }
-        Ok(matches!(
-            is_handle_owner_only_windows(tmp_file, tmp_path),
-            Ok(true)
-        ))
-    })
+    let parent = path
+        .parent()
+        .context("target path has no parent directory")?;
+    let mut tmp_guard = TempPathGuard(None);
+    let (tmp_path, mut tmp_file) = match create_owner_only_temp_file_windows(parent) {
+        Ok(pair) => pair,
+        Err(_) => return Ok(false),
+    };
+    tmp_guard.0 = Some(tmp_path.clone());
+    if !matches!(is_handle_owner_only_windows(&tmp_file, &tmp_path), Ok(true)) {
+        return Ok(false);
+    }
+    tmp_file
+        .write_all(new_token.as_bytes())
+        .with_context(|| format!("writing temp file for {}", path.display()))?;
+    tmp_file
+        .sync_all()
+        .with_context(|| format!("syncing temp file for {}", path.display()))?;
+    drop(tmp_file);
+    persist_temp_file_windows(&tmp_path, path)
+        .with_context(|| format!("persisting {}", path.display()))?;
+    tmp_guard.0 = None;
+    Ok(true)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn try_rotate_token_if_owner_only_enforced_windows_with<F>(
     path: &Path,
     new_token: &str,
@@ -979,50 +1200,13 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
 #[cfg(windows)]
 pub(crate) fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_ALL, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW,
-        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
-    };
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    struct LocalFreeAcl(*mut ACL);
-    impl Drop for LocalFreeAcl {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    LocalFree(self.0.cast());
-                }
-            }
-        }
-    }
-
-    let token_buf = current_user_token_buf()?;
-    let token_user = unsafe { token_buf[0].assume_init_ref() };
-    let user_sid = token_user.User.Sid;
-
-    let ea = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: GENERIC_ALL,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: NO_INHERITANCE,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_USER,
-            ptstrName: user_sid.cast(),
-        },
-    };
-
-    let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    let err = unsafe { SetEntriesInAclW(1, &ea, std::ptr::null(), &mut new_dacl) };
-    if err != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(err as i32))
-            .context("SetEntriesInAclW failed");
-    }
-    let _acl_guard = LocalFreeAcl(new_dacl);
+    let dacl_guard = build_owner_only_dacl_windows()?;
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -1036,7 +1220,7 @@ pub(crate) fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            new_dacl.cast_const(),
+            dacl_guard.0.cast_const(),
             std::ptr::null(),
         )
     };
@@ -1477,6 +1661,34 @@ mod tests {
             format!("{err:#}").contains("hard-linked"),
             "expected hard-linked token rejection, got: {err:#}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_token_rotates_hard_linked_token_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let original = store.load_or_create_token().unwrap();
+        let backup_link = dir.path().join("backup-link");
+        fs::hard_link(store.token_path(), &backup_link).unwrap();
+
+        let rotated = store.load_or_create_token().unwrap();
+        assert_ne!(rotated, original);
+        assert_eq!(fs::read_to_string(&backup_link).unwrap(), original);
+        assert_eq!(fs::metadata(store.token_path()).unwrap().nlink(), 1);
+        assert_eq!(store.read_token().unwrap(), rotated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_token_uid_allows_root_only_when_permitted() {
+        assert!(validate_token_uid(1000, 1000, false));
+        assert!(validate_token_uid(1000, 1000, true));
+        assert!(!validate_token_uid(1000, 0, false));
+        assert!(validate_token_uid(1000, 0, true));
+        assert!(!validate_token_uid(1000, 1001, true));
     }
 
     #[cfg(windows)]

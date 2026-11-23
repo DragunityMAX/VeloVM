@@ -126,7 +126,8 @@ pub fn open_raw_disk_file(
 /// file will be opened using the kernel-mode VHD parser (Windows only).
 ///
 /// If the file ends with .vhdx or .avhdx (case-insensitively), the VHDX backend is used
-/// (kernel-mode VHD parser on Windows, or the pure-Rust VHDX parser on Linux).
+/// (on Windows, `.vhdx` or direct I/O uses the kernel-mode VHD parser, while non-direct
+/// `.avhdx` uses the pure-Rust VHDX parser; Linux always uses the pure-Rust VHDX parser).
 ///
 /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
 pub async fn open_disk_type(

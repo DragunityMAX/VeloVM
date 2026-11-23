@@ -1,8 +1,8 @@
 diff --git a/openvmm/openvmm/openvmm_helpers/src/disk.rs b/openvmm/openvmm/openvmm_helpers/src/disk.rs
-index 4eab368..88735d4 100644
+index 4eab368..6df0889 100644
 --- a/openvmm/openvmm/openvmm_helpers/src/disk.rs
 +++ b/openvmm/openvmm/openvmm_helpers/src/disk.rs
-@@ -31,15 +31,102 @@ pub struct OpenDiskOptions {
+@@ -31,15 +31,103 @@ pub struct OpenDiskOptions {
      pub direct: bool,
  }
  
@@ -106,11 +106,12 @@ index 4eab368..88735d4 100644
 -/// Windows. On Linux, the pure-Rust VHDX parser is used, with automatic
 -/// parent-locator walking for differencing chains.
 +/// If the file ends with .vhdx or .avhdx (case-insensitively), the VHDX backend is used
-+/// (kernel-mode VHD parser on Windows, or the pure-Rust VHDX parser on Linux).
++/// (on Windows, `.vhdx` or direct I/O uses the kernel-mode VHD parser, while non-direct
++/// `.avhdx` uses the pure-Rust VHDX parser; Linux always uses the pure-Rust VHDX parser).
  ///
  /// If the file ends with .vmdk, the VMDK backend is used for all platforms.
  pub async fn open_disk_type(
-@@ -53,18 +140,18 @@ pub async fn open_disk_type(
+@@ -53,18 +141,18 @@ pub async fn open_disk_type(
          };
          Ok(())
      };
@@ -136,7 +137,7 @@ index 4eab368..88735d4 100644
  
              match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
                  Ok(vhd) => {
-@@ -90,23 +177,7 @@ pub async fn open_disk_type(
+@@ -90,23 +178,7 @@ pub async fn open_disk_type(
                  Err(err) => return Err(err.into()),
              }
          }
@@ -161,7 +162,7 @@ index 4eab368..88735d4 100644
          Some("iso") if !read_only => {
              anyhow::bail!("iso file cannot be opened as read/write")
          }
-@@ -114,11 +185,7 @@ pub async fn open_disk_type(
+@@ -114,11 +186,7 @@ pub async fn open_disk_type(
              ensure_no_direct(".vmgs")?;
              // VMGS files are fixed VHD1s. Don't bother to validate the footer
              // here; let the resource resolver do that later.
@@ -174,7 +175,7 @@ index 4eab368..88735d4 100644
  
              Resource::new(disk_backend_resources::FixedVhd1DiskHandle(file))
          }
-@@ -132,24 +199,32 @@ pub fn create_disk_type(
+@@ -132,24 +200,32 @@ pub fn create_disk_type(
      size: u64,
      options: OpenDiskOptions,
  ) -> anyhow::Result<Resource<DiskHandleKind>> {
@@ -216,7 +217,7 @@ index 4eab368..88735d4 100644
              anyhow::bail!("creating vhdx not supported")
          }
          Some("vmdk") => {
-@@ -174,28 +249,15 @@ fn open_raw_disk(
+@@ -174,28 +250,15 @@ fn open_raw_disk(
      }
  
      let create = size.is_some();
@@ -247,7 +248,7 @@ index 4eab368..88735d4 100644
          file.set_len(size)?;
      }
  
-@@ -288,4 +350,330 @@ async fn rejects_vmdk_write_direct_io_and_creation() {
+@@ -288,4 +351,330 @@ async fn rejects_vmdk_write_direct_io_and_creation() {
              .is_err()
          );
      }
@@ -597,7 +598,7 @@ index 7330b00..c03826d 100644
  pal_async.workspace = true
  storage_tests.workspace = true
 diff --git a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
-index 3668d9c..ba0902a 100644
+index 3668d9c..7312e11 100644
 --- a/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
 +++ b/openvmm/vm/devices/storage/disklayer_vhdx/src/chain.rs
 @@ -17,6 +17,105 @@
@@ -606,7 +607,7 @@ index 3668d9c..ba0902a 100644
  
 +#[cfg(unix)]
 +fn is_unsupported_lock_error(err: &std::io::Error) -> bool {
-+    #[allow(unreachable_patterns)]
++    #[cfg_attr(target_os = "linux", expect(unreachable_patterns))]
 +    let unsupported_errno = matches!(
 +        err.raw_os_error(),
 +        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS)

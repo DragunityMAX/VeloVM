@@ -21,6 +21,7 @@ use std::io::BufRead;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -132,6 +133,7 @@ pub struct BackendHandle {
 impl Drop for BackendHandle {
     fn drop(&mut self) {
         self.state.shutdown.store(true, Ordering::Release);
+        self.state.wake_sse();
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
@@ -151,6 +153,7 @@ struct BackendState {
     sse_active: AtomicBool,
     notified_connected: AtomicBool,
     shutdown: AtomicBool,
+    sse_wake: (Mutex<u64>, Condvar),
     connect_in_flight: AtomicBool,
     snapshot_seq: std::sync::atomic::AtomicU64,
     daemon_instance_id: Mutex<(u64, Option<Uuid>)>,
@@ -343,6 +346,7 @@ impl BackendHandle {
             sse_active: AtomicBool::new(false),
             notified_connected: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            sse_wake: (Mutex::new(0), Condvar::new()),
             connect_in_flight: AtomicBool::new(false),
             snapshot_seq: std::sync::atomic::AtomicU64::new(0),
             daemon_instance_id: Mutex::new((0, None)),
@@ -377,6 +381,7 @@ impl BackendHandle {
             sse_active: AtomicBool::new(false),
             notified_connected: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            sse_wake: (Mutex::new(0), Condvar::new()),
             connect_in_flight: AtomicBool::new(false),
             snapshot_seq: std::sync::atomic::AtomicU64::new(0),
             daemon_instance_id: Mutex::new((0, None)),
@@ -464,6 +469,12 @@ impl BackendState {
 
     fn next_snapshot_seq(&self) -> u64 {
         self.snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn wake_sse(&self) {
+        let mut guard = self.sse_wake.0.lock().unwrap();
+        *guard = guard.wrapping_add(1);
+        self.sse_wake.1.notify_all();
     }
 
     fn acquire_storage_op_guard<'a>(
@@ -583,6 +594,7 @@ impl BackendState {
                         set_shared_endpoint(&self.shared_endpoint, &c);
                         *self.client.write().unwrap() = Some(c.clone());
                         if !self.ensure_sse() {
+                            self.wake_sse();
                             let snapshot_seq = self.next_snapshot_seq();
                             match fetch_full_snapshot(&c) {
                                 Ok((host_info, host_config, switches, vms)) => {
@@ -619,7 +631,9 @@ impl BackendState {
                     )
                 {
                     set_shared_endpoint(&self.shared_endpoint, &reloaded);
-                    self.ensure_sse();
+                    if !self.ensure_sse() {
+                        self.wake_sse();
+                    }
                     if !matches!(other, GuiRequest::RefreshAll) {
                         let snapshot_seq = self.next_snapshot_seq();
                         if let Ok((host_info, host_config, switches, vms)) =
@@ -680,7 +694,9 @@ impl BackendState {
                             c = reloaded;
                             set_shared_endpoint(&self.shared_endpoint, &c);
                             *self.client.write().unwrap() = Some(c.clone());
-                            self.ensure_sse();
+                            if !self.ensure_sse() {
+                                self.wake_sse();
+                            }
                             if is_idempotent_read(&other)
                                 || openvmms_core::api_client::is_pre_request_connect_error(&err)
                             {
@@ -843,6 +859,9 @@ impl BackendState {
         match req {
             GuiRequest::ConnectOrStartDaemon => Ok(()),
             GuiRequest::RefreshAll => {
+                if !self.notified_connected.load(Ordering::Acquire) {
+                    self.wake_sse();
+                }
                 let snapshot_seq = self.next_snapshot_seq();
                 let (host_info, host_config, switches, vms) = fetch_full_snapshot(client)?;
                 self.emit(GuiUpdate::DaemonConnected {
@@ -1106,8 +1125,8 @@ impl BackendState {
             }
             GuiRequest::SaveHostConfig(patch) => {
                 let _guard = self.host_cfg_lock.lock().unwrap();
+                let pre_patch_seq = self.next_snapshot_seq();
                 let updated = client.patch_host_config(&patch)?;
-                let snapshot_seq = self.next_snapshot_seq();
                 // Follow only `daemon.addr` when the daemon rebinds; never connect to `updated.listen_addr`.
                 if let Some(next_client) = reload_client_from_runtime_addr(
                     self.data_dir.as_deref(),
@@ -1117,7 +1136,19 @@ impl BackendState {
                 {
                     *client = next_client;
                     *self.client.write().unwrap() = Some(client.clone());
+                    self.wake_sse();
                 }
+                let refresh_seq = self.next_snapshot_seq();
+                let (host_config, snapshot_seq) = match client.host_config() {
+                    Ok(fresh) => (fresh, refresh_seq),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "Host settings saved, but follow-up host_config refresh failed"
+                        );
+                        (updated, pre_patch_seq)
+                    }
+                };
                 let (host_info, status_msg) = match client.host_info() {
                     Ok(info) => (Some(info), "Saved host settings".to_string()),
                     Err(err) => {
@@ -1136,7 +1167,7 @@ impl BackendState {
                 self.emit(GuiUpdate::HostConfigUpdated {
                     base_url,
                     host_info,
-                    host_config: updated,
+                    host_config,
                     snapshot_seq,
                 });
                 Ok(())
@@ -1174,14 +1205,25 @@ fn maybe_switch_endpoint_on_disconnect(
     false
 }
 
-fn sleep_backoff(shutdown: &AtomicBool, dur: Duration) {
+fn sleep_backoff(state: &BackendState, start_wake_gen: u64, dur: Duration) -> bool {
     let deadline = std::time::Instant::now() + dur;
-    while !shutdown.load(Ordering::Acquire) {
+    let mut guard = state.sse_wake.0.lock().unwrap();
+    loop {
+        if state.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        if *guard != start_wake_gen {
+            return true;
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            break;
+            return false;
         }
-        thread::sleep(remaining.min(Duration::from_millis(50)));
+        let (next_guard, wait_res) = state.sse_wake.1.wait_timeout(guard, remaining).unwrap();
+        guard = next_guard;
+        if wait_res.timed_out() {
+            return !state.shutdown.load(Ordering::Acquire) && *guard != start_wake_gen;
+        }
     }
 }
 
@@ -1202,6 +1244,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
         let mut retry_delay = state.sse_backoff_initial;
         let next_delay = |d: Duration| d.saturating_mul(2).min(state.sse_backoff_max);
         while !state.shutdown.load(Ordering::Acquire) {
+            let wake_gen = *state.sse_wake.0.lock().unwrap();
             let endpoint = state.shared_endpoint.read().unwrap().clone().or_else(|| {
                 reload_client_from_runtime_addr(
                     state.data_dir.as_deref(),
@@ -1211,8 +1254,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                 .map(|c| (c.base_url().to_string(), c.token().to_string()))
             });
             let Some((mut base_url, mut token)) = endpoint else {
-                sleep_backoff(&state.shutdown, retry_delay);
-                retry_delay = next_delay(retry_delay);
+                if sleep_backoff(&state, wake_gen, retry_delay) {
+                    retry_delay = state.sse_backoff_initial;
+                } else {
+                    retry_delay = next_delay(retry_delay);
+                }
                 continue;
             };
             // Verify health authentication challenge before transmitting token on the SSE request.
@@ -1239,8 +1285,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             break;
                         }
                     }
-                    sleep_backoff(&state.shutdown, retry_delay);
-                    retry_delay = next_delay(retry_delay);
+                    if sleep_backoff(&state, wake_gen, retry_delay) {
+                        retry_delay = state.sse_backoff_initial;
+                    } else {
+                        retry_delay = next_delay(retry_delay);
+                    }
                     continue;
                 }
             }
@@ -1282,8 +1331,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     break;
                                 }
                             }
-                            sleep_backoff(&state.shutdown, retry_delay);
-                            retry_delay = next_delay(retry_delay);
+                            if sleep_backoff(&state, wake_gen, retry_delay) {
+                                retry_delay = state.sse_backoff_initial;
+                            } else {
+                                retry_delay = next_delay(retry_delay);
+                            }
                             continue;
                         }
                     };
@@ -1415,8 +1467,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             retry_delay = state.sse_backoff_initial;
                         }
                         if saw_daemon_stopping {
-                            sleep_backoff(&state.shutdown, retry_delay);
-                            retry_delay = next_delay(retry_delay);
+                            if sleep_backoff(&state, wake_gen, retry_delay) {
+                                retry_delay = state.sse_backoff_initial;
+                            } else {
+                                retry_delay = next_delay(retry_delay);
+                            }
                             continue;
                         }
                         if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
@@ -1438,8 +1493,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 }
                             }
                         }
-                        sleep_backoff(&state.shutdown, retry_delay);
-                        retry_delay = next_delay(retry_delay);
+                        if sleep_backoff(&state, wake_gen, retry_delay) {
+                            retry_delay = state.sse_backoff_initial;
+                        } else {
+                            retry_delay = next_delay(retry_delay);
+                        }
                     }
                 }
                 sse_res => {
@@ -1471,8 +1529,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             break;
                         }
                     }
-                    sleep_backoff(&state.shutdown, retry_delay);
-                    retry_delay = next_delay(retry_delay);
+                    if sleep_backoff(&state, wake_gen, retry_delay) {
+                        retry_delay = state.sse_backoff_initial;
+                    } else {
+                        retry_delay = next_delay(retry_delay);
+                    }
                 }
             }
         }
@@ -1483,7 +1544,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openvmms_core::api_client::normalize_base_url;
     use openvmms_core::models::VmPreset;
     use openvmms_core::models::VmStatus;
 
@@ -1549,7 +1609,11 @@ mod tests {
         let mut cfg = external_client.host_config().unwrap();
         cfg.listen_addr = "127.0.0.1:0".to_string();
         let updated_cfg = external_client.update_host_config(&cfg).unwrap();
-        let new_base_url = normalize_base_url(&updated_cfg.listen_addr);
+        assert_eq!(updated_cfg.listen_addr, "127.0.0.1:0");
+        let new_base_url = ApiClient::from_data_dir(Some(dir.path()), None)
+            .unwrap()
+            .base_url()
+            .to_string();
         assert_ne!(new_base_url, old_base_url);
 
         // Wait until the GUI's SSE listener emits the reconnected snapshot on the new URL.
@@ -3930,6 +3994,7 @@ mod tests {
 
         let host_info_reqs = Arc::new(AtomicUsize::new(0));
         let fail_followup_info = Arc::new(AtomicBool::new(false));
+        let patch_applied = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let new_bin = dir.path().join("updated-openvmm");
 
@@ -3937,6 +4002,7 @@ mod tests {
             let token = token.clone();
             let host_info_reqs = Arc::clone(&host_info_reqs);
             let fail_followup_info = Arc::clone(&fail_followup_info);
+            let patch_applied = Arc::clone(&patch_applied);
             let stop = Arc::clone(&stop);
             let store_dir = dir.path().to_path_buf();
             let new_bin = new_bin.clone();
@@ -3949,6 +4015,7 @@ mod tests {
                             let token = token.clone();
                             let host_info_reqs = Arc::clone(&host_info_reqs);
                             let fail_followup_info = Arc::clone(&fail_followup_info);
+                            let patch_applied = Arc::clone(&patch_applied);
                             let stop = Arc::clone(&stop);
                             let store_dir = store_dir.clone();
                             let new_bin = new_bin.clone();
@@ -3990,6 +4057,14 @@ mod tests {
                                             .unwrap()
                                     }
                                 } else if method == "PATCH" && target == "/api/v1/host/config" {
+                                    patch_applied.store(true, Ordering::Release);
+                                    let mut cfg = HostConfig::default();
+                                    cfg.openvmm_bin = Some(new_bin);
+                                    ("200 OK", serde_json::to_string(&cfg).unwrap())
+                                } else if method == "GET"
+                                    && target == "/api/v1/host/config"
+                                    && patch_applied.load(Ordering::Acquire)
+                                {
                                     let mut cfg = HostConfig::default();
                                     cfg.openvmm_bin = Some(new_bin);
                                     ("200 OK", serde_json::to_string(&cfg).unwrap())
@@ -4355,6 +4430,7 @@ mod tests {
 
         let patch_started = Arc::new(AtomicBool::new(false));
         let unblock_patch = Arc::new(AtomicBool::new(false));
+        let patch_applied = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let old_bin = dir.path().join("old-openvmm");
         let new_bin = dir.path().join("new-openvmm");
@@ -4363,6 +4439,7 @@ mod tests {
             let token = token.clone();
             let patch_started = Arc::clone(&patch_started);
             let unblock_patch = Arc::clone(&unblock_patch);
+            let patch_applied = Arc::clone(&patch_applied);
             let stop = Arc::clone(&stop);
             let store_dir = dir.path().to_path_buf();
             let old_bin = old_bin.clone();
@@ -4376,6 +4453,7 @@ mod tests {
                             let token = token.clone();
                             let patch_started = Arc::clone(&patch_started);
                             let unblock_patch = Arc::clone(&unblock_patch);
+                            let patch_applied = Arc::clone(&patch_applied);
                             let stop = Arc::clone(&stop);
                             let store_dir = store_dir.clone();
                             let old_bin = old_bin.clone();
@@ -4414,12 +4492,17 @@ mod tests {
                                         {
                                             thread::sleep(Duration::from_millis(10));
                                         }
+                                        patch_applied.store(true, Ordering::Release);
                                         let mut cfg = HostConfig::default();
                                         cfg.openvmm_bin = Some(new_bin);
                                         ("200 OK", serde_json::to_string(&cfg).unwrap())
                                     } else if method == "GET" && target == "/api/v1/host/config" {
                                         let mut cfg = HostConfig::default();
-                                        cfg.openvmm_bin = Some(old_bin);
+                                        cfg.openvmm_bin = Some(if patch_applied.load(Ordering::Acquire) {
+                                            new_bin
+                                        } else {
+                                            old_bin
+                                        });
                                         ("200 OK", serde_json::to_string(&cfg).unwrap())
                                     } else if target == "/api/v1/vms" {
                                         ("200 OK", "[]".to_string())
@@ -4780,6 +4863,273 @@ mod tests {
         assert!(
             gap < Duration::from_millis(220),
             "expected reconnect delay to reset to ~40ms after stable stream, got {gap:?}"
+        );
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn save_host_config_fetches_fresher_cli_change_after_patch() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let gui_bin = dir.path().join("gui-openvmm");
+        let cli_fw = dir.path().join("cli-MSVM.fd");
+        let patch_returned = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let token = token.clone();
+            let gui_bin = gui_bin.clone();
+            let cli_fw = cli_fw.clone();
+            let patch_returned = Arc::clone(&patch_returned);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match accept_blocking_stream(&listener) {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let gui_bin = gui_bin.clone();
+                            let cli_fw = cli_fw.clone();
+                            let patch_returned = Arc::clone(&patch_returned);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let first = req_text.lines().next().unwrap_or("");
+                                let mut parts = first.split_whitespace();
+                                let method = parts.next().unwrap_or("");
+                                let target = parts.next().unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    while !stop.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keepalive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+                                let (status, body) =
+                                    if method == "PATCH" && target == "/api/v1/host/config" {
+                                        patch_returned.store(true, Ordering::Release);
+                                        let mut cfg = HostConfig::default();
+                                        cfg.openvmm_bin = Some(gui_bin);
+                                        ("200 OK", serde_json::to_string(&cfg).unwrap())
+                                    } else if method == "GET" && target == "/api/v1/host/config" {
+                                        let mut cfg = HostConfig::default();
+                                        if patch_returned.load(Ordering::Acquire) {
+                                            // Simulate a CLI change committed immediately after PATCH.
+                                            cfg.openvmm_bin = Some(gui_bin);
+                                            cfg.uefi_firmware_path = Some(cli_fw);
+                                        }
+                                        ("200 OK", serde_json::to_string(&cfg).unwrap())
+                                    } else if target == "/api/v1/vms" {
+                                        ("200 OK", "[]".to_string())
+                                    } else {
+                                        mock_common_endpoint(target, &token, addr, &store_dir)
+                                            .unwrap_or(("404 Not Found", "{}".into()))
+                                    };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonConnected { .. })
+        });
+
+        backend.send(GuiRequest::SaveHostConfig(HostConfigPatch {
+            openvmm_bin: Some(Some(gui_bin.clone())),
+            ..Default::default()
+        }));
+
+        let updated_cfg = match recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::HostConfigUpdated { .. })
+        }) {
+            GuiUpdate::HostConfigUpdated { host_config, .. } => host_config,
+            _ => unreachable!(),
+        };
+        assert_eq!(updated_cfg.openvmm_bin, Some(gui_bin));
+        assert_eq!(updated_cfg.uefi_firmware_path, Some(cli_fw));
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn wake_sse_interrupts_long_backoff_immediately() {
+        use openvmms_core::models::{VmConfig, VmPreset, VmRuntimeState};
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let fail_events = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let vm_cfg = VmConfig::from_preset("Woken-VM", VmPreset::Custom, &store.vm_dir(Uuid::new_v4()));
+        let vm_summary = VmSummary {
+            config: vm_cfg,
+            runtime: VmRuntimeState {
+                revision: 42,
+                ..Default::default()
+            },
+        };
+
+        let server = {
+            let token = token.clone();
+            let fail_events = Arc::clone(&fail_events);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            let vm_summary = vm_summary.clone();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match accept_blocking_stream(&listener) {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let fail_events = Arc::clone(&fail_events);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            let vm_summary = vm_summary.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let target = req_text
+                                    .lines()
+                                    .next()
+                                    .and_then(|l| l.split_whitespace().nth(1))
+                                    .unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    if fail_events.load(Ordering::Acquire) {
+                                        let resp = mock_http_response(
+                                            "500 Internal Server Error",
+                                            r#"{"error":"events unavailable"}"#,
+                                        );
+                                        let _ = stream.write_all(resp.as_bytes());
+                                        return;
+                                    }
+                                    let evt = DaemonEvent::VmUpdated { vm: vm_summary };
+                                    let frame = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\ndata: {}\n\ndata: {}\n\n",
+                                        serde_json::to_string(&DaemonEvent::Resync).unwrap(),
+                                        serde_json::to_string(&evt).unwrap(),
+                                    );
+                                    let _ = stream.write_all(frame.as_bytes());
+                                    let _ = stream.flush();
+                                    while !stop.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keepalive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(25));
+                                    }
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/vms" {
+                                    ("200 OK", "[]".to_string())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timing(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        // Wait until SSE fails and enters the 10-second backoff sleep.
+        let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+            matches!(u, GuiUpdate::DaemonDisconnected(_))
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        // Now bring SSE up and trigger ConnectOrStartDaemon, which must wake backoff immediately.
+        fail_events.store(false, Ordering::Release);
+        let started = std::time::Instant::now();
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        let _ = recv_until(&backend, Duration::from_secs(2), |u| {
+            matches!(
+                u,
+                GuiUpdate::VmUpdated { vm, .. } if vm.config.name == "Woken-VM"
+            )
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "SSE wakeup took too long: {:?}",
+            started.elapsed()
         );
 
         drop(backend);

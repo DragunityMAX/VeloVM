@@ -239,10 +239,14 @@ impl ApiClient {
             .send()
             .context("PATCH /api/v1/host/config")?;
         if resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-            tracing::warn!(
-                base_url = %self.base_url,
-                "daemon does not support PATCH /api/v1/host/config (405); falling back to non-atomic GET+PUT update"
+            let msg = format!(
+                "daemon at {} does not support PATCH /api/v1/host/config (405); falling back to non-atomic GET+PUT update",
+                self.base_url
             );
+            tracing::warn!(base_url = %self.base_url, "{msg}");
+            if !tracing::dispatcher::has_been_set() {
+                eprintln!("warning: {msg}");
+            }
             let mut live = self.host_config()?;
             resolved.apply_to(&mut live);
             return self.put("/api/v1/host/config", &live);

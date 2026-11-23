@@ -49,6 +49,9 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
         }
     }
     supervisor.mark_shutting_down();
+    supervisor
+        .wait_for_in_flight_mutations(std::time::Duration::from_secs(10))
+        .await;
     if supervisor.should_stop_vms_on_shutdown() {
         supervisor.shutdown_all_vms().await;
     } else {
@@ -160,6 +163,9 @@ impl TestDaemonHandle {
         let task = tokio::spawn(async move {
             shutdown_sup.wait_for_shutdown_signal().await;
             shutdown_sup.mark_shutting_down();
+            shutdown_sup
+                .wait_for_in_flight_mutations(std::time::Duration::from_secs(10))
+                .await;
             if shutdown_sup.should_stop_vms_on_shutdown() {
                 shutdown_sup.shutdown_all_vms().await;
             } else {
