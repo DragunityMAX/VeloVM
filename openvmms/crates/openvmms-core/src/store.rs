@@ -912,11 +912,17 @@ pub fn save_pending_disks_journal(
     atomic_write(path, &bytes, false)
 }
 
-pub fn load_pending_disks_journal(path: &Path) -> Vec<crate::models::DiskAttachment> {
-    let Ok(bytes) = fs::read(path) else {
-        return Vec::new();
+pub fn load_pending_disks_journal(path: &Path) -> anyhow::Result<Vec<crate::models::DiskAttachment>> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading pending disk journal {}", path.display()));
+        }
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing pending disk journal {}", path.display()))
 }
 
 pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {

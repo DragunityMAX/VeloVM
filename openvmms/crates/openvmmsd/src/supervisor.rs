@@ -313,6 +313,8 @@ impl Supervisor {
         let wait = async {
             loop {
                 let notified = self.mutations_drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.in_flight_mutations.load(Ordering::SeqCst) == 0 {
                     return;
                 }
@@ -332,7 +334,40 @@ impl Supervisor {
         self.shutting_down.load(Ordering::Acquire) || *self.shutdown_watch.borrow()
     }
 
-    /// Probes existing VM RPC sockets under `runtime_dir` and re-adopts running VMs.
+    fn restore_pending_disks_from_journal(vm: &mut ManagedVm, sock_path: &Path) {
+    let journal_path = sock_path.with_extension("pending-disks.json");
+    let entries = match openvmms_core::store::load_pending_disks_journal(&journal_path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(
+                vm_id = %vm.config.id,
+                path = %journal_path.display(),
+                error = %err,
+                "failed to load pending disk journal for re-adopted VM"
+            );
+            return;
+        }
+    };
+    let surviving: Vec<DiskAttachment> = entries
+        .into_iter()
+        .filter(|pd| {
+            !vm.config
+                .disks
+                .iter()
+                .any(|d| d.lun == pd.lun && d.path == pd.path)
+        })
+        .collect();
+    if !surviving.is_empty() {
+        warn!(
+            vm_id = %vm.config.id,
+            count = surviving.len(),
+            "restoring surviving pending disk reservations from runtime journal for re-adopted VM"
+        );
+        vm.pending_disks.extend(surviving);
+    }
+}
+
+/// Probes existing VM RPC sockets under `runtime_dir` and re-adopts running VMs.
     /// Must only be called after the daemon has validated config and bound its HTTP listener.
     pub fn adopt_running_vms(self: &Arc<Self>) {
         let runtime_dir = self.host_config().runtime_dir;
@@ -379,26 +414,7 @@ impl Supervisor {
                                 .exists()
                                 .then(|| shm_candidate.to_string_lossy().into_owned())
                         });
-                        let surviving_pending: Vec<DiskAttachment> =
-                            openvmms_core::store::load_pending_disks_journal(
-                                &sock_path.with_extension("pending-disks.json"),
-                            )
-                            .into_iter()
-                            .filter(|pd| {
-                                !vm.config
-                                    .disks
-                                    .iter()
-                                    .any(|d| d.lun == pd.lun && d.path == pd.path)
-                            })
-                            .collect();
-                        if !surviving_pending.is_empty() {
-                            warn!(
-                                vm_id = %id,
-                                count = surviving_pending.len(),
-                                "restoring surviving pending disk reservations from runtime journal for re-adopted VM"
-                            );
-                            vm.pending_disks.extend(surviving_pending);
-                        }
+                        Self::restore_pending_disks_from_journal(vm, &sock_path);
                         vm.runtime.revision = self.next_revision();
                         vm.generation = 1;
                         adopted_vms.push((id, sock_path));
@@ -440,26 +456,7 @@ impl Supervisor {
                             vm.runtime.shm_path = shm_candidate
                                 .exists()
                                 .then(|| shm_candidate.to_string_lossy().into_owned());
-                            let surviving_pending: Vec<DiskAttachment> =
-                            openvmms_core::store::load_pending_disks_journal(
-                                &sock_path.with_extension("pending-disks.json"),
-                            )
-                            .into_iter()
-                            .filter(|pd| {
-                                !vm.config
-                                    .disks
-                                    .iter()
-                                    .any(|d| d.lun == pd.lun && d.path == pd.path)
-                            })
-                            .collect();
-                        if !surviving_pending.is_empty() {
-                            warn!(
-                                vm_id = %id,
-                                count = surviving_pending.len(),
-                                "restoring surviving pending disk reservations from runtime journal for re-adopted VM"
-                            );
-                            vm.pending_disks.extend(surviving_pending);
-                        }
+                            Self::restore_pending_disks_from_journal(vm, &sock_path);
                         vm.runtime.revision = self.next_revision();
                             vm.generation = 1;
                             adopted_vms.push((id, sock_path));
