@@ -397,10 +397,6 @@ fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Vhd1Foot
     if &footer[0..8] != b"conectix" {
         return Vhd1FooterParse::Invalid;
     }
-    let version = u32::from_be_bytes([footer[12], footer[13], footer[14], footer[15]]);
-    if version != 0x0001_0000 {
-        return Vhd1FooterParse::UnsupportedVersion(version);
-    }
     let stored_checksum = u32::from_be_bytes([footer[64], footer[65], footer[66], footer[67]]);
     let sum: u32 = footer
         .iter()
@@ -410,6 +406,10 @@ fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Vhd1Foot
         .sum();
     if !sum != stored_checksum {
         return Vhd1FooterParse::Invalid;
+    }
+    let version = u32::from_be_bytes([footer[12], footer[13], footer[14], footer[15]]);
+    if version != 0x0001_0000 {
+        return Vhd1FooterParse::UnsupportedVersion(version);
     }
     let disk_type = u32::from_be_bytes([footer[60], footer[61], footer[62], footer[63]]);
     if !matches!(disk_type, 2..=4) {
@@ -1596,10 +1596,23 @@ mod tests {
             "unexpected legacy 511-byte error: {legacy_err}"
         );
 
+        // Exact 511-byte file exercises the `file_size_bytes < 512` skip path directly.
+        let exact_511_vhd = dir.path().join("exact-511.vhd");
+        fs::write(&exact_511_vhd, &legacy_footer).unwrap();
+        let exact_511_err = inspect_disk(&exact_511_vhd, None).unwrap_err().to_string();
+        assert!(
+            exact_511_err.contains("511-byte Connectix footer")
+                && !exact_511_err.contains("corrupt"),
+            "unexpected exact 511-byte error: {exact_511_err}"
+        );
+
         // Unsupported VHD1 format version reports a clear version mismatch error rather than "corrupt".
         let old_ver_vhd = dir.path().join("unsupported-version.vhd");
         let mut old_ver_footer = build_vhd1_footer(2, 4096, u64::MAX);
         old_ver_footer[12..16].copy_from_slice(&0x0000_0001u32.to_be_bytes());
+        old_ver_footer[64..68].fill(0);
+        let old_ver_sum: u32 = old_ver_footer.iter().map(|&b| b as u32).sum();
+        old_ver_footer[64..68].copy_from_slice(&(!old_ver_sum).to_be_bytes());
         let mut old_ver_bytes = vec![0u8; 4096];
         old_ver_bytes.extend_from_slice(&old_ver_footer);
         fs::write(&old_ver_vhd, &old_ver_bytes).unwrap();
@@ -1608,6 +1621,24 @@ mod tests {
             old_ver_err.contains("unsupported VHD1 format version 0x00000001")
                 && !old_ver_err.contains("corrupt"),
             "unexpected version error: {old_ver_err}"
+        );
+
+        // A dynamic VHD1 with damaged version bytes (bad checksum) in the trailing footer
+        // and a valid backup header at offset 0 must report a corrupt trailing footer, not
+        // an unsupported version.
+        let damaged_ver_vhd = dir.path().join("damaged-version-with-backup.vhd");
+        let mut damaged_trailing = diff_footer;
+        damaged_trailing[12..16].copy_from_slice(&0xdead_beefu32.to_be_bytes());
+        let mut damaged_bytes = Vec::new();
+        damaged_bytes.extend_from_slice(&diff_footer);
+        damaged_bytes.extend_from_slice(&fallback_hdr);
+        damaged_bytes.extend_from_slice(&damaged_trailing);
+        fs::write(&damaged_ver_vhd, &damaged_bytes).unwrap();
+        let damaged_err = inspect_disk(&damaged_ver_vhd, None).unwrap_err().to_string();
+        assert!(
+            damaged_err.contains("corrupt trailing footer")
+                && damaged_err.contains("backup header copy at offset 0 exists"),
+            "unexpected damaged version error: {damaged_err}"
         );
     }
 }
