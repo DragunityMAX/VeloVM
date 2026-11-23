@@ -6,6 +6,7 @@ use controller::BackendHandle;
 use controller::DialogKind;
 use controller::GuiRequest;
 use controller::GuiUpdate;
+use controller::HostConfigPatch;
 use dialogs::ConfirmActionDialog;
 use dialogs::DeleteVmDialog;
 use dialogs::DiskManagerDialog;
@@ -90,7 +91,9 @@ struct OpenVmmsApp {
     vms: Vec<VmSummary>,
     selected_vm: Option<Uuid>,
     daemon_instance_id: Option<Uuid>,
-    last_snapshot_seq: u64,
+    connected_base_url: Option<String>,
+    last_vm_snapshot_seq: u64,
+    last_host_config_seq: u64,
     vm_revisions: std::collections::HashMap<Uuid, u64>,
     deleted_vms: std::collections::HashMap<Uuid, u64>,
     nav_filter: NavFilter,
@@ -103,8 +106,9 @@ struct OpenVmmsApp {
     // Inline inputs in bottom inspector tabs
     attach_disk_input: String,
     mount_iso_input: String,
-    attach_disk_in_flight: std::collections::HashSet<Uuid>,
-    mount_iso_in_flight: std::collections::HashSet<Uuid>,
+    attach_disk_in_flight: std::collections::HashMap<Uuid, u64>,
+    mount_iso_in_flight: std::collections::HashMap<Uuid, u64>,
+    next_storage_op_id: u64,
     pf_proto: IpProto,
     pf_host_addr: String,
     pf_host_port: u16,
@@ -150,7 +154,9 @@ impl OpenVmmsApp {
             vms: Vec::new(),
             selected_vm: None,
             daemon_instance_id: None,
-            last_snapshot_seq: 0,
+            connected_base_url: None,
+            last_vm_snapshot_seq: 0,
+            last_host_config_seq: 0,
             vm_revisions: std::collections::HashMap::new(),
             deleted_vms: std::collections::HashMap::new(),
             nav_filter: NavFilter::All,
@@ -161,8 +167,9 @@ impl OpenVmmsApp {
             error_banner: None,
             attach_disk_input: String::new(),
             mount_iso_input: String::new(),
-            attach_disk_in_flight: std::collections::HashSet::new(),
-            mount_iso_in_flight: std::collections::HashSet::new(),
+            attach_disk_in_flight: std::collections::HashMap::new(),
+            mount_iso_in_flight: std::collections::HashMap::new(),
+            next_storage_op_id: 1,
             pf_proto: IpProto::Tcp,
             pf_host_addr: "127.0.0.1".to_string(),
             pf_host_port: 3389,
@@ -193,36 +200,56 @@ impl OpenVmmsApp {
                 vms,
                 snapshot_seq,
             } => {
-                if snapshot_seq > 0 && snapshot_seq < self.last_snapshot_seq {
+                if snapshot_seq > 0 && snapshot_seq < self.last_vm_snapshot_seq {
                     return;
                 }
-                if snapshot_seq > self.last_snapshot_seq {
-                    self.last_snapshot_seq = snapshot_seq;
+                if snapshot_seq > self.last_vm_snapshot_seq {
+                    self.last_vm_snapshot_seq = snapshot_seq;
                 }
+                let was_connected = self.connected;
+                let prev_id = self.daemon_instance_id;
+                let prev_url = self.connected_base_url.clone();
                 let same_daemon = self.daemon_instance_id.is_some()
                     && self.daemon_instance_id == host_info.daemon_instance_id;
+                let daemon_changed = ((prev_id.is_some() || host_info.daemon_instance_id.is_some())
+                    && prev_id != host_info.daemon_instance_id)
+                    || !was_connected
+                    || prev_url.as_deref() != Some(base_url.as_str());
                 self.daemon_instance_id = host_info.daemon_instance_id;
+                self.connected_base_url = Some(base_url.clone());
+
+                let has_authoritative_rev = host_info.event_revision > 0;
+                let snap_rev_watermark = host_info
+                    .event_revision
+                    .max(vms.iter().map(|v| v.runtime.revision).max().unwrap_or(0));
 
                 self.connected = true;
                 self.host_config_loaded = true;
                 self.connection_status = format!("Connected ({base_url})");
                 self.host_info = Some(host_info);
-                self.host_config = host_config;
+                if snapshot_seq == 0 || snapshot_seq >= self.last_host_config_seq {
+                    self.last_host_config_seq = self.last_host_config_seq.max(snapshot_seq);
+                    self.host_config = host_config;
+                    if let Some(d) = self.host_settings_dlg.as_mut() {
+                        d.sync_from_config(&self.host_config);
+                    }
+                }
                 self.switches = switches;
 
                 if same_daemon {
                     let existing_by_id: std::collections::HashMap<Uuid, VmSummary> =
                         self.vms.drain(..).map(|v| (v.config.id, v)).collect();
-                    let mut merged = Vec::with_capacity(vms.len());
+                    let mut merged = Vec::with_capacity(vms.len().max(existing_by_id.len()));
+                    let mut seen_ids = std::collections::HashSet::with_capacity(vms.len());
                     for vm in vms {
                         let id = vm.config.id;
+                        seen_ids.insert(id);
                         if self.deleted_vms.contains_key(&id) {
                             continue;
                         }
                         let snap_rev = vm.runtime.revision;
                         let known_rev = self.vm_revisions.get(&id).copied().unwrap_or(0);
-                        if snap_rev > 0
-                            && snap_rev < known_rev
+                        if snap_rev < known_rev
                             && let Some(existing) = existing_by_id.get(&id)
                         {
                             merged.push(existing.clone());
@@ -232,6 +259,32 @@ impl OpenVmmsApp {
                             self.vm_revisions.insert(id, snap_rev.max(known_rev));
                         }
                         merged.push(vm);
+                    }
+                    for (id, existing) in existing_by_id {
+                        if seen_ids.contains(&id) || self.deleted_vms.contains_key(&id) {
+                            continue;
+                        }
+                        let known_rev = self
+                            .vm_revisions
+                            .get(&id)
+                            .copied()
+                            .unwrap_or(existing.runtime.revision);
+                        if has_authoritative_rev && known_rev > snap_rev_watermark {
+                            merged.push(existing);
+                        } else {
+                            if has_authoritative_rev {
+                                let del_entry = self.deleted_vms.entry(id).or_insert(0);
+                                *del_entry = (*del_entry).max(snap_rev_watermark);
+                                let rev_entry = self.vm_revisions.entry(id).or_insert(0);
+                                *rev_entry = (*rev_entry).max(snap_rev_watermark);
+                            } else {
+                                self.vm_revisions.remove(&id);
+                            }
+                            if matches!(&self.logs_cache, Some((cached_id, _)) if *cached_id == id)
+                            {
+                                self.logs_cache = None;
+                            }
+                        }
                     }
                     merged.sort_by(|a, b| {
                         a.config
@@ -243,6 +296,11 @@ impl OpenVmmsApp {
                 } else {
                     self.vm_revisions.clear();
                     self.deleted_vms.clear();
+                    if daemon_changed {
+                        self.attach_disk_in_flight.clear();
+                        self.mount_iso_in_flight.clear();
+                    }
+                    self.logs_cache = None;
                     for vm in &vms {
                         if vm.runtime.revision > 0 {
                             self.vm_revisions.insert(vm.config.id, vm.runtime.revision);
@@ -252,8 +310,6 @@ impl OpenVmmsApp {
                 }
 
                 self.error_banner = None;
-                self.attach_disk_in_flight.clear();
-                self.mount_iso_in_flight.clear();
                 self.status_line = format!("{} virtual machine(s) loaded", self.vms.len());
                 if self
                     .selected_vm
@@ -264,8 +320,6 @@ impl OpenVmmsApp {
             }
             GuiUpdate::DaemonDisconnected(reason) => {
                 self.connected = false;
-                self.attach_disk_in_flight.clear();
-                self.mount_iso_in_flight.clear();
                 self.connection_status = "Disconnected".to_string();
                 self.error_banner = Some(reason);
             }
@@ -273,20 +327,25 @@ impl OpenVmmsApp {
                 vm,
                 select,
                 is_details_fetch,
+                daemon_instance_id,
             } => {
+                if self.daemon_instance_id.is_some()
+                    && daemon_instance_id.is_some()
+                    && daemon_instance_id != self.daemon_instance_id
+                {
+                    return;
+                }
                 let id = vm.config.id;
                 if self.deleted_vms.contains_key(&id) {
                     return;
                 }
                 let rev = vm.runtime.revision;
-                if rev > 0 {
-                    let prev_rev = self.vm_revisions.get(&id).copied().unwrap_or(0);
-                    if rev < prev_rev {
-                        if select && self.vms.iter().any(|v| v.config.id == id) {
-                            self.selected_vm = Some(id);
-                        }
-                        return;
+                let prev_rev = self.vm_revisions.get(&id).copied().unwrap_or(0);
+                if rev < prev_rev {
+                    if select && self.vms.iter().any(|v| v.config.id == id) {
+                        self.selected_vm = Some(id);
                     }
+                    return;
                 }
                 if let Some(slot) = self.vms.iter_mut().find(|v| v.config.id == id) {
                     if rev > 0 {
@@ -320,7 +379,17 @@ impl OpenVmmsApp {
                     }
                 }
             }
-            GuiUpdate::VmDeleted { id, revision } => {
+            GuiUpdate::VmDeleted {
+                id,
+                revision,
+                daemon_instance_id,
+            } => {
+                if self.daemon_instance_id.is_some()
+                    && daemon_instance_id.is_some()
+                    && daemon_instance_id != self.daemon_instance_id
+                {
+                    return;
+                }
                 let del_entry = self.deleted_vms.entry(id).or_insert(0);
                 *del_entry = (*del_entry).max(revision);
                 if revision > 0 {
@@ -355,12 +424,41 @@ impl OpenVmmsApp {
                     base_url,
                     host_info,
                     host_config,
+                    snapshot_seq,
                 } => {
-                    self.connected = true;
+                    if snapshot_seq > 0 && snapshot_seq < self.last_host_config_seq {
+                        return;
+                    }
+                    if snapshot_seq > self.last_host_config_seq {
+                        self.last_host_config_seq = snapshot_seq;
+                    }
+                    if let Some(info) = host_info {
+                        let prev_id = self.daemon_instance_id;
+                        let daemon_changed = (prev_id.is_some()
+                            || info.daemon_instance_id.is_some())
+                            && prev_id != info.daemon_instance_id;
+                        if daemon_changed {
+                            self.vms.clear();
+                            self.selected_vm = None;
+                            self.vm_revisions.clear();
+                            self.deleted_vms.clear();
+                            self.attach_disk_in_flight.clear();
+                            self.mount_iso_in_flight.clear();
+                            self.logs_cache = None;
+                            self.backend.send(GuiRequest::RefreshAll);
+                        }
+                        self.daemon_instance_id = info.daemon_instance_id;
+                        self.host_info = Some(info);
+                        self.connected_base_url = Some(base_url.clone());
+                        if self.connected {
+                            self.connection_status = format!("Connected ({base_url})");
+                        }
+                    }
                     self.host_config_loaded = true;
-                    self.connection_status = format!("Connected ({base_url})");
-                    self.host_info = Some(host_info);
                     self.host_config = host_config;
+                    if let Some(d) = self.host_settings_dlg.as_mut() {
+                        d.sync_from_config(&self.host_config);
+                    }
                 }
                 GuiUpdate::DialogFinished { kind, error } => match (kind, error) {
                     (DialogKind::NewVmWizard(wid), None) => {
@@ -398,6 +496,7 @@ impl OpenVmmsApp {
                         if let Some(d) = self.host_settings_dlg.as_mut() {
                             d.submitting = false;
                             d.error = Some(err);
+                            d.sync_from_config(&self.host_config);
                         }
                     }
                     (DialogKind::DeleteVm(id), None) => {
@@ -414,14 +513,15 @@ impl OpenVmmsApp {
                         }
                     }
                 },
-                GuiUpdate::StorageOpFinished { vm_id, op } => match op {
-                    controller::StorageOpKind::AttachDisk => {
-                        self.attach_disk_in_flight.remove(&vm_id);
+                GuiUpdate::StorageOpFinished { vm_id, op, op_id } => {
+                    let map = match op {
+                        controller::StorageOpKind::AttachDisk => &mut self.attach_disk_in_flight,
+                        controller::StorageOpKind::MountIso => &mut self.mount_iso_in_flight,
+                    };
+                    if op_id == 0 || map.get(&vm_id) == Some(&op_id) {
+                        map.remove(&vm_id);
                     }
-                    controller::StorageOpKind::MountIso => {
-                        self.mount_iso_in_flight.remove(&vm_id);
-                    }
-                },
+                }
                 GuiUpdate::StatusMessage(msg) => {
                     self.status_line = msg;
                     self.error_banner = None;
@@ -1078,16 +1178,19 @@ impl OpenVmmsApp {
                     vec!["vhdx", "vhd", "img", "raw"],
                 ));
             }
-            let attach_busy = self.attach_disk_in_flight.contains(&id);
+            let attach_busy = self.attach_disk_in_flight.contains_key(&id);
             let attach_label = if attach_busy { "Attaching…" } else { "Attach" };
             let can_attach = !attach_busy && !self.attach_disk_input.trim().is_empty();
             if ui
                 .add_enabled(can_attach, egui::Button::new(attach_label))
                 .clicked()
             {
-                self.attach_disk_in_flight.insert(id);
+                let op_id = self.next_storage_op_id;
+                self.next_storage_op_id += 1;
+                self.attach_disk_in_flight.insert(id, op_id);
                 self.backend.send(GuiRequest::AttachDisk {
                     id,
+                    op_id,
                     payload: AttachDiskPayload {
                         path: PathBuf::from(self.attach_disk_input.trim()),
                         lun: None,
@@ -1109,7 +1212,7 @@ impl OpenVmmsApp {
                     vec!["iso"],
                 ));
             }
-            let mount_busy = self.mount_iso_in_flight.contains(&id);
+            let mount_busy = self.mount_iso_in_flight.contains_key(&id);
             let mount_label = if mount_busy {
                 "Mounting…"
             } else {
@@ -1120,9 +1223,12 @@ impl OpenVmmsApp {
                 .add_enabled(can_mount, egui::Button::new(mount_label))
                 .clicked()
             {
-                self.mount_iso_in_flight.insert(id);
+                let op_id = self.next_storage_op_id;
+                self.next_storage_op_id += 1;
+                self.mount_iso_in_flight.insert(id, op_id);
                 self.backend.send(GuiRequest::MountIso {
                     id,
+                    op_id,
                     payload: MountIsoPayload {
                         path: PathBuf::from(self.mount_iso_input.trim()),
                         lun: None,
@@ -1471,6 +1577,7 @@ fn run_self_test() -> anyhow::Result<()> {
     std::fs::write(&iso_path, vec![0u8; 4096])?;
     app.backend.send(GuiRequest::MountIso {
         id: vm_id,
+        op_id: 1,
         payload: MountIsoPayload {
             path: iso_path.clone(),
             lun: None,
@@ -1531,10 +1638,10 @@ fn run_self_test() -> anyhow::Result<()> {
 
     // Render HostSettingsDialog and verify saving config keeps client connected on daemon's actual URL.
     let host_dlg = HostSettingsDialog::from_config(&app.host_config);
-    let host_cfg = host_dlg.base_config.clone();
     app.host_settings_dlg = Some(host_dlg);
     let _ = step_headless_ui(&ctx, &mut app, 2);
-    app.backend.send(GuiRequest::SaveHostConfig(host_cfg));
+    app.backend
+        .send(GuiRequest::SaveHostConfig(HostConfigPatch::default()));
     wait_for_app(&ctx, &mut app, Duration::from_secs(15), "host settings save", |a| {
         a.host_settings_dlg.is_none()
     })?;
@@ -1609,6 +1716,7 @@ mod tests {
             runtime_dir: PathBuf::from("/tmp"),
             listen_addr: "127.0.0.1:0".into(),
             daemon_instance_id,
+            event_revision: 0,
             resolved_paths: Default::default(),
         }
     }
@@ -1637,6 +1745,7 @@ mod tests {
             vm: make_test_vm(vm_b_id, "Beta", VmStatus::Off, 2),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(app.vms.len(), 2);
         assert_eq!(app.selected_vm, Some(vm_a_id));
@@ -1647,12 +1756,14 @@ mod tests {
             vm: make_test_vm(vm_c_id, "Gamma", VmStatus::Running, 4),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(app.selected_vm, Some(vm_a_id));
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_c_id, "Gamma", VmStatus::Off, 3),
             select: true,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(app.selected_vm, Some(vm_c_id));
         let vm_c = app.vms.iter().find(|v| v.config.id == vm_c_id).unwrap();
@@ -1698,11 +1809,13 @@ mod tests {
             vm: make_test_vm(vm_a_id, "Alpha", VmStatus::Running, 5),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_a_id, "Alpha", VmStatus::Off, 3),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         assert_eq!(
             app.vms.iter().find(|v| v.config.id == vm_a_id).unwrap().runtime.status,
@@ -1713,6 +1826,7 @@ mod tests {
         app.apply_update(GuiUpdate::VmDeleted {
             id: vm_b_id,
             revision: 6,
+            daemon_instance_id: Some(daemon_id),
         });
         assert!(!app.vms.iter().any(|v| v.config.id == vm_b_id));
 
@@ -1720,16 +1834,19 @@ mod tests {
             vm: make_test_vm(vm_b_id, "Beta", VmStatus::Off, 2),
             select: false,
             is_details_fetch: true,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(unknown_id, "Unknown", VmStatus::Off, 1),
             select: false,
             is_details_fetch: true,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::VmUpdated {
             vm: make_test_vm(vm_b_id, "Beta", VmStatus::Off, 2),
             select: false,
             is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
         });
         app.apply_update(GuiUpdate::DaemonConnected {
             base_url: "http://127.0.0.1:1".into(),
@@ -1789,20 +1906,22 @@ mod tests {
         let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
         let vm_id = Uuid::new_v4();
 
-        app.attach_disk_in_flight.insert(vm_id);
-        app.mount_iso_in_flight.insert(vm_id);
+        app.attach_disk_in_flight.insert(vm_id, 1);
+        app.mount_iso_in_flight.insert(vm_id, 2);
         app.apply_update(GuiUpdate::StorageOpFinished {
             vm_id,
             op: controller::StorageOpKind::AttachDisk,
+            op_id: 1,
         });
-        assert!(!app.attach_disk_in_flight.contains(&vm_id));
-        assert!(app.mount_iso_in_flight.contains(&vm_id));
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_id));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_id));
 
         app.apply_update(GuiUpdate::StorageOpFinished {
             vm_id,
             op: controller::StorageOpKind::MountIso,
+            op_id: 2,
         });
-        assert!(!app.mount_iso_in_flight.contains(&vm_id));
+        assert!(!app.mount_iso_in_flight.contains_key(&vm_id));
     }
 
     #[test]
@@ -1850,6 +1969,7 @@ mod tests {
         app.apply_update(GuiUpdate::VmDeleted {
             id: vm_b,
             revision: 2,
+            daemon_instance_id: Some(daemon_id),
         });
         assert!(app.logs_cache.is_none());
     }
@@ -1888,6 +2008,510 @@ mod tests {
         assert!(
             app.last_log_fetch > stale_ts,
             "connected ConsoleLogs tab should poll logs when interval elapsed"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_preserves_just_created_vm_while_fresher_snapshot_drops_unseen_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_id = Uuid::new_v4();
+        let vm_a = Uuid::new_v4();
+        let vm_b = Uuid::new_v4();
+
+        let mut info1 = make_host_info(Some(daemon_id));
+        info1.event_revision = 1;
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: info1,
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 1,
+        });
+
+        // Newly created VM arrives over SSE at revision 5.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_b, "Beta", VmStatus::Off, 5),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
+        });
+        assert!(app.vms.iter().any(|v| v.config.id == vm_b));
+
+        // Older snapshot (watermark 2 < Beta's revision 5) omits Beta -> Beta must be preserved.
+        let mut stale_info = make_host_info(Some(daemon_id));
+        stale_info.event_revision = 2;
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: stale_info,
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Off, 2)],
+            snapshot_seq: 2,
+        });
+        assert!(
+            app.vms.iter().any(|v| v.config.id == vm_b),
+            "just-created VM with rev 5 must survive stale snapshot at rev 2"
+        );
+
+        // Fresher snapshot (watermark 6 >= Beta's revision 5) omits Beta -> Beta was deleted, so drop it.
+        app.selected_vm = Some(vm_b);
+        app.logs_cache = Some((vm_b, "stale beta logs".into()));
+        let mut fresh_info = make_host_info(Some(daemon_id));
+        fresh_info.event_revision = 6;
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: fresh_info,
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Off, 6)],
+            snapshot_seq: 3,
+        });
+        assert!(
+            !app.vms.iter().any(|v| v.config.id == vm_b),
+            "VM omitted from fresher snapshot at rev 6 must be dropped"
+        );
+        assert!(
+            app.deleted_vms.contains_key(&vm_b),
+            "VM omitted from fresher snapshot must be recorded in deleted_vms"
+        );
+        assert!(
+            app.logs_cache.is_none(),
+            "logs_cache for snapshot-dropped VM must be cleared"
+        );
+
+        // Late VmUpdated at prev_rev (or even rev 6) must not resurrect the snapshot-dropped VM.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_b, "Beta", VmStatus::Off, 5),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
+        });
+        assert!(!app.vms.iter().any(|v| v.config.id == vm_b));
+
+        // Stale rev=0 snapshot and stale rev=0 VmUpdated must not overwrite a VM at known_rev > 0.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_a, "Alpha", VmStatus::Running, 7),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
+        });
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_a, "Alpha", VmStatus::Off, 0),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_id),
+        });
+        assert_eq!(
+            app.vms.iter().find(|v| v.config.id == vm_a).unwrap().runtime.status,
+            VmStatus::Running
+        );
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Off, 0)],
+            snapshot_seq: 4,
+        });
+        assert_eq!(
+            app.vms.iter().find(|v| v.config.id == vm_a).unwrap().runtime.status,
+            VmStatus::Running
+        );
+    }
+
+    #[test]
+    fn same_daemon_snapshot_preserves_inflight_attach_and_mount_while_new_daemon_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_1 = Uuid::new_v4();
+        let daemon_2 = Uuid::new_v4();
+        let vm_a = Uuid::new_v4();
+
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_1)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Running, 1)],
+            snapshot_seq: 1,
+        });
+        app.attach_disk_in_flight.insert(vm_a, 1);
+        app.mount_iso_in_flight.insert(vm_a, 2);
+
+        // Same-daemon snapshot arrives mid-operation -> keep buttons disabled.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_1)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Running, 2)],
+            snapshot_seq: 2,
+        });
+        assert!(app.attach_disk_in_flight.contains_key(&vm_a));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_a));
+
+        // Transient DaemonDisconnected on same daemon must keep buttons disabled until worker finishes.
+        app.apply_update(GuiUpdate::DaemonDisconnected("transient drop".into()));
+        assert!(app.attach_disk_in_flight.contains_key(&vm_a));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_a));
+
+        // Different daemon instance -> clear stale in-flight flags.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_2)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Running, 1)],
+            snapshot_seq: 3,
+        });
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_a));
+        assert!(!app.mount_iso_in_flight.contains_key(&vm_a));
+
+        // Stale StorageOpFinished with old op_id must not clear a newer op_id.
+        app.attach_disk_in_flight.insert(vm_a, 10);
+        app.apply_update(GuiUpdate::StorageOpFinished {
+            vm_id: vm_a,
+            op: controller::StorageOpKind::AttachDisk,
+            op_id: 1,
+        });
+        assert_eq!(app.attach_disk_in_flight.get(&vm_a), Some(&10));
+        app.apply_update(GuiUpdate::StorageOpFinished {
+            vm_id: vm_a,
+            op: controller::StorageOpKind::AttachDisk,
+            op_id: 10,
+        });
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_a));
+    }
+
+    #[test]
+    fn late_update_from_previous_daemon_instance_does_not_block_new_daemon_lower_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_a = Uuid::new_v4();
+        let daemon_b = Uuid::new_v4();
+        let vm_id = Uuid::new_v4();
+
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_a)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 50)],
+            snapshot_seq: 1,
+        });
+
+        // Switch to daemon_b (restarted daemon whose revision counter restarted at 1).
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_b)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 2,
+        });
+
+        // Late VmUpdated / VmDeleted from daemon_a with high revision 99 must be ignored.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_id, "Alpha", VmStatus::Running, 99),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_a),
+        });
+        app.apply_update(GuiUpdate::VmDeleted {
+            id: vm_id,
+            revision: 100,
+            daemon_instance_id: Some(daemon_a),
+        });
+        assert_eq!(app.vms.len(), 1);
+        assert_eq!(app.vms[0].runtime.status, VmStatus::Off);
+
+        // Lower-revision update from daemon_b (revision 2) must still apply cleanly.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_id, "Alpha", VmStatus::Running, 2),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_b),
+        });
+        assert_eq!(app.vms[0].runtime.status, VmStatus::Running);
+        assert_eq!(app.vms[0].runtime.revision, 2);
+    }
+
+    #[test]
+    fn refresh_with_missing_daemon_instance_id_preserves_inflight_flags_on_same_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let vm_id = Uuid::new_v4();
+
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 1)],
+            snapshot_seq: 1,
+        });
+        app.attach_disk_in_flight.insert(vm_id, 1);
+        app.mount_iso_in_flight.insert(vm_id, 2);
+
+        // Refresh on same URL while connected with daemon_instance_id == None preserves flags.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 2)],
+            snapshot_seq: 2,
+        });
+        assert!(app.attach_disk_in_flight.contains_key(&vm_id));
+        assert!(app.mount_iso_in_flight.contains_key(&vm_id));
+
+        // Switching to a different URL clears flags.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:2".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Running, 1)],
+            snapshot_seq: 3,
+        });
+        assert!(!app.attach_disk_in_flight.contains_key(&vm_id));
+        assert!(!app.mount_iso_in_flight.contains_key(&vm_id));
+    }
+
+    #[test]
+    fn legacy_daemon_without_event_revision_drops_deleted_vm_on_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let vm_a = Uuid::new_v4();
+        let vm_b = Uuid::new_v4();
+
+        // Older daemon from main: event_revision == 0, daemon_instance_id == None.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 1,
+        });
+
+        // VM B arrives at revision 5, then the live SSE stream drops and B is deleted via CLI.
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_b, "Beta", VmStatus::Off, 5),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: None,
+        });
+        assert!(app.vms.iter().any(|v| v.config.id == vm_b));
+
+        // Reconnect snapshot from legacy daemon (event_revision == 0) only includes Alpha (rev 1).
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(None),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_a, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 2,
+        });
+        assert!(
+            !app.vms.iter().any(|v| v.config.id == vm_b),
+            "deleted VM omitted from legacy daemon snapshot (event_revision == 0) must not be stranded"
+        );
+    }
+
+    #[test]
+    fn host_config_updated_ignores_out_of_order_and_syncs_restarted_daemon_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_1 = Uuid::new_v4();
+        let daemon_2 = Uuid::new_v4();
+        let vm_id = Uuid::new_v4();
+
+        let mut cfg_old = HostConfig::default();
+        cfg_old.openvmm_bin = Some(PathBuf::from("/tmp/old-openvmm"));
+        let mut cfg_new = HostConfig::default();
+        cfg_new.openvmm_bin = Some(PathBuf::from("/tmp/new-openvmm"));
+
+        // Newer snapshot (seq=5) arrives before an earlier save response (seq=2).
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_1)),
+            host_config: cfg_new.clone(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_id, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 5,
+        });
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: Some(make_host_info(Some(daemon_1))),
+            host_config: cfg_old,
+            snapshot_seq: 2,
+        });
+        assert_eq!(app.host_config.openvmm_bin, cfg_new.openvmm_bin);
+        assert_eq!(app.last_vm_snapshot_seq, 5);
+        assert_eq!(app.last_host_config_seq, 5);
+
+        // Save response from a restarted daemon (daemon_2, seq=6) updates daemon_instance_id,
+        // immediately clears the previous daemon's VM list, and accepts subsequent VmUpdated events
+        // from daemon_2.
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: Some(make_host_info(Some(daemon_2))),
+            host_config: cfg_new,
+            snapshot_seq: 6,
+        });
+        assert_eq!(app.daemon_instance_id, Some(daemon_2));
+        assert!(app.vms.is_empty());
+        assert_eq!(app.selected_vm, None);
+        app.apply_update(GuiUpdate::VmUpdated {
+            vm: make_test_vm(vm_id, "Alpha", VmStatus::Running, 1),
+            select: false,
+            is_details_fetch: false,
+            daemon_instance_id: Some(daemon_2),
+        });
+        assert_eq!(
+            app.vms.iter().find(|v| v.config.id == vm_id).unwrap().runtime.status,
+            VmStatus::Running
+        );
+    }
+
+    #[test]
+    fn host_config_updated_without_host_info_does_not_mark_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        assert!(!app.connected);
+        let initial_status = app.connection_status.clone();
+
+        let mut cfg = HostConfig::default();
+        cfg.openvmm_bin = Some(PathBuf::from("/tmp/updated-openvmm"));
+
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: None,
+            host_config: cfg.clone(),
+            snapshot_seq: 1,
+        });
+
+        assert!(!app.connected);
+        assert_eq!(app.connected_base_url, None);
+        assert_eq!(app.connection_status, initial_status);
+        assert!(app.host_config_loaded);
+        assert_eq!(app.host_config.openvmm_bin, cfg.openvmm_bin);
+    }
+
+    #[test]
+    fn host_config_updated_does_not_drop_in_flight_vm_snapshot_or_flip_disconnected_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_id = Uuid::new_v4();
+        let vm_old_id = Uuid::new_v4();
+        let vm_new_id = Uuid::new_v4();
+
+        let mut cfg_before = HostConfig::default();
+        cfg_before.openvmm_bin = Some(PathBuf::from("/tmp/before-openvmm"));
+        let mut cfg_saved = HostConfig::default();
+        cfg_saved.openvmm_bin = Some(PathBuf::from("/tmp/saved-openvmm"));
+
+        // Initial snapshot at seq 1, then disconnect before saving host settings.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: cfg_before.clone(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_old_id, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 1,
+        });
+        app.apply_update(GuiUpdate::DaemonDisconnected("stream down".into()));
+        assert!(!app.connected);
+
+        // SaveHostConfig completes at seq 3 while a resync snapshot (seq 2) is in flight.
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: Some(make_host_info(Some(daemon_id))),
+            host_config: cfg_saved.clone(),
+            snapshot_seq: 3,
+        });
+        assert!(
+            !app.connected,
+            "HostConfigUpdated while SSE is disconnected must not flip connected banner back on"
+        );
+        assert_eq!(app.connection_status, "Disconnected");
+
+        // In-flight VM snapshot at seq 2 arrives after seq 3 HostConfigUpdated:
+        // VM list must still update, while newer host_config from seq 3 is preserved.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: cfg_before,
+            switches: vec![],
+            vms: vec![
+                make_test_vm(vm_old_id, "Alpha", VmStatus::Off, 1),
+                make_test_vm(vm_new_id, "Beta", VmStatus::Running, 2),
+            ],
+            snapshot_seq: 2,
+        });
+        assert!(app.vms.iter().any(|v| v.config.id == vm_new_id));
+        assert_eq!(app.host_config.openvmm_bin, cfg_saved.openvmm_bin);
+        assert_eq!(app.last_vm_snapshot_seq, 2);
+        assert_eq!(app.last_host_config_seq, 3);
+    }
+
+    #[test]
+    fn failed_host_settings_save_resyncs_dialog_initial_values_from_latest_host_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+
+        let initial_cfg = HostConfig {
+            listen_addr: "127.0.0.1:47620".into(),
+            openvmm_bin: Some(PathBuf::from("/old/openvmm")),
+            uefi_firmware_path: Some(PathBuf::from("/old/MSVM.fd")),
+            ..Default::default()
+        };
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:47620".into(),
+            host_info: None,
+            host_config: initial_cfg.clone(),
+            snapshot_seq: 1,
+        });
+
+        let mut dlg = HostSettingsDialog::from_config(&app.host_config);
+        dlg.openvmm_bin = "/bad/openvmm".into();
+        dlg.submitting = true;
+        app.host_settings_dlg = Some(dlg);
+
+        // While save is in flight, an external config change arrives and updates app.host_config.
+        let external_cfg = HostConfig {
+            listen_addr: "127.0.0.1:47620".into(),
+            openvmm_bin: Some(PathBuf::from("/old/openvmm")),
+            uefi_firmware_path: Some(PathBuf::from("/cli/MSVM.fd")),
+            ..Default::default()
+        };
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:47620".into(),
+            host_info: None,
+            host_config: external_cfg,
+            snapshot_seq: 2,
+        });
+
+        // Save fails: dialog clears submitting, shows error, and syncs unedited/initial fields.
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::HostSettings,
+            error: Some("invalid openvmm path".into()),
+        });
+
+        let dlg = app.host_settings_dlg.as_ref().unwrap();
+        assert!(!dlg.submitting);
+        assert_eq!(dlg.error.as_deref(), Some("invalid openvmm path"));
+        assert_eq!(dlg.openvmm_bin, "/bad/openvmm");
+        assert_eq!(dlg.uefi_firmware_path, "/cli/MSVM.fd");
+        assert_eq!(dlg.initial_uefi_firmware_path, "/cli/MSVM.fd");
+        let patch = dlg.build_patch();
+        assert!(patch.uefi_firmware_path.is_none());
+        assert_eq!(
+            patch.openvmm_bin,
+            Some(Some(PathBuf::from("/bad/openvmm")))
         );
     }
 }

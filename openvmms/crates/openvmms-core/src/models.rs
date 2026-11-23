@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub const DEFAULT_DAEMON_PORT: u16 = 47620;
 pub const DEFAULT_DAEMON_LISTEN: &str = "127.0.0.1:47620";
 pub const MAX_VM_MEMORY_MB: u64 = 16 * 1024 * 1024;
+pub const EVENT_REVISION_HEADER: &str = "x-openvmms-event-revision";
 
 /// Parses and validates a loopback HTTP listen address (e.g. `127.0.0.1:47620`,
 /// `[::1]:47620`, or `http://localhost:47620`), rejecting arbitrary hostnames and
@@ -67,6 +68,84 @@ pub struct HostConfig {
     pub fastdesk_viewer_bin: Option<PathBuf>,
     pub openvmm_img_bin: Option<PathBuf>,
     pub uefi_firmware_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfigPatch {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_null_string"
+    )]
+    pub listen_addr: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub openvmm_bin: Option<Option<PathBuf>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub fastdesk_viewer_bin: Option<Option<PathBuf>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub openvmm_img_bin: Option<Option<PathBuf>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable_path"
+    )]
+    pub uefi_firmware_path: Option<Option<PathBuf>>,
+}
+
+impl HostConfigPatch {
+    pub fn is_empty(&self) -> bool {
+        self.listen_addr.is_none()
+            && self.openvmm_bin.is_none()
+            && self.fastdesk_viewer_bin.is_none()
+            && self.openvmm_img_bin.is_none()
+            && self.uefi_firmware_path.is_none()
+    }
+
+    pub fn apply_to(&self, cfg: &mut HostConfig) {
+        if let Some(addr) = &self.listen_addr {
+            cfg.listen_addr = addr.clone();
+        }
+        if let Some(val) = &self.openvmm_bin {
+            cfg.openvmm_bin = val.clone();
+        }
+        if let Some(val) = &self.fastdesk_viewer_bin {
+            cfg.fastdesk_viewer_bin = val.clone();
+        }
+        if let Some(val) = &self.openvmm_img_bin {
+            cfg.openvmm_img_bin = val.clone();
+        }
+        if let Some(val) = &self.uefi_firmware_path {
+            cfg.uefi_firmware_path = val.clone();
+        }
+    }
+
+    pub fn from_diff(base: &HostConfig, edited: &HostConfig) -> Self {
+        Self {
+            listen_addr: (edited.listen_addr != base.listen_addr)
+                .then(|| edited.listen_addr.clone()),
+            openvmm_bin: (edited.openvmm_bin != base.openvmm_bin)
+                .then(|| edited.openvmm_bin.clone()),
+            fastdesk_viewer_bin: (edited.fastdesk_viewer_bin != base.fastdesk_viewer_bin)
+                .then(|| edited.fastdesk_viewer_bin.clone()),
+            openvmm_img_bin: (edited.openvmm_img_bin != base.openvmm_img_bin)
+                .then(|| edited.openvmm_img_bin.clone()),
+            uefi_firmware_path: (edited.uefi_firmware_path != base.uefi_firmware_path)
+                .then(|| edited.uefi_firmware_path.clone()),
+        }
+    }
 }
 
 impl Default for HostConfig {
@@ -160,18 +239,25 @@ pub fn normalize_path_key(path: &Path) -> PathBuf {
     }
 }
 
-/// Validates a unicast 6-octet IEEE 802 MAC address (`-` or `:` separated).
-pub fn validate_mac_address(mac: &str) -> anyhow::Result<()> {
-    let trimmed = mac.trim();
-    let sep = if trimmed.contains('-') && !trimmed.contains(':') {
+/// Validates a unicast 6-octet IEEE 802 MAC address (`-` or `:` separated) and
+/// returns its 6 octets. Rejects leading or trailing whitespace.
+pub fn parse_mac_bytes(mac: &str) -> anyhow::Result<[u8; 6]> {
+    if mac != mac.trim() {
+        bail!("MAC address '{mac}' cannot have leading or trailing whitespace");
+    }
+    let sep = if mac.contains('-') && !mac.contains(':') {
         '-'
-    } else if trimmed.contains(':') && !trimmed.contains('-') {
+    } else if mac.contains(':') && !mac.contains('-') {
         ':'
     } else {
         bail!("invalid MAC address '{mac}' (expected 6 hex octets separated by '-' or ':')");
     };
-    let parts: Vec<&str> = trimmed.split(sep).collect();
-    if parts.len() != 6 || parts.iter().any(|p| p.len() != 2) {
+    let parts: Vec<&str> = mac.split(sep).collect();
+    if parts.len() != 6
+        || parts
+            .iter()
+            .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
         bail!("invalid MAC address '{mac}' (expected 6 hex octets)");
     }
     let mut bytes = [0u8; 6];
@@ -185,7 +271,12 @@ pub fn validate_mac_address(mac: &str) -> anyhow::Result<()> {
     if (bytes[0] & 0x01) != 0 {
         bail!("invalid MAC address '{mac}': must be a unicast MAC address");
     }
-    Ok(())
+    Ok(bytes)
+}
+
+/// Validates a unicast 6-octet IEEE 802 MAC address (`-` or `:` separated).
+pub fn validate_mac_address(mac: &str) -> anyhow::Result<()> {
+    parse_mac_bytes(mac).map(|_| ())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -288,16 +379,58 @@ fn cargo_workspace_repo_root(exe_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Resolves an explicit file path (e.g. per-VM `uefi_firmware`) against CWD, the
+/// current executable directory, and any enclosing Cargo workspace root.
+pub fn resolve_explicit_file_path(explicit: &Path) -> Option<PathBuf> {
+    if explicit.as_os_str().is_empty() {
+        return None;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().ok();
+    resolve_file_candidate(
+        Some(explicit),
+        exe_dir.as_deref(),
+        cwd.as_deref(),
+        None,
+        &[],
+    )
+}
+
 fn resolve_binary_candidate(
     explicit: Option<&Path>,
     exe_dir: Option<&Path>,
     bin_name: &str,
     workspace_rel: &[&str],
 ) -> Option<PathBuf> {
-    if let Some(p) = explicit
-        && p.is_file()
-    {
-        return Some(p.to_path_buf());
+    if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
+        if p.is_absolute() {
+            return p.is_file().then(|| p.to_path_buf());
+        }
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+        if let Some(dir) = exe_dir {
+            let candidate = dir.join(p);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if let Some(root) = cargo_workspace_repo_root(dir) {
+                for base in [root.as_path(), root.join("openvmms").as_path()] {
+                    let c = base.join(p);
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        if p.components().count() == 1
+            && let Some(name) = p.to_str()
+        {
+            return find_in_path(name);
+        }
+        return None;
     }
     if let Some(dir) = exe_dir {
         let candidate = dir.join(bin_name);
@@ -325,10 +458,29 @@ fn resolve_file_candidate(
     env_override: Option<&Path>,
     rel_paths: &[&str],
 ) -> Option<PathBuf> {
-    if let Some(p) = explicit
-        && p.is_file()
-    {
-        return Some(p.to_path_buf());
+    if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
+        if p.is_absolute() {
+            return p.is_file().then(|| p.to_path_buf());
+        }
+        let cwd_candidate = cwd.map(|d| d.join(p)).unwrap_or_else(|| p.to_path_buf());
+        if cwd_candidate.is_file() {
+            return Some(cwd_candidate);
+        }
+        if let Some(dir) = exe_dir {
+            let candidate = dir.join(p);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if let Some(root) = cargo_workspace_repo_root(dir) {
+                for base in [root.as_path(), root.join("openvmms").as_path()] {
+                    let c = base.join(p);
+                    if c.is_file() {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        return None;
     }
     if let Some(p) = env_override
         && p.is_file()
@@ -429,8 +581,8 @@ impl DiskFormat {
             .map(|s| s.to_ascii_lowercase())
             .as_deref()
         {
-            Some("vhdx") => Self::Vhdx,
-            Some("vhd") => Self::Vhd,
+            Some("vhdx" | "avhdx") => Self::Vhdx,
+            Some("vhd" | "avhd") => Self::Vhd,
             Some("iso") => Self::Iso,
             _ => Self::Raw,
         }
@@ -497,6 +649,21 @@ impl std::fmt::Display for PortForward {
     }
 }
 
+fn canonical_bind_ip(addr: &str) -> Option<std::net::IpAddr> {
+    let trimmed = addr.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    match trimmed.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => Some(std::net::IpAddr::V4(v4)),
+        std::net::IpAddr::V6(v6) => Some(
+            v6.to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+        ),
+    }
+}
+
 impl PortForward {
     pub fn normalize(&mut self) {
         let trimmed = self.host_addr.trim();
@@ -508,9 +675,19 @@ impl PortForward {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.host_addr
+        let ip = self
+            .host_addr
             .parse::<std::net::IpAddr>()
             .with_context(|| format!("invalid port forward host address '{}'", self.host_addr))?;
+        if let std::net::IpAddr::V6(v6) = ip
+            && let Some(v4) = v6.to_ipv4_mapped()
+        {
+            bail!(
+                "IPv4-mapped IPv6 port forward host address '{}' is not supported; use IPv4 address '{}' instead",
+                self.host_addr,
+                v4
+            );
+        }
         if self.host_port == 0 {
             bail!("port forward host_port must be >= 1");
         }
@@ -518,6 +695,44 @@ impl PortForward {
             bail!("port forward guest_port must be >= 1");
         }
         Ok(())
+    }
+
+    pub fn overlaps(&self, other: &PortForward) -> bool {
+        if self.protocol != other.protocol || self.host_port != other.host_port {
+            return false;
+        }
+        match (
+            canonical_bind_ip(&self.host_addr),
+            canonical_bind_ip(&other.host_addr),
+        ) {
+            (Some(std::net::IpAddr::V4(a)), Some(std::net::IpAddr::V4(b))) => {
+                a == b || a.is_unspecified() || b.is_unspecified()
+            }
+            (Some(std::net::IpAddr::V6(a)), Some(std::net::IpAddr::V6(b))) => {
+                a == b || a.is_unspecified() || b.is_unspecified()
+            }
+            (Some(_), Some(_)) => false,
+            _ => self
+                .host_addr
+                .trim()
+                .eq_ignore_ascii_case(other.host_addr.trim()),
+        }
+    }
+
+    pub fn same_nic_guest_conflict(&self, other: &PortForward) -> bool {
+        if self.protocol != other.protocol || self.guest_port != other.guest_port {
+            return false;
+        }
+        match (
+            canonical_bind_ip(&self.host_addr),
+            canonical_bind_ip(&other.host_addr),
+        ) {
+            (Some(a), Some(b)) => a.is_ipv4() == b.is_ipv4(),
+            _ => self
+                .host_addr
+                .trim()
+                .eq_ignore_ascii_case(other.host_addr.trim()),
+        }
     }
 }
 
@@ -631,6 +846,39 @@ impl NicAttachment {
             name: "Default NAT".to_string(),
             mac_address: generate_hyperv_mac(),
             backend: NicBackendConfig::default(),
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        self.mac_address = self.mac_address.trim().to_string();
+        match &mut self.backend {
+            NicBackendConfig::Consomme {
+                cidr,
+                port_forwards,
+                ..
+            } => {
+                *cidr = cidr
+                    .take()
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty());
+                for pf in port_forwards {
+                    pf.normalize();
+                }
+            }
+            NicBackendConfig::VmSwitch {
+                switch_id,
+                switch_name,
+            } => {
+                *switch_id = switch_id.trim().to_string();
+                *switch_name = switch_name
+                    .take()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty());
+            }
+            NicBackendConfig::Tap { name } => {
+                *name = name.trim().to_string();
+            }
         }
     }
 }
@@ -748,96 +996,214 @@ impl VmConfig {
         }
     }
 
-    pub fn validate(&self) -> anyhow::Result<()> {
-        validate_vm_name(&self.name)?;
-        if self.name != self.name.trim() {
-            bail!("VM name cannot have leading or trailing whitespace");
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        self.fastdesk.listen_addr = self.fastdesk.listen_addr.trim().to_string();
+        for nic in &mut self.nics {
+            nic.normalize();
         }
-        if self.vcpus == 0 || self.vcpus > 256 {
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmValidationOptions {
+    pub validate_name: bool,
+    pub validate_vcpus: bool,
+    pub validate_memory: bool,
+    pub validate_fastdesk: bool,
+    pub validate_disks: bool,
+    pub strict_disks_absolute: bool,
+    pub validate_nics: bool,
+    pub strict_nic_conflicts: bool,
+}
+
+impl VmValidationOptions {
+    pub fn strict() -> Self {
+        Self {
+            validate_name: true,
+            validate_vcpus: true,
+            validate_memory: true,
+            validate_fastdesk: true,
+            validate_disks: true,
+            strict_disks_absolute: true,
+            validate_nics: true,
+            strict_nic_conflicts: true,
+        }
+    }
+
+    pub fn for_update(payload: &UpdateVmPayload) -> Self {
+        Self {
+            validate_name: payload.name.is_some(),
+            validate_vcpus: payload.vcpus.is_some(),
+            validate_memory: payload.memory_mb.is_some(),
+            validate_fastdesk: payload.fastdesk.is_some(),
+            validate_disks: payload.disks.is_some(),
+            strict_disks_absolute: payload.disks.is_some(),
+            validate_nics: payload.nics.is_some(),
+            strict_nic_conflicts: payload.nics.is_some(),
+        }
+    }
+}
+
+impl VmConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_with_options(true, true)
+    }
+
+    pub fn validate_with_options(
+        &self,
+        strict_disks_absolute: bool,
+        strict_nic_conflicts: bool,
+    ) -> anyhow::Result<()> {
+        self.validate_with_field_options(VmValidationOptions {
+            strict_disks_absolute,
+            strict_nic_conflicts,
+            ..VmValidationOptions::strict()
+        })
+    }
+
+    pub fn validate_with_field_options(&self, opts: VmValidationOptions) -> anyhow::Result<()> {
+        if opts.validate_name {
+            validate_vm_name(&self.name)?;
+            if self.name != self.name.trim() {
+                bail!("VM name cannot have leading or trailing whitespace");
+            }
+        }
+        if opts.validate_vcpus && (self.vcpus == 0 || self.vcpus > 256) {
             bail!("vcpus must be between 1 and 256");
         }
-        if self.memory_mb < 128 || self.memory_mb > MAX_VM_MEMORY_MB {
+        if opts.validate_memory && (self.memory_mb < 128 || self.memory_mb > MAX_VM_MEMORY_MB) {
             bail!("memory_mb must be between 128 and {MAX_VM_MEMORY_MB} MiB");
         }
-        if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
-            bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
-        }
-        if !self.fastdesk.listen_addr.trim().is_empty() {
-            parse_loopback_listen_addr(&self.fastdesk.listen_addr)
-                .context("invalid fastdesk.listen_addr")?;
-        }
-        let mut seen_luns = std::collections::HashSet::new();
-        let mut seen_disk_paths = std::collections::HashSet::new();
-        for disk in &self.disks {
-            if disk.lun > 255 {
-                bail!("SCSI LUN {} is out of range (must be between 0 and 255)", disk.lun);
+        if opts.validate_fastdesk {
+            if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
+                bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
             }
-            if disk.path.as_os_str().is_empty() {
-                bail!("disk path at SCSI LUN {} cannot be empty", disk.lun);
-            }
-            if (disk.format == DiskFormat::Iso || DiskFormat::from_path(&disk.path) == DiskFormat::Iso)
-                && (disk.kind != DiskKind::Dvd || !disk.read_only)
-            {
-                bail!(
-                    "ISO image '{}' at SCSI LUN {} must be attached as a read-only DVD drive",
-                    disk.path.display(),
-                    disk.lun
-                );
-            }
-            if !seen_luns.insert(disk.lun) {
-                bail!("duplicate SCSI LUN {}", disk.lun);
-            }
-            if !seen_disk_paths.insert(normalize_path_key(&disk.path)) {
-                bail!(
-                    "disk '{}' is attached multiple times to VM '{}'",
-                    disk.path.display(),
-                    self.name
-                );
+            if !self.fastdesk.listen_addr.trim().is_empty() {
+                parse_loopback_listen_addr(&self.fastdesk.listen_addr)
+                    .context("invalid fastdesk.listen_addr")?;
             }
         }
-        for nic in &self.nics {
-            validate_mac_address(&nic.mac_address)?;
-            match &nic.backend {
-                NicBackendConfig::Consomme { port_forwards, .. } => {
-                    for pf in port_forwards {
-                        pf.validate()?;
-                    }
+        if opts.validate_disks {
+            let mut seen_luns = std::collections::HashSet::new();
+            let mut seen_disk_paths = std::collections::HashSet::new();
+            for disk in &self.disks {
+                if disk.lun > 255 {
+                    bail!("SCSI LUN {} is out of range (must be between 0 and 255)", disk.lun);
                 }
-                NicBackendConfig::VmSwitch { switch_id, .. } => {
-                    #[cfg(not(windows))]
-                    {
-                        let _ = switch_id;
-                        bail!("Windows Hyper-V VMSwitch NIC backend is only supported on Windows");
+                if disk.path.as_os_str().is_empty() {
+                    bail!("disk path at SCSI LUN {} cannot be empty", disk.lun);
+                }
+                if opts.strict_disks_absolute && !disk.path.is_absolute() {
+                    bail!(
+                        "disk path '{}' at SCSI LUN {} must be an absolute path",
+                        disk.path.display(),
+                        disk.lun
+                    );
+                }
+                if (disk.format == DiskFormat::Iso || DiskFormat::from_path(&disk.path) == DiskFormat::Iso)
+                    && (disk.kind != DiskKind::Dvd || !disk.read_only)
+                {
+                    bail!(
+                        "ISO image '{}' at SCSI LUN {} must be attached as a read-only DVD drive",
+                        disk.path.display(),
+                        disk.lun
+                    );
+                }
+                if !seen_luns.insert(disk.lun) {
+                    bail!("duplicate SCSI LUN {}", disk.lun);
+                }
+                if !seen_disk_paths.insert(normalize_path_key(&disk.path)) {
+                    bail!(
+                        "disk '{}' is attached multiple times to VM '{}'",
+                        disk.path.display(),
+                        self.name
+                    );
+                }
+            }
+        }
+        if opts.validate_nics {
+            let mut seen_nic_ids = std::collections::HashSet::new();
+            let mut seen_macs = std::collections::HashSet::new();
+            let mut seen_port_forwards: Vec<&PortForward> = Vec::new();
+            for nic in &self.nics {
+                if opts.strict_nic_conflicts && !seen_nic_ids.insert(nic.id) {
+                    bail!("duplicate NIC id {}", nic.id);
+                }
+                let mac_bytes = parse_mac_bytes(&nic.mac_address)?;
+                if opts.strict_nic_conflicts && !seen_macs.insert(mac_bytes) {
+                    bail!("duplicate MAC address '{}' across NICs", nic.mac_address);
+                }
+                match &nic.backend {
+                    NicBackendConfig::Consomme { port_forwards, .. } => {
+                        let mut seen_nic_forwards: Vec<&PortForward> = Vec::new();
+                        for pf in port_forwards {
+                            pf.validate()?;
+                            if opts.strict_nic_conflicts {
+                                if let Some(conflict) =
+                                    seen_port_forwards.iter().find(|e| e.overlaps(pf))
+                                {
+                                    bail!(
+                                        "port forward '{pf}' overlaps with existing port forward '{conflict}'"
+                                    );
+                                }
+                                if let Some(conflict) =
+                                    seen_nic_forwards.iter().find(|e| e.same_nic_guest_conflict(pf))
+                                {
+                                    bail!(
+                                        "port forward '{pf}' conflicts with existing port forward '{conflict}' on NIC '{}' (duplicate guest port for protocol and IP family)",
+                                        nic.name
+                                    );
+                                }
+                                seen_port_forwards.push(pf);
+                                seen_nic_forwards.push(pf);
+                            }
+                        }
                     }
-                    #[cfg(windows)]
-                    {
-                        let trimmed = switch_id.trim();
-                        if !trimmed.eq_ignore_ascii_case("default")
-                            && Uuid::parse_str(trimmed).is_err()
+                    NicBackendConfig::VmSwitch { switch_id, .. } => {
+                        #[cfg(not(windows))]
                         {
-                            bail!(
-                                "invalid VMSwitch id '{switch_id}' (expected 'default' or a switch GUID)"
-                            );
+                            let _ = switch_id;
+                            bail!("Windows Hyper-V VMSwitch NIC backend is only supported on Windows");
+                        }
+                        #[cfg(windows)]
+                        {
+                            if switch_id != switch_id.trim() {
+                                bail!(
+                                    "VMSwitch id '{switch_id}' cannot have leading or trailing whitespace"
+                                );
+                            }
+                            if !switch_id.eq_ignore_ascii_case("default")
+                                && Uuid::parse_str(switch_id).is_err()
+                            {
+                                bail!(
+                                    "invalid VMSwitch id '{switch_id}' (expected 'default' or a switch GUID)"
+                                );
+                            }
                         }
                     }
-                }
-                NicBackendConfig::Tap { name } => {
-                    #[cfg(windows)]
-                    {
-                        let _ = name;
-                        bail!("Linux TAP NIC backend is only supported on Linux");
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        let trimmed = name.trim();
-                        if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\0') {
-                            bail!("invalid TAP interface name '{name}'");
+                    NicBackendConfig::Tap { name } => {
+                        #[cfg(windows)]
+                        {
+                            let _ = name;
+                            bail!("Linux TAP NIC backend is only supported on Linux");
                         }
-                        #[cfg(target_os = "linux")]
-                        validate_tap_sysfs_dir(
-                            trimmed,
-                            &Path::new("/sys/class/net").join(trimmed),
-                        )?;
+                        #[cfg(not(windows))]
+                        {
+                            if name != name.trim() {
+                                bail!(
+                                    "TAP interface name '{name}' cannot have leading or trailing whitespace"
+                                );
+                            }
+                            if name.is_empty() || name.contains('/') || name.contains('\0') {
+                                bail!("invalid TAP interface name '{name}'");
+                            }
+                            #[cfg(target_os = "linux")]
+                            validate_tap_sysfs_dir(
+                                name,
+                                &Path::new("/sys/class/net").join(name),
+                            )?;
+                        }
                     }
                 }
             }
@@ -978,6 +1344,13 @@ impl UpdateVmPayload {
     }
 }
 
+fn deserialize_non_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
 fn deserialize_nullable_path<'de, D>(deserializer: D) -> Result<Option<Option<PathBuf>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1040,6 +1413,8 @@ pub struct DiskInfo {
     pub sector_size_bytes: Option<u32>,
     pub parent_path: Option<String>,
     pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1063,6 +1438,8 @@ pub struct HostInfo {
     pub resolved_paths: ResolvedHostPaths,
     #[serde(default)]
     pub daemon_instance_id: Option<Uuid>,
+    #[serde(default)]
+    pub event_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1175,13 +1552,24 @@ pub fn format_memory_mb(memory_mb: u64) -> String {
 
 pub fn parse_memory_mb(input: &str) -> anyhow::Result<u64> {
     let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("memory size cannot be empty");
+    }
     if trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return trimmed
+        let mb = trimmed
             .parse::<u64>()
-            .context("invalid memory MiB integer");
+            .context("invalid memory MiB integer")?;
+        if mb == 0 {
+            bail!("memory size '{input}' must be a non-zero whole number of MiB");
+        }
+        return Ok(mb);
     }
     let bytes = parse_byte_size(trimmed)?;
-    Ok((bytes / (1024 * 1024)).max(1))
+    const MIB: u64 = 1024 * 1024;
+    if bytes == 0 || bytes % MIB != 0 {
+        bail!("memory size '{input}' must be a non-zero whole number of MiB");
+    }
+    Ok(bytes / MIB)
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -1399,10 +1787,11 @@ mod tests {
         pf.validate().unwrap();
 
         let mut cfg = VmConfig::from_preset("ValidVM", VmPreset::Custom, Path::new("/tmp/vm"));
+        let disk_path = std::env::temp_dir().join("d.img");
         cfg.disks.push(DiskAttachment {
             lun: 256,
             kind: DiskKind::HardDisk,
-            path: PathBuf::from("/tmp/d.img"),
+            path: disk_path.clone(),
             read_only: false,
             format: DiskFormat::Raw,
         });
@@ -1412,15 +1801,25 @@ mod tests {
         cfg.disks.push(DiskAttachment {
             lun: 1,
             kind: DiskKind::HardDisk,
-            path: PathBuf::from("/tmp/d.img"),
+            path: disk_path,
             read_only: false,
             format: DiskFormat::Raw,
         });
         assert!(cfg.validate().is_err());
         cfg.disks.pop();
 
+        // Relative disk paths must be rejected.
+        cfg.disks[0].path = PathBuf::from("relative-disk.img");
+        assert!(cfg.validate().is_err());
+        cfg.disks[0].path = std::env::temp_dir().join("d.img");
+
         cfg.nics[0].mac_address = "01-15-5D-01-02-03".into();
         assert!(cfg.validate().is_err());
+        // Untrimmed MAC addresses must be rejected by validate(), and trimmed by normalize().
+        cfg.nics[0].mac_address = format!(" {} ", generate_hyperv_mac());
+        assert!(cfg.validate().is_err());
+        cfg.normalize();
+        cfg.validate().unwrap();
         cfg.nics[0].mac_address = generate_hyperv_mac();
 
         #[cfg(not(windows))]
@@ -1469,6 +1868,452 @@ mod tests {
             "openvmm",
             &["openvmm/target/release/openvmm"],
         );
-        assert_eq!(found, Some(fake_openvmm));
+        assert_eq!(found, Some(fake_openvmm.clone()));
+
+        // An explicit path that does not exist must never silently fall back to cargo output or PATH.
+        let missing_explicit = dir.path().join("typo-openvmm");
+        assert_eq!(
+            resolve_binary_candidate(
+                Some(&missing_explicit),
+                Some(&cargo_ws.join("target/debug/deps")),
+                "openvmm",
+                &["openvmm/target/release/openvmm"],
+            ),
+            None
+        );
+
+        let fake_fw = dir.path().join("firmware/MSVM.fd");
+        std::fs::create_dir_all(fake_fw.parent().unwrap()).unwrap();
+        std::fs::write(&fake_fw, b"fw").unwrap();
+        let missing_fw = dir.path().join("typo-MSVM.fd");
+        assert_eq!(
+            resolve_file_candidate(
+                Some(&missing_fw),
+                Some(&cargo_ws.join("target/debug/deps")),
+                Some(dir.path()),
+                Some(&fake_fw),
+                &["firmware/MSVM.fd"],
+            ),
+            None
+        );
+
+        // Relative explicit paths resolve against exe_dir and workspace root, while
+        // non-existent relative paths still fail without falling back to unrelated defaults.
+        let sibling_bin = cargo_ws.join("target/debug/deps/custom-openvmm");
+        std::fs::write(&sibling_bin, b"sibling").unwrap();
+        assert_eq!(
+            resolve_binary_candidate(
+                Some(Path::new("custom-openvmm")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                "openvmm",
+                &["openvmm/target/release/openvmm"],
+            ),
+            Some(sibling_bin)
+        );
+        assert_eq!(
+            resolve_binary_candidate(
+                Some(Path::new("openvmm/target/release/openvmm")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                "definitely-missing-openvmm-bin",
+                &[],
+            ),
+            Some(fake_openvmm)
+        );
+        assert_eq!(
+            resolve_binary_candidate(
+                Some(Path::new("missing/custom-openvmm")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                "openvmm",
+                &["openvmm/target/release/openvmm"],
+            ),
+            None
+        );
+
+        assert_eq!(
+            resolve_file_candidate(
+                Some(Path::new("firmware/MSVM.fd")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                Some(&installed_bin_dir),
+                None,
+                &[],
+            ),
+            Some(fake_fw)
+        );
+        let sibling_fw = cargo_ws.join("target/debug/deps/local.fd");
+        std::fs::write(&sibling_fw, b"fw").unwrap();
+        assert_eq!(
+            resolve_file_candidate(
+                Some(Path::new("local.fd")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                Some(&installed_bin_dir),
+                None,
+                &[],
+            ),
+            Some(sibling_fw)
+        );
+        assert_eq!(
+            resolve_file_candidate(
+                Some(Path::new("missing/local.fd")),
+                Some(&cargo_ws.join("target/debug/deps")),
+                Some(&installed_bin_dir),
+                None,
+                &[],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn validates_duplicate_nics_macs_port_forwards_and_memory_units() {
+        let mut cfg = VmConfig::from_preset("NetChecks", VmPreset::Custom, &std::env::temp_dir().join("vm"));
+        let nic_id = cfg.nics[0].id;
+        let mac = cfg.nics[0].mac_address.clone();
+
+        // Duplicate NIC id rejected.
+        cfg.nics.push(NicAttachment {
+            id: nic_id,
+            name: "second".into(),
+            mac_address: generate_hyperv_mac(),
+            backend: NicBackendConfig::default(),
+        });
+        assert!(cfg.validate().unwrap_err().to_string().contains("duplicate NIC id"));
+
+        // Duplicate MAC (even with different separator/case) rejected.
+        cfg.nics[1].id = Uuid::new_v4();
+        cfg.nics[1].mac_address = mac.replace('-', ":").to_ascii_lowercase();
+        assert!(cfg.validate().unwrap_err().to_string().contains("duplicate MAC"));
+
+        // Distinct MACs with overlapping host port forwards (0.0.0.0 vs 127.0.0.1) rejected.
+        cfg.nics[1].mac_address = generate_hyperv_mac();
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 3389,
+                guest_port: 3389,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.nics[1].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "0.0.0.0".into(),
+                host_port: 3389,
+                guest_port: 3390,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        assert!(cfg.validate().unwrap_err().to_string().contains("overlaps"));
+
+        // Different protocol (UDP vs TCP) on same port is allowed.
+        if let NicBackendConfig::Consomme { port_forwards, .. } = &mut cfg.nics[1].backend {
+            port_forwards[0].protocol = IpProto::Udp;
+        }
+        cfg.validate().unwrap();
+
+        // Untrimmed TAP name rejected before normalize(), accepted after normalize().
+        #[cfg(not(windows))]
+        {
+            cfg.nics[1].backend = NicBackendConfig::Tap {
+                name: " tap0 ".into(),
+            };
+            assert!(cfg.validate().is_err());
+            cfg.normalize();
+            cfg.validate().unwrap();
+        }
+
+        // parse_memory_mb rejects sub-MiB / zero / non-multiple values instead of silently truncating.
+        assert!(parse_memory_mb("1536K").is_err());
+        assert!(parse_memory_mb("512K").is_err());
+        assert!(parse_memory_mb("0M").is_err());
+        assert!(parse_memory_mb("0").is_err());
+        assert!(parse_memory_mb("").is_err());
+        assert_eq!(parse_memory_mb("2048K").unwrap(), 2);
+        assert_eq!(parse_memory_mb("1G").unwrap(), 1024);
+
+        // Consomme sets IPV6_V6ONLY on IPv6 sockets, so IPv4 and IPv6 wildcards on the same
+        // host port do not overlap each other, while wildcards overlap binds in their own family.
+        let v6_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let v4_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 8080,
+            guest_port: 81,
+        };
+        let v4_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "0.0.0.0".into(),
+            host_port: 8080,
+            guest_port: 82,
+        };
+        let v6_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::1".into(),
+            host_port: 8080,
+            guest_port: 83,
+        };
+        assert!(!v6_wild.overlaps(&v4_loopback));
+        assert!(!v4_loopback.overlaps(&v6_wild));
+        assert!(!v6_wild.overlaps(&v4_wild));
+        assert!(v6_wild.overlaps(&v6_loopback));
+        assert!(!v4_wild.overlaps(&v6_loopback));
+        assert!(v4_wild.overlaps(&v4_loopback));
+
+        // Legacy "localhost" and non-IP hostnames compare properly in overlaps/same_nic_guest_conflict.
+        let v4_loopback_80 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 8081,
+            guest_port: 80,
+        };
+        let localhost_8080 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "localhost".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let localhost_8081 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "LOCALHOST".into(),
+            host_port: 8081,
+            guest_port: 80,
+        };
+        let custom_a = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "myhost".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let custom_b = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "MYHOST".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        assert!(localhost_8080.overlaps(&v4_loopback));
+        assert!(localhost_8080.overlaps(&v4_wild));
+        assert!(localhost_8080.same_nic_guest_conflict(&v4_loopback_80));
+        assert!(!localhost_8080.same_nic_guest_conflict(&v4_loopback));
+        assert!(localhost_8080.same_nic_guest_conflict(&localhost_8081));
+        assert!(custom_a.overlaps(&custom_b));
+        assert!(custom_a.same_nic_guest_conflict(&custom_b));
+        assert!(!custom_a.same_nic_guest_conflict(&v4_loopback_80));
+
+        // 0.0.0.0:8080->80 + [::]:8080->80 coexist on the same NIC.
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "0.0.0.0".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "::".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.nics[1].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.validate().unwrap();
+
+        // Same NIC duplicate (protocol, IP family, guest_port) with different host ports fails.
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 8081,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate guest port")
+        );
+
+        // Different NICs may share the same (protocol, IP family, guest_port) when host ports differ.
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8080,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.nics[1].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8081,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.validate().unwrap();
+
+        // Same NIC may reuse guest_port across different IP families (IPv4 vs IPv6).
+        cfg.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 8080,
+                    guest_port: 80,
+                },
+                PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "::1".into(),
+                    host_port: 8081,
+                    guest_port: 80,
+                },
+            ],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.nics[1].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        cfg.validate().unwrap();
+
+        // Legacy validation options allow relative disk paths / pre-existing NIC conflicts when unchanged.
+        cfg.disks.push(DiskAttachment {
+            lun: 0,
+            kind: DiskKind::HardDisk,
+            path: PathBuf::from("legacy/relative.img"),
+            read_only: false,
+            format: DiskFormat::Raw,
+        });
+        assert!(cfg.validate().is_err());
+        cfg.validate_with_options(false, true).unwrap();
+
+        // parse_mac_bytes rejects leading '+' signs in hex octets.
+        assert!(parse_mac_bytes("+0:+1:+2:+3:+4:+5").is_err());
+        assert!(parse_mac_bytes("+2:00:00:00:00:01").is_err());
+        assert!(parse_mac_bytes("02-00-00-00-00-01").is_ok());
+    }
+
+    #[test]
+    fn host_config_patch_nullable_absent_and_deny_unknown_fields() {
+        let patch_null: HostConfigPatch =
+            serde_json::from_str(r#"{"openvmm_bin": null}"#).unwrap();
+        assert_eq!(patch_null.openvmm_bin, Some(None));
+        assert_eq!(patch_null.fastdesk_viewer_bin, None);
+
+        let patch_empty: HostConfigPatch =
+            serde_json::from_str(r#"{"openvmm_bin": ""}"#).unwrap();
+        assert_eq!(patch_empty.openvmm_bin, Some(None));
+
+        let patch_absent: HostConfigPatch = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(patch_absent.listen_addr, None);
+        assert_eq!(patch_absent.openvmm_bin, None);
+        assert!(patch_absent.is_empty());
+
+        let patch_listen: HostConfigPatch =
+            serde_json::from_str(r#"{"listen_addr": "127.0.0.1:47621"}"#).unwrap();
+        assert_eq!(patch_listen.listen_addr.as_deref(), Some("127.0.0.1:47621"));
+
+        let null_listen = serde_json::from_str::<HostConfigPatch>(r#"{"listen_addr": null}"#);
+        assert!(null_listen.is_err());
+
+        let patch_path: HostConfigPatch =
+            serde_json::from_str(r#"{"openvmm_bin": "/usr/local/bin/openvmm"}"#).unwrap();
+        assert_eq!(
+            patch_path.openvmm_bin,
+            Some(Some(PathBuf::from("/usr/local/bin/openvmm")))
+        );
+
+        let unknown = serde_json::from_str::<HostConfigPatch>(r#"{"runtime_dir": "/tmp/x"}"#);
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn disk_format_from_path_handles_avhdx_and_avhd() {
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.vhdx")), DiskFormat::Vhdx);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.avhdx")), DiskFormat::Vhdx);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.AVHDX")), DiskFormat::Vhdx);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.vhd")), DiskFormat::Vhd);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.avhd")), DiskFormat::Vhd);
+        assert_eq!(DiskFormat::from_path(Path::new("/tmp/a.AVHD")), DiskFormat::Vhd);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_port_forward_is_rejected_and_canonicalized_in_overlaps() {
+        let mapped_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::ffff:127.0.0.1".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let err = mapped_loopback.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("IPv4-mapped IPv6"),
+            "unexpected error: {err:#}"
+        );
+
+        let mapped_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "::ffff:0.0.0.0".into(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        assert!(mapped_wild.validate().is_err());
+
+        let v4_loopback = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 8080,
+            guest_port: 81,
+        };
+        let v4_wild = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "0.0.0.0".into(),
+            host_port: 8080,
+            guest_port: 82,
+        };
+        assert!(mapped_loopback.overlaps(&v4_loopback));
+        assert!(v4_loopback.overlaps(&mapped_loopback));
+        assert!(mapped_loopback.overlaps(&v4_wild));
+        assert!(v4_wild.overlaps(&mapped_loopback));
     }
 }

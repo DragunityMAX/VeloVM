@@ -51,4 +51,6 @@ fn main() {
         .expect("failed to compile vmservice.proto");
 
     println!("cargo:rerun-if-changed={}", proto_file.display());
+    println!("cargo:rerun-if-env-changed=PROTOC");
+    println!("cargo:rerun-if-env-changed=PROTOC_INCLUDE");
 }

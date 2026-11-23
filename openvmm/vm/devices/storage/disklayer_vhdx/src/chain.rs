@@ -18,26 +18,59 @@ use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
 
 #[cfg(unix)]
-fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
+fn is_unsupported_lock_error(err: &std::io::Error) -> bool {
+    #[cfg_attr(target_os = "linux", expect(unreachable_patterns))]
+    let unsupported_errno = matches!(
+        err.raw_os_error(),
+        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS)
+    );
+    err.kind() == std::io::ErrorKind::Unsupported || unsupported_errno
+}
+
+#[cfg(unix)]
+fn handle_disk_lock_result(
+    res: Result<(), std::fs::TryLockError>,
+    path: &Path,
+    read_only: bool,
+) -> anyhow::Result<()> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!(
+                "disk image '{}' is already locked for writing or in use by another process",
+                path.display()
+            );
+        }
+        Err(std::fs::TryLockError::Error(err)) if is_unsupported_lock_error(&err) => {
+            // Match QEMU's fallback on filesystems without advisory lock support
+            // (e.g., ENOLCK / EOPNOTSUPP / ENOTSUP / ENOSYS on NFS, CIFS, or 9p): warn and continue.
+            tracing::warn!(
+                path = %path.display(),
+                read_only,
+                error = %err,
+                "disk locking unavailable on this filesystem; continuing without file lock"
+            );
+            Ok(())
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("acquiring file lock on {}", path.display()))
+        }
+    }
+}
+
+/// Acquires a Unix advisory file lock on `file` when supported by the filesystem.
+///
+/// Logs a warning and returns `Ok(())` when the filesystem reports that locking
+/// is unsupported.
+#[cfg(unix)]
+pub fn acquire_disk_lock(file: &std::fs::File, path: &Path, read_only: bool) -> anyhow::Result<()> {
     if file.metadata().is_ok_and(|m| m.is_file()) {
         let res = if read_only {
             file.try_lock_shared()
         } else {
             file.try_lock()
         };
-        match res {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                anyhow::bail!(
-                    "disk image '{}' is already locked for writing or in use by another process",
-                    path.display()
-                );
-            }
-            Err(std::fs::TryLockError::Error(err)) => {
-                return Err(err)
-                    .with_context(|| format!("failed to lock disk image {}", path.display()));
-            }
-        }
+        handle_disk_lock_result(res, path, read_only)?;
     }
     Ok(())
 }
@@ -487,5 +520,42 @@ mod tests {
             "{child_err:#}"
         );
         drop(base_rw);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_lock_error_warns_and_real_io_errors_fail() {
+        let p = Path::new("/mnt/9p/base.vhdx");
+        handle_disk_lock_result(
+            Err(std::fs::TryLockError::Error(std::io::Error::from(
+                std::io::ErrorKind::Unsupported,
+            ))),
+            p,
+            false,
+        )
+        .expect("unsupported filesystem lock error should warn and continue without locking");
+        handle_disk_lock_result(
+            Err(std::fs::TryLockError::Error(std::io::Error::from_raw_os_error(
+                libc::ENOLCK,
+            ))),
+            p,
+            true,
+        )
+        .expect("ENOLCK filesystem lock error should warn and continue without locking");
+
+        for raw_err in [libc::EBADF, libc::EIO] {
+            handle_disk_lock_result(
+                Err(std::fs::TryLockError::Error(std::io::Error::from_raw_os_error(
+                    raw_err,
+                ))),
+                p,
+                false,
+            )
+            .expect_err("real I/O or bad-fd lock errors must fail");
+        }
+
+        let err = handle_disk_lock_result(Err(std::fs::TryLockError::WouldBlock), p, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
     }
 }

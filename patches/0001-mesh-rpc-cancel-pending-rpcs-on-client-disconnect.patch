@@ -1,5 +1,5 @@
 diff --git a/openvmm/support/mesh/mesh_rpc/src/server.rs b/openvmm/support/mesh/mesh_rpc/src/server.rs
-index 24acaf8..63d481f 100644
+index 24acaf8..44a2946 100644
 --- a/openvmm/support/mesh/mesh_rpc/src/server.rs
 +++ b/openvmm/support/mesh/mesh_rpc/src/server.rs
 @@ -29,8 +29,12 @@
@@ -15,7 +15,7 @@ index 24acaf8..63d481f 100644
  use pal_async::socket::PolledSocket;
  use std::collections::HashMap;
  use std::io::Read;
-@@ -168,44 +172,80 @@ pub async fn serve_connection(
+@@ -168,43 +172,85 @@ pub async fn serve_connection(
      ) -> anyhow::Result<()> {
          let (mut reader, mut writer) = stream.split();
          let (stream_send, mut stream_recv) = mesh::channel();
@@ -106,31 +106,36 @@ index 24acaf8..63d481f 100644
 +                cancel.lock().cancel();
 +                return res;
 +            }
-+            // A clean read EOF can be either a half-close (`shutdown(SHUT_WR)`),
-+            // where the peer still expects replies, or a full socket close.
-+            // On Linux, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
-+            // so half-closed clients still receive in-flight replies while
-+            // full disconnects cancel pending RPCs immediately.
++            // On Linux (`epoll`), read EOF can be a half-close (`shutdown(SHUT_WR)` ->
++            // `EPOLLRDHUP`) where the peer still expects in-flight replies, rather than a
++            // full disconnect (`EPOLLHUP`/`EPOLLERR`). Keep pending RPCs alive until
++            // either full disconnect or `send_task` finishes draining responses. Note: this
++            // assumes `AF_UNIX` stream sockets (used by OpenVMM's ttrpc transport); on
++            // TCP sockets, a peer `close()` only sends `FIN` and won't trigger `HUP`.
 +            #[cfg(target_os = "linux")]
-+            {
-+                futures::select! {
-+                    _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
-+                        peer_closed.store(true, std::sync::atomic::Ordering::Release);
-+                        cancel.lock().cancel();
-+                    }
-+                    _ = send_done_rx.fuse() => {}
++            futures::select! {
++                _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
++                    peer_closed.store(true, std::sync::atomic::Ordering::Release);
++                    cancel.lock().cancel();
                  }
-             }
++                _ = send_done_rx.fuse() => {}
++            }
++            // On Windows `afunix.sys` / AFD, both `shutdown(SD_SEND)` and a
++            // graceful `closesocket()` raise `AFD_POLL_DISCONNECT` (`PollEvents::RDHUP`)
++            // rather than `AFD_POLL_ABORT` (`PollEvents::HUP`), so full disconnect
++            // cannot be distinguished from half-close via socket readiness. On
++            // non-Linux Unix targets (e.g., macOS `kqueue`), `PollEvents` handling is
++            // untested. Cancel on read EOF so client disconnects (e.g. `WaitVM`) release
++            // promptly.
 +            #[cfg(not(target_os = "linux"))]
 +            {
 +                drop(send_done_rx);
 +                peer_closed.store(true, std::sync::atomic::Ordering::Release);
 +                cancel.lock().cancel();
-+            }
+             }
              Ok(())
          };
-         let send_task = async {
-@@ -239,16 +279,24 @@ enum Event<T> {
+@@ -239,16 +285,24 @@ enum Event<T> {
                          responses.push(recv);
                      }
                      Event::Response((stream_id, payload)) => {
@@ -162,7 +167,7 @@ index 24acaf8..63d481f 100644
              anyhow::Result::<_>::Ok(())
          };
          (recv_task, send_task).try_join().await?;
-@@ -626,6 +674,9 @@ mod tests {
+@@ -626,6 +680,9 @@ mod tests {
      use crate::Client;
      use crate::Server;
      use crate::client::ExistingConnection;
@@ -172,7 +177,7 @@ index 24acaf8..63d481f 100644
      use crate::service::Code;
      use crate::service::ServiceRpc;
      use futures::StreamExt;
-@@ -702,4 +753,213 @@ fn client_server() {
+@@ -702,4 +759,213 @@ fn client_server() {
          client_thread.join().unwrap();
          server_thread.join().unwrap().unwrap();
      }

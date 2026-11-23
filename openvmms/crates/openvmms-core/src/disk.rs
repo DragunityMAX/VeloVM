@@ -5,9 +5,7 @@ use anyhow::Context;
 use anyhow::bail;
 use std::fs;
 use std::io::Read;
-#[cfg(target_os = "linux")]
 use std::io::Seek;
-#[cfg(target_os = "linux")]
 use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
@@ -28,8 +26,8 @@ pub fn file_has_vhdx_signature(path: &Path) -> bool {
 }
 
 /// Validates that `path` has a file name and does not collide with another disk format's
-/// reserved extension.
-pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow::Result<()> {
+/// reserved extension (used on relative inputs before client path resolution).
+pub fn validate_disk_extension_for_format(path: &Path, format: DiskFormat) -> anyhow::Result<()> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         bail!("disk path must specify a file name");
     }
@@ -64,6 +62,18 @@ pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow:
     Ok(())
 }
 
+/// Validates that `path` is an absolute path with a file name and does not collide
+/// with another disk format's reserved extension.
+pub fn validate_disk_path_for_format(path: &Path, format: DiskFormat) -> anyhow::Result<()> {
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        bail!("disk path must specify a file name");
+    }
+    if !path.is_absolute() {
+        bail!("disk path '{}' must be an absolute path", path.display());
+    }
+    validate_disk_extension_for_format(path, format)
+}
+
 /// Adjusts mismatched disk extensions so GUI defaults match the requested disk format.
 pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
@@ -75,7 +85,7 @@ pub fn sync_disk_path_extension(path: &mut PathBuf, format: DiskFormat) {
         .map(|e| e.to_ascii_lowercase());
     let raw_ext = path.extension().and_then(|e| e.to_str());
     match format {
-        DiskFormat::Raw if validate_disk_path_for_format(path, format).is_ok() => return,
+        DiskFormat::Raw if validate_disk_extension_for_format(path, format).is_ok() => return,
         DiskFormat::Vhdx if raw_ext == Some("vhdx") => return,
         DiskFormat::Vhd if raw_ext == Some("vhd") => return,
         _ => {}
@@ -163,6 +173,8 @@ pub fn create_disk_cancellable(
                 allocate_fixed_raw(&mut file, req.size_bytes, cancelled)
                     .with_context(|| format!("allocating fixed raw disk {}", req.path.display()))
             } else {
+                #[cfg(windows)]
+                mark_file_sparse(&file);
                 file.set_len(req.size_bytes)
                     .with_context(|| format!("sizing raw disk {}", req.path.display()))
             };
@@ -176,20 +188,22 @@ pub fn create_disk_cancellable(
         Some(img_bin) => {
             drop(file);
             let mut cmd = Command::new(img_bin);
-            // `--force` overwrites only the placeholder this operation reserved above.
+            // `--force` overwrites only the placeholder this operation reserved above;
+            // `--` prevents paths starting with `-` from being parsed as CLI flags.
             cmd.arg("create")
-                .arg(&req.path)
                 .arg("--format")
                 .arg("vhdx")
                 .arg("--size")
                 .arg(req.size_bytes.to_string())
-                .arg("--force")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .arg("--force");
             if req.fixed {
                 cmd.arg("--format-options").arg("allocation=fixed");
             }
+            cmd.arg("--")
+                .arg(&req.path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(err) => {
@@ -338,7 +352,233 @@ fn write_fixed_raw_zeros(
     Ok(())
 }
 
+#[cfg(windows)]
+fn mark_file_sparse(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
+    let mut bytes_returned: u32 = 0;
+    // Best-effort: succeeds on NTFS/ReFS and leaves filesystems without sparse
+    // support (e.g. FAT32/exFAT) unaffected.
+    let _ = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+}
+
+struct Vhd1Meta {
+    disk_type: String,
+    virtual_size_bytes: u64,
+    block_size_bytes: Option<u32>,
+    parent_path: Option<String>,
+}
+
+fn parse_vhd1_footer_bytes(footer: &[u8; 512], file_size_bytes: u64) -> Option<(u32, u64, u64)> {
+    if &footer[0..8] != b"conectix" {
+        return None;
+    }
+    let version = u32::from_be_bytes([footer[12], footer[13], footer[14], footer[15]]);
+    if version != 0x0001_0000 {
+        return None;
+    }
+    let stored_checksum = u32::from_be_bytes([footer[64], footer[65], footer[66], footer[67]]);
+    let sum: u32 = footer
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(64..68).contains(i))
+        .map(|(_, &b)| b as u32)
+        .sum();
+    if !sum != stored_checksum {
+        return None;
+    }
+    let disk_type = u32::from_be_bytes([footer[60], footer[61], footer[62], footer[63]]);
+    if !matches!(disk_type, 2..=4) {
+        return None;
+    }
+    let current_size = u64::from_be_bytes([
+        footer[48], footer[49], footer[50], footer[51], footer[52], footer[53], footer[54],
+        footer[55],
+    ]);
+    if current_size == 0 || !current_size.is_multiple_of(512) {
+        return None;
+    }
+    let data_offset = u64::from_be_bytes([
+        footer[16], footer[17], footer[18], footer[19], footer[20], footer[21], footer[22],
+        footer[23],
+    ]);
+    if disk_type == 2
+        && (!file_size_bytes.is_multiple_of(512)
+            || current_size > file_size_bytes.saturating_sub(512))
+    {
+        return None;
+    }
+    Some((disk_type, current_size, data_offset))
+}
+
+fn decode_utf16_until_nul(bytes: &[u8], little_endian: bool) -> Option<String> {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .take_while(|&u| u != 0)
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+    String::from_utf16(&units).ok().filter(|s| !s.is_empty())
+}
+
+fn parse_vhd1_parent_path(
+    file: &mut fs::File,
+    dyn_hdr: &[u8; 1024],
+    file_size_bytes: u64,
+) -> Option<String> {
+    const MAX_LOCATOR_BYTES: u32 = 65_536;
+    for platform in [b"W2ru", b"W2ku", b"MacX"] {
+        for entry in dyn_hdr[576..768].chunks_exact(24) {
+            if &entry[0..4] != platform {
+                continue;
+            }
+            let data_len = u32::from_be_bytes([entry[8], entry[9], entry[10], entry[11]]);
+            let data_offset = u64::from_be_bytes([
+                entry[16], entry[17], entry[18], entry[19], entry[20], entry[21], entry[22],
+                entry[23],
+            ]);
+            if data_len == 0
+                || data_len > MAX_LOCATOR_BYTES
+                || data_offset
+                    .checked_add(u64::from(data_len))
+                    .is_none_or(|end| end > file_size_bytes)
+            {
+                continue;
+            }
+            let mut buf = vec![0u8; data_len as usize];
+            if file.seek(SeekFrom::Start(data_offset)).is_err()
+                || file.read_exact(&mut buf).is_err()
+            {
+                continue;
+            }
+            let decoded = if platform == b"MacX" {
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                std::str::from_utf8(&buf[..end])
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+            } else {
+                decode_utf16_until_nul(&buf, true)
+            };
+            if decoded.is_some() {
+                return decoded;
+            }
+        }
+    }
+    decode_utf16_until_nul(&dyn_hdr[64..576], false)
+}
+
+fn parse_vhd1_metadata(path: &Path, file_size_bytes: u64) -> anyhow::Result<Option<Vhd1Meta>> {
+    if file_size_bytes < 512 {
+        return Ok(None);
+    }
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("opening {} to inspect VHD1 footer", path.display()))?;
+
+    let mut footer = [0u8; 512];
+    file.seek(SeekFrom::End(-512))
+        .with_context(|| format!("seeking VHD1 footer in {}", path.display()))?;
+    file.read_exact(&mut footer)
+        .with_context(|| format!("reading VHD1 footer from {}", path.display()))?;
+    let Some((disk_type_code, virtual_size_bytes, data_offset)) =
+        parse_vhd1_footer_bytes(&footer, file_size_bytes)
+    else {
+        if file.seek(SeekFrom::Start(0)).is_ok()
+            && file.read_exact(&mut footer).is_ok()
+            && parse_vhd1_footer_bytes(&footer, file_size_bytes)
+                .is_some_and(|(disk_type, _, _)| matches!(disk_type, 3 | 4))
+        {
+            bail!(
+                "invalid or corrupt VHD1 image: corrupt trailing footer in {} (backup header copy at offset 0 exists; repair the image before attaching)",
+                path.display()
+            );
+        }
+        return Ok(None);
+    };
+
+    let disk_type = match disk_type_code {
+        2 => "fixed".to_string(),
+        3 => "dynamic".to_string(),
+        4 => "differencing".to_string(),
+        _ => unreachable!(),
+    };
+    let mut block_size_bytes = None;
+    let mut parent_path = None;
+    if matches!(disk_type_code, 3 | 4)
+        && data_offset != u64::MAX
+        && data_offset
+            .checked_add(1024)
+            .is_some_and(|end| end <= file_size_bytes)
+    {
+        let mut dyn_hdr = [0u8; 1024];
+        if file.seek(SeekFrom::Start(data_offset)).is_ok()
+            && file.read_exact(&mut dyn_hdr).is_ok()
+            && &dyn_hdr[0..8] == b"cxsparse"
+        {
+            let hdr_version = u32::from_be_bytes([dyn_hdr[24], dyn_hdr[25], dyn_hdr[26], dyn_hdr[27]]);
+            let stored_checksum =
+                u32::from_be_bytes([dyn_hdr[36], dyn_hdr[37], dyn_hdr[38], dyn_hdr[39]]);
+            let sum: u32 = dyn_hdr
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !(36..40).contains(i))
+                .map(|(_, &b)| b as u32)
+                .sum();
+            if hdr_version == 0x0001_0000 && !sum == stored_checksum {
+                let block_size =
+                    u32::from_be_bytes([dyn_hdr[32], dyn_hdr[33], dyn_hdr[34], dyn_hdr[35]]);
+                if block_size > 0 {
+                    block_size_bytes = Some(block_size);
+                }
+                if disk_type_code == 4 {
+                    parent_path = parse_vhd1_parent_path(&mut file, &dyn_hdr, file_size_bytes);
+                }
+            }
+        }
+    }
+
+    Ok(Some(Vhd1Meta {
+        disk_type,
+        virtual_size_bytes,
+        block_size_bytes,
+        parent_path,
+    }))
+}
+
 pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Result<DiskInfo> {
+    inspect_disk_with_explicit_tool(path, None, openvmm_img_bin)
+}
+
+pub fn inspect_disk_with_explicit_tool(
+    path: &Path,
+    explicit_img_bin: Option<&Path>,
+    resolved_img_bin: Option<&Path>,
+) -> anyhow::Result<DiskInfo> {
+    if !path.is_absolute() {
+        bail!("disk path '{}' must be an absolute path", path.display());
+    }
     let meta = fs::metadata(path)
         .with_context(|| format!("reading disk metadata for {}", path.display()))?;
     if !meta.is_file() {
@@ -351,78 +591,141 @@ pub fn inspect_disk(path: &Path, openvmm_img_bin: Option<&Path>) -> anyhow::Resu
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
-    let is_vhdx = ext.as_deref() == Some("vhdx");
-    if is_vhdx {
-        let img_bin = openvmm_img_bin.with_context(|| {
-            format!(
-                "cannot inspect VHDX metadata for {}: openvmm-img binary not found; configure openvmm_img_bin in host settings",
-                path.display()
-            )
-        })?;
-        let output = Command::new(img_bin)
-            .arg("info")
-            .arg(path)
-            .arg("--json")
-            .output()
-            .with_context(|| format!("running {}", img_bin.display()))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            bail!(
-                "openvmm-img info failed ({}): {}{}",
-                output.status,
-                stderr.trim(),
-                if stdout.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", stdout.trim())
-                }
-            );
-        }
-        let val: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .context("parsing openvmm-img info JSON output")?;
-        let virtual_size_bytes = val["disk_size"]
-            .as_u64()
-            .context("missing disk_size in openvmm-img info JSON output")?;
-        let disk_type = val["type"].as_str().unwrap_or("vhdx").to_string();
-        let block_size_bytes = val["block_size"].as_u64().and_then(|v| u32::try_from(v).ok());
-        let sector_size_bytes = val["logical_sector_size"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok());
-        let parent_path = val["relative_path"]
-            .as_str()
-            .or_else(|| val["absolute_win32_path"].as_str())
-            .map(ToOwned::to_owned);
-        return Ok(DiskInfo {
-            path: path.to_path_buf(),
-            format: "vhdx".to_string(),
-            disk_type,
-            virtual_size_bytes,
-            file_size_bytes,
-            block_size_bytes,
-            sector_size_bytes,
-            parent_path,
-            read_only,
-        });
+    enum DetectedFormat {
+        Vhdx,
+        Vhd(Option<Vhd1Meta>),
+        Iso,
+        Raw,
     }
 
-    let (format, disk_type) = match ext.as_deref() {
-        Some("iso") => ("iso".to_string(), "read-only image".to_string()),
-        Some("vhd") => ("vhd".to_string(), "vhd".to_string()),
-        _ => ("raw".to_string(), "sparse/flat".to_string()),
+    // Classify solely by extension so `inspect_disk` matches `DiskFormat::from_path`
+    // and VM attach without sniffing raw disk contents (even for unknown extensions
+    // like `.dsk` or `.blob`).
+    let detected = match ext.as_deref() {
+        Some("vhdx" | "avhdx") => DetectedFormat::Vhdx,
+        Some("vhd" | "avhd") => DetectedFormat::Vhd(parse_vhd1_metadata(path, file_size_bytes)?),
+        Some("iso") => DetectedFormat::Iso,
+        _ => DetectedFormat::Raw,
     };
 
-    Ok(DiskInfo {
-        path: path.to_path_buf(),
-        format,
-        disk_type,
-        virtual_size_bytes: file_size_bytes,
-        file_size_bytes,
-        block_size_bytes: None,
-        sector_size_bytes: Some(512),
-        parent_path: None,
-        read_only,
-    })
+    match detected {
+        DetectedFormat::Vhdx => {
+            let img_bin = match resolved_img_bin {
+                Some(bin) => bin,
+                None => {
+                    if let Some(explicit) = explicit_img_bin.filter(|p| !p.as_os_str().is_empty())
+                    {
+                        bail!(
+                            "configured openvmm-img binary not found at '{}'",
+                            explicit.display()
+                        );
+                    }
+                    bail!(
+                        "cannot inspect VHDX metadata for {}: openvmm-img binary not found; configure openvmm_img_bin in host settings",
+                        path.display()
+                    );
+                }
+            };
+            let output = Command::new(img_bin)
+                .arg("info")
+                .arg("--json")
+                .arg("--")
+                .arg(path)
+                .output()
+                .with_context(|| format!("running {}", img_bin.display()))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                bail!(
+                    "openvmm-img info failed ({}): {}{}",
+                    output.status,
+                    stderr.trim(),
+                    if stdout.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", stdout.trim())
+                    }
+                );
+            }
+            let val: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .context("parsing openvmm-img info JSON output")?;
+            let virtual_size_bytes = val["disk_size"]
+                .as_u64()
+                .context("missing disk_size in openvmm-img info JSON output")?;
+            let disk_type = val["type"].as_str().unwrap_or("vhdx").to_string();
+            let block_size_bytes = val["block_size"].as_u64().and_then(|v| u32::try_from(v).ok());
+            let sector_size_bytes = val["logical_sector_size"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok());
+            let parent_path = val["relative_path"]
+                .as_str()
+                .or_else(|| val["absolute_win32_path"].as_str())
+                .map(ToOwned::to_owned);
+            Ok(DiskInfo {
+                path: path.to_path_buf(),
+                format: "vhdx".to_string(),
+                disk_type,
+                virtual_size_bytes,
+                file_size_bytes,
+                block_size_bytes,
+                sector_size_bytes,
+                parent_path,
+                read_only,
+                warning: None,
+            })
+        }
+        DetectedFormat::Vhd(Some(vhd)) => {
+            #[cfg(not(windows))]
+            let warning = (vhd.disk_type != "fixed").then(|| {
+                format!(
+                    "{} VHD1 images are not supported by OpenVMM on this platform (only fixed VHD1 images can be attached; convert to VHDX or fixed VHD)",
+                    vhd.disk_type
+                )
+            });
+            #[cfg(windows)]
+            let warning = None;
+            Ok(DiskInfo {
+                path: path.to_path_buf(),
+                format: "vhd".to_string(),
+                disk_type: vhd.disk_type,
+                virtual_size_bytes: vhd.virtual_size_bytes,
+                file_size_bytes,
+                block_size_bytes: vhd.block_size_bytes,
+                sector_size_bytes: Some(512),
+                parent_path: vhd.parent_path,
+                read_only,
+                warning,
+            })
+        }
+        DetectedFormat::Vhd(None) => bail!(
+            "invalid or corrupt VHD1 image: missing valid VHD footer in {}",
+            path.display()
+        ),
+        DetectedFormat::Iso => Ok(DiskInfo {
+            path: path.to_path_buf(),
+            format: "iso".to_string(),
+            disk_type: "read-only image".to_string(),
+            virtual_size_bytes: file_size_bytes,
+            file_size_bytes,
+            block_size_bytes: None,
+            sector_size_bytes: Some(512),
+            parent_path: None,
+            read_only,
+            warning: None,
+        }),
+        DetectedFormat::Raw => Ok(DiskInfo {
+            path: path.to_path_buf(),
+            format: "raw".to_string(),
+            disk_type: "sparse/flat".to_string(),
+            virtual_size_bytes: file_size_bytes,
+            file_size_bytes,
+            block_size_bytes: None,
+            sector_size_bytes: Some(512),
+            parent_path: None,
+            read_only,
+            warning: None,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -573,7 +876,13 @@ mod tests {
             sync_disk_path_extension(&mut p, format);
             assert_eq!(p, PathBuf::from(expected), "{input} as {format:?}");
             assert_eq!(DiskFormat::from_path(&p), format);
-            validate_disk_path_for_format(&p, format).unwrap();
+            validate_disk_extension_for_format(&p, format).unwrap();
+            assert!(
+                validate_disk_path_for_format(&p, format).is_err(),
+                "relative path {p:?} must be rejected by validate_disk_path_for_format"
+            );
+            let abs = std::env::temp_dir().join(&p);
+            validate_disk_path_for_format(&abs, format).unwrap();
         }
     }
 
@@ -627,7 +936,7 @@ mod tests {
             let stub_bin = dir.path().join("stub-openvmm-img.sh");
             fs::write(
                 &stub_bin,
-                "#!/bin/sh\nset -eu\ncmd=\"$1\"\npath=\"$2\"\nif [ \"$cmd\" = \"create\" ]; then\n  sleep 0.05\n  printf \"VHDX_WINNER_PAYLOAD\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
+                "#!/bin/sh\nset -eu\ncmd=\"$1\"\nshift\nsaw_sep=0\npath=\"\"\nfor arg in \"$@\"; do\n  if [ \"$saw_sep\" -eq 1 ]; then\n    path=\"$arg\"\n    break\n  fi\n  if [ \"$arg\" = \"--\" ]; then\n    saw_sep=1\n  fi\ndone\ntest \"$saw_sep\" -eq 1 && test -n \"$path\"\nif [ \"$cmd\" = \"create\" ]; then\n  sleep 0.05\n  printf \"VHDX_WINNER_PAYLOAD\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
             )
             .unwrap();
             fs::set_permissions(&stub_bin, fs::Permissions::from_mode(0o755)).unwrap();
@@ -669,12 +978,13 @@ mod tests {
             assert_eq!(vhdx_err, 7);
             assert_eq!(fs::read(&vhdx_path).unwrap(), b"VHDX_WINNER_PAYLOAD");
 
-            // Case-insensitive .VHDX succeeds as VHDX, .vhd classifies as Vhd, and .img
-            // starting with `vhdxfile` bytes stays Raw (never format-sniffed).
+            // Case-insensitive .VHDX succeeds as VHDX, .vhd classifies as Vhd, and
+            // inspect_disk treats `.img` and unknown extensions (e.g. `.blob`) as raw
+            // without content sniffing even if they contain `vhdxfile` magic.
             let vhdx_stub = dir.path().join("vhdx-stub-openvmm-img.sh");
             fs::write(
                 &vhdx_stub,
-                "#!/bin/sh\nset -eu\ncmd=\"$1\"\npath=\"$2\"\nif [ \"$cmd\" = \"create\" ]; then\n  printf \"vhdxfileDUMMY\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
+                "#!/bin/sh\nset -eu\ncmd=\"$1\"\nshift\nsaw_sep=0\npath=\"\"\nfor arg in \"$@\"; do\n  if [ \"$saw_sep\" -eq 1 ]; then\n    path=\"$arg\"\n    break\n  fi\n  if [ \"$arg\" = \"--\" ]; then\n    saw_sep=1\n  fi\ndone\ntest \"$saw_sep\" -eq 1 && test -n \"$path\"\nif [ \"$cmd\" = \"create\" ]; then\n  printf \"vhdxfileDUMMY\" > \"$path\"\nelif [ \"$cmd\" = \"info\" ]; then\n  printf '{\"disk_size\":16777216,\"type\":\"dynamic\",\"block_size\":33554432,\"logical_sector_size\":512}\\n'\nelse\n  exit 1\nfi\n",
             )
             .unwrap();
             fs::set_permissions(&vhdx_stub, fs::Permissions::from_mode(0o755)).unwrap();
@@ -694,12 +1004,31 @@ mod tests {
             assert_eq!(created.virtual_size_bytes, size_bytes);
             assert_eq!(DiskFormat::from_path(&upper_vhdx), DiskFormat::Vhdx);
 
+            // Leading-dash filenames must be passed safely after `--`.
+            let dash_vhdx = dir.path().join("-leading-dash.vhdx");
+            let dash_created = create_disk(
+                &CreateDiskPayload {
+                    path: dash_vhdx.clone(),
+                    size_bytes,
+                    format: DiskFormat::Vhdx,
+                    fixed: false,
+                },
+                Some(&vhdx_stub),
+            )
+            .unwrap();
+            assert_eq!(dash_created.format, "vhdx");
+
             assert_eq!(DiskFormat::from_path(Path::new("legacy.vhd")), DiskFormat::Vhd);
 
             let raw_with_magic = dir.path().join("raw-with-magic.img");
             fs::write(&raw_with_magic, b"vhdxfileDUMMY").unwrap();
             assert_eq!(DiskFormat::from_path(&raw_with_magic), DiskFormat::Raw);
-            let inspected = inspect_disk(&raw_with_magic, Some(&vhdx_stub)).unwrap();
+            let inspected_raw = inspect_disk(&raw_with_magic, Some(&vhdx_stub)).unwrap();
+            assert_eq!(inspected_raw.format, "raw");
+
+            let unknown_with_magic = dir.path().join("unknown-with-magic.blob");
+            fs::write(&unknown_with_magic, b"vhdxfileDUMMY").unwrap();
+            let inspected = inspect_disk(&unknown_with_magic, Some(&vhdx_stub)).unwrap();
             assert_eq!(inspected.format, "raw");
         }
     }
@@ -772,6 +1101,18 @@ mod tests {
             None,
         )
         .unwrap();
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+            let attrs = fs::metadata(&sparse_path).unwrap().file_attributes();
+            assert_ne!(
+                attrs & FILE_ATTRIBUTE_SPARSE_FILE,
+                0,
+                "expected dynamic raw disk on Windows NTFS to have FILE_ATTRIBUTE_SPARSE_FILE (attrs={attrs:#x})"
+            );
+        }
 
         #[cfg(unix)]
         {
@@ -904,5 +1245,288 @@ mod tests {
         assert_eq!(fixed_info.virtual_size_bytes, 8 * 1024 * 1024);
         assert!(fixed_info.file_size_bytes >= 8 * 1024 * 1024);
         assert!(file_has_vhdx_signature(&fixed_path));
+    }
+
+    fn build_vhd1_footer(disk_type: u32, current_size: u64, data_offset: u64) -> [u8; 512] {
+        let mut footer = [0u8; 512];
+        footer[0..8].copy_from_slice(b"conectix");
+        footer[8..12].copy_from_slice(&0x0000_0002u32.to_be_bytes());
+        footer[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        footer[16..24].copy_from_slice(&data_offset.to_be_bytes());
+        footer[40..48].copy_from_slice(&current_size.to_be_bytes());
+        footer[48..56].copy_from_slice(&current_size.to_be_bytes());
+        footer[60..64].copy_from_slice(&disk_type.to_be_bytes());
+        let sum: u32 = footer.iter().map(|&b| b as u32).sum();
+        footer[64..68].copy_from_slice(&(!sum).to_be_bytes());
+        footer
+    }
+
+    #[test]
+    fn inspect_disk_reports_vhd1_virtual_sizes_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Relative path must be rejected by inspect_disk.
+        assert!(inspect_disk(Path::new("relative.img"), None).is_err());
+
+        // Fixed VHD1: virtual_size_bytes must exclude the 512-byte trailing footer.
+        let fixed_vhd = dir.path().join("fixed.vhd");
+        let fixed_virtual = 64 * 1024u64;
+        let mut fixed_bytes = vec![0u8; fixed_virtual as usize];
+        fixed_bytes.extend_from_slice(&build_vhd1_footer(2, fixed_virtual, u64::MAX));
+        fs::write(&fixed_vhd, &fixed_bytes).unwrap();
+        let fixed_info = inspect_disk(&fixed_vhd, None).unwrap();
+        assert_eq!(fixed_info.format, "vhd");
+        assert_eq!(fixed_info.disk_type, "fixed");
+        assert_eq!(fixed_info.virtual_size_bytes, fixed_virtual);
+        assert_eq!(fixed_info.file_size_bytes, fixed_virtual + 512);
+        assert_eq!(fixed_info.warning, None);
+
+        // Fixed VHD1 written with a 32-bit 0xFFFFFFFF data_offset (instead of u64::MAX) is valid.
+        let fixed_32bit_offset_vhd = dir.path().join("fixed-32bit-offset.vhd");
+        let mut fixed_32bit_bytes = vec![0u8; fixed_virtual as usize];
+        fixed_32bit_bytes.extend_from_slice(&build_vhd1_footer(2, fixed_virtual, 0xFFFF_FFFF));
+        fs::write(&fixed_32bit_offset_vhd, &fixed_32bit_bytes).unwrap();
+        let fixed_32bit_info = inspect_disk(&fixed_32bit_offset_vhd, None).unwrap();
+        assert_eq!(fixed_32bit_info.format, "vhd");
+        assert_eq!(fixed_32bit_info.disk_type, "fixed");
+        assert_eq!(fixed_32bit_info.virtual_size_bytes, fixed_virtual);
+        assert_eq!(fixed_32bit_info.warning, None);
+
+        // `.avhd` extension also inspects as VHD1.
+        let avhd_path = dir.path().join("snapshot.avhd");
+        fs::write(&avhd_path, &fixed_bytes).unwrap();
+        let avhd_info = inspect_disk(&avhd_path, None).unwrap();
+        assert_eq!(avhd_info.format, "vhd");
+        assert_eq!(avhd_info.disk_type, "fixed");
+
+        // Fixed VHD1 whose total file size is not a multiple of 512 bytes must be rejected
+        // (Vhd1Disk::open_fixed requires file size alignment).
+        let unaligned_fixed_vhd = dir.path().join("unaligned-fixed.vhd");
+        let mut unaligned_fixed_bytes = vec![0u8; fixed_virtual as usize + 1];
+        unaligned_fixed_bytes.extend_from_slice(&build_vhd1_footer(2, fixed_virtual, u64::MAX));
+        fs::write(&unaligned_fixed_vhd, &unaligned_fixed_bytes).unwrap();
+        assert!(
+            inspect_disk(&unaligned_fixed_vhd, None).is_err(),
+            "unaligned fixed VHD1 must be rejected by inspect_disk"
+        );
+
+        // Dynamic VHD1: virtual_size_bytes comes from footer.current_size (much larger than file size),
+        // and block_size_bytes comes from the dynamic header (`cxsparse`) at bytes 32..36 (while
+        // bytes 28..32 store Max Table Entries).
+        let build_dyn_hdr = |version: u32, max_table_entries: u32, block_size: u32| {
+            let mut dyn_hdr = [0u8; 1024];
+            dyn_hdr[0..8].copy_from_slice(b"cxsparse");
+            dyn_hdr[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+            dyn_hdr[16..24].copy_from_slice(&1536u64.to_be_bytes());
+            dyn_hdr[24..28].copy_from_slice(&version.to_be_bytes());
+            dyn_hdr[28..32].copy_from_slice(&max_table_entries.to_be_bytes());
+            dyn_hdr[32..36].copy_from_slice(&block_size.to_be_bytes());
+            let sum: u32 = dyn_hdr.iter().map(|&b| b as u32).sum();
+            dyn_hdr[36..40].copy_from_slice(&(!sum).to_be_bytes());
+            dyn_hdr
+        };
+
+        let dyn_vhd = dir.path().join("dynamic.vhd");
+        let dyn_virtual = 10 * 1024 * 1024 * 1024u64;
+        let footer = build_vhd1_footer(3, dyn_virtual, 512);
+        let dyn_hdr = build_dyn_hdr(0x0001_0000, 5120, 2 * 1024 * 1024);
+        let mut dyn_bytes = Vec::new();
+        dyn_bytes.extend_from_slice(&footer);
+        dyn_bytes.extend_from_slice(&dyn_hdr);
+        dyn_bytes.extend_from_slice(&footer);
+        fs::write(&dyn_vhd, &dyn_bytes).unwrap();
+        let dyn_info = inspect_disk(&dyn_vhd, None).unwrap();
+        assert_eq!(dyn_info.format, "vhd");
+        assert_eq!(dyn_info.disk_type, "dynamic");
+        assert_eq!(dyn_info.virtual_size_bytes, dyn_virtual);
+        assert_eq!(dyn_info.file_size_bytes, dyn_bytes.len() as u64);
+        assert_eq!(dyn_info.block_size_bytes, Some(2 * 1024 * 1024));
+        #[cfg(not(windows))]
+        assert!(
+            dyn_info
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("not supported")),
+            "expected platform warning for dynamic VHD on non-Windows, got {:?}",
+            dyn_info.warning
+        );
+        #[cfg(windows)]
+        assert_eq!(dyn_info.warning, None);
+
+        // Dynamic VHD1 with corrupted trailing footer must fail rather than silently falling back
+        // to the offset-0 backup copy and reporting healthy.
+        let dyn_offset0_vhd = dir.path().join("dynamic-offset0.vhd");
+        let mut dyn_offset0_bytes = dyn_bytes.clone();
+        let tail_start = dyn_offset0_bytes.len() - 512;
+        dyn_offset0_bytes[tail_start..].fill(0);
+        fs::write(&dyn_offset0_vhd, &dyn_offset0_bytes).unwrap();
+        let dyn_offset0_err = inspect_disk(&dyn_offset0_vhd, None).unwrap_err();
+        assert!(
+            dyn_offset0_err.to_string().contains("corrupt trailing footer"),
+            "{dyn_offset0_err:#}"
+        );
+
+        // Dynamic header with bad checksum or bad version ignores block_size_bytes.
+        let mut bad_csum_bytes = dyn_bytes.clone();
+        bad_csum_bytes[512 + 36] ^= 0xff;
+        let bad_csum_vhd = dir.path().join("dynamic-bad-csum.vhd");
+        fs::write(&bad_csum_vhd, &bad_csum_bytes).unwrap();
+        assert_eq!(inspect_disk(&bad_csum_vhd, None).unwrap().block_size_bytes, None);
+
+        let mut bad_ver_bytes = Vec::new();
+        bad_ver_bytes.extend_from_slice(&footer);
+        bad_ver_bytes.extend_from_slice(&build_dyn_hdr(0x0002_0000, 5120, 2 * 1024 * 1024));
+        bad_ver_bytes.extend_from_slice(&footer);
+        let bad_ver_vhd = dir.path().join("dynamic-bad-ver.vhd");
+        fs::write(&bad_ver_vhd, &bad_ver_bytes).unwrap();
+        assert_eq!(inspect_disk(&bad_ver_vhd, None).unwrap().block_size_bytes, None);
+
+        // Fixed VHD1 at offset 0 only, oversized current_size, zero size, or unaligned size is rejected.
+        let fixed_offset0_vhd = dir.path().join("fixed-offset0.vhd");
+        let mut fixed_offset0_bytes = build_vhd1_footer(2, 64 * 1024, u64::MAX).to_vec();
+        fixed_offset0_bytes.extend_from_slice(&vec![0u8; 64 * 1024]);
+        fs::write(&fixed_offset0_vhd, &fixed_offset0_bytes).unwrap();
+        assert!(inspect_disk(&fixed_offset0_vhd, None).is_err());
+
+        let fixed_too_small_vhd = dir.path().join("fixed-too-small.vhd");
+        let mut fixed_too_small_bytes = vec![0u8; 32 * 1024];
+        fixed_too_small_bytes.extend_from_slice(&build_vhd1_footer(2, 64 * 1024, u64::MAX));
+        fs::write(&fixed_too_small_vhd, &fixed_too_small_bytes).unwrap();
+        assert!(inspect_disk(&fixed_too_small_vhd, None).is_err());
+
+        let zero_size_vhd = dir.path().join("zero-size.vhd");
+        fs::write(&zero_size_vhd, build_vhd1_footer(3, 0, 512)).unwrap();
+        assert!(inspect_disk(&zero_size_vhd, None).is_err());
+
+        let unaligned_vhd = dir.path().join("unaligned.vhd");
+        fs::write(&unaligned_vhd, build_vhd1_footer(3, 1000, 512)).unwrap();
+        assert!(inspect_disk(&unaligned_vhd, None).is_err());
+
+        // Raw extensions (`.img`, `.raw`, `.bin`) are never sniffed even if containing VHD/VHDX magic.
+        let raw_with_vhd_magic = dir.path().join("raw-with-vhd.img");
+        fs::write(&raw_with_vhd_magic, &dyn_bytes).unwrap();
+        let raw_vhd_info = inspect_disk_with_explicit_tool(
+            &raw_with_vhd_magic,
+            Some(Path::new("/nonexistent/openvmm-img")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(raw_vhd_info.format, "raw");
+        assert_eq!(raw_vhd_info.virtual_size_bytes, dyn_bytes.len() as u64);
+
+        let raw_with_vhdx_magic = dir.path().join("raw-with-vhdx.img");
+        let mut vhdx_magic = b"vhdxfile".to_vec();
+        vhdx_magic.resize(4096, 0);
+        fs::write(&raw_with_vhdx_magic, &vhdx_magic).unwrap();
+        let raw_vhdx_info = inspect_disk_with_explicit_tool(
+            &raw_with_vhdx_magic,
+            Some(Path::new("/nonexistent/openvmm-img")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(raw_vhdx_info.format, "raw");
+
+        // Unknown/extensionless files (e.g. `.blob`, `.dsk`) are also treated as raw without
+        // content sniffing, matching VM attach behavior.
+        let renamed_vhd = dir.path().join("disguised-vhd.blob");
+        fs::write(&renamed_vhd, &dyn_bytes).unwrap();
+        let renamed_info = inspect_disk_with_explicit_tool(
+            &renamed_vhd,
+            Some(Path::new("/nonexistent/openvmm-img")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(renamed_info.format, "raw");
+        assert_eq!(renamed_info.virtual_size_bytes, dyn_bytes.len() as u64);
+
+        // Inspecting non-VHDX fails only when inspecting an actual `.vhdx` with missing explicit tool.
+        let bad_explicit_vhdx = dir.path().join("needs-tool.vhdx");
+        fs::write(&bad_explicit_vhdx, &vhdx_magic).unwrap();
+        assert!(
+            inspect_disk_with_explicit_tool(
+                &bad_explicit_vhdx,
+                Some(Path::new("/nonexistent/openvmm-img")),
+                None,
+            )
+            .is_err()
+        );
+
+        // Corrupt `.vhd` with invalid footer fails rather than pretending to be raw.
+        let bad_vhd = dir.path().join("corrupt.vhd");
+        fs::write(&bad_vhd, vec![0u8; 4096]).unwrap();
+        assert!(inspect_disk(&bad_vhd, None).is_err());
+
+        // Unknown extensions with ISO9660 magic (`CD001`) are treated as raw, while `.iso`
+        // files classify as `"iso"`.
+        let iso_blob = dir.path().join("installer.blob");
+        let mut iso_bytes = vec![0u8; 0x9000];
+        iso_bytes[0x8001..0x8006].copy_from_slice(b"CD001");
+        fs::write(&iso_blob, &iso_bytes).unwrap();
+        let blob_info = inspect_disk(&iso_blob, None).unwrap();
+        assert_eq!(blob_info.format, "raw");
+
+        let iso_file = dir.path().join("installer.iso");
+        fs::write(&iso_file, &iso_bytes).unwrap();
+        let iso_info = inspect_disk(&iso_file, None).unwrap();
+        assert_eq!(iso_info.format, "iso");
+
+        // Differencing VHD1 extracts parent_path from W2ru locator (UTF-16LE), falling back
+        // to Parent Unicode Name (UTF-16BE) when no locator entry is present.
+        let diff_footer = build_vhd1_footer(4, dyn_virtual, 512);
+        let locator_bytes: Vec<u8> = "base/parent.vhd"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let locator_offset = (512 + 1024) as u64;
+        let mut diff_hdr = [0u8; 1024];
+        diff_hdr[0..8].copy_from_slice(b"cxsparse");
+        diff_hdr[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+        diff_hdr[16..24].copy_from_slice(&(locator_offset + locator_bytes.len() as u64).to_be_bytes());
+        diff_hdr[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        diff_hdr[28..32].copy_from_slice(&5120u32.to_be_bytes());
+        diff_hdr[32..36].copy_from_slice(&(2 * 1024 * 1024u32).to_be_bytes());
+        // Parent Unicode Name fallback (overridden by W2ru locator when present).
+        let unicode_name_bytes: Vec<u8> = "fallback-parent.vhd"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        diff_hdr[64..64 + unicode_name_bytes.len()].copy_from_slice(&unicode_name_bytes);
+        // First Parent Locator entry: W2ru pointing at locator_offset.
+        diff_hdr[576..580].copy_from_slice(b"W2ru");
+        diff_hdr[580..584].copy_from_slice(&512u32.to_be_bytes());
+        diff_hdr[584..588].copy_from_slice(&(locator_bytes.len() as u32).to_be_bytes());
+        diff_hdr[592..600].copy_from_slice(&locator_offset.to_be_bytes());
+        let sum: u32 = diff_hdr.iter().map(|&b| b as u32).sum();
+        diff_hdr[36..40].copy_from_slice(&(!sum).to_be_bytes());
+
+        let mut diff_bytes = Vec::new();
+        diff_bytes.extend_from_slice(&diff_footer);
+        diff_bytes.extend_from_slice(&diff_hdr);
+        diff_bytes.extend_from_slice(&locator_bytes);
+        diff_bytes.extend_from_slice(&diff_footer);
+        let diff_avhd = dir.path().join("child.avhd");
+        fs::write(&diff_avhd, &diff_bytes).unwrap();
+        let diff_info = inspect_disk(&diff_avhd, None).unwrap();
+        assert_eq!(diff_info.disk_type, "differencing");
+        assert_eq!(diff_info.parent_path.as_deref(), Some("base/parent.vhd"));
+
+        // Clear locator entries and recompute checksum -> falls back to Parent Unicode Name.
+        let mut fallback_hdr = diff_hdr;
+        fallback_hdr[36..40].fill(0);
+        fallback_hdr[576..768].fill(0);
+        let fallback_sum: u32 = fallback_hdr.iter().map(|&b| b as u32).sum();
+        fallback_hdr[36..40].copy_from_slice(&(!fallback_sum).to_be_bytes());
+        let mut fallback_bytes = Vec::new();
+        fallback_bytes.extend_from_slice(&diff_footer);
+        fallback_bytes.extend_from_slice(&fallback_hdr);
+        fallback_bytes.extend_from_slice(&diff_footer);
+        let fallback_avhd = dir.path().join("child-fallback.avhd");
+        fs::write(&fallback_avhd, &fallback_bytes).unwrap();
+        let fallback_info = inspect_disk(&fallback_avhd, None).unwrap();
+        assert_eq!(fallback_info.disk_type, "differencing");
+        assert_eq!(
+            fallback_info.parent_path.as_deref(),
+            Some("fallback-parent.vhd")
+        );
     }
 }

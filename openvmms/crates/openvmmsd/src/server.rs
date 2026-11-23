@@ -27,6 +27,7 @@ use openvmms_core::models::CreateVmPayload;
 use openvmms_core::models::DaemonEvent;
 use openvmms_core::models::DiskInfo;
 use openvmms_core::models::HostConfig;
+use openvmms_core::models::HostConfigPatch;
 use openvmms_core::models::HostInfo;
 use openvmms_core::models::InspectDiskPayload;
 use openvmms_core::models::MountIsoPayload;
@@ -135,7 +136,9 @@ pub fn build_router(supervisor: Arc<Supervisor>, token: String, bound_addr: Sock
         .route("/api/v1/host/info", get(host_info))
         .route(
             "/api/v1/host/config",
-            get(get_host_config).put(put_host_config),
+            get(get_host_config)
+                .put(put_host_config)
+                .patch(patch_host_config),
         )
         .route("/api/v1/host/switches", get(list_switches))
         .route("/api/v1/daemon/shutdown", post(daemon_shutdown))
@@ -233,10 +236,18 @@ async fn events_handler(
     let rx = state.supervisor.subscribe();
     let shutdown_rx = state.supervisor.subscribe_shutdown();
     let stream = futures_util::stream::unfold(
-        (rx, shutdown_rx, false),
-        |(mut rx, mut shutdown_rx, done)| async move {
+        (rx, shutdown_rx, true, false),
+        |(mut rx, mut shutdown_rx, send_initial_resync, done)| async move {
             if done || *shutdown_rx.borrow() {
                 return None;
+            }
+            if send_initial_resync
+                && let Ok(json) = serde_json::to_string(&DaemonEvent::Resync)
+            {
+                return Some((
+                    Ok::<Event, Infallible>(Event::default().data(json)),
+                    (rx, shutdown_rx, false, false),
+                ));
             }
             loop {
                 tokio::select! {
@@ -247,7 +258,7 @@ async fn events_handler(
                                 if let Ok(json) = serde_json::to_string(&event) {
                                     return Some((
                                         Ok::<Event, Infallible>(Event::default().data(json)),
-                                        (rx, shutdown_rx, is_stopping),
+                                        (rx, shutdown_rx, false, is_stopping),
                                     ));
                                 }
                                 if is_stopping {
@@ -258,7 +269,7 @@ async fn events_handler(
                                 if let Ok(json) = serde_json::to_string(&DaemonEvent::Resync) {
                                     return Some((
                                         Ok::<Event, Infallible>(Event::default().data(json)),
-                                        (rx, shutdown_rx, false),
+                                        (rx, shutdown_rx, false, false),
                                     ));
                                 }
                             }
@@ -273,7 +284,7 @@ async fn events_handler(
                                 {
                                     return Some((
                                         Ok::<Event, Infallible>(Event::default().data(json)),
-                                        (rx, shutdown_rx, true),
+                                        (rx, shutdown_rx, false, true),
                                     ));
                                 }
                             }
@@ -309,6 +320,18 @@ async fn put_host_config(
     let updated = state
         .supervisor
         .update_host_config(cfg)
+        .await
+        .map_err(ApiError::map_anyhow)?;
+    Ok(([(axum::http::header::CONNECTION, "close")], Json(updated)))
+}
+
+async fn patch_host_config(
+    State(state): State<AppState>,
+    Json(patch): Json<HostConfigPatch>,
+) -> Result<impl IntoResponse, ApiError> {
+    let updated = state
+        .supervisor
+        .patch_host_config(patch)
         .await
         .map_err(ApiError::map_anyhow)?;
     Ok(([(axum::http::header::CONNECTION, "close")], Json(updated)))
@@ -364,8 +387,15 @@ async fn inspect_disk(
         .map_err(ApiError::map_anyhow)
 }
 
-async fn list_vms(State(state): State<AppState>) -> Json<Vec<VmSummary>> {
-    Json(state.supervisor.list_vms())
+async fn list_vms(State(state): State<AppState>) -> impl IntoResponse {
+    let (vms, rev) = state.supervisor.list_vms_with_revision();
+    (
+        [(
+            axum::http::HeaderName::from_static(openvmms_core::models::EVENT_REVISION_HEADER),
+            rev.to_string(),
+        )],
+        Json(vms),
+    )
 }
 
 async fn create_vm(
@@ -400,9 +430,10 @@ async fn update_vm(
     Path(id): Path<String>,
     Json(req): Json<UpdateVmPayload>,
 ) -> Result<Json<VmSummary>, ApiError> {
-    tokio::task::spawn_blocking(move || state.supervisor.update_vm(&id, req))
+    state
+        .supervisor
+        .update_vm(&id, req)
         .await
-        .map_err(ApiError::internal)?
         .map(Json)
         .map_err(ApiError::map_anyhow)
 }
@@ -418,9 +449,10 @@ async fn delete_vm(
     Path(id): Path<String>,
     Query(query): Query<DeleteVmQuery>,
 ) -> Result<StatusCode, ApiError> {
-    tokio::task::spawn_blocking(move || state.supervisor.delete_vm(&id, query.delete_disks))
+    state
+        .supervisor
+        .delete_vm(&id, query.delete_disks)
         .await
-        .map_err(ApiError::internal)?
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(ApiError::map_anyhow)
 }
@@ -1394,16 +1426,20 @@ mod tests {
             .unwrap();
         assert_eq!(put_resp.status(), 200);
         let updated: openvmms_core::models::HostConfig = put_resp.json().await.unwrap();
-        let new_url = format!("http://{}", updated.listen_addr);
-        assert_ne!(new_url, daemon.base_url);
+        assert_eq!(updated.listen_addr, "127.0.0.1:0");
 
         // ApiClient::from_data_dir resolves the persisted new listen_addr and talks to the SAME daemon.
         let data_dir = dir.path().to_path_buf();
+        let old_base_url = daemon.base_url.clone();
         let (health_ok, vm_names): (bool, Vec<String>) = tokio::task::spawn_blocking(move || {
             let api = openvmms_core::api_client::ApiClient::from_data_dir(Some(&data_dir), None)
                 .unwrap();
-            assert_eq!(api.base_url(), new_url);
+            assert_ne!(api.base_url(), old_base_url);
             api.health().unwrap();
+            assert_eq!(
+                format!("http://{}", api.host_info().unwrap().listen_addr),
+                api.base_url()
+            );
             let vms = api.list_vms().unwrap();
             (
                 true,
@@ -2384,6 +2420,1003 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inferred_vhdx.status(), 400);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sse_events_stream_emits_initial_resync() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let mut sse_resp = client
+            .get(format!("{}/api/v1/events", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), 200);
+
+        let first_chunk = tokio::time::timeout(std::time::Duration::from_secs(2), sse_resp.chunk())
+            .await
+            .expect("timed out waiting for initial SSE resync event")
+            .unwrap()
+            .expect("expected initial SSE chunk before EOF");
+        let text = String::from_utf8_lossy(&first_chunk);
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("expected SSE data line in first chunk");
+        let parsed: openvmms_core::models::DaemonEvent =
+            serde_json::from_str(data).expect("valid DaemonEvent JSON");
+        assert!(
+            matches!(parsed, openvmms_core::models::DaemonEvent::Resync),
+            "expected initial Resync SSE event, got: {parsed:?}"
+        );
+
+        daemon.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_vm_preserves_existing_custom_runtime_dir_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let custom_runtime = dir.path().join("custom-runtime");
+        fs::create_dir_all(&custom_runtime).unwrap();
+        fs::set_permissions(&custom_runtime, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_openvmm = dir.path().join("fake-openvmm.sh");
+        fs::write(&fake_openvmm, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&fake_openvmm, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_uefi = dir.path().join("MSVM.fd");
+        fs::write(&fake_uefi, b"uefi").unwrap();
+
+        let mut host_cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        host_cfg.runtime_dir = custom_runtime.clone();
+        host_cfg.openvmm_bin = Some(fake_openvmm);
+        host_cfg.uefi_firmware_path = Some(fake_uefi);
+
+        let put_resp = client
+            .put(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&host_cfg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 200);
+
+        let vm_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "PermTestVm".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vm_resp.status(), 201);
+
+        let _start_resp = client
+            .post(format!("{}/api/v1/vms/PermTestVm/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+
+        let mode = fs::metadata(&custom_runtime).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "existing custom runtime_dir permissions should be preserved (got {mode:o})"
+        );
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_host_config_save_keeps_old_listen_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let initial_cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Find a free ephemeral port that update_host_config would try to bind.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let new_addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        // Replace config.toml with a non-empty directory so atomic_write/rename fails.
+        let cfg_path = dir.path().join("config.toml");
+        if cfg_path.exists() {
+            fs::remove_file(&cfg_path).unwrap();
+        }
+        fs::create_dir_all(&cfg_path).unwrap();
+        fs::write(cfg_path.join("blocker"), b"x").unwrap();
+
+        let mut next_cfg = initial_cfg.clone();
+        next_cfg.listen_addr = new_addr.clone();
+        let put_resp = client
+            .put(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&next_cfg)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            put_resp.status().is_server_error(),
+            "expected config save failure to return 5xx, got {}",
+            put_resp.status()
+        );
+
+        // Old endpoint still serves and still holds the original listen_addr.
+        let current_cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(current_cfg.listen_addr, initial_cfg.listen_addr);
+
+        let recorded_addr = fs::read_to_string(dir.path().join("daemon.addr")).unwrap();
+        assert_eq!(format!("http://{}", recorded_addr.trim()), daemon.base_url);
+        // The tentatively bound new listener must be released after config save rollback.
+        let _rebound = std::net::TcpListener::bind(&new_addr)
+            .expect("new listen address should be released after failed config save");
+
+        // Clean up blocker dir before shutdown.
+        fs::remove_dir_all(&cfg_path).unwrap();
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relative_disk_paths_are_rejected_across_disk_and_vm_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let create_disk_resp = client
+            .post(format!("{}/api/v1/disks/create", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateDiskPayload {
+                path: std::path::PathBuf::from("relative/os.img"),
+                size_bytes: 1024 * 1024 * 1024,
+                format: DiskFormat::Raw,
+                fixed: false,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_disk_resp.status(), 400);
+
+        let inspect_resp = client
+            .post(format!("{}/api/v1/disks/inspect", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::InspectDiskPayload {
+                path: std::path::PathBuf::from("relative/os.img"),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(inspect_resp.status(), 400);
+
+        let create_vm_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "RelDiskVm".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                disks: vec![openvmms_core::models::DiskAttachment {
+                    lun: 0,
+                    kind: DiskKind::HardDisk,
+                    path: std::path::PathBuf::from("relative/os.img"),
+                    read_only: false,
+                    format: DiskFormat::Raw,
+                }],
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_vm_resp.status(), 400);
+
+        let valid_vm: VmSummary = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "RelAttachVm".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let attach_resp = client
+            .post(format!(
+                "{}/api/v1/vms/{}/disks",
+                daemon.base_url, valid_vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::AttachDiskPayload {
+                path: std::path::PathBuf::from("relative/extra.img"),
+                lun: Some(1),
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(attach_resp.status(), 400);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_port_forwards_are_rejected_on_single_and_multiple_nics() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let nic1_id = uuid::Uuid::new_v4();
+        let nic2_id = uuid::Uuid::new_v4();
+        let vm: VmSummary = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "PortOverlapVm".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                nics: Some(vec![
+                    openvmms_core::models::NicAttachment {
+                        id: nic1_id,
+                        name: "nat0".into(),
+                        mac_address: "00-15-5D-11-22-33".into(),
+                        backend: NicBackendConfig::Consomme {
+                            cidr: None,
+                            port_forwards: vec![PortForward {
+                                host_port: 8080,
+                                guest_port: 80,
+                                protocol: IpProto::Tcp,
+                                host_addr: "127.0.0.1".into(),
+                            }],
+                            internal_dns: true,
+                            allow_host_local_access: true,
+                        },
+                    },
+                    openvmms_core::models::NicAttachment {
+                        id: nic2_id,
+                        name: "nat1".into(),
+                        mac_address: "00-15-5D-11-22-34".into(),
+                        backend: NicBackendConfig::Consomme {
+                            cidr: None,
+                            port_forwards: vec![],
+                            internal_dns: true,
+                            allow_host_local_access: true,
+                        },
+                    },
+                ]),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Overlapping rule on same NIC with different guest port -> 409 Conflict.
+        let same_nic_overlap = client
+            .post(format!(
+                "{}/api/v1/vms/{}/nics/{nic1_id}/ports",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&PortForwardPayload {
+                port: PortForward {
+                    host_port: 8080,
+                    guest_port: 8081,
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(same_nic_overlap.status(), 409);
+
+        // Wildcard bind on second NIC overlaps 127.0.0.1:8080 on NIC 1 -> 409 Conflict.
+        let cross_nic_wildcard = client
+            .post(format!(
+                "{}/api/v1/vms/{}/nics/{nic2_id}/ports",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&PortForwardPayload {
+                port: PortForward {
+                    host_port: 8080,
+                    guest_port: 8443,
+                    protocol: IpProto::Tcp,
+                    host_addr: "0.0.0.0".into(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cross_nic_wildcard.status(), 409);
+
+        // IPv6 wildcard on same host port and guest port coexists with IPv4 rule (IPV6_V6ONLY) -> 200 OK.
+        let ipv6_coexist_ok = client
+            .post(format!(
+                "{}/api/v1/vms/{}/nics/{nic1_id}/ports",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&PortForwardPayload {
+                port: PortForward {
+                    host_port: 8080,
+                    guest_port: 80,
+                    protocol: IpProto::Tcp,
+                    host_addr: "::".into(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ipv6_coexist_ok.status(), 200);
+
+        // Same NIC duplicate (protocol, IP family, guest_port) with a different host port -> 409 Conflict.
+        let same_nic_guest_dup = client
+            .post(format!(
+                "{}/api/v1/vms/{}/nics/{nic1_id}/ports",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&PortForwardPayload {
+                port: PortForward {
+                    host_port: 8081,
+                    guest_port: 80,
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(same_nic_guest_dup.status(), 409);
+
+        // Different protocol (UDP) on the same host port is allowed -> 200 OK.
+        let udp_ok = client
+            .post(format!(
+                "{}/api/v1/vms/{}/nics/{nic2_id}/ports",
+                daemon.base_url, vm.config.id
+            ))
+            .bearer_auth(&daemon.token)
+            .json(&PortForwardPayload {
+                port: PortForward {
+                    host_port: 8080,
+                    guest_port: 5353,
+                    protocol: IpProto::Udp,
+                    host_addr: String::new(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(udp_ok.status(), 200);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_update_and_delete_futures_midflight_still_completes_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let vm: VmSummary = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "DisconnectSafeVm".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Start update_vm and drop its caller future after one poll.
+        {
+            let update_fut = daemon.supervisor.update_vm(
+                &vm.config.name,
+                UpdateVmPayload {
+                    description: Some("updated after disconnect".into()),
+                    ..Default::default()
+                },
+            );
+            tokio::pin!(update_fut);
+            tokio::select! {
+                biased;
+                res = &mut update_fut => {
+                    res.unwrap();
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let current = daemon.supervisor.get_vm(&vm.config.name).unwrap();
+            if current.config.description == "updated after disconnect" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "update_vm did not finish in background after caller future was dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let disk_vms = openvmms_core::store::RegistryStore::new(dir.path())
+            .unwrap()
+            .load_all_vms()
+            .unwrap();
+        assert_eq!(disk_vms.len(), 1);
+        assert_eq!(disk_vms[0].description, "updated after disconnect");
+
+        // Start delete_vm and drop its caller future after one poll.
+        {
+            let delete_fut = daemon.supervisor.delete_vm(&vm.config.name, false);
+            tokio::pin!(delete_fut);
+            tokio::select! {
+                biased;
+                res = &mut delete_fut => {
+                    res.unwrap();
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+
+        let del_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if daemon.supervisor.list_vms().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < del_deadline,
+                "delete_vm left VM stranded with deleting=true after caller future dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!dir.path().join("vms").join(vm.config.id.to_string()).join("vm.toml").exists());
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_vm_with_relative_disk_whitespace_and_overlapping_ports_allows_metadata_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm_id = uuid::Uuid::new_v4();
+        let vm_dir = dir.path().join("vms").join(vm_id.to_string());
+        fs::create_dir_all(&vm_dir).unwrap();
+
+        let mut legacy_vm = openvmms_core::models::VmConfig::from_preset(
+            "LegacyVm",
+            VmPreset::Custom,
+            &vm_dir,
+        );
+        legacy_vm.id = vm_id;
+        legacy_vm.name = "  LegacyVm  ".into();
+        legacy_vm.disks.push(openvmms_core::models::DiskAttachment {
+            lun: 0,
+            kind: DiskKind::HardDisk,
+            path: std::path::PathBuf::from("relative/legacy.img"),
+            read_only: false,
+            format: DiskFormat::Raw,
+        });
+        legacy_vm.nics[0].mac_address = "  00-15-5D-11-22-33  ".into();
+        legacy_vm.nics[0].backend = NicBackendConfig::Consomme {
+            cidr: None,
+            port_forwards: vec![PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 8080,
+                guest_port: 80,
+            }],
+            internal_dns: true,
+            allow_host_local_access: false,
+        };
+        legacy_vm.nics.push(openvmms_core::models::NicAttachment {
+            id: uuid::Uuid::new_v4(),
+            name: "nat1".into(),
+            mac_address: "00-15-5D-11-22-34".into(),
+            backend: NicBackendConfig::Consomme {
+                cidr: None,
+                port_forwards: vec![PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "0.0.0.0".into(),
+                    host_port: 8080,
+                    guest_port: 81,
+                }],
+                internal_dns: true,
+                allow_host_local_access: false,
+            },
+        });
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        legacy_vm.name = "LegacyVm".into();
+        legacy_vm.nics[0].mac_address = "00-15-5D-11-22-33".into();
+        store.save_vm_with_options(&legacy_vm, false, false).unwrap();
+        let raw_toml = fs::read_to_string(store.vm_config_path(vm_id))
+            .unwrap()
+            .replacen("name = \"LegacyVm\"", "name = \"  LegacyVm  \"", 1)
+            .replacen(
+                "mac_address = \"00-15-5D-11-22-33\"",
+                "mac_address = \"  00-15-5D-11-22-33  \"",
+                1,
+            )
+            .replacen("host_addr = \"127.0.0.1\"", "host_addr = \" 127.0.0.1 \"", 1);
+        fs::write(store.vm_config_path(vm_id), raw_toml).unwrap();
+
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        // Loaded config is normalized at startup.
+        let loaded: VmSummary = client
+            .get(format!("{}/api/v1/vms/{vm_id}", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(loaded.config.name, "LegacyVm");
+        assert_eq!(loaded.config.nics[0].mac_address, "00-15-5D-11-22-33");
+
+        // Description-only update succeeds despite legacy relative disk & overlapping ports.
+        let updated_resp = client
+            .put(format!("{}/api/v1/vms/{vm_id}", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&UpdateVmPayload {
+                description: Some("metadata update ok".into()),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated_resp.status(), 200);
+        let updated: VmSummary = updated_resp.json().await.unwrap();
+        assert_eq!(updated.config.description, "metadata update ok");
+
+        // Explicitly updating disks with a relative path is still rejected.
+        let bad_disk_update = client
+            .put(format!("{}/api/v1/vms/{vm_id}", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&UpdateVmPayload {
+                disks: Some(loaded.config.disks),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_disk_update.status(), 400);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_host_config_is_atomic_and_inspect_non_vhdx_ignores_missing_img_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let missing_img_bin = dir.path().join("missing-openvmm-img");
+        let firmware = dir.path().join("MSVM.fd");
+        fs::write(&firmware, b"fw").unwrap();
+
+        let mut init_cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        init_cfg.openvmm_img_bin = Some(missing_img_bin.clone());
+        init_cfg.uefi_firmware_path = Some(firmware.clone());
+        let put_resp = client
+            .put(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&init_cfg)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 200);
+
+        // PATCH updates only openvmm_bin without touching openvmm_img_bin or uefi_firmware_path.
+        let custom_openvmm = dir.path().join("custom-openvmm");
+        let patch_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::HostConfigPatch {
+                openvmm_bin: Some(Some(custom_openvmm.clone())),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), 200);
+        let patched: openvmms_core::models::HostConfig = patch_resp.json().await.unwrap();
+        assert_eq!(patched.openvmm_bin, Some(custom_openvmm));
+        assert_eq!(patched.openvmm_img_bin, Some(missing_img_bin));
+        assert_eq!(patched.uefi_firmware_path, Some(firmware));
+
+        // Inspecting raw/ISO succeeds even though configured openvmm_img_bin does not exist.
+        let raw_img = dir.path().join("guest.img");
+        fs::write(&raw_img, vec![0u8; 4096]).unwrap();
+        let raw_resp = client
+            .post(format!("{}/api/v1/disks/inspect", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::InspectDiskPayload { path: raw_img })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(raw_resp.status(), 200);
+        let raw_info: openvmms_core::models::DiskInfo = raw_resp.json().await.unwrap();
+        assert_eq!(raw_info.format, "raw");
+
+        let iso_file = dir.path().join("disc.iso");
+        fs::write(&iso_file, vec![0u8; 4096]).unwrap();
+        let iso_resp = client
+            .post(format!("{}/api/v1/disks/inspect", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::InspectDiskPayload { path: iso_file })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(iso_resp.status(), 200);
+        let iso_info: openvmms_core::models::DiskInfo = iso_resp.json().await.unwrap();
+        assert_eq!(iso_info.format, "iso");
+
+        // Inspecting `.vhdx` fails clearly with the configured missing openvmm-img error.
+        let vhdx_file = dir.path().join("disk.vhdx");
+        fs::write(&vhdx_file, b"vhdxfile").unwrap();
+        let vhdx_resp = client
+            .post(format!("{}/api/v1/disks/inspect", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&openvmms_core::models::InspectDiskPayload { path: vhdx_file })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vhdx_resp.status(), 400);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_vms_returns_atomic_event_revision_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let created: VmSummary = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "RevHeader-VM".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let vms_resp = client
+            .get(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vms_resp.status(), 200);
+        let hdr_rev: u64 = vms_resp
+            .headers()
+            .get(openvmms_core::models::EVENT_REVISION_HEADER)
+            .expect("missing x-openvmms-event-revision header")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(hdr_rev, created.runtime.revision);
+
+        let base_url = daemon.base_url.clone();
+        let token = daemon.token.clone();
+        let (api_vms, api_rev) = tokio::task::spawn_blocking(move || {
+            openvmms_core::api_client::ApiClient::new(&base_url, &token)?.list_vms_with_revision()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(api_vms.len(), 1);
+        assert_eq!(api_rev, Some(created.runtime.revision));
+
+        daemon.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_default_runtime_dir_trailing_slash_gets_0700_and_worker_umask_is_0077() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let fake_uefi = dir.path().join("MSVM.fd");
+        fs::write(&fake_uefi, b"uefi").unwrap();
+
+        // 1. Default runtime_dir specified with a trailing slash (pre-existing 0o755) must still get 0o700.
+        let default_rt = openvmms_core::models::default_runtime_dir(dir.path());
+        fs::create_dir_all(&default_rt).unwrap();
+        fs::set_permissions(&default_rt, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let exit_script = dir.path().join("exit-script.sh");
+        fs::write(&exit_script, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&exit_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cfg: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        cfg.runtime_dir = std::path::PathBuf::from(format!("{}/", default_rt.display()));
+        cfg.openvmm_bin = Some(exit_script);
+        cfg.uefi_firmware_path = Some(fake_uefi);
+        assert_eq!(
+            client
+                .put(format!("{}/api/v1/host/config", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&cfg)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        let vm_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "Umask-VM".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(vm_resp.status(), 201);
+
+        let _ = client
+            .post(format!("{}/api/v1/vms/Umask-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        let default_mode = fs::metadata(&default_rt).unwrap().permissions().mode() & 0o777;
+        assert_eq!(default_mode, 0o700);
+
+        // 2. Custom 0o755 runtime_dir keeps 0o755, while the spawned child creates files with umask 0o077.
+        let custom_rt = dir.path().join("custom-umask-rt");
+        fs::create_dir_all(&custom_rt).unwrap();
+        fs::set_permissions(&custom_rt, fs::Permissions::from_mode(0o755)).unwrap();
+        let probe_file = custom_rt.join("worker-created.probe");
+        let probe_script = dir.path().join("probe-script.sh");
+        fs::write(
+            &probe_script,
+            format!("#!/bin/sh\n: > '{}'\nexit 1\n", probe_file.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&probe_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        cfg.runtime_dir = custom_rt.clone();
+        cfg.openvmm_bin = Some(probe_script);
+        assert_eq!(
+            client
+                .put(format!("{}/api/v1/host/config", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&cfg)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+
+        let _ = client
+            .post(format!("{}/api/v1/vms/Umask-VM/start", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        let custom_mode = fs::metadata(&custom_rt).unwrap().permissions().mode() & 0o777;
+        assert_eq!(custom_mode, 0o755);
+        let probe_mode = fs::metadata(&probe_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            probe_mode & 0o077,
+            0,
+            "child worker must run with umask 0o077 (got {probe_mode:o})"
+        );
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_host_config_empty_preserves_port0_listener_and_handles_unknown_null_empty_absent()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+            let mut cfg = store.load_or_init_host_config().unwrap();
+            cfg.listen_addr = "127.0.0.1:0".into();
+            store.save_host_config(&cfg).unwrap();
+        }
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        // Daemon config starts with listen_addr = "127.0.0.1:0" on an ephemeral bound port.
+        let initial: openvmms_core::models::HostConfig = client
+            .get(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(initial.listen_addr, "127.0.0.1:0");
+
+        let custom_openvmm = dir.path().join("bin-openvmm");
+        let custom_viewer = dir.path().join("bin-viewer");
+        let custom_img = dir.path().join("bin-img");
+        let seed_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({
+                "openvmm_bin": custom_openvmm,
+                "fastdesk_viewer_bin": custom_viewer,
+                "openvmm_img_bin": custom_img,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(seed_resp.status(), 200);
+
+        // 1. Empty PATCH {} must NOT rebind the listener when listen_addr is "127.0.0.1:0".
+        let empty_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_resp.status(), 200);
+        // Daemon must still be reachable at the exact same base_url (listener did not move).
+        let health = client
+            .get(format!("{}/api/v1/health", daemon.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200);
+        let after_empty: openvmms_core::models::HostConfig = empty_resp.json().await.unwrap();
+        assert_eq!(after_empty.openvmm_bin.as_ref(), Some(&custom_openvmm));
+        assert_eq!(
+            after_empty.fastdesk_viewer_bin.as_ref(),
+            Some(&custom_viewer)
+        );
+        assert_eq!(after_empty.openvmm_img_bin.as_ref(), Some(&custom_img));
+
+        // 2. Unknown fields must be rejected (422 Unprocessable Entity), not silently ignored.
+        let unknown_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({ "runtime_dir": "/tmp/ignored" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown_resp.status(), 422);
+
+        // 3. `null` clears openvmm_bin, `""` clears fastdesk_viewer_bin, absent preserves openvmm_img_bin.
+        let nullable_resp = client
+            .patch(format!("{}/api/v1/host/config", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({
+                "openvmm_bin": null,
+                "fastdesk_viewer_bin": "",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(nullable_resp.status(), 200);
+        let cleared: openvmms_core::models::HostConfig = nullable_resp.json().await.unwrap();
+        assert_eq!(cleared.openvmm_bin, None);
+        assert_eq!(cleared.fastdesk_viewer_bin, None);
+        assert_eq!(cleared.openvmm_img_bin, Some(custom_img));
 
         daemon.shutdown().await;
     }

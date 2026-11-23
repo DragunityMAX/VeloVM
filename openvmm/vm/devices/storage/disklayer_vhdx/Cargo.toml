@@ -18,8 +18,12 @@ guid.workspace = true
 inspect.workspace = true
 scsi_buffers.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 vhdx.workspace = true
 vm_resource.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 pal_async.workspace = true

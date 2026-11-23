@@ -280,7 +280,7 @@ index 4c6546f..57c7860 100644
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
-index b63d6b6..44ef6b5 100644
+index b63d6b6..ad519ea 100644
 --- a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 +++ b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 @@ -35,6 +35,7 @@ struct FdRegistry {}
@@ -1012,7 +1012,7 @@ index b63d6b6..44ef6b5 100644
          vmservice::NicFrontend::Vmbus => NicDevice::Vmbus(
              NetvspHandle {
                  instance_id,
-@@ -2503,33 +2850,75 @@ fn parse_nic_config(
+@@ -2503,33 +2850,80 @@ fn parse_nic_config(
              }
              .into_resource(),
          },
@@ -1051,6 +1051,11 @@ index b63d6b6..44ef6b5 100644
 +        }
 +        .into_resource()
 +    } else {
++        // Intentional behavioral change from upstream: upstream ignored `disk.r#type`
++        // and always dispatched by file extension. `SCSI_DISK_TYPE_VHDX` is now
++        // explicitly honoured via `open_vhdx_disk` regardless of extension (e.g.
++        // `.avhdx`), so existing clients passing `DiskType=VHDX` for non-VHDX
++        // images must switch to `SCSI_DISK_TYPE_PHYSICAL` or `SCSI_DISK_TYPE_VHD1`.
 +        let disk_handle = match vmservice::DiskType::from_i32(disk.r#type) {
 +            Some(vmservice::DiskType::ScsiDiskTypeVhdx) => {
 +                openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await
@@ -1102,7 +1107,7 @@ index b63d6b6..44ef6b5 100644
  /// Applies the MMIO gap sizes from the request's `MemoryConfig` to the
  /// chipset's default layout. A zero-sized request field leaves the chipset
  /// default in place.
-@@ -3439,11 +3828,16 @@ fn service(
+@@ -3439,11 +3833,16 @@ fn service(
              controller_task: None,
              wait_vm_response: None,
              lifecycle: VmLifecycle::Running,
@@ -1119,7 +1124,7 @@ index b63d6b6..44ef6b5 100644
          }
      }
  
-@@ -4363,11 +4757,16 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4363,11 +4762,16 @@ fn guest_power_exit_stops_rpc_server() {
                      controller_task: None,
                      wait_vm_response: None,
                      lifecycle: VmLifecycle::Running,
@@ -1136,7 +1141,7 @@ index b63d6b6..44ef6b5 100644
                  };
                  event_send.send(VmControllerEvent::ExitRequested { code });
                  assert_eq!(service.run(listener, worker_recv).await.unwrap(), code);
-@@ -4375,6 +4774,118 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4375,6 +4779,118 @@ fn guest_power_exit_stops_rpc_server() {
          });
      }
  
@@ -1255,7 +1260,7 @@ index b63d6b6..44ef6b5 100644
      #[test]
      fn uefi_initial_variables_defaults() {
          for arch in [
-@@ -4568,6 +5079,17 @@ fn platform_config_rejects_vmbus_devices() {
+@@ -4568,6 +5084,17 @@ fn platform_config_rejects_vmbus_devices() {
                  }),
                  ..Default::default()
              },
@@ -1273,7 +1278,7 @@ index b63d6b6..44ef6b5 100644
          ] {
              assert!(validate_platform_config(&config).is_ok());
              assert!(
-@@ -4877,4 +5399,392 @@ fn reject_invalid_vfio_bar_address_config() {
+@@ -4877,4 +5404,392 @@ fn reject_invalid_vfio_bar_address_config() {
              .is_err()
          );
      }
@@ -1667,7 +1672,7 @@ index b63d6b6..44ef6b5 100644
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto b/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
-index 2b4d184..5b2c53e 100644
+index 2b4d184..c4b9258 100644
 --- a/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
 +++ b/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
 @@ -27,6 +27,9 @@ service VM {
@@ -1735,8 +1740,23 @@ index 2b4d184..5b2c53e 100644
  }
  
  message CapabilitiesVMResponse {
-@@ -1027,6 +1057,8 @@ message SCSIDisk {
+@@ -1017,6 +1047,10 @@ enum ModifyType {
+ 
+ enum DiskType {
+     SCSI_DISK_TYPE_VHD1 = 0;
++    // Explicitly honoured on SCSIDisk attachments: opens the image via the
++    // VHDX backend regardless of file extension (intentional behavioral change
++    // from upstream, where DiskType=VHDX was previously ignored in favor of
++    // extension-based dispatch).
+     SCSI_DISK_TYPE_VHDX = 1;
+     SCSI_DISK_TYPE_PHYSICAL = 2;
+ }
+@@ -1025,8 +1059,12 @@ message SCSIDisk {
+     uint32 controller = 1;
+     uint32 lun = 2;
      string host_path = 3;
++    // Note: SCSI_DISK_TYPE_VHDX opens via open_vhdx_disk regardless of extension;
++    // other values use extension-based dispatch (open_disk_type).
      DiskType type = 4;
      bool read_only = 5;
 +    // Attach as a virtual DVD/ISO optical drive (SimpleScsiDvdHandle) instead of a disk.

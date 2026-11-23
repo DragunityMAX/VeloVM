@@ -225,21 +225,27 @@ impl Server {
                 cancel.lock().cancel();
                 return res;
             }
-            // A clean read EOF can be either a half-close (`shutdown(SHUT_WR)`),
-            // where the peer still expects replies, or a full socket close.
-            // On Linux, wait for `POLLHUP`/`POLLERR` vs `send_task` completing
-            // so half-closed clients still receive in-flight replies while
-            // full disconnects cancel pending RPCs immediately.
+            // On Linux (`epoll`), read EOF can be a half-close (`shutdown(SHUT_WR)` ->
+            // `EPOLLRDHUP`) where the peer still expects in-flight replies, rather than a
+            // full disconnect (`EPOLLHUP`/`EPOLLERR`). Keep pending RPCs alive until
+            // either full disconnect or `send_task` finishes draining responses. Note: this
+            // assumes `AF_UNIX` stream sockets (used by OpenVMM's ttrpc transport); on
+            // TCP sockets, a peer `close()` only sends `FIN` and won't trigger `HUP`.
             #[cfg(target_os = "linux")]
-            {
-                futures::select! {
-                    _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
-                        peer_closed.store(true, std::sync::atomic::Ordering::Release);
-                        cancel.lock().cancel();
-                    }
-                    _ = send_done_rx.fuse() => {}
+            futures::select! {
+                _ = reader.wait_ready(PollEvents::HUP | PollEvents::ERR).fuse() => {
+                    peer_closed.store(true, std::sync::atomic::Ordering::Release);
+                    cancel.lock().cancel();
                 }
+                _ = send_done_rx.fuse() => {}
             }
+            // On Windows `afunix.sys` / AFD, both `shutdown(SD_SEND)` and a
+            // graceful `closesocket()` raise `AFD_POLL_DISCONNECT` (`PollEvents::RDHUP`)
+            // rather than `AFD_POLL_ABORT` (`PollEvents::HUP`), so full disconnect
+            // cannot be distinguished from half-close via socket readiness. On
+            // non-Linux Unix targets (e.g., macOS `kqueue`), `PollEvents` handling is
+            // untested. Cancel on read EOF so client disconnects (e.g. `WaitVM`) release
+            // promptly.
             #[cfg(not(target_os = "linux"))]
             {
                 drop(send_done_rx);

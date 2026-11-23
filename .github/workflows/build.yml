@@ -24,7 +24,7 @@ jobs:
   build-windows-x64:
     name: Build & Package Windows x64 (WHP)
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -160,16 +160,49 @@ jobs:
           $autoDir = Join-Path $env:RUNNER_TEMP "openvmms-autostart-win"
           if (Test-Path $autoDir) { Remove-Item -Recurse -Force $autoDir }
           New-Item -ItemType Directory -Force -Path $autoDir | Out-Null
+          $killAutoDaemon = {
+            $pattern = [regex]::Escape($autoDir)
+            Get-CimInstance Win32_Process -Filter "Name = 'openvmmsd.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -and $_.CommandLine -match $pattern } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          }
           try {
-            $autoOut = & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --json vm list | Out-String
-            if ($LASTEXITCODE -ne 0 -or $autoOut -notmatch '\[\]') {
-              throw "openvmms auto-start stdout-capture check failed (exit $LASTEXITCODE):`n$autoOut"
+            $psi = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path ".\openvmms\target\release\openvmms.exe").Path)
+            $psi.Arguments = ('--data-dir "{0}" --json vm list' -f $autoDir)
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            try {
+              $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+              $stderrTask = $proc.StandardError.ReadToEndAsync()
+              $deadline = [DateTime]::UtcNow.AddSeconds(15)
+              if (-not $proc.WaitForExit(15000)) {
+                try { $proc.Kill($true); $proc.WaitForExit(5000) | Out-Null } catch { try { $proc.Kill(); $proc.WaitForExit(5000) | Out-Null } catch {} }
+                & $killAutoDaemon
+                throw "openvmms auto-start stdout-capture check timed out after 15s"
+              }
+              $remainingMs = [Math]::Max(2000, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+              $ioTask = [System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]($stdoutTask, $stderrTask))
+              if (-not $ioTask.Wait($remainingMs)) {
+                & $killAutoDaemon
+                throw "openvmms auto-start stdout/stderr pipe remained open after 15s (inherited stdio handle leak)"
+              }
+              $autoOut = $stdoutTask.GetAwaiter().GetResult()
+              $autoErr = $stderrTask.GetAwaiter().GetResult()
+              if ($proc.ExitCode -ne 0 -or $autoOut -notmatch '\[\]') {
+                throw "openvmms auto-start stdout-capture check failed (exit $($proc.ExitCode)):`n$autoOut`n$autoErr"
+              }
+            } finally {
+              $proc.Dispose()
             }
           } finally {
             try {
               & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --no-auto-start daemon stop | Out-Null
             } catch {}
             Start-Sleep -Milliseconds 300
+            & $killAutoDaemon
+            Start-Sleep -Milliseconds 150
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $autoDir
           }
 
@@ -485,7 +518,7 @@ jobs:
           ./openvmm/target/release/openvmm-img --help >/dev/null
           ./openvmms/target/release/openvmmsd --help >/dev/null
           ./openvmms/target/release/openvmms --help >/dev/null
-          ./openvmms/target/release/openvmms-gui --self-test | grep -q "SELF-TEST OK"
+          ./openvmms/target/release/openvmms-gui --self-test | grep "SELF-TEST OK" >/dev/null
 
           AUTO_DIR="$RUNNER_TEMP/openvmms-autostart-linux"
           rm -rf "$AUTO_DIR"
@@ -549,11 +582,11 @@ jobs:
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.vhdx" --size 64M --format vhdx >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            disk info "$SMOKE_DIR/smoke.vhdx" | grep -q '"format": "vhdx"'
+            disk info "$SMOKE_DIR/smoke.vhdx" | grep '"format": "vhdx"' >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            vm list | grep -q "Smoke-VM"
+            vm list | grep "Smoke-VM" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm start "Smoke-VM" >/dev/null
           SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
@@ -562,11 +595,11 @@ jobs:
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm pause "Smoke-VM" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            vm show "Smoke-VM" | grep -q '"status": "paused"'
+            vm show "Smoke-VM" | grep '"status": "paused"' >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm resume "Smoke-VM" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            vm show "Smoke-VM" | grep -q '"status": "running"'
+            vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
           # Default daemon stop must exit promptly while preserving the running VM across restart.
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop >/dev/null
@@ -594,20 +627,20 @@ jobs:
             exit 1
           fi
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            vm show "Smoke-VM" | grep -q '"status": "running"'
+            vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm stop "Smoke-VM" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            vm show "Smoke-VM" | grep -q '"status": "off"'
+            vm show "Smoke-VM" | grep '"status": "off"' >/dev/null
           # Verify win11 preset enables vTPM 2.0 and boots openvmm with --tpm.
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-Win11-TPM" --preset win11 --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.vhdx" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            vm show "Smoke-Win11-TPM" | grep -q '"tpm_enabled": true'
+            vm show "Smoke-Win11-TPM" | grep '"tpm_enabled": true' >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm start "Smoke-Win11-TPM" >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
-            vm show "Smoke-Win11-TPM" | grep -q '"status": "running"'
+            vm show "Smoke-Win11-TPM" | grep '"status": "running"' >/dev/null
           ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop --stop-vms >/dev/null
           wait_for_pid_exit "$SMOKE_PID"

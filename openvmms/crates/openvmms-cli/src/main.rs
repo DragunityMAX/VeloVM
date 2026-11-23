@@ -19,6 +19,7 @@ use openvmms_core::models::DiskInfo;
 use openvmms_core::models::DiskKind;
 use openvmms_core::models::FastDeskSettings;
 use openvmms_core::models::FastDeskTransport;
+use openvmms_core::models::HostConfigPatch;
 use openvmms_core::models::MountIsoPayload;
 use openvmms_core::models::NicAttachment;
 use openvmms_core::models::NicBackendConfig;
@@ -537,32 +538,17 @@ fn handle_host(cli: &Cli, action: &HostCmd) -> anyhow::Result<()> {
             uefi_firmware,
             listen_addr,
         } => {
-            let mut cfg = client.host_config()?;
-            let mut changed = false;
-            if let Some(p) = openvmm_bin {
-                cfg.openvmm_bin = Some(resolve_client_path(p));
-                changed = true;
-            }
-            if let Some(p) = viewer_bin {
-                cfg.fastdesk_viewer_bin = Some(resolve_client_path(p));
-                changed = true;
-            }
-            if let Some(p) = img_bin {
-                cfg.openvmm_img_bin = Some(resolve_client_path(p));
-                changed = true;
-            }
-            if let Some(p) = uefi_firmware {
-                cfg.uefi_firmware_path = Some(resolve_client_path(p));
-                changed = true;
-            }
-            if let Some(addr) = listen_addr {
-                cfg.listen_addr = addr.clone();
-                changed = true;
-            }
-            let out = if changed {
-                client.update_host_config(&cfg)?
+            let patch = HostConfigPatch {
+                listen_addr: listen_addr.clone(),
+                openvmm_bin: openvmm_bin.as_ref().map(|p| Some(resolve_client_path(p))),
+                fastdesk_viewer_bin: viewer_bin.as_ref().map(|p| Some(resolve_client_path(p))),
+                openvmm_img_bin: img_bin.as_ref().map(|p| Some(resolve_client_path(p))),
+                uefi_firmware_path: uefi_firmware.as_ref().map(|p| Some(resolve_client_path(p))),
+            };
+            let out = if !patch.is_empty() {
+                client.patch_host_config(&patch)?
             } else {
-                cfg
+                client.host_config()?
             };
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&out)?);
@@ -1009,6 +995,7 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
         return Ok(vec![NicAttachment::default_consomme()]);
     }
     if let Some(switch_id) = trimmed.strip_prefix("vmswitch:") {
+        let switch_id = switch_id.trim();
         let sid = if switch_id.is_empty() {
             "default".to_string()
         } else {
@@ -1025,7 +1012,8 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
         }]);
     }
     if let Some(tap_name) = trimmed.strip_prefix("tap:") {
-        if tap_name.trim().is_empty() {
+        let tap_name = tap_name.trim();
+        if tap_name.is_empty() {
             bail!("tap:<interface> requires an interface name");
         }
         return Ok(vec![NicAttachment {
@@ -1033,7 +1021,7 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
             name: format!("TAP ({tap_name})"),
             mac_address: generate_hyperv_mac(),
             backend: NicBackendConfig::Tap {
-                name: tap_name.trim().to_string(),
+                name: tap_name.to_string(),
             },
         }]);
     }
@@ -1060,6 +1048,9 @@ fn print_disk_info(info: &DiskInfo, json: bool) -> anyhow::Result<()> {
         );
         if let Some(parent) = &info.parent_path {
             println!("Parent:       {parent}");
+        }
+        if let Some(warning) = &info.warning {
+            println!("Warning:      {warning}");
         }
     }
     Ok(())
