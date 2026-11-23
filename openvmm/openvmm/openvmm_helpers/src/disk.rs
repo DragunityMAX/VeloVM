@@ -119,6 +119,41 @@ pub fn open_raw_disk_file(
     open_raw_disk(path, options, None)
 }
 
+/// Opens `path` as a VHD1 disk regardless of its file extension.
+pub fn open_vhd1_disk(
+    path: &Path,
+    options: OpenDiskOptions,
+) -> anyhow::Result<Resource<DiskHandleKind>> {
+    let read_only = options.read_only;
+    let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
+
+    match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
+        Ok(vhd) => {
+            if options.direct {
+                anyhow::bail!("direct I/O is not supported for fixed .vhd files");
+            }
+            Ok(Resource::new(disk_backend_resources::FixedVhd1DiskHandle(
+                vhd.into_inner(),
+            )))
+        }
+        Err(disk_vhd1::OpenError::NotFixed) => {
+            #[cfg(windows)]
+            {
+                Ok(Resource::new(disk_vhdmp::OpenVhdmpDiskConfig(
+                    disk_vhdmp::VhdmpDisk::options()
+                        .read_only(read_only)
+                        .cached_io(!options.direct)
+                        .open(path)
+                        .with_context(|| disk_open_error(path, "failed to open"))?,
+                )))
+            }
+            #[cfg(not(windows))]
+            anyhow::bail!("non-fixed VHD not supported on Linux");
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Opens the resources needed for using a disk from a file at `path`.
 ///
 /// If the file ends with .vhd or .avhd and is a fixed VHD1, it will be opened using
@@ -151,33 +186,7 @@ pub async fn open_disk_type(
             disk_vmdk::open_vmdk(path, read_only)
                 .with_context(|| disk_open_error(path, "failed to open"))?
         }
-        Some("vhd" | "avhd") => {
-            let file = open_disk_file_with_lock(path, read_only, false, false, "failed to open")?;
-
-            match disk_vhd1::Vhd1Disk::open_fixed(file, read_only) {
-                Ok(vhd) => {
-                    ensure_no_direct("fixed .vhd")?;
-                    Resource::new(disk_backend_resources::FixedVhd1DiskHandle(
-                        vhd.into_inner(),
-                    ))
-                }
-                Err(disk_vhd1::OpenError::NotFixed) => {
-                    #[cfg(windows)]
-                    {
-                        Resource::new(disk_vhdmp::OpenVhdmpDiskConfig(
-                            disk_vhdmp::VhdmpDisk::options()
-                                .read_only(read_only)
-                                .cached_io(!options.direct)
-                                .open(path)
-                                .with_context(|| disk_open_error(path, "failed to open"))?,
-                        ))
-                    }
-                    #[cfg(not(windows))]
-                    anyhow::bail!("non-fixed VHD not supported on Linux");
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
+        Some("vhd" | "avhd") => open_vhd1_disk(path, options)?,
         Some("vhdx" | "avhdx") => open_vhdx_disk(path, options).await?,
         Some("iso") if !read_only => {
             anyhow::bail!("iso file cannot be opened as read/write")

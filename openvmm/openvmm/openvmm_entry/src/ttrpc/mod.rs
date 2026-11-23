@@ -2886,17 +2886,21 @@ async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDevic
         .into_resource()
     } else {
         // Intentional behavioral change from upstream: upstream ignored `disk.r#type`
-        // and always dispatched by file extension. `SCSI_DISK_TYPE_VHDX` is now
-        // explicitly honoured via `open_vhdx_disk` regardless of extension (e.g.
-        // `.avhdx`), so existing clients passing `DiskType=VHDX` for non-VHDX
-        // images must switch to `SCSI_DISK_TYPE_PHYSICAL` or `SCSI_DISK_TYPE_VHD1`.
+        // and always dispatched by file extension. `SCSI_DISK_TYPE_VHDX`,
+        // `SCSI_DISK_TYPE_VHD1`, and `SCSI_DISK_TYPE_PHYSICAL` now each explicitly
+        // select their respective backend regardless of file extension (`None`
+        // falls back to extension-based `open_disk_type`).
         let disk_handle = match vmservice::DiskType::from_i32(disk.r#type) {
             Some(vmservice::DiskType::ScsiDiskTypeVhdx) => {
                 openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await
             }
-            Some(vmservice::DiskType::ScsiDiskTypePhysical)
-            | Some(vmservice::DiskType::ScsiDiskTypeVhd1)
-            | None => open_disk_type(disk.host_path.as_ref(), options).await,
+            Some(vmservice::DiskType::ScsiDiskTypeVhd1) => {
+                openvmm_helpers::disk::open_vhd1_disk(disk.host_path.as_ref(), options)
+            }
+            Some(vmservice::DiskType::ScsiDiskTypePhysical) => {
+                openvmm_helpers::disk::open_raw_disk_file(disk.host_path.as_ref(), options)
+            }
+            None => open_disk_type(disk.host_path.as_ref(), options).await,
         }
         .with_context(|| format!("failed to open {}", disk.host_path))?;
         SimpleScsiDiskHandle {
@@ -5566,6 +5570,74 @@ mod tests {
                 err.chain()
                     .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
                 "{err:#}"
+            );
+        });
+    }
+
+    #[test]
+    fn make_disk_config_explicit_physical_opens_vhd_extension_as_raw() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let raw_vhd = dir.path().join("raw.vhd");
+            std::fs::write(&raw_vhd, [0u8; 512]).unwrap();
+
+            let disk = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 0,
+                host_path: raw_vhd.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypePhysical as i32,
+                read_only: true,
+                is_dvd: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(disk.device.id(), "emulated_disk");
+        });
+    }
+
+    #[test]
+    fn make_disk_config_explicit_vhd1_opens_non_vhd_extension_as_vhd1() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp_vhd = dir.path().join("seed.vhd");
+            let created = openvmm_helpers::disk::create_disk_type(
+                &tmp_vhd,
+                64 * 1024,
+                OpenDiskOptions {
+                    read_only: false,
+                    direct: false,
+                },
+            )
+            .unwrap();
+            drop(created);
+
+            let img_vhd1 = dir.path().join("legacy.img");
+            std::fs::rename(&tmp_vhd, &img_vhd1).unwrap();
+            let disk = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 0,
+                host_path: img_vhd1.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypeVhd1 as i32,
+                read_only: false,
+                is_dvd: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(disk.device.id(), "emulated_disk");
+
+            let bad_img = dir.path().join("invalid.img");
+            std::fs::write(&bad_img, [0u8; 512]).unwrap();
+            assert!(
+                make_disk_config(vmservice::ScsiDisk {
+                    controller: 0,
+                    lun: 1,
+                    host_path: bad_img.to_string_lossy().into(),
+                    r#type: vmservice::DiskType::ScsiDiskTypeVhd1 as i32,
+                    read_only: true,
+                    is_dvd: false,
+                })
+                .await
+                .is_err()
             );
         });
     }

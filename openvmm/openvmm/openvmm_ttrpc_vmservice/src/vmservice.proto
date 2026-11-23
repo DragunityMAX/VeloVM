@@ -1046,12 +1046,16 @@ enum ModifyType {
 }
 
 enum DiskType {
+    // Explicitly honoured on SCSIDisk attachments: opens the image via the
+    // VHD1 backend regardless of file extension.
     SCSI_DISK_TYPE_VHD1 = 0;
     // Explicitly honoured on SCSIDisk attachments: opens the image via the
     // VHDX backend regardless of file extension (intentional behavioral change
-    // from upstream, where DiskType=VHDX was previously ignored in favor of
+    // from upstream, where DiskType was previously ignored in favor of
     // extension-based dispatch).
     SCSI_DISK_TYPE_VHDX = 1;
+    // Explicitly honoured on SCSIDisk attachments: opens the image as a raw
+    // physical file/device regardless of file extension.
     SCSI_DISK_TYPE_PHYSICAL = 2;
 }
 
@@ -1059,8 +1063,8 @@ message SCSIDisk {
     uint32 controller = 1;
     uint32 lun = 2;
     string host_path = 3;
-    // Note: SCSI_DISK_TYPE_VHDX opens via open_vhdx_disk regardless of extension;
-    // other values use extension-based dispatch (open_disk_type).
+    // Note: SCSI_DISK_TYPE_VHD1, SCSI_DISK_TYPE_VHDX, and SCSI_DISK_TYPE_PHYSICAL
+    // each explicitly select their backend regardless of extension.
     DiskType type = 4;
     bool read_only = 5;
     // Attach as a virtual DVD/ISO optical drive (SimpleScsiDvdHandle) instead of a disk.

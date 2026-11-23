@@ -149,7 +149,7 @@ impl RegistryStore {
             }
         }
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         loop {
             match file.try_lock() {
                 Ok(()) => {
@@ -166,7 +166,7 @@ impl RegistryStore {
                             self.data_dir.display()
                         );
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(fs::TryLockError::Error(err)) => {
                     return Err(err)
@@ -1514,6 +1514,7 @@ mod tests {
             readers.push(std::thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     let _ = store.is_daemon_locked();
+                    std::thread::yield_now();
                 }
             }));
         }
