@@ -19,7 +19,10 @@ use vm_resource::kind::DiskHandleKind;
 
 #[cfg(unix)]
 fn is_unsupported_lock_error(err: &std::io::Error) -> bool {
-    #[cfg_attr(target_os = "linux", expect(unreachable_patterns))]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "freebsd"),
+        expect(unreachable_patterns)
+    )]
     let unsupported_errno = matches!(
         err.raw_os_error(),
         Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS)
