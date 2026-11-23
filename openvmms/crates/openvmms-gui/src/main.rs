@@ -92,7 +92,8 @@ struct OpenVmmsApp {
     selected_vm: Option<Uuid>,
     daemon_instance_id: Option<Uuid>,
     connected_base_url: Option<String>,
-    last_snapshot_seq: u64,
+    last_vm_snapshot_seq: u64,
+    last_host_config_seq: u64,
     vm_revisions: std::collections::HashMap<Uuid, u64>,
     deleted_vms: std::collections::HashMap<Uuid, u64>,
     nav_filter: NavFilter,
@@ -154,7 +155,8 @@ impl OpenVmmsApp {
             selected_vm: None,
             daemon_instance_id: None,
             connected_base_url: None,
-            last_snapshot_seq: 0,
+            last_vm_snapshot_seq: 0,
+            last_host_config_seq: 0,
             vm_revisions: std::collections::HashMap::new(),
             deleted_vms: std::collections::HashMap::new(),
             nav_filter: NavFilter::All,
@@ -198,11 +200,11 @@ impl OpenVmmsApp {
                 vms,
                 snapshot_seq,
             } => {
-                if snapshot_seq > 0 && snapshot_seq < self.last_snapshot_seq {
+                if snapshot_seq > 0 && snapshot_seq < self.last_vm_snapshot_seq {
                     return;
                 }
-                if snapshot_seq > self.last_snapshot_seq {
-                    self.last_snapshot_seq = snapshot_seq;
+                if snapshot_seq > self.last_vm_snapshot_seq {
+                    self.last_vm_snapshot_seq = snapshot_seq;
                 }
                 let was_connected = self.connected;
                 let prev_id = self.daemon_instance_id;
@@ -225,9 +227,12 @@ impl OpenVmmsApp {
                 self.host_config_loaded = true;
                 self.connection_status = format!("Connected ({base_url})");
                 self.host_info = Some(host_info);
-                self.host_config = host_config;
-                if let Some(d) = self.host_settings_dlg.as_mut() {
-                    d.sync_from_config(&self.host_config);
+                if snapshot_seq == 0 || snapshot_seq >= self.last_host_config_seq {
+                    self.last_host_config_seq = self.last_host_config_seq.max(snapshot_seq);
+                    self.host_config = host_config;
+                    if let Some(d) = self.host_settings_dlg.as_mut() {
+                        d.sync_from_config(&self.host_config);
+                    }
                 }
                 self.switches = switches;
 
@@ -421,11 +426,11 @@ impl OpenVmmsApp {
                     host_config,
                     snapshot_seq,
                 } => {
-                    if snapshot_seq > 0 && snapshot_seq < self.last_snapshot_seq {
+                    if snapshot_seq > 0 && snapshot_seq < self.last_host_config_seq {
                         return;
                     }
-                    if snapshot_seq > self.last_snapshot_seq {
-                        self.last_snapshot_seq = snapshot_seq;
+                    if snapshot_seq > self.last_host_config_seq {
+                        self.last_host_config_seq = snapshot_seq;
                     }
                     if let Some(info) = host_info {
                         let prev_id = self.daemon_instance_id;
@@ -445,8 +450,9 @@ impl OpenVmmsApp {
                         self.daemon_instance_id = info.daemon_instance_id;
                         self.host_info = Some(info);
                         self.connected_base_url = Some(base_url.clone());
-                        self.connected = true;
-                        self.connection_status = format!("Connected ({base_url})");
+                        if self.connected {
+                            self.connection_status = format!("Connected ({base_url})");
+                        }
                     }
                     self.host_config_loaded = true;
                     self.host_config = host_config;
@@ -490,6 +496,7 @@ impl OpenVmmsApp {
                         if let Some(d) = self.host_settings_dlg.as_mut() {
                             d.submitting = false;
                             d.error = Some(err);
+                            d.sync_from_config(&self.host_config);
                         }
                     }
                     (DialogKind::DeleteVm(id), None) => {
@@ -2343,7 +2350,8 @@ mod tests {
             snapshot_seq: 2,
         });
         assert_eq!(app.host_config.openvmm_bin, cfg_new.openvmm_bin);
-        assert_eq!(app.last_snapshot_seq, 5);
+        assert_eq!(app.last_vm_snapshot_seq, 5);
+        assert_eq!(app.last_host_config_seq, 5);
 
         // Save response from a restarted daemon (daemon_2, seq=6) updates daemon_instance_id,
         // immediately clears the previous daemon's VM list, and accepts subsequent VmUpdated events
@@ -2391,5 +2399,119 @@ mod tests {
         assert_eq!(app.connection_status, initial_status);
         assert!(app.host_config_loaded);
         assert_eq!(app.host_config.openvmm_bin, cfg.openvmm_bin);
+    }
+
+    #[test]
+    fn host_config_updated_does_not_drop_in_flight_vm_snapshot_or_flip_disconnected_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_id = Uuid::new_v4();
+        let vm_old_id = Uuid::new_v4();
+        let vm_new_id = Uuid::new_v4();
+
+        let mut cfg_before = HostConfig::default();
+        cfg_before.openvmm_bin = Some(PathBuf::from("/tmp/before-openvmm"));
+        let mut cfg_saved = HostConfig::default();
+        cfg_saved.openvmm_bin = Some(PathBuf::from("/tmp/saved-openvmm"));
+
+        // Initial snapshot at seq 1, then disconnect before saving host settings.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: cfg_before.clone(),
+            switches: vec![],
+            vms: vec![make_test_vm(vm_old_id, "Alpha", VmStatus::Off, 1)],
+            snapshot_seq: 1,
+        });
+        app.apply_update(GuiUpdate::DaemonDisconnected("stream down".into()));
+        assert!(!app.connected);
+
+        // SaveHostConfig completes at seq 3 while a resync snapshot (seq 2) is in flight.
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: Some(make_host_info(Some(daemon_id))),
+            host_config: cfg_saved.clone(),
+            snapshot_seq: 3,
+        });
+        assert!(
+            !app.connected,
+            "HostConfigUpdated while SSE is disconnected must not flip connected banner back on"
+        );
+        assert_eq!(app.connection_status, "Disconnected");
+
+        // In-flight VM snapshot at seq 2 arrives after seq 3 HostConfigUpdated:
+        // VM list must still update, while newer host_config from seq 3 is preserved.
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:1".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: cfg_before,
+            switches: vec![],
+            vms: vec![
+                make_test_vm(vm_old_id, "Alpha", VmStatus::Off, 1),
+                make_test_vm(vm_new_id, "Beta", VmStatus::Running, 2),
+            ],
+            snapshot_seq: 2,
+        });
+        assert!(app.vms.iter().any(|v| v.config.id == vm_new_id));
+        assert_eq!(app.host_config.openvmm_bin, cfg_saved.openvmm_bin);
+        assert_eq!(app.last_vm_snapshot_seq, 2);
+        assert_eq!(app.last_host_config_seq, 3);
+    }
+
+    #[test]
+    fn failed_host_settings_save_resyncs_dialog_initial_values_from_latest_host_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+
+        let initial_cfg = HostConfig {
+            listen_addr: "127.0.0.1:47620".into(),
+            openvmm_bin: Some(PathBuf::from("/old/openvmm")),
+            uefi_firmware_path: Some(PathBuf::from("/old/MSVM.fd")),
+            ..Default::default()
+        };
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:47620".into(),
+            host_info: None,
+            host_config: initial_cfg.clone(),
+            snapshot_seq: 1,
+        });
+
+        let mut dlg = HostSettingsDialog::from_config(&app.host_config);
+        dlg.openvmm_bin = "/bad/openvmm".into();
+        dlg.submitting = true;
+        app.host_settings_dlg = Some(dlg);
+
+        // While save is in flight, an external config change arrives and updates app.host_config.
+        let external_cfg = HostConfig {
+            listen_addr: "127.0.0.1:47620".into(),
+            openvmm_bin: Some(PathBuf::from("/old/openvmm")),
+            uefi_firmware_path: Some(PathBuf::from("/cli/MSVM.fd")),
+            ..Default::default()
+        };
+        app.apply_update(GuiUpdate::HostConfigUpdated {
+            base_url: "http://127.0.0.1:47620".into(),
+            host_info: None,
+            host_config: external_cfg,
+            snapshot_seq: 2,
+        });
+
+        // Save fails: dialog clears submitting, shows error, and syncs unedited/initial fields.
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::HostSettings,
+            error: Some("invalid openvmm path".into()),
+        });
+
+        let dlg = app.host_settings_dlg.as_ref().unwrap();
+        assert!(!dlg.submitting);
+        assert_eq!(dlg.error.as_deref(), Some("invalid openvmm path"));
+        assert_eq!(dlg.openvmm_bin, "/bad/openvmm");
+        assert_eq!(dlg.uefi_firmware_path, "/cli/MSVM.fd");
+        assert_eq!(dlg.initial_uefi_firmware_path, "/cli/MSVM.fd");
+        let patch = dlg.build_patch();
+        assert!(patch.uefi_firmware_path.is_none());
+        assert_eq!(
+            patch.openvmm_bin,
+            Some(Some(PathBuf::from("/bad/openvmm")))
+        );
     }
 }

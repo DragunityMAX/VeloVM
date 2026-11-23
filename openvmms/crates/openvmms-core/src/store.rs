@@ -312,6 +312,24 @@ impl RegistryStore {
         let path = self.token_path();
         if let Some((token, was_permissive)) = open_and_read_token(&path)? {
             if was_permissive {
+                #[cfg(windows)]
+                if !token.is_empty() {
+                    let a = Uuid::new_v4().as_u128();
+                    let b = Uuid::new_v4().as_u128();
+                    let new_token = format!("{a:032x}{b:032x}");
+                    if try_rotate_token_if_owner_only_enforced_windows(&path, &new_token)? {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "regenerated daemon.token after detecting overly permissive file permissions"
+                        );
+                        return Ok(new_token);
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        "filesystem does not enforce owner-only ACLs on daemon.token; keeping existing token"
+                    );
+                    return Ok(token);
+                }
                 tracing::warn!(
                     path = %path.display(),
                     "regenerating daemon.token after detecting overly permissive file permissions"
@@ -659,6 +677,7 @@ fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
 
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -706,6 +725,22 @@ fn open_and_read_token(path: &Path) -> anyhow::Result<Option<(String, bool)>> {
             bail!(
                 "refusing to use non-regular or symlinked daemon token file {}",
                 path.display()
+            );
+        }
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            bail!(
+                "refusing to use daemon token file {} owned by uid {} (expected {})",
+                path.display(),
+                meta.uid(),
+                euid
+            );
+        }
+        if meta.nlink() > 1 {
+            bail!(
+                "refusing to use hard-linked daemon token file {} (nlink={})",
+                path.display(),
+                meta.nlink()
             );
         }
         let mut was_permissive = false;
@@ -806,6 +841,50 @@ pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
         set_path_owner_only_windows(path)?;
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn try_rotate_token_if_owner_only_enforced_windows(
+    path: &Path,
+    new_token: &str,
+) -> anyhow::Result<bool> {
+    try_rotate_token_if_owner_only_enforced_windows_with(path, new_token, |tmp_path, tmp_file| {
+        if set_path_owner_only_windows(tmp_path).is_err() {
+            return Ok(false);
+        }
+        Ok(matches!(
+            is_handle_owner_only_windows(tmp_file, tmp_path),
+            Ok(true)
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn try_rotate_token_if_owner_only_enforced_windows_with<F>(
+    path: &Path,
+    new_token: &str,
+    enforce_owner_only: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce(&Path, &fs::File) -> anyhow::Result<bool>,
+{
+    let parent = path
+        .parent()
+        .context("target path has no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+    if !enforce_owner_only(tmp.path(), tmp.as_file())? {
+        return Ok(false);
+    }
+    tmp.write_all(new_token.as_bytes())
+        .with_context(|| format!("writing temp file for {}", path.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temp file for {}", path.display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("persisting {}", path.display()))?;
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -1382,5 +1461,37 @@ mod tests {
         assert!(active_vmgs.is_file());
         assert!(store.vm_config_path(active.id).is_file());
         assert!(non_uuid_dir.join("state.vmgs").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_token_rejects_hard_linked_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let _token = store.load_or_create_token().unwrap();
+        let alias = dir.path().join("token-hardlink");
+        fs::hard_link(store.token_path(), &alias).unwrap();
+
+        let err = store.read_token().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hard-linked"),
+            "expected hard-linked token rejection, got: {err:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_token_rotation_keeps_existing_when_acl_not_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let original = store.load_or_create_token().unwrap();
+        let rotated = try_rotate_token_if_owner_only_enforced_windows_with(
+            &store.token_path(),
+            "new-token",
+            |_, _| Ok(false),
+        )
+        .unwrap();
+        assert!(!rotated);
+        assert_eq!(fs::read_to_string(store.token_path()).unwrap(), original);
     }
 }

@@ -660,6 +660,7 @@ pub struct HostSettingsDialog {
     pub initial_fastdesk_viewer_bin: String,
     pub initial_openvmm_img_bin: String,
     pub initial_uefi_firmware_path: String,
+    pub conflicted_fields: Vec<(&'static str, String)>,
     pub external_change_warning: Option<String>,
     pub submitting: bool,
     pub error: Option<String>,
@@ -683,6 +684,7 @@ impl HostSettingsDialog {
             fastdesk_viewer_bin,
             openvmm_img_bin,
             uefi_firmware_path,
+            conflicted_fields: Vec::new(),
             external_change_warning: None,
             submitting: false,
             error: None,
@@ -693,22 +695,31 @@ impl HostSettingsDialog {
         if self.submitting {
             return;
         }
-        let mut conflicts = Vec::new();
+        let conflicted_fields = &mut self.conflicted_fields;
         let sync_field = |label: &'static str,
                           cur: &mut String,
                           init: &mut String,
                           incoming: String,
-                          conflicts: &mut Vec<&'static str>| {
+                          conflicted_fields: &mut Vec<(&'static str, String)>| {
             if incoming.trim() == init.trim() {
                 return;
             }
             if cur.trim() == init.trim() {
                 *cur = incoming.clone();
                 *init = incoming;
+                conflicted_fields.retain(|(l, _)| *l != label);
             } else {
                 *init = incoming.clone();
                 if cur.trim() != incoming.trim() {
-                    conflicts.push(label);
+                    if let Some((_, prev_val)) =
+                        conflicted_fields.iter_mut().find(|(l, _)| *l == label)
+                    {
+                        *prev_val = cur.clone();
+                    } else {
+                        conflicted_fields.push((label, cur.clone()));
+                    }
+                } else {
+                    conflicted_fields.retain(|(l, _)| *l != label);
                 }
             }
         };
@@ -718,41 +729,78 @@ impl HostSettingsDialog {
             &mut self.listen_addr,
             &mut self.initial_listen_addr,
             cfg.listen_addr.clone(),
-            &mut conflicts,
+            conflicted_fields,
         );
         sync_field(
             "openvmm Binary",
             &mut self.openvmm_bin,
             &mut self.initial_openvmm_bin,
             opt_to_string(cfg.openvmm_bin.as_deref()),
-            &mut conflicts,
+            conflicted_fields,
         );
         sync_field(
             "fastdesk-viewer Binary",
             &mut self.fastdesk_viewer_bin,
             &mut self.initial_fastdesk_viewer_bin,
             opt_to_string(cfg.fastdesk_viewer_bin.as_deref()),
-            &mut conflicts,
+            conflicted_fields,
         );
         sync_field(
             "openvmm-img Binary",
             &mut self.openvmm_img_bin,
             &mut self.initial_openvmm_img_bin,
             opt_to_string(cfg.openvmm_img_bin.as_deref()),
-            &mut conflicts,
+            conflicted_fields,
         );
         sync_field(
             "UEFI Firmware (MSVM.fd)",
             &mut self.uefi_firmware_path,
             &mut self.initial_uefi_firmware_path,
             opt_to_string(cfg.uefi_firmware_path.as_deref()),
-            &mut conflicts,
+            conflicted_fields,
         );
 
-        if !conflicts.is_empty() {
+        self.update_conflict_warning();
+    }
+
+    pub fn update_conflict_warning(&mut self) {
+        let listen_addr = &self.listen_addr;
+        let initial_listen_addr = &self.initial_listen_addr;
+        let openvmm_bin = &self.openvmm_bin;
+        let initial_openvmm_bin = &self.initial_openvmm_bin;
+        let fastdesk_viewer_bin = &self.fastdesk_viewer_bin;
+        let initial_fastdesk_viewer_bin = &self.initial_fastdesk_viewer_bin;
+        let openvmm_img_bin = &self.openvmm_img_bin;
+        let initial_openvmm_img_bin = &self.initial_openvmm_img_bin;
+        let uefi_firmware_path = &self.uefi_firmware_path;
+        let initial_uefi_firmware_path = &self.initial_uefi_firmware_path;
+
+        self.conflicted_fields.retain(|(label, conflict_val)| {
+            let Some((cur, init)) = (match *label {
+                "Daemon Listen Addr" => Some((listen_addr, initial_listen_addr)),
+                "openvmm Binary" => Some((openvmm_bin, initial_openvmm_bin)),
+                "fastdesk-viewer Binary" => {
+                    Some((fastdesk_viewer_bin, initial_fastdesk_viewer_bin))
+                }
+                "openvmm-img Binary" => Some((openvmm_img_bin, initial_openvmm_img_bin)),
+                "UEFI Firmware (MSVM.fd)" => {
+                    Some((uefi_firmware_path, initial_uefi_firmware_path))
+                }
+                _ => None,
+            }) else {
+                return false;
+            };
+            cur.trim() == conflict_val.trim() && cur.trim() != init.trim()
+        });
+
+        if self.conflicted_fields.is_empty() {
+            self.external_change_warning = None;
+        } else {
+            let labels: Vec<&'static str> =
+                self.conflicted_fields.iter().map(|(l, _)| *l).collect();
             self.external_change_warning = Some(format!(
                 "Modified externally (e.g. via CLI): {}. Review before saving or Cancel and reopen.",
-                conflicts.join(", ")
+                labels.join(", ")
             ));
         }
     }
@@ -1705,6 +1753,8 @@ pub fn render_host_settings_dialog(
                     ));
                 }
 
+                d.update_conflict_warning();
+
                 if let Some(warning) = &d.external_change_warning {
                     ui.add_space(6.0);
                     ui.colored_label(Color32::from_rgb(245, 194, 66), warning);
@@ -2523,5 +2573,23 @@ mod tests {
             "expected conflict warning, got: {:?}",
             dlg.external_change_warning
         );
+
+        // Editing the conflicted field to a new value clears the warning.
+        dlg.openvmm_bin = "/user/resolved-openvmm".into();
+        dlg.update_conflict_warning();
+        assert_eq!(dlg.external_change_warning, None);
+
+        // A second conflict followed by adopting the external value also clears the warning.
+        let cli_conflict_2 = HostConfig {
+            listen_addr: "127.0.0.1:47620".into(),
+            openvmm_bin: Some(PathBuf::from("/cli/openvmm-v2")),
+            uefi_firmware_path: Some(PathBuf::from("/cli/MSVM.fd")),
+            ..Default::default()
+        };
+        dlg.sync_from_config(&cli_conflict_2);
+        assert!(dlg.external_change_warning.is_some());
+        dlg.openvmm_bin = "/cli/openvmm-v2".into();
+        dlg.update_conflict_warning();
+        assert_eq!(dlg.external_change_warning, None);
     }
 }

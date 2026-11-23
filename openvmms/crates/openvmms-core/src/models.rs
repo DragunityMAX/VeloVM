@@ -73,7 +73,11 @@ pub struct HostConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfigPatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_null_string"
+    )]
     pub listen_addr: Option<String>,
     #[serde(
         default,
@@ -1340,6 +1344,13 @@ impl UpdateVmPayload {
     }
 }
 
+fn deserialize_non_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
 fn deserialize_nullable_path<'de, D>(deserializer: D) -> Result<Option<Option<PathBuf>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2234,8 +2245,16 @@ mod tests {
         assert_eq!(patch_empty.openvmm_bin, Some(None));
 
         let patch_absent: HostConfigPatch = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(patch_absent.listen_addr, None);
         assert_eq!(patch_absent.openvmm_bin, None);
         assert!(patch_absent.is_empty());
+
+        let patch_listen: HostConfigPatch =
+            serde_json::from_str(r#"{"listen_addr": "127.0.0.1:47621"}"#).unwrap();
+        assert_eq!(patch_listen.listen_addr.as_deref(), Some("127.0.0.1:47621"));
+
+        let null_listen = serde_json::from_str::<HostConfigPatch>(r#"{"listen_addr": null}"#);
+        assert!(null_listen.is_err());
 
         let patch_path: HostConfigPatch =
             serde_json::from_str(r#"{"openvmm_bin": "/usr/local/bin/openvmm"}"#).unwrap();

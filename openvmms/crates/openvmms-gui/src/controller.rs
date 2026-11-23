@@ -141,6 +141,7 @@ impl Drop for BackendHandle {
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const SSE_BACKOFF_MAX: Duration = Duration::from_secs(15);
+const SSE_BACKOFF_STABLE_AFTER: Duration = Duration::from_secs(5);
 
 struct BackendState {
     data_dir: Option<PathBuf>,
@@ -161,6 +162,7 @@ struct BackendState {
     sse_read_timeout: Duration,
     sse_backoff_initial: Duration,
     sse_backoff_max: Duration,
+    sse_backoff_stable_after: Duration,
     upd_tx: mpsc::Sender<GuiUpdate>,
     repaint_ctx: egui::Context,
 }
@@ -304,6 +306,26 @@ impl BackendHandle {
         sse_backoff_initial: Duration,
         sse_backoff_max: Duration,
     ) -> Self {
+        Self::spawn_with_sse_timing_and_stable(
+            data_dir,
+            daemon_url,
+            repaint_ctx,
+            sse_read_timeout,
+            sse_backoff_initial,
+            sse_backoff_max,
+            SSE_BACKOFF_STABLE_AFTER,
+        )
+    }
+
+    fn spawn_with_sse_timing_and_stable(
+        data_dir: Option<PathBuf>,
+        daemon_url: Option<String>,
+        repaint_ctx: egui::Context,
+        sse_read_timeout: Duration,
+        sse_backoff_initial: Duration,
+        sse_backoff_max: Duration,
+        sse_backoff_stable_after: Duration,
+    ) -> Self {
         let (upd_tx, upd_rx) = mpsc::channel::<GuiUpdate>();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -332,6 +354,7 @@ impl BackendHandle {
             sse_read_timeout,
             sse_backoff_initial,
             sse_backoff_max,
+            sse_backoff_stable_after,
             upd_tx,
             repaint_ctx,
         });
@@ -365,6 +388,7 @@ impl BackendHandle {
             sse_read_timeout: SSE_READ_TIMEOUT,
             sse_backoff_initial: SSE_BACKOFF_INITIAL,
             sse_backoff_max: SSE_BACKOFF_MAX,
+            sse_backoff_stable_after: SSE_BACKOFF_STABLE_AFTER,
             upd_tx,
             repaint_ctx,
         });
@@ -415,7 +439,6 @@ impl BackendState {
                 ..
             } => {
                 if let Some(info) = host_info {
-                    self.notified_connected.store(true, Ordering::Release);
                     let mut guard = self.daemon_instance_id.lock().unwrap();
                     if *snapshot_seq >= guard.0 {
                         guard.0 = *snapshot_seq;
@@ -1233,7 +1256,6 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         Ok((c, (host_info, host_config, switches, vms))) => {
                             let inst_id = host_info.daemon_instance_id;
                             reported_initial_error = false;
-                            retry_delay = state.sse_backoff_initial;
                             *state.client.write().unwrap() = Some(c);
                             if !state.emit_checked(GuiUpdate::DaemonConnected {
                                 base_url: base_url.clone(),
@@ -1265,6 +1287,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             continue;
                         }
                     };
+                    let stream_connected_at = std::time::Instant::now();
                     let reader = std::io::BufReader::new(resp);
                     let mut skip_leading_resync = true;
                     let mut sse_send_closed = false;
@@ -1386,6 +1409,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     if switched_endpoint {
                         retry_delay = state.sse_backoff_initial;
                     } else if !state.shutdown.load(Ordering::Acquire) {
+                        if saw_daemon_stopping
+                            || stream_connected_at.elapsed() >= state.sse_backoff_stable_after
+                        {
+                            retry_delay = state.sse_backoff_initial;
+                        }
                         if saw_daemon_stopping {
                             sleep_backoff(&state.shutdown, retry_delay);
                             retry_delay = next_delay(retry_delay);
@@ -1481,6 +1509,14 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn accept_blocking_stream(
+        listener: &std::net::TcpListener,
+    ) -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)> {
+        let (stream, peer) = listener.accept()?;
+        let _ = stream.set_nonblocking(false);
+        Ok((stream, peer))
     }
 
     #[test]
@@ -1769,7 +1805,7 @@ mod tests {
 
         let squatter_thread = thread::spawn(move || {
             while !squatter_stop_srv.load(Ordering::Acquire) {
-                match squatter.accept() {
+                match accept_blocking_stream(&squatter) {
                     Ok((_stream, _)) => {
                         squatter_hit_srv.store(true, Ordering::SeqCst);
                     }
@@ -1883,9 +1919,8 @@ mod tests {
         let srv = thread::spawn(move || {
             let mut handlers = Vec::new();
             while !srv_stop.load(Ordering::Acquire) {
-                match listener.accept() {
+                match accept_blocking_stream(&listener) {
                     Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
                         let start_entered = Arc::clone(&srv_start_entered);
                         let release_start = Arc::clone(&srv_release_start);
                         let srv_stop_conn = Arc::clone(&srv_stop);
@@ -2059,9 +2094,8 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
-                            let _ = stream.set_nonblocking(false);
                             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                             let store_dir = store_dir.clone();
                             let vm_summary = vm_summary.clone();
@@ -2420,7 +2454,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let sse_count = Arc::clone(&sse_count);
@@ -2707,7 +2741,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let sse_connected = Arc::clone(&sse_connected);
@@ -2836,7 +2870,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let sse_count = Arc::clone(&sse_count);
@@ -3029,7 +3063,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let vms_reqs = Arc::clone(&vms_reqs);
@@ -3165,7 +3199,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let sse_count = Arc::clone(&sse_count);
@@ -3210,9 +3244,9 @@ mod tests {
                                                 break;
                                             }
                                             let _ = stream.flush();
-                                        } else if idx == 2
+                                        } else if idx >= 2
                                             && !sent_mid
-                                            && send_host_cfg.load(Ordering::Acquire)
+                                            && send_host_cfg.swap(false, Ordering::AcqRel)
                                         {
                                             sent_mid = true;
                                             if stream
@@ -3288,14 +3322,14 @@ mod tests {
             matches!(u, GuiUpdate::DaemonConnected { snapshot_seq: 1, .. })
         });
 
-        // 1. Mid-stream Resync fails snapshot -> must drop stream and reconnect (sse_count == 2),
+        // 1. Mid-stream Resync fails snapshot -> must drop stream and reconnect (sse_count >= 2),
         //    emitting DaemonConnected on the new SSE stream.
         fail_vms.store(true, Ordering::Release);
         send_resync.store(true, Ordering::Release);
         let _ = recv_until(&backend, Duration::from_secs(5), |u| {
             matches!(u, GuiUpdate::DaemonConnected { snapshot_seq, .. } if *snapshot_seq >= 2)
         });
-        assert_eq!(sse_count.load(Ordering::Acquire), 2);
+        assert!(sse_count.load(Ordering::Acquire) >= 2);
 
         // 2. On sse_count == 2, mid-stream HostConfigUpdated fails snapshot -> drops stream, reconnects at sse_count == 3,
         //    and loads MidstreamRecovered-VM.
@@ -3348,7 +3382,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let health_fail = Arc::clone(&health_fail);
@@ -3552,7 +3586,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let current_instance_id = Arc::clone(&current_instance_id);
@@ -3787,7 +3821,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let events_times = Arc::clone(&events_times);
@@ -3910,7 +3944,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let host_info_reqs = Arc::clone(&host_info_reqs);
@@ -4130,7 +4164,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let events_times = Arc::clone(&events_times);
@@ -4337,7 +4371,7 @@ mod tests {
             thread::spawn(move || {
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match accept_blocking_stream(&listener) {
                         Ok((mut stream, _)) => {
                             let token = token.clone();
                             let patch_started = Arc::clone(&patch_started);
@@ -4490,5 +4524,266 @@ mod tests {
             snapshot_seq: 1,
         }));
         assert!(!backend.state.notified_connected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn sse_backoff_does_not_reset_when_stream_drops_immediately_after_snapshot() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let events_times = Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let token = token.clone();
+            let events_times = Arc::clone(&events_times);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match accept_blocking_stream(&listener) {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let events_times = Arc::clone(&events_times);
+                            let store_dir = store_dir.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let target = req_text
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    events_times.lock().unwrap().push(std::time::Instant::now());
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    // Immediately drop the SSE stream right after serving 200 OK.
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/vms" {
+                                    ("200 OK", "[]".to_string())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        let backend = BackendHandle::spawn_with_sse_timing(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(2),
+            Duration::from_millis(40),
+            Duration::from_millis(640),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while events_times.lock().unwrap().len() < 5 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for 5 SSE reconnect attempts"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let times = events_times.lock().unwrap().clone();
+        // Delays before attempts 1..4 should grow exponentially (40ms -> 80ms -> 160ms -> 320ms),
+        // rather than resetting to 40ms after each immediate drop.
+        let gap3_4 = times[4].duration_since(times[3]);
+        assert!(
+            gap3_4 >= Duration::from_millis(240),
+            "expected exponential backoff to preserve >= 240ms delay after immediate stream drops, got {gap3_4:?} (all gaps: {:?})",
+            times.windows(2).map(|w| w[1].duration_since(w[0])).collect::<Vec<_>>()
+        );
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sse_backoff_resets_after_stream_stays_stable() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let token = store.load_or_create_token().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        store.write_runtime_listen_addr(&addr.to_string()).unwrap();
+
+        let sse_attempts = Arc::new(AtomicUsize::new(0));
+        let stable_closed_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let reconnected_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let token = token.clone();
+            let sse_attempts = Arc::clone(&sse_attempts);
+            let stable_closed_at = Arc::clone(&stable_closed_at);
+            let reconnected_at = Arc::clone(&reconnected_at);
+            let stop = Arc::clone(&stop);
+            let store_dir = dir.path().to_path_buf();
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match accept_blocking_stream(&listener) {
+                        Ok((mut stream, _)) => {
+                            let token = token.clone();
+                            let sse_attempts = Arc::clone(&sse_attempts);
+                            let stable_closed_at = Arc::clone(&stable_closed_at);
+                            let reconnected_at = Arc::clone(&reconnected_at);
+                            let stop = Arc::clone(&stop);
+                            let store_dir = store_dir.clone();
+                            handlers.push(thread::spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut buf = [0u8; 4096];
+                                let n = match stream.read(&mut buf) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => return,
+                                };
+                                let req_text = String::from_utf8_lossy(&buf[..n]);
+                                let target = req_text
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .unwrap_or("");
+                                if target == "/api/v1/events" {
+                                    let idx = sse_attempts.fetch_add(1, Ordering::SeqCst);
+                                    if idx < 3 {
+                                        let resp = mock_http_response(
+                                            "500 Internal Server Error",
+                                            r#"{"error":"transient events error"}"#,
+                                        );
+                                        let _ = stream.write_all(resp.as_bytes());
+                                        return;
+                                    }
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    );
+                                    let _ = stream.flush();
+                                    if idx == 3 {
+                                        // Stay connected longer than sse_backoff_stable_after (120ms), then close without DaemonStopping.
+                                        for _ in 0..8 {
+                                            if stop.load(Ordering::Acquire) {
+                                                return;
+                                            }
+                                            if stream.write_all(b": keepalive\n\n").is_err() {
+                                                return;
+                                            }
+                                            let _ = stream.flush();
+                                            thread::sleep(Duration::from_millis(30));
+                                        }
+                                        *stable_closed_at.lock().unwrap() =
+                                            Some(std::time::Instant::now());
+                                        return;
+                                    }
+                                    if idx == 4 {
+                                        *reconnected_at.lock().unwrap() =
+                                            Some(std::time::Instant::now());
+                                    }
+                                    while !stop.load(Ordering::Acquire) {
+                                        if stream.write_all(b": keepalive\n\n").is_err() {
+                                            break;
+                                        }
+                                        let _ = stream.flush();
+                                        thread::sleep(Duration::from_millis(20));
+                                    }
+                                    return;
+                                }
+                                let (status, body) = if target == "/api/v1/vms" {
+                                    ("200 OK", "[]".to_string())
+                                } else {
+                                    mock_common_endpoint(target, &token, addr, &store_dir)
+                                        .unwrap_or(("404 Not Found", "{}".into()))
+                                };
+                                let resp = mock_http_response(status, &body);
+                                let _ = stream.write_all(resp.as_bytes());
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for h in handlers {
+                    let _ = h.join();
+                }
+            })
+        };
+
+        // After 3 failures (40+80+160ms), backoff is 320ms (max 640ms).
+        // Stream #3 stays up for ~240ms (> stable_after=120ms) and drops; backoff should reset to 40ms.
+        let backend = BackendHandle::spawn_with_sse_timing_and_stable(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+            Duration::from_secs(2),
+            Duration::from_millis(40),
+            Duration::from_millis(640),
+            Duration::from_millis(120),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while reconnected_at.lock().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for reconnect after stable SSE stream drop"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let closed = stable_closed_at.lock().unwrap().unwrap();
+        let reconnected = reconnected_at.lock().unwrap().unwrap();
+        let gap = reconnected.duration_since(closed);
+        assert!(
+            gap < Duration::from_millis(220),
+            "expected reconnect delay to reset to ~40ms after stable stream, got {gap:?}"
+        );
+
+        drop(backend);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
     }
 }

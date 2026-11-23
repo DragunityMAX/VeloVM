@@ -2541,6 +2541,12 @@ impl Supervisor {
             let vm = guard
                 .get_mut(&id)
                 .ok_or_else(|| err_not_found("VM not found"))?;
+            if vm.deleting {
+                return Err(err_conflict(format!(
+                    "cannot stop VM '{}' while it is being deleted",
+                    vm.config.name
+                )));
+            }
             if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
                 let changed =
                     vm.runtime.status != VmStatus::Off || vm.runtime.last_error.is_some();
@@ -6646,5 +6652,45 @@ mod tests {
         let again = sup.stop_vm(&cfg.id.to_string()).await.unwrap();
         assert_eq!(again.runtime.revision, stopped.runtime.revision);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_vm_rejects_when_vm_is_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let cfg = openvmms_core::models::VmConfig::from_preset(
+            "DeletingStop-VM",
+            openvmms_core::models::VmPreset::Custom,
+            &store.vm_dir(Uuid::new_v4()),
+        );
+        store.save_vm(&cfg).unwrap();
+
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let initial_rev = {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&cfg.id).unwrap();
+            vm.runtime.status = VmStatus::Error;
+            vm.runtime.last_error = Some("boot failure".into());
+            vm.runtime.revision = sup.next_revision();
+            vm.deleting = true;
+            vm.runtime.revision
+        };
+
+        let mut rx = sup.subscribe();
+        let err = sup.stop_vm(&cfg.id.to_string()).await.unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::Conflict(_))),
+            "expected Conflict error, got: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("being deleted"),
+            "unexpected error message: {err:#}"
+        );
+        assert!(rx.try_recv().is_err());
+
+        let vm = sup.get_vm(&cfg.id.to_string()).unwrap();
+        assert_eq!(vm.runtime.status, VmStatus::Error);
+        assert_eq!(vm.runtime.last_error.as_deref(), Some("boot failure"));
+        assert_eq!(vm.runtime.revision, initial_rev);
     }
 }
