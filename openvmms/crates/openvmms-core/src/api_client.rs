@@ -815,6 +815,15 @@ pub fn resolve_local_viewer_binary(data_dir: Option<&Path>) -> anyhow::Result<Pa
     bail!("fastdesk-viewer binary not found next to current executable or in PATH")
 }
 
+fn is_fatal_token_read_error(err: &anyhow::Error) -> bool {
+    crate::store::is_token_security_error(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::PermissionDenied)
+        })
+}
+
 pub fn ensure_daemon_running(
     data_dir: Option<&Path>,
     daemon_url_override: Option<&str>,
@@ -824,10 +833,11 @@ pub fn ensure_daemon_running(
     if let Some(url) = daemon_url_override {
         let _ = crate::models::parse_loopback_listen_addr(url)?;
     }
-    if let Ok(client) = ApiClient::from_data_dir(data_dir, daemon_url_override)
-        && client.health().is_ok()
-    {
-        return Ok(client);
+    match ApiClient::from_data_dir(data_dir, daemon_url_override) {
+        Ok(client) if client.health().is_ok() => return Ok(client),
+        Ok(_) => {}
+        Err(err) if is_fatal_token_read_error(&err) => return Err(err),
+        Err(_) => {}
     }
 
     let dir = data_dir
@@ -846,10 +856,11 @@ pub fn ensure_daemon_running(
         }
         let wait_deadline = std::time::Instant::now() + Duration::from_secs(5);
         while store.is_daemon_locked() {
-            if let Ok(client) = ApiClient::from_data_dir(Some(&dir), None)
-                && client.health().is_ok()
-            {
-                return Ok(client);
+            match ApiClient::from_data_dir(Some(&dir), None) {
+                Ok(client) if client.health().is_ok() => return Ok(client),
+                Ok(_) => {}
+                Err(err) if is_fatal_token_read_error(&err) => return Err(err),
+                Err(_) => {}
             }
             if std::time::Instant::now() >= wait_deadline {
                 let latest_cfg = store.load_host_config_or_default().unwrap_or(cfg);
@@ -1834,5 +1845,30 @@ mod tests {
         assert!(saw_patch.load(Ordering::SeqCst));
         assert!(!saw_get_or_put.load(Ordering::SeqCst));
         srv.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_daemon_running_fails_promptly_on_hard_linked_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let _token = store.load_or_create_token().unwrap();
+        store.write_runtime_listen_addr("127.0.0.1:47621").unwrap();
+        std::fs::hard_link(store.token_path(), dir.path().join("token-link")).unwrap();
+
+        let start = std::time::Instant::now();
+        let err = ensure_daemon_running(Some(dir.path()), None).unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected prompt failure instead of 5s wait, took {elapsed:?}"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hard-linked") && msg.contains("daemon.token"),
+            "unexpected error message: {msg}"
+        );
     }
 }

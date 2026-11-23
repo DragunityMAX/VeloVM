@@ -623,34 +623,49 @@ impl BackendState {
             other => {
                 let dialog_kind = request_dialog_kind(&other);
                 let mut current_client = self.client.read().unwrap().clone();
-                if current_client.is_none()
-                    && let Some(reloaded) = reload_client_from_runtime_addr(
+                if current_client.is_none() {
+                    match reload_client_from_runtime_addr_result(
                         self.data_dir.as_deref(),
                         self.daemon_url.as_deref(),
                         &self.shared_endpoint,
-                    )
-                {
-                    set_shared_endpoint(&self.shared_endpoint, &reloaded);
-                    if !self.ensure_sse() {
-                        self.wake_sse();
-                    }
-                    if !matches!(other, GuiRequest::RefreshAll) {
-                        let snapshot_seq = self.next_snapshot_seq();
-                        if let Ok((host_info, host_config, switches, vms)) =
-                            fetch_full_snapshot(&reloaded)
-                        {
-                            self.emit(GuiUpdate::DaemonConnected {
-                                base_url: reloaded.base_url().to_string(),
-                                host_info,
-                                host_config,
-                                switches,
-                                vms,
-                                snapshot_seq,
-                            });
+                    ) {
+                        Ok(Some(reloaded)) => {
+                            set_shared_endpoint(&self.shared_endpoint, &reloaded);
+                            if !self.ensure_sse() {
+                                self.wake_sse();
+                            }
+                            if !matches!(other, GuiRequest::RefreshAll) {
+                                let snapshot_seq = self.next_snapshot_seq();
+                                if let Ok((host_info, host_config, switches, vms)) =
+                                    fetch_full_snapshot(&reloaded)
+                                {
+                                    self.emit(GuiUpdate::DaemonConnected {
+                                        base_url: reloaded.base_url().to_string(),
+                                        host_info,
+                                        host_config,
+                                        switches,
+                                        vms,
+                                        snapshot_seq,
+                                    });
+                                }
+                            }
+                            *self.client.write().unwrap() = Some(reloaded.clone());
+                            current_client = Some(reloaded);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            self.emit(GuiUpdate::DaemonDisconnected(err_msg.clone()));
+                            self.emit(GuiUpdate::ErrorMessage(err_msg.clone()));
+                            if let Some(kind) = dialog_kind {
+                                self.emit(GuiUpdate::DialogFinished {
+                                    kind,
+                                    error: Some(err_msg),
+                                });
+                            }
+                            return;
                         }
                     }
-                    *self.client.write().unwrap() = Some(reloaded.clone());
-                    current_client = Some(reloaded);
                 }
 
                 let Some(mut c) = current_client else {
@@ -682,11 +697,27 @@ impl BackendState {
                         }
                     }
                     Err(err) => {
-                        let reloaded = reload_client_from_runtime_addr(
+                        let reloaded = match reload_client_from_runtime_addr_result(
                             self.data_dir.as_deref(),
                             self.daemon_url.as_deref(),
                             &self.shared_endpoint,
-                        );
+                        ) {
+                            Ok(opt) => opt,
+                            Err(reload_err) => {
+                                let err_msg = format!("{reload_err:#}");
+                                *self.client.write().unwrap() = None;
+                                self.notified_connected.store(false, Ordering::Release);
+                                self.emit(GuiUpdate::DaemonDisconnected(err_msg.clone()));
+                                self.emit(GuiUpdate::ErrorMessage(err_msg.clone()));
+                                if let Some(kind) = dialog_kind {
+                                    self.emit(GuiUpdate::DialogFinished {
+                                        kind,
+                                        error: Some(err_msg),
+                                    });
+                                }
+                                return;
+                            }
+                        };
                         if let Some(reloaded) = reloaded
                             && (reloaded.base_url() != c.base_url()
                                 || reloaded.token() != c.token())
@@ -784,28 +815,52 @@ fn set_shared_endpoint(shared_endpoint: &SharedEndpoint, client: &ApiClient) {
         Some((client.base_url().to_string(), client.token().to_string()));
 }
 
+fn reload_client_from_runtime_addr_result(
+    data_dir: Option<&Path>,
+    daemon_url: Option<&str>,
+    shared_endpoint: &SharedEndpoint,
+) -> anyhow::Result<Option<ApiClient>> {
+    let current = shared_endpoint.read().unwrap().clone();
+    let runtime_err = match ApiClient::from_runtime_addr(data_dir) {
+        Ok(Some(c)) => {
+            let token_matches = current
+                .as_ref()
+                .is_none_or(|(_, cur_token)| c.token() == cur_token);
+            if (daemon_url.is_none() || token_matches) && c.health().is_ok() {
+                set_shared_endpoint(shared_endpoint, &c);
+                return Ok(Some(c));
+            }
+            None
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "failed to load daemon client from runtime address"
+            );
+            Some(err)
+        }
+    };
+    if let Some((base_url, token)) = current
+        && let Ok(c) = ApiClient::new(base_url, token)
+        && c.health().is_ok()
+    {
+        return Ok(Some(c));
+    }
+    match runtime_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
+}
+
 fn reload_client_from_runtime_addr(
     data_dir: Option<&Path>,
     daemon_url: Option<&str>,
     shared_endpoint: &SharedEndpoint,
 ) -> Option<ApiClient> {
-    let current = shared_endpoint.read().unwrap().clone();
-    if let Ok(Some(c)) = ApiClient::from_runtime_addr(data_dir) {
-        let token_matches = current
-            .as_ref()
-            .is_none_or(|(_, cur_token)| c.token() == cur_token);
-        if (daemon_url.is_none() || token_matches) && c.health().is_ok() {
-            set_shared_endpoint(shared_endpoint, &c);
-            return Some(c);
-        }
-    }
-    if let Some((base_url, token)) = current
-        && let Ok(c) = ApiClient::new(base_url, token)
-        && c.health().is_ok()
-    {
-        return Some(c);
-    }
-    None
+    reload_client_from_runtime_addr_result(data_dir, daemon_url, shared_endpoint)
+        .ok()
+        .flatten()
 }
 
 fn sync_client_before_request(
@@ -823,14 +878,24 @@ fn sync_client_before_request(
         return true;
     }
 
-    if let Ok(Some(runtime_client)) = ApiClient::from_runtime_addr(data_dir) {
-        let token_matches = runtime_client.token() == client.token();
-        let changed = runtime_client.base_url() != client.base_url()
-            || runtime_client.token() != client.token();
-        if changed && (daemon_url.is_none() || token_matches) && runtime_client.health().is_ok() {
-            set_shared_endpoint(shared_endpoint, &runtime_client);
-            *client = runtime_client;
-            return true;
+    match ApiClient::from_runtime_addr(data_dir) {
+        Ok(Some(runtime_client)) => {
+            let token_matches = runtime_client.token() == client.token();
+            let changed = runtime_client.base_url() != client.base_url()
+                || runtime_client.token() != client.token();
+            if changed && (daemon_url.is_none() || token_matches) && runtime_client.health().is_ok()
+            {
+                set_shared_endpoint(shared_endpoint, &runtime_client);
+                *client = runtime_client;
+                return true;
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "failed to refresh daemon runtime endpoint/token before request"
+            );
         }
     }
     false
@@ -1192,17 +1257,17 @@ fn resolve_updated_client(
 fn maybe_switch_endpoint_on_disconnect(
     current_base_url: &str,
     state: &BackendState,
-) -> bool {
-    if let Some(c) = reload_client_from_runtime_addr(
+) -> anyhow::Result<bool> {
+    if let Some(c) = reload_client_from_runtime_addr_result(
         state.data_dir.as_deref(),
         state.daemon_url.as_deref(),
         &state.shared_endpoint,
-    ) && c.base_url() != current_base_url
+    )? && c.base_url() != current_base_url
     {
         *state.client.write().unwrap() = Some(c);
-        return true;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 fn sleep_backoff(state: &BackendState, start_wake_gen: u64, dur: Duration) -> bool {
@@ -1245,43 +1310,32 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
         let next_delay = |d: Duration| d.saturating_mul(2).min(state.sse_backoff_max);
         while !state.shutdown.load(Ordering::Acquire) {
             let wake_gen = *state.sse_wake.0.lock().unwrap();
-            let endpoint = state.shared_endpoint.read().unwrap().clone().or_else(|| {
-                reload_client_from_runtime_addr(
+            let endpoint = match state.shared_endpoint.read().unwrap().clone() {
+                Some(ep) => Ok(Some(ep)),
+                None => reload_client_from_runtime_addr_result(
                     state.data_dir.as_deref(),
                     state.daemon_url.as_deref(),
                     &state.shared_endpoint,
                 )
-                .map(|c| (c.base_url().to_string(), c.token().to_string()))
-            });
-            let Some((mut base_url, mut token)) = endpoint else {
-                if sleep_backoff(&state, wake_gen, retry_delay) {
-                    retry_delay = state.sse_backoff_initial;
-                } else {
-                    retry_delay = next_delay(retry_delay);
-                }
-                continue;
+                .map(|opt| opt.map(|c| (c.base_url().to_string(), c.token().to_string()))),
             };
-            // Verify health authentication challenge before transmitting token on the SSE request.
-            if !ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok()) {
-                if let Some(reloaded) = reload_client_from_runtime_addr(
-                    state.data_dir.as_deref(),
-                    state.daemon_url.as_deref(),
-                    &state.shared_endpoint,
-                ) {
-                    if reloaded.base_url() != base_url {
+            let (mut base_url, mut token) = match endpoint {
+                Ok(Some(ep)) => ep,
+                Ok(None) => {
+                    if sleep_backoff(&state, wake_gen, retry_delay) {
                         retry_delay = state.sse_backoff_initial;
+                    } else {
+                        retry_delay = next_delay(retry_delay);
                     }
-                    base_url = reloaded.base_url().to_string();
-                    token = reloaded.token().to_string();
-                } else {
+                    continue;
+                }
+                Err(err) => {
                     if state.notified_connected.swap(false, Ordering::AcqRel)
                         || !reported_initial_error
                     {
                         reported_initial_error = true;
                         *state.client.write().unwrap() = None;
-                        if !state.emit_checked(GuiUpdate::DaemonDisconnected(
-                            "Lost connection or failed daemon verification".to_string(),
-                        )) {
+                        if !state.emit_checked(GuiUpdate::DaemonDisconnected(format!("{err:#}"))) {
                             break;
                         }
                     }
@@ -1291,6 +1345,60 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         retry_delay = next_delay(retry_delay);
                     }
                     continue;
+                }
+            };
+            // Verify health authentication challenge before transmitting token on the SSE request.
+            if !ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok()) {
+                match reload_client_from_runtime_addr_result(
+                    state.data_dir.as_deref(),
+                    state.daemon_url.as_deref(),
+                    &state.shared_endpoint,
+                ) {
+                    Ok(Some(reloaded)) => {
+                        if reloaded.base_url() != base_url {
+                            retry_delay = state.sse_backoff_initial;
+                        }
+                        base_url = reloaded.base_url().to_string();
+                        token = reloaded.token().to_string();
+                    }
+                    Ok(None) => {
+                        if state.notified_connected.swap(false, Ordering::AcqRel)
+                            || !reported_initial_error
+                        {
+                            reported_initial_error = true;
+                            *state.client.write().unwrap() = None;
+                            if !state.emit_checked(GuiUpdate::DaemonDisconnected(
+                                "Lost connection or failed daemon verification".to_string(),
+                            )) {
+                                break;
+                            }
+                        }
+                        if sleep_backoff(&state, wake_gen, retry_delay) {
+                            retry_delay = state.sse_backoff_initial;
+                        } else {
+                            retry_delay = next_delay(retry_delay);
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        if state.notified_connected.swap(false, Ordering::AcqRel)
+                            || !reported_initial_error
+                        {
+                            reported_initial_error = true;
+                            *state.client.write().unwrap() = None;
+                            if !state.emit_checked(GuiUpdate::DaemonDisconnected(format!(
+                                "{err:#}"
+                            ))) {
+                                break;
+                            }
+                        }
+                        if sleep_backoff(&state, wake_gen, retry_delay) {
+                            retry_delay = state.sse_backoff_initial;
+                        } else {
+                            retry_delay = next_delay(retry_delay);
+                        }
+                        continue;
+                    }
                 }
             }
             let url = format!("{base_url}/api/v1/events");
@@ -1474,21 +1582,27 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             }
                             continue;
                         }
-                        if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
-                            retry_delay = state.sse_backoff_initial;
-                            continue;
-                        }
+                        let switch_err = match maybe_switch_endpoint_on_disconnect(&base_url, &state)
+                        {
+                            Ok(true) => {
+                                retry_delay = state.sse_backoff_initial;
+                                continue;
+                            }
+                            Ok(false) => None,
+                            Err(err) => Some(err),
+                        };
                         let healthy =
                             ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
-                        if !healthy {
+                        if !healthy || switch_err.is_some() {
                             *state.client.write().unwrap() = None;
                             if state.notified_connected.swap(false, Ordering::AcqRel)
                                 || !reported_initial_error
                             {
                                 reported_initial_error = true;
-                                if !state.emit_checked(GuiUpdate::DaemonDisconnected(
-                                    "Lost connection to openvmmsd".to_string(),
-                                )) {
+                                let reason = switch_err
+                                    .map(|e| format!("{e:#}"))
+                                    .unwrap_or_else(|| "Lost connection to openvmmsd".to_string());
+                                if !state.emit_checked(GuiUpdate::DaemonDisconnected(reason)) {
                                     break;
                                 }
                             }
@@ -1501,10 +1615,14 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     }
                 }
                 sse_res => {
-                    if maybe_switch_endpoint_on_disconnect(&base_url, &state) {
-                        retry_delay = state.sse_backoff_initial;
-                        continue;
-                    }
+                    let switch_err = match maybe_switch_endpoint_on_disconnect(&base_url, &state) {
+                        Ok(true) => {
+                            retry_delay = state.sse_backoff_initial;
+                            continue;
+                        }
+                        Ok(false) => None,
+                        Err(err) => Some(err),
+                    };
                     let healthy =
                         ApiClient::new(&base_url, &token).is_ok_and(|c| c.health().is_ok());
                     if !healthy {
@@ -1514,7 +1632,9 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         || !reported_initial_error
                     {
                         reported_initial_error = true;
-                        let reason = if !healthy {
+                        let reason = if let Some(err) = switch_err {
+                            format!("{err:#}")
+                        } else if !healthy {
                             "Lost connection to openvmmsd".to_string()
                         } else {
                             match sse_res {
@@ -5135,5 +5255,36 @@ mod tests {
         drop(backend);
         stop.store(true, Ordering::Release);
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_token_surfaces_reason_in_daemon_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+        let _lock = store.try_acquire_daemon_lock().unwrap();
+        let _token = store.load_or_create_token().unwrap();
+        store.write_runtime_listen_addr("127.0.0.1:47621").unwrap();
+        std::fs::hard_link(store.token_path(), dir.path().join("token-link")).unwrap();
+
+        let backend = BackendHandle::spawn(
+            Some(dir.path().to_path_buf()),
+            None,
+            egui::Context::default(),
+        );
+        backend.send(GuiRequest::ConnectOrStartDaemon);
+
+        let update = recv_until(&backend, Duration::from_secs(3), |u| {
+            matches!(u, GuiUpdate::DaemonDisconnected(_))
+        });
+        match update {
+            GuiUpdate::DaemonDisconnected(reason) => {
+                assert!(
+                    reason.contains("hard-linked") && reason.contains("daemon.token"),
+                    "expected hard-linked token error in DaemonDisconnected, got: {reason}"
+                );
+            }
+            other => panic!("expected DaemonDisconnected, got {other:?}"),
+        }
     }
 }
