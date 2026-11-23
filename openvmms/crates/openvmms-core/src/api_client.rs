@@ -201,16 +201,14 @@ impl ApiClient {
         if !resolved.runtime_dir.as_os_str().is_empty() {
             resolved.runtime_dir = resolve_client_path(&resolved.runtime_dir);
         }
-        resolved.openvmm_bin = resolved.openvmm_bin.as_deref().map(resolve_client_path);
-        resolved.fastdesk_viewer_bin = resolved
-            .fastdesk_viewer_bin
-            .as_deref()
-            .map(resolve_client_path);
-        resolved.openvmm_img_bin = resolved.openvmm_img_bin.as_deref().map(resolve_client_path);
-        resolved.uefi_firmware_path = resolved
-            .uefi_firmware_path
-            .as_deref()
-            .map(resolve_client_path);
+        let resolve_opt = |path: Option<&std::path::Path>| {
+            path.filter(|p| !p.as_os_str().is_empty())
+                .map(resolve_client_path)
+        };
+        resolved.openvmm_bin = resolve_opt(resolved.openvmm_bin.as_deref());
+        resolved.fastdesk_viewer_bin = resolve_opt(resolved.fastdesk_viewer_bin.as_deref());
+        resolved.openvmm_img_bin = resolve_opt(resolved.openvmm_img_bin.as_deref());
+        resolved.uefi_firmware_path = resolve_opt(resolved.uefi_firmware_path.as_deref());
         self.put("/api/v1/host/config", &resolved)
     }
 

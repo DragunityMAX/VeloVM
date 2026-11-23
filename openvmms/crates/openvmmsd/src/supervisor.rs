@@ -7206,4 +7206,21 @@ mod tests {
             "expected NotFound (404) when VM is removed while stop_vm waits, got: {err:#}"
         );
     }
+
+    #[tokio::test]
+    async fn update_host_config_locked_clears_empty_optional_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let mut cfg = sup.host_config();
+        cfg.openvmm_bin = Some(PathBuf::from(""));
+        cfg.fastdesk_viewer_bin = Some(PathBuf::from(""));
+        cfg.openvmm_img_bin = Some(PathBuf::from(""));
+        cfg.uefi_firmware_path = Some(PathBuf::from(""));
+
+        let updated = sup.update_host_config_locked(cfg, false).await.unwrap();
+        assert_eq!(updated.openvmm_bin, None);
+        assert_eq!(updated.fastdesk_viewer_bin, None);
+        assert_eq!(updated.openvmm_img_bin, None);
+        assert_eq!(updated.uefi_firmware_path, None);
+    }
 }
