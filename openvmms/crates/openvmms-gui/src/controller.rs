@@ -4772,7 +4772,7 @@ mod tests {
                                     .unwrap_or("");
                                 if target == "/api/v1/events" {
                                     let idx = sse_attempts.fetch_add(1, Ordering::SeqCst);
-                                    if idx < 3 {
+                                    if idx < 5 {
                                         let resp = mock_http_response(
                                             "500 Internal Server Error",
                                             r#"{"error":"transient events error"}"#,
@@ -4784,7 +4784,7 @@ mod tests {
                                         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                                     );
                                     let _ = stream.flush();
-                                    if idx == 3 {
+                                    if idx == 5 {
                                         // Stay connected longer than sse_backoff_stable_after (120ms), then close without DaemonStopping.
                                         for _ in 0..8 {
                                             if stop.load(Ordering::Acquire) {
@@ -4800,7 +4800,7 @@ mod tests {
                                             Some(std::time::Instant::now());
                                         return;
                                     }
-                                    if idx == 4 {
+                                    if idx == 6 {
                                         *reconnected_at.lock().unwrap() =
                                             Some(std::time::Instant::now());
                                     }
@@ -4824,7 +4824,7 @@ mod tests {
                             }));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
+                            thread::sleep(Duration::from_millis(1));
                         }
                         Err(_) => break,
                     }
@@ -4835,20 +4835,20 @@ mod tests {
             })
         };
 
-        // After 3 failures (40+80+160ms), backoff is 320ms (max 640ms).
-        // Stream #3 stays up for ~240ms (> stable_after=120ms) and drops; backoff should reset to 40ms.
+        // After 5 failures (40+80+160+320+640ms), backoff reaches 1280ms (max 1500ms).
+        // Stream #5 stays up for ~240ms (> stable_after=120ms) and drops; backoff should reset to 40ms.
         let backend = BackendHandle::spawn_with_sse_timing_and_stable(
             Some(dir.path().to_path_buf()),
             None,
             egui::Context::default(),
             Duration::from_secs(2),
             Duration::from_millis(40),
-            Duration::from_millis(640),
+            Duration::from_millis(1500),
             Duration::from_millis(120),
         );
         backend.send(GuiRequest::ConnectOrStartDaemon);
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
         while reconnected_at.lock().unwrap().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4861,8 +4861,8 @@ mod tests {
         let reconnected = reconnected_at.lock().unwrap().unwrap();
         let gap = reconnected.duration_since(closed);
         assert!(
-            gap < Duration::from_millis(220),
-            "expected reconnect delay to reset to ~40ms after stable stream, got {gap:?}"
+            gap < Duration::from_millis(800),
+            "expected reconnect delay to reset to ~40ms after stable stream (un-reset would be ~1280ms), got {gap:?}"
         );
 
         drop(backend);
