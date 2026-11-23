@@ -3448,4 +3448,169 @@ mod tests {
 
         daemon.shutdown().await;
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_rollback_exposes_orphaned_reservations_over_http_and_clears_on_stop() {
+        use openvmms_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+        let shared_disk = dir.path().join("http-orphan.img");
+        fs::write(&shared_disk, vec![0u8; 4096]).unwrap();
+
+        let created: VmSummary = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "HttpOrphan-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let vm_id = created.config.id;
+        let nic_id = created.config.nics[0].id;
+
+        let sock_path = dir.path().join("orphan-http.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let _server = std::thread::spawn(move || {
+            for idx in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let Ok((stream_id, _, _)) = read_frame(&mut stream) else {
+                    break;
+                };
+                let resp = if idx % 2 == 0 {
+                    TestWireResponse {
+                        result: Some(test_wire_response::Result::Payload(Vec::new())),
+                    }
+                } else {
+                    TestWireResponse {
+                        result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                            code: 13,
+                            message: "injected rollback failure".into(),
+                            details: Vec::new(),
+                        })),
+                    }
+                };
+                if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                    let _ = stream.write_all(&frame);
+                    let _ = stream.flush();
+                }
+            }
+        });
+
+        daemon
+            .supervisor
+            .set_vm_running_socket_for_test(vm_id, sock_path);
+        let vm_dir = openvmms_core::store::RegistryStore::open(dir.path()).vm_dir(vm_id);
+        struct RestorePerm(std::path::PathBuf);
+        impl Drop for RestorePerm {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let restore = RestorePerm(vm_dir.clone());
+        fs::set_permissions(&vm_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        if fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(vm_dir.join(".probe"))
+            .is_err()
+        {
+            let attach_resp = client
+                .post(format!("{}/api/v1/vms/{vm_id}/disks", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&openvmms_core::models::AttachDiskPayload {
+                    lun: Some(1),
+                    path: shared_disk.clone(),
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                })
+                .send()
+                .await
+                .unwrap();
+            assert!(!attach_resp.status().is_success());
+
+            let pf = PortForward {
+                protocol: IpProto::Tcp,
+                host_addr: "127.0.0.1".into(),
+                host_port: 19122,
+                guest_port: 22,
+            };
+            let pf_resp = client
+                .post(format!(
+                    "{}/api/v1/vms/{vm_id}/nics/{nic_id}/ports",
+                    daemon.base_url
+                ))
+                .bearer_auth(&daemon.token)
+                .json(&openvmms_core::models::PortForwardPayload { port: pf.clone() })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(pf_resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+            let summary: VmSummary = client
+                .get(format!("{}/api/v1/vms/{vm_id}", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(summary.runtime.orphaned_disks.len(), 1);
+            assert_eq!(summary.runtime.orphaned_disks[0].path, shared_disk);
+            assert_eq!(summary.runtime.orphaned_port_forwards.len(), 1);
+            assert_eq!(summary.runtime.orphaned_port_forwards[0].forward, pf);
+
+            drop(restore);
+            let stopped: VmSummary = client
+                .post(format!("{}/api/v1/vms/{vm_id}/stop", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(stopped.runtime.orphaned_disks.is_empty());
+            assert!(stopped.runtime.orphaned_port_forwards.is_empty());
+        } else {
+            drop(restore);
+        }
+
+        daemon.shutdown().await;
+    }
 }

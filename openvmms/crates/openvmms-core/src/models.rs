@@ -1266,6 +1266,12 @@ pub struct LiveVmProperties {
     pub total_runtime_ns: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanedPortForward {
+    pub nic_id: Uuid,
+    pub forward: PortForward,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VmRuntimeState {
     pub status: VmStatus,
@@ -1278,6 +1284,10 @@ pub struct VmRuntimeState {
     pub live_properties: Option<LiveVmProperties>,
     #[serde(default)]
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphaned_disks: Vec<DiskAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphaned_port_forwards: Vec<OrphanedPortForward>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
