@@ -10,6 +10,22 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
+pub struct TokenSecurityError(pub String);
+
+impl std::fmt::Display for TokenSecurityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TokenSecurityError {}
+
+pub fn is_token_security_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<TokenSecurityError>().is_some())
+}
+
+#[derive(Debug, Clone)]
 pub struct RegistryStore {
     data_dir: PathBuf,
 }
@@ -365,10 +381,10 @@ impl RegistryStore {
                 .with_context(|| format!("reading daemon token at {}", path.display()));
         };
         if read.has_hard_links {
-            bail!(
-                "refusing to use hard-linked daemon token file {}",
+            return Err(anyhow::Error::new(TokenSecurityError(format!(
+                "refusing to use hard-linked daemon token file {} (remove the extra hard link or restart openvmmsd to rotate daemon.token)",
                 path.display()
-            );
+            ))));
         }
         if read.token.is_empty() {
             bail!("daemon token file {} is empty", path.display());
@@ -771,10 +787,10 @@ fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<O
                     }
                 } =>
             {
-                bail!(
+                return Err(anyhow::Error::new(TokenSecurityError(format!(
                     "refusing to use non-regular or symlinked daemon token file {}",
                     path.display()
-                );
+                ))));
             }
             Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
         };
@@ -782,19 +798,19 @@ fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<O
             .metadata()
             .with_context(|| format!("inspecting {}", path.display()))?;
         if !meta.file_type().is_file() {
-            bail!(
+            return Err(anyhow::Error::new(TokenSecurityError(format!(
                 "refusing to use non-regular or symlinked daemon token file {}",
                 path.display()
-            );
+            ))));
         }
         let euid = unsafe { libc::geteuid() };
         if !validate_token_uid(meta.uid(), euid, allow_root_reader) {
-            bail!(
+            return Err(anyhow::Error::new(TokenSecurityError(format!(
                 "refusing to use daemon token file {} owned by uid {} (expected {})",
                 path.display(),
                 meta.uid(),
                 euid
-            );
+            ))));
         }
         let has_hard_links = meta.nlink() > 1;
         let mut was_permissive = false;
@@ -832,10 +848,10 @@ fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<O
             }
         };
         if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
-            bail!(
+            return Err(anyhow::Error::new(TokenSecurityError(format!(
                 "refusing to use non-regular or symlinked daemon token file {}",
                 path.display()
-            );
+            ))));
         }
 
         let mut opts = fs::OpenOptions::new();
@@ -851,10 +867,10 @@ fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<O
         if !meta.file_type().is_file()
             || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
         {
-            bail!(
+            return Err(anyhow::Error::new(TokenSecurityError(format!(
                 "refusing to use non-regular or symlinked daemon token file {}",
                 path.display()
-            );
+            ))));
         }
         let mut was_permissive = false;
         if !is_handle_owner_only_windows(&file, path)? {
