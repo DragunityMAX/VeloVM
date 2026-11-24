@@ -2172,6 +2172,7 @@ dependencies = [
  "futures",
  "input_core",
  "inspect",
+ "libc",
  "lz4_flex",
  "mesh",
  "mesh_worker",
