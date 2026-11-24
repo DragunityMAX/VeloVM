@@ -201,29 +201,38 @@ pub fn configure_worker_command(cmd: &mut std::process::Command) {
 }
 
 /// Writes `<pid>\n<start_token>` (or `<pid>` if no start token can be queried)
-/// to `path`, creating/replacing the file with owner-only permissions on Unix.
+/// atomically to `path` with owner-only permissions, refusing symlinks or
+/// non-regular files.
 pub fn write_pid_file(path: &Path, pid: u32) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to write PID file to symlink or non-regular path '{}'",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
     let content = match process_start_token(pid) {
         Some(tok) => format!("{pid}\n{tok}"),
         None => pid.to_string(),
     };
-
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(content.as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, content)
-    }
+    let target = if path.parent().is_some_and(|p| p.as_os_str().is_empty()) {
+        std::borrow::Cow::Owned(Path::new(".").join(path))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    };
+    crate::store::atomic_write(target.as_ref(), content.as_bytes(), true).map_err(|err| {
+        err.downcast::<std::io::Error>()
+            .unwrap_or_else(|e| std::io::Error::other(format!("{e:#}")))
+    })
 }
 
 /// Parses `<pid>[\n<start_token>]` from a `.pid` file.
@@ -637,5 +646,31 @@ mod tests {
             matches!(child.try_wait(), Ok(Some(_))),
             "AdoptedProcess::is_alive must not reap child processes"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_pid_file_rejects_symlinks_and_sets_0600_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("victim.txt");
+        fs::write(&target, "original-content").unwrap();
+
+        let pid_link = dir.path().join("vm.pid");
+        symlink(&target, &pid_link).unwrap();
+
+        let err = write_pid_file(&pid_link, std::process::id()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original-content");
+
+        let regular_pid = dir.path().join("regular.pid");
+        write_pid_file(&regular_pid, std::process::id()).unwrap();
+        let mode = fs::symlink_metadata(&regular_pid)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
