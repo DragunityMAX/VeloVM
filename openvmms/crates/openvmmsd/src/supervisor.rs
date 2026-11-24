@@ -651,7 +651,9 @@ impl Supervisor {
                     let _ = old.handle.await;
                 }
             });
-            self.draining_listeners.lock().unwrap().push(drain);
+            let mut draining = self.draining_listeners.lock().unwrap();
+            draining.retain(|h| !h.is_finished());
+            draining.push(drain);
         }
         Ok(bound_addr)
     }
@@ -9272,5 +9274,24 @@ mod tests {
             sup.vms.read().unwrap().get(&vm_id).unwrap().runtime.status,
             VmStatus::Running
         );
+    }
+
+    #[tokio::test]
+    async fn serve_on_listener_prunes_finished_draining_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+
+        for _ in 0..6 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            sup.serve_on_listener(listener).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            sup.draining_listeners.lock().unwrap().len() <= 1,
+            "expected finished drain handles to be pruned, got {}",
+            sup.draining_listeners.lock().unwrap().len()
+        );
+        sup.mark_shutting_down();
+        sup.join_all_listeners().await;
     }
 }
