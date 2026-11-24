@@ -556,6 +556,7 @@ impl<T: Listener> MultiClientServer<T> {
     async fn process(&mut self, driver: &LocalDriver) -> anyhow::Result<()> {
         enum Event<A> {
             Accepted(A),
+            AcceptTransientError(std::io::Error),
             ClientDone(u64),
             DirtyRects(Vec<DirtyRect>),
             Cursor(CursorUpdate),
@@ -608,10 +609,11 @@ impl<T: Listener> MultiClientServer<T> {
             };
 
             let event = futures::select! {
-                accept = listener.accept().fuse() => {
-                    let (socket, addr) = accept?;
-                    Event::Accepted((socket, addr))
-                }
+                accept = listener.accept().fuse() => match accept {
+                    Ok((socket, addr)) => Event::Accepted((socket, addr)),
+                    Err(e) if is_transient_accept_error(&e) => Event::AcceptTransientError(e),
+                    Err(e) => return Err(e.into()),
+                },
                 id = client_done.fuse() => Event::ClientDone(id),
                 msg = dirty_fut.fuse() => match msg {
                     Ok(rects) => Event::DirtyRects(rects),
@@ -702,6 +704,12 @@ impl<T: Listener> MultiClientServer<T> {
                                 "failed to register FastDesk client socket"
                             );
                         }
+                    }
+                }
+                Event::AcceptTransientError(e) => {
+                    tracing::warn!(error = %e, "FastDesk accept failed; continuing");
+                    if is_resource_exhaustion_accept_error(&e) {
+                        timer.sleep(Duration::from_millis(50)).await;
                     }
                 }
                 Event::ClientDone(id) => {
@@ -1456,6 +1464,38 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
         r = reader_fut => r,
         r = writer_fut => r,
     }
+}
+
+fn is_resource_exhaustion_accept_error(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(c) if c == libc::EMFILE || c == libc::ENFILE || c == libc::ENOBUFS || c == libc::ENOMEM
+        )
+    }
+    #[cfg(windows)]
+    {
+        const WSAEMFILE: i32 = 10024;
+        const WSAENOBUFS: i32 = 10055;
+        matches!(err.raw_os_error(), Some(c) if c == WSAEMFILE || c == WSAENOBUFS)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::OutOfMemory
+    ) || is_resource_exhaustion_accept_error(err)
 }
 
 #[cfg(test)]
@@ -3079,5 +3119,39 @@ mod tests {
         drop(stream1);
         drop(stream2);
         server.stop();
+    }
+
+    #[test]
+    fn transient_accept_errors_are_classified_without_terminating() {
+        use std::io::Error;
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+        ] {
+            assert!(
+                is_transient_accept_error(&Error::from(kind)),
+                "expected {kind:?} to be transient"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+                let err = Error::from_raw_os_error(code);
+                assert!(is_transient_accept_error(&err));
+                assert!(is_resource_exhaustion_accept_error(&err));
+            }
+        }
+
+        for fatal_kind in [ErrorKind::PermissionDenied, ErrorKind::InvalidInput, ErrorKind::Other] {
+            assert!(
+                !is_transient_accept_error(&Error::from(fatal_kind)),
+                "expected {fatal_kind:?} to be fatal"
+            );
+        }
     }
 }

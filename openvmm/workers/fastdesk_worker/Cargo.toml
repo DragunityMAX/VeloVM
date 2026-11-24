@@ -29,6 +29,9 @@ socket2 = { workspace = true, features = ["all"] }
 tracing.workspace = true
 unicycle.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 vmsocket.workspace = true
 
