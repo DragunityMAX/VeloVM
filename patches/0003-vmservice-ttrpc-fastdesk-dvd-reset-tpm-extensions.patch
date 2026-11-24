@@ -280,7 +280,7 @@ index 4c6546f..57c7860 100644
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
-index b63d6b6..cd65dd6 100644
+index b63d6b6..72caa04 100644
 --- a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 +++ b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 @@ -35,6 +35,7 @@ struct FdRegistry {}
@@ -869,7 +869,22 @@ index b63d6b6..cd65dd6 100644
      }
  
      fn modify_resource(
-@@ -2087,18 +2373,27 @@ impl Future<Output = anyhow::Result<vmservice::ModifyResourceResponse>> + use<>,
+@@ -2068,7 +2354,13 @@ impl Future<Output = anyhow::Result<vmservice::ModifyResourceResponse>> + use<>,
+                         .context("no scsi controller")?
+                         .call_failable(ScsiControllerRequest::RemoveDevice, scsi_path);
+                     Ok(async move {
+-                        recv.await.map_err(anyhow::Error::from)?;
++                        if let Err(err) = recv.await {
++                            let msg = format!("{err:#}");
++                            if msg.contains("is not in use") {
++                                return Err(anyhow!(Code::NotFound).context(msg));
++                            }
++                            return Err(err.into());
++                        }
+                         Ok(vmservice::ModifyResourceResponse::default())
+                     }
+                     .boxed())
+@@ -2087,18 +2379,27 @@ impl Future<Output = anyhow::Result<vmservice::ModifyResourceResponse>> + use<>,
                               configure it at VM creation time"
                          );
                      }
@@ -898,7 +913,26 @@ index b63d6b6..cd65dd6 100644
                          Ok(vmservice::ModifyResourceResponse::default())
                      }
                      .boxed())
-@@ -2438,6 +2733,38 @@ fn parse_port_config(port: vmservice::PortConfig) -> anyhow::Result<HostPortConf
+@@ -2274,9 +2575,16 @@ fn modify_consomme_nic(
+             }
+             ConsommeNicAction::UnbindPorts(ports) => {
+                 for cfg in ports {
+-                    consomme_rpc
++                    if let Err(err) = consomme_rpc
+                         .call_failable(ConsommeRequest::Unbind, cfg)
+-                        .await?;
++                        .await
++                    {
++                        let msg = format!("{err:#}");
++                        if msg.contains("port is not bound") {
++                            return Err(anyhow!(Code::NotFound).context(msg));
++                        }
++                        return Err(err.into());
++                    }
+                 }
+                 None
+             }
+@@ -2438,6 +2746,38 @@ fn parse_port_config(port: vmservice::PortConfig) -> anyhow::Result<HostPortConf
      })
  }
  
@@ -937,7 +971,7 @@ index b63d6b6..cd65dd6 100644
  enum NicDevice {
      Vmbus(Resource<VmbusDeviceHandleKind>),
      Virtio {
-@@ -2446,16 +2773,29 @@ enum NicDevice {
+@@ -2446,16 +2786,29 @@ enum NicDevice {
      },
  }
  
@@ -968,7 +1002,7 @@ index b63d6b6..cd65dd6 100644
      let endpoint = match nic.backend.context("missing backend")? {
          #[cfg(windows)]
          Backend::LegacyPortId(port_id) => net_backend_resources::dio::WindowsDirectIoHandle {
-@@ -2466,24 +2806,31 @@ fn parse_nic_config(
+@@ -2466,24 +2819,31 @@ fn parse_nic_config(
          }
          .into_resource(),
          #[cfg(windows)]
@@ -1012,7 +1046,7 @@ index b63d6b6..cd65dd6 100644
          vmservice::NicFrontend::Vmbus => NicDevice::Vmbus(
              NetvspHandle {
                  instance_id,
-@@ -2503,33 +2850,84 @@ fn parse_nic_config(
+@@ -2503,33 +2863,84 @@ fn parse_nic_config(
              }
              .into_resource(),
          },
@@ -1111,7 +1145,7 @@ index b63d6b6..cd65dd6 100644
  /// Applies the MMIO gap sizes from the request's `MemoryConfig` to the
  /// chipset's default layout. A zero-sized request field leaves the chipset
  /// default in place.
-@@ -3439,11 +3837,16 @@ fn service(
+@@ -3439,11 +3850,16 @@ fn service(
              controller_task: None,
              wait_vm_response: None,
              lifecycle: VmLifecycle::Running,
@@ -1128,7 +1162,7 @@ index b63d6b6..cd65dd6 100644
          }
      }
  
-@@ -4363,11 +4766,16 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4363,11 +4779,16 @@ fn guest_power_exit_stops_rpc_server() {
                      controller_task: None,
                      wait_vm_response: None,
                      lifecycle: VmLifecycle::Running,
@@ -1145,7 +1179,7 @@ index b63d6b6..cd65dd6 100644
                  };
                  event_send.send(VmControllerEvent::ExitRequested { code });
                  assert_eq!(service.run(listener, worker_recv).await.unwrap(), code);
-@@ -4375,6 +4783,118 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4375,6 +4796,118 @@ fn guest_power_exit_stops_rpc_server() {
          });
      }
  
@@ -1264,7 +1298,7 @@ index b63d6b6..cd65dd6 100644
      #[test]
      fn uefi_initial_variables_defaults() {
          for arch in [
-@@ -4568,6 +5088,17 @@ fn platform_config_rejects_vmbus_devices() {
+@@ -4568,6 +5101,17 @@ fn platform_config_rejects_vmbus_devices() {
                  }),
                  ..Default::default()
              },
@@ -1282,7 +1316,7 @@ index b63d6b6..cd65dd6 100644
          ] {
              assert!(validate_platform_config(&config).is_ok());
              assert!(
-@@ -4877,4 +5408,460 @@ fn reject_invalid_vfio_bar_address_config() {
+@@ -4877,4 +5421,556 @@ fn reject_invalid_vfio_bar_address_config() {
              .is_err()
          );
      }
@@ -1740,6 +1774,102 @@ index b63d6b6..cd65dd6 100644
 +            );
 +            assert!(!fresh_shm.exists());
 +            assert!(svc.fastdesk_shm_path.is_none());
++        });
++    }
++
++    #[test]
++    fn modify_resource_remove_maps_missing_scsi_and_unbound_consomme_to_not_found() {
++        DefaultPool::run_with(async |driver| {
++            let mut svc = service(driver.clone(), None);
++            let (scsi_send, mut scsi_recv) = mesh::channel();
++            let (consomme_send, mut consomme_recv) = mesh::channel();
++            let nic_id = Guid::new_random();
++            {
++                let vm = Arc::get_mut(svc.vm.as_mut().unwrap()).unwrap();
++                vm.scsi_rpc = Some(scsi_send);
++                vm.consomme_rpc.insert(nic_id, consomme_send);
++            }
++
++            // 1. Removing a non-existent SCSI LUN must yield Code::NotFound (5).
++            let (resp_tx, resp_rx) = mesh::oneshot();
++            svc.handle(
++                mesh::CancelContext::new(),
++                vmservice::Vm::ModifyResource(
++                    vmservice::ModifyResourceRequest {
++                        r#type: vmservice::ModifyType::Remove as i32,
++                        resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
++                            vmservice::ScsiDisk {
++                                controller: 0,
++                                lun: 3,
++                                ..Default::default()
++                            },
++                        )),
++                    },
++                    resp_tx,
++                ),
++            )
++            .await;
++
++            match scsi_recv.next().await.unwrap() {
++                ScsiControllerRequest::RemoveDevice(rpc) => {
++                    rpc.handle_failable_sync(|path| {
++                        Err::<(), _>(anyhow::anyhow!(
++                            "failed to remove device: SCSI path {}:{}:{} is not in use",
++                            path.path,
++                            path.target,
++                            path.lun
++                        ))
++                    });
++                }
++                _ => panic!("unexpected scsi request"),
++            }
++            let status = resp_rx.await.unwrap().unwrap_err();
++            assert_eq!(status.code, Code::NotFound as i32);
++            assert!(status.message.contains("is not in use"), "{}", status.message);
++
++            // 2. Unbinding an unbound Consomme port must yield Code::NotFound (5).
++            let (resp_tx, resp_rx) = mesh::oneshot();
++            svc.handle(
++                mesh::CancelContext::new(),
++                vmservice::Vm::ModifyResource(
++                    vmservice::ModifyResourceRequest {
++                        r#type: vmservice::ModifyType::Remove as i32,
++                        resource: Some(vmservice::modify_resource_request::Resource::NicConfig(
++                            vmservice::NicConfig {
++                                nic_id: nic_id.to_string(),
++                                backend: Some(vmservice::nic_config::Backend::Consomme(
++                                    vmservice::ConsommeBackend {
++                                        ports: vec![vmservice::PortConfig {
++                                            protocol: vmservice::IpProtocol::Tcp as i32,
++                                            host_address: "127.0.0.1".into(),
++                                            host_port: 18080,
++                                            guest_port: 80,
++                                        }],
++                                        ..Default::default()
++                                    },
++                                )),
++                                ..Default::default()
++                            },
++                        )),
++                    },
++                    resp_tx,
++                ),
++            )
++            .await;
++
++            match consomme_recv.next().await.unwrap() {
++                ConsommeRequest::Unbind(rpc) => {
++                    rpc.handle_failable_sync(|_cfg| Err::<(), _>(anyhow::anyhow!("port is not bound")));
++                }
++                _ => panic!("unexpected consomme request"),
++            }
++            let status = resp_rx.await.unwrap().unwrap_err();
++            assert_eq!(status.code, Code::NotFound as i32);
++            assert!(status.message.contains("port is not bound"), "{}", status.message);
++
++            while let Some(task) = svc.rpc_tasks.pop() {
++                task.await;
++            }
 +        });
 +    }
  }

@@ -2354,7 +2354,13 @@ impl VmService {
                         .context("no scsi controller")?
                         .call_failable(ScsiControllerRequest::RemoveDevice, scsi_path);
                     Ok(async move {
-                        recv.await.map_err(anyhow::Error::from)?;
+                        if let Err(err) = recv.await {
+                            let msg = format!("{err:#}");
+                            if msg.contains("is not in use") {
+                                return Err(anyhow!(Code::NotFound).context(msg));
+                            }
+                            return Err(err.into());
+                        }
                         Ok(vmservice::ModifyResourceResponse::default())
                     }
                     .boxed())
@@ -2569,9 +2575,16 @@ fn modify_consomme_nic(
             }
             ConsommeNicAction::UnbindPorts(ports) => {
                 for cfg in ports {
-                    consomme_rpc
+                    if let Err(err) = consomme_rpc
                         .call_failable(ConsommeRequest::Unbind, cfg)
-                        .await?;
+                        .await
+                    {
+                        let msg = format!("{err:#}");
+                        if msg.contains("port is not bound") {
+                            return Err(anyhow!(Code::NotFound).context(msg));
+                        }
+                        return Err(err.into());
+                    }
                 }
                 None
             }
@@ -5862,6 +5875,102 @@ mod tests {
             );
             assert!(!fresh_shm.exists());
             assert!(svc.fastdesk_shm_path.is_none());
+        });
+    }
+
+    #[test]
+    fn modify_resource_remove_maps_missing_scsi_and_unbound_consomme_to_not_found() {
+        DefaultPool::run_with(async |driver| {
+            let mut svc = service(driver.clone(), None);
+            let (scsi_send, mut scsi_recv) = mesh::channel();
+            let (consomme_send, mut consomme_recv) = mesh::channel();
+            let nic_id = Guid::new_random();
+            {
+                let vm = Arc::get_mut(svc.vm.as_mut().unwrap()).unwrap();
+                vm.scsi_rpc = Some(scsi_send);
+                vm.consomme_rpc.insert(nic_id, consomme_send);
+            }
+
+            // 1. Removing a non-existent SCSI LUN must yield Code::NotFound (5).
+            let (resp_tx, resp_rx) = mesh::oneshot();
+            svc.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::ModifyResource(
+                    vmservice::ModifyResourceRequest {
+                        r#type: vmservice::ModifyType::Remove as i32,
+                        resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
+                            vmservice::ScsiDisk {
+                                controller: 0,
+                                lun: 3,
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                    resp_tx,
+                ),
+            )
+            .await;
+
+            match scsi_recv.next().await.unwrap() {
+                ScsiControllerRequest::RemoveDevice(rpc) => {
+                    rpc.handle_failable_sync(|path| {
+                        Err::<(), _>(anyhow::anyhow!(
+                            "failed to remove device: SCSI path {}:{}:{} is not in use",
+                            path.path,
+                            path.target,
+                            path.lun
+                        ))
+                    });
+                }
+                _ => panic!("unexpected scsi request"),
+            }
+            let status = resp_rx.await.unwrap().unwrap_err();
+            assert_eq!(status.code, Code::NotFound as i32);
+            assert!(status.message.contains("is not in use"), "{}", status.message);
+
+            // 2. Unbinding an unbound Consomme port must yield Code::NotFound (5).
+            let (resp_tx, resp_rx) = mesh::oneshot();
+            svc.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::ModifyResource(
+                    vmservice::ModifyResourceRequest {
+                        r#type: vmservice::ModifyType::Remove as i32,
+                        resource: Some(vmservice::modify_resource_request::Resource::NicConfig(
+                            vmservice::NicConfig {
+                                nic_id: nic_id.to_string(),
+                                backend: Some(vmservice::nic_config::Backend::Consomme(
+                                    vmservice::ConsommeBackend {
+                                        ports: vec![vmservice::PortConfig {
+                                            protocol: vmservice::IpProtocol::Tcp as i32,
+                                            host_address: "127.0.0.1".into(),
+                                            host_port: 18080,
+                                            guest_port: 80,
+                                        }],
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                    resp_tx,
+                ),
+            )
+            .await;
+
+            match consomme_recv.next().await.unwrap() {
+                ConsommeRequest::Unbind(rpc) => {
+                    rpc.handle_failable_sync(|_cfg| Err::<(), _>(anyhow::anyhow!("port is not bound")));
+                }
+                _ => panic!("unexpected consomme request"),
+            }
+            let status = resp_rx.await.unwrap().unwrap_err();
+            assert_eq!(status.code, Code::NotFound as i32);
+            assert!(status.message.contains("port is not bound"), "{}", status.message);
+
+            while let Some(task) = svc.rpc_tasks.pop() {
+                task.await;
+            }
         });
     }
 }
