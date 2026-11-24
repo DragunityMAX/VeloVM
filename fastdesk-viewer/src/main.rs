@@ -603,14 +603,14 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
             }
 
             #[cfg(target_os = "macos")]
-            native_cursor.sync(
-                &mut window,
-                should_hide_macos_cursor(
+            {
+                let hide_cursor = should_hide_macos_cursor(
                     window.is_active(),
                     window.get_size(),
                     window.get_unscaled_mouse_pos(minifb::MouseMode::Pass),
-                ),
-            );
+                );
+                native_cursor.sync(&mut window, hide_cursor);
+            }
 
             for msg in input.poll(&window, comp.width, comp.height) {
                 write_client_msg(&mut writer_stream, &msg)?;
