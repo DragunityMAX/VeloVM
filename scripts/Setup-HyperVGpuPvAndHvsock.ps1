@@ -44,6 +44,100 @@ function Assert-Administrator {
     }
 }
 
+function Resolve-DisplayDriverInfNames {
+    param(
+        [string[]]$InfNames = @(),
+        [hashtable]$PublishedDriverMap = @{}
+    )
+
+    $resolved = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($raw in $InfNames) {
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $fileName = ($raw.Trim() -split '[\\/]')[-1].ToLowerInvariant()
+        if ($PublishedDriverMap.ContainsKey($fileName)) {
+            $orig = (([string]$PublishedDriverMap[$fileName]).Trim() -split '[\\/]')[-1].ToLowerInvariant()
+            if (-not [string]::IsNullOrWhiteSpace($orig)) {
+                $null = $resolved.Add($orig)
+            }
+        }
+        $null = $resolved.Add($fileName)
+    }
+    return @($resolved)
+}
+
+function Get-PublishedDriverOriginalInfMap {
+    $map = @{}
+    if (Get-Command Get-WindowsDriver -ErrorAction SilentlyContinue) {
+        try {
+            foreach ($drv in (Get-WindowsDriver -Online -ErrorAction Stop)) {
+                if ($drv.Driver -and $drv.OriginalFileName) {
+                    $pub = [System.IO.Path]::GetFileName([string]$drv.Driver).ToLowerInvariant()
+                    $orig = [System.IO.Path]::GetFileName([string]$drv.OriginalFileName).ToLowerInvariant()
+                    if ($pub -and $orig) {
+                        $map[$pub] = $orig
+                    }
+                }
+            }
+            if ($map.Count -gt 0) {
+                return $map
+            }
+        } catch {}
+    }
+    if (Get-Command pnputil.exe -ErrorAction SilentlyContinue) {
+        try {
+            $curPub = $null
+            foreach ($line in (& pnputil.exe /enum-drivers 2>$null)) {
+                if ($line -match '^\s*Published Name\s*:\s*(\S+\.inf)\s*$') {
+                    $curPub = [System.IO.Path]::GetFileName($Matches[1].Trim()).ToLowerInvariant()
+                } elseif ($curPub -and $line -match '^\s*Original Name\s*:\s*(\S+\.inf)\s*$') {
+                    $map[$curPub] = [System.IO.Path]::GetFileName($Matches[1].Trim()).ToLowerInvariant()
+                    $curPub = $null
+                }
+            }
+        } catch {}
+    }
+    return $map
+}
+
+function Sync-HostDriverStorePackages {
+    param(
+        [Parameter(Mandatory)]
+        [string]$HostRepo,
+        [Parameter(Mandatory)]
+        [string]$GuestRepo,
+        [string[]]$DisplayDriverInfNames = @(),
+        [hashtable]$PublishedDriverMap = @{}
+    )
+
+    New-Item -ItemType Directory -Path $GuestRepo -Force | Out-Null
+    $resolvedInfNames = Resolve-DisplayDriverInfNames -InfNames $DisplayDriverInfNames -PublishedDriverMap $PublishedDriverMap
+
+    $pkgDirs = Get-ChildItem -Path $HostRepo -Directory | Where-Object {
+        $name = $_.Name.ToLowerInvariant()
+        if ($name -match '^(nv|amd|ati|igfx|iigd|ialm|u0|qxl)') {
+            return $true
+        }
+        foreach ($infName in $resolvedInfNames) {
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($infName).ToLowerInvariant()
+            if ($name.StartsWith($infName + "_") -or $name -eq $infName -or $name.StartsWith($base + ".inf_") -or $name.StartsWith($base + "_")) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    foreach ($dir in $pkgDirs) {
+        $dest = Join-Path $GuestRepo $dir.Name
+        if (Test-Path -LiteralPath $dest) {
+            Remove-Item -LiteralPath $dest -Recurse -Force
+        }
+        Write-Host "  Copying driver package: $($dir.Name)"
+        Copy-Item -LiteralPath $dir.FullName -Destination $dest -Recurse -Force
+    }
+    return @($pkgDirs | ForEach-Object { $_.Name })
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
 Assert-Administrator
 
 # 1. Register AF_HYPERV GuestCommunicationServices GUID for FastDesk (port 5901 default).
@@ -145,22 +239,18 @@ if (-not $SkipDriverCopy) {
         $guestRepo = Join-Path $windowsRoot "System32\HostDriverStore\FileRepository"
         New-Item -ItemType Directory -Path $guestRepo -Force | Out-Null
 
-        $displayDrivers = Get-CimInstance Win32_VideoController | ForEach-Object { $_.InfName } | Where-Object { $_ } | Select-Object -Unique
+        $displayDrivers = @(Get-CimInstance Win32_VideoController | ForEach-Object { $_.InfName } | Where-Object { $_ } | Select-Object -Unique)
+        $publishedDriverMap = Get-PublishedDriverOriginalInfMap
         $hostRepo = "$env:SystemRoot\System32\DriverStore\FileRepository"
         $hostDrv = "$env:SystemRoot\System32\drivers"
         $guestDrv = Join-Path $windowsRoot "System32\drivers"
 
         # Copy all display-class driver packages referenced by active display adapters (plus nv* / amd* / igfx* / iigd* if present).
-        $pkgDirs = Get-ChildItem -Path $hostRepo -Directory | Where-Object {
-            $name = $_.Name.ToLowerInvariant()
-            $name -match '^(nv|amd|ati|igfx|iigd|ialm|u0|qxl)' -or ($displayDrivers | Where-Object { $name.StartsWith([System.IO.Path]::GetFileNameWithoutExtension($_).ToLowerInvariant()) })
-        }
-
-        foreach ($dir in $pkgDirs) {
-            $dest = Join-Path $guestRepo $dir.Name
-            Write-Host "  Copying driver package: $($dir.Name)"
-            Copy-Item -Path $dir.FullName -Destination $dest -Recurse -Force
-        }
+        $null = Sync-HostDriverStorePackages `
+            -HostRepo $hostRepo `
+            -GuestRepo $guestRepo `
+            -DisplayDriverInfNames $displayDrivers `
+            -PublishedDriverMap $publishedDriverMap
 
         # Copy NVIDIA host user-mode/kernel API DLLs if present (required by NVIDIA GPU-PV).
         foreach ($pattern in @("nvapi*.dll", "nvcuda*.dll", "nvdlist*.dll", "nvofapi*.dll", "nvencodeapi*.dll", "nvlddmkm.sys")) {
@@ -179,3 +269,4 @@ if (-not $SkipDriverCopy) {
 }
 
 Write-Host "Done. Next: Set guest registry HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\DWMFRAMEINTERVAL = 15 (DWORD) if also using RDP, or launch FastDesk over hvsock://$($vm.Id)/$VsockPort." -ForegroundColor Cyan
+}
