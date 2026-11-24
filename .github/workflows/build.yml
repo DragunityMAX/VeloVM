@@ -1,4 +1,4 @@
-name: Build & Package OpenVMM FastDesk
+name: Build & Package VeloVM
 
 on:
   push:
@@ -39,14 +39,14 @@ jobs:
           workspaces: |
             openvmm -> openvmm/target
             openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
-            fastdesk-viewer -> fastdesk-viewer/target
-            openvmms -> openvmms/target
+            velovm-viewer -> velovm-viewer/target
+            velovm -> velovm/target
 
       - name: Download protoc and mu_msvm x64 UEFI firmware
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $toolsRoot = Join-Path $env:RUNNER_TEMP "fastdesk-tools"
+          $toolsRoot = Join-Path $env:RUNNER_TEMP "velovm-tools"
           $protocExtract = Join-Path $toolsRoot "protoc"
           $msvmExtract = Join-Path $toolsRoot "mu_msvm"
           New-Item -ItemType Directory -Force -Path $protocExtract, $msvmExtract | Out-Null
@@ -92,8 +92,8 @@ jobs:
         working-directory: openvmm
         run: cargo test -p mesh_rpc -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
 
-      - name: Run fastdesk-viewer tests
-        working-directory: fastdesk-viewer
+      - name: Run velovm-viewer tests
+        working-directory: velovm-viewer
         run: cargo test
 
       - name: Configure Windows vTPM and OpenSSL build tools
@@ -120,18 +120,18 @@ jobs:
           cargo build -p openvmm-img --release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build fastdesk-viewer release binary
-        working-directory: fastdesk-viewer
+      - name: Build velovm-viewer release binary
+        working-directory: velovm-viewer
         run: cargo build --release
 
-      - name: Run openvmms tests
-        working-directory: openvmms
+      - name: Run velovm tests
+        working-directory: velovm
         env:
           OPENVMM_REQUIRE_REAL_BINARY: "1"
         run: cargo test
 
-      - name: Build openvmms release binaries
-        working-directory: openvmms
+      - name: Build velovm release binaries
+        working-directory: velovm
         run: cargo build --release
 
       - name: Smoke-test and benchmark Windows x64 binaries
@@ -148,26 +148,26 @@ jobs:
 
           & .\openvmm\target\release\openvmm-img.exe --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "openvmm-img.exe --help failed" }
-          & .\openvmms\target\release\openvmmsd.exe --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "openvmmsd.exe --help failed" }
-          & .\openvmms\target\release\openvmms.exe --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "openvmms.exe --help failed" }
-          $guiTestOut = & .\openvmms\target\release\openvmms-gui.exe --self-test 2>&1 | Out-String
+          & .\velovm\target\release\velovmd.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "velovmd.exe --help failed" }
+          & .\velovm\target\release\velovm.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "velovm.exe --help failed" }
+          $guiTestOut = & .\velovm\target\release\velovm-gui.exe --self-test 2>&1 | Out-String
           if ($LASTEXITCODE -ne 0 -or $guiTestOut -notmatch "SELF-TEST OK") {
-            throw "openvmms-gui.exe --self-test failed:`n$guiTestOut"
+            throw "velovm-gui.exe --self-test failed:`n$guiTestOut"
           }
 
-          $autoDir = Join-Path $env:RUNNER_TEMP "openvmms-autostart-win"
+          $autoDir = Join-Path $env:RUNNER_TEMP "velovm-autostart-win"
           if (Test-Path $autoDir) { Remove-Item -Recurse -Force $autoDir }
           New-Item -ItemType Directory -Force -Path $autoDir | Out-Null
           $killAutoDaemon = {
             $pattern = [regex]::Escape($autoDir)
-            Get-CimInstance Win32_Process -Filter "Name = 'openvmmsd.exe'" -ErrorAction SilentlyContinue |
+            Get-CimInstance Win32_Process -Filter "Name = 'velovmd.exe'" -ErrorAction SilentlyContinue |
               Where-Object { $_.CommandLine -and $_.CommandLine -match $pattern } |
               ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           }
           try {
-            $psi = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path ".\openvmms\target\release\openvmms.exe").Path)
+            $psi = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path ".\velovm\target\release\velovm.exe").Path)
             $psi.Arguments = ('--data-dir "{0}" --json vm list' -f $autoDir)
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
@@ -180,25 +180,25 @@ jobs:
               if (-not $proc.WaitForExit(15000)) {
                 try { $proc.Kill($true); $proc.WaitForExit(5000) | Out-Null } catch { try { $proc.Kill(); $proc.WaitForExit(5000) | Out-Null } catch {} }
                 & $killAutoDaemon
-                throw "openvmms auto-start stdout-capture check timed out after 15s"
+                throw "velovm auto-start stdout-capture check timed out after 15s"
               }
               $remainingMs = [Math]::Max(2000, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
               $ioTask = [System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]($stdoutTask, $stderrTask))
               if (-not $ioTask.Wait($remainingMs)) {
                 & $killAutoDaemon
-                throw "openvmms auto-start stdout/stderr pipe remained open after 15s (inherited stdio handle leak)"
+                throw "velovm auto-start stdout/stderr pipe remained open after 15s (inherited stdio handle leak)"
               }
               $autoOut = $stdoutTask.GetAwaiter().GetResult()
               $autoErr = $stderrTask.GetAwaiter().GetResult()
               if ($proc.ExitCode -ne 0 -or $autoOut -notmatch '\[\]') {
-                throw "openvmms auto-start stdout-capture check failed (exit $($proc.ExitCode)):`n$autoOut`n$autoErr"
+                throw "velovm auto-start stdout-capture check failed (exit $($proc.ExitCode)):`n$autoOut`n$autoErr"
               }
             } finally {
               $proc.Dispose()
             }
           } finally {
             try {
-              & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --no-auto-start daemon stop | Out-Null
+              & .\velovm\target\release\velovm.exe --data-dir $autoDir --no-auto-start daemon stop | Out-Null
             } catch {}
             Start-Sleep -Milliseconds 300
             & $killAutoDaemon
@@ -206,11 +206,11 @@ jobs:
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $autoDir
           }
 
-          $smokeDir = Join-Path $env:RUNNER_TEMP "openvmms-smoke-win"
+          $smokeDir = Join-Path $env:RUNNER_TEMP "velovm-smoke-win"
           if (Test-Path $smokeDir) { Remove-Item -Recurse -Force $smokeDir }
           New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
           $smokePort = 47691
-          $smokeDaemon = Start-Process -FilePath (Resolve-Path ".\openvmms\target\release\openvmmsd.exe").Path `
+          $smokeDaemon = Start-Process -FilePath (Resolve-Path ".\velovm\target\release\velovmd.exe").Path `
             -ArgumentList @("--data-dir", $smokeDir, "--listen", "127.0.0.1:$smokePort") -PassThru -NoNewWindow
           try {
             $deadline = (Get-Date).AddSeconds(15)
@@ -222,27 +222,27 @@ jobs:
               } catch {}
               Start-Sleep -Milliseconds 100
             }
-            if (-not $healthy) { throw "openvmmsd smoke daemon did not become healthy" }
+            if (-not $healthy) { throw "velovmd smoke daemon did not become healthy" }
             $smokeDisk = Join-Path $smokeDir "smoke.img"
-            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+            & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               disk create $smokeDisk --size 16M --format raw | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms disk create (raw) failed" }
+            if ($LASTEXITCODE -ne 0) { throw "velovm disk create (raw) failed" }
             $smokeVhdx = Join-Path $smokeDir "smoke.vhdx"
-            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+            & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               disk create $smokeVhdx --size 64M --format vhdx | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms disk create (vhdx) failed" }
-            $vhdxInfo = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+            if ($LASTEXITCODE -ne 0) { throw "velovm disk create (vhdx) failed" }
+            $vhdxInfo = & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
               disk info $smokeVhdx | Out-String | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0 -or $vhdxInfo.format -ne "vhdx") {
               throw "Expected VHDX disk info format 'vhdx', got $($vhdxInfo | ConvertTo-Json -Compress)"
             }
-            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+            & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm create "Smoke-VM" --preset win11 --cpus 2 --memory 2G --disk $smokeDisk | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms vm create failed" }
-            $listJson = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+            if ($LASTEXITCODE -ne 0) { throw "velovm vm create failed" }
+            $listJson = & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
               vm list | Out-String
             if ($LASTEXITCODE -ne 0 -or $listJson -notmatch "Smoke-VM") {
-              throw "openvmms vm list failed:`n$listJson"
+              throw "velovm vm list failed:`n$listJson"
             }
             $whpEnabled = $false
             try {
@@ -252,11 +252,11 @@ jobs:
               }
             } catch {}
             Write-Host "Windows smoke check: HypervisorPlatform enabled = $whpEnabled"
-            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+            & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm start "Smoke-VM" | Out-Null
             if ($LASTEXITCODE -eq 0) {
               Write-Host "Windows smoke check branch: WHP available — Smoke-VM booted and running"
-              $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+              $show = & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
                 vm show "Smoke-VM" | Out-String | ConvertFrom-Json
               if ($show.runtime.status -ne "running") {
                 throw "Expected Smoke-VM status running, got $($show.runtime.status)"
@@ -264,17 +264,17 @@ jobs:
               if ([string]::IsNullOrWhiteSpace($show.runtime.fastdesk_endpoint)) {
                 throw "Expected Smoke-VM fastdesk_endpoint to be populated"
               }
-              & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
                 vm pause "Smoke-VM" | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw "openvmms vm pause failed" }
-              & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              if ($LASTEXITCODE -ne 0) { throw "velovm vm pause failed" }
+              & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
                 vm resume "Smoke-VM" | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw "openvmms vm resume failed" }
+              if ($LASTEXITCODE -ne 0) { throw "velovm vm resume failed" }
             } else {
               if ($whpEnabled) {
-                throw "openvmms vm start failed even though HypervisorPlatform is enabled"
+                throw "velovm vm start failed even though HypervisorPlatform is enabled"
               }
-              $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+              $show = & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
                 vm show "Smoke-VM" | Out-String | ConvertFrom-Json
               if ($show.runtime.status -ne "error") {
                 throw "Expected Smoke-VM to recover cleanly to error when runner lacks WHP, got $($show.runtime.status)"
@@ -284,17 +284,17 @@ jobs:
               }
               Write-Host "Windows smoke check branch: runner lacks WHP — verified clean VM error recovery: $($show.runtime.last_error)"
             }
-            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+            & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               vm stop "Smoke-VM" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms vm stop failed" }
+            if ($LASTEXITCODE -ne 0) { throw "velovm vm stop failed" }
             # Verify daemon stop + restart preserves VM registry and disk state cleanly on Windows.
-            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+            & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               daemon stop | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop (restart check) failed" }
+            if ($LASTEXITCODE -ne 0) { throw "velovm daemon stop (restart check) failed" }
             if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
-              throw "openvmmsd smoke daemon did not exit cleanly before restart (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
+              throw "velovmd smoke daemon did not exit cleanly before restart (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
             }
-            $smokeDaemon = Start-Process -FilePath (Resolve-Path ".\openvmms\target\release\openvmmsd.exe").Path `
+            $smokeDaemon = Start-Process -FilePath (Resolve-Path ".\velovm\target\release\velovmd.exe").Path `
               -ArgumentList @("--data-dir", $smokeDir, "--listen", "127.0.0.1:$smokePort") -PassThru -NoNewWindow
             $deadline = (Get-Date).AddSeconds(15)
             $healthy = $false
@@ -305,17 +305,17 @@ jobs:
               } catch {}
               Start-Sleep -Milliseconds 100
             }
-            if (-not $healthy) { throw "restarted openvmmsd smoke daemon did not become healthy" }
-            $restartedShow = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+            if (-not $healthy) { throw "restarted velovmd smoke daemon did not become healthy" }
+            $restartedShow = & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
               vm show "Smoke-VM" | Out-String | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0 -or $restartedShow.config.name -ne "Smoke-VM") {
               throw "Expected Smoke-VM to persist across Windows daemon restart"
             }
-            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+            & .\velovm\target\release\velovm.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
               daemon stop --stop-vms | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop --stop-vms failed" }
+            if ($LASTEXITCODE -ne 0) { throw "velovm daemon stop --stop-vms failed" }
             if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
-              throw "openvmmsd smoke daemon did not exit cleanly (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
+              throw "velovmd smoke daemon did not exit cleanly (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
             }
           } finally {
             if ($null -ne $smokeDaemon -and -not $smokeDaemon.HasExited) {
@@ -324,12 +324,12 @@ jobs:
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $smokeDir
           }
 
-          $benchOut = & .\fastdesk-viewer\target\release\fastdesk-viewer.exe `
+          $benchOut = & .\velovm-viewer\target\release\velovm-viewer.exe `
             --bench --self-test --frames 200 --resolution 1920x1080 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0) { throw "fastdesk-viewer.exe --bench failed with $LASTEXITCODE`n$benchOut" }
+          if ($LASTEXITCODE -ne 0) { throw "velovm-viewer.exe --bench failed with $LASTEXITCODE`n$benchOut" }
           Write-Host $benchOut
           if ($benchOut -notmatch "CHECKSUM OK") {
-            throw "Expected CHECKSUM OK in fastdesk-viewer self-test output"
+            throw "Expected CHECKSUM OK in velovm-viewer self-test output"
           }
 
           $benchFile = Join-Path $env:RUNNER_TEMP "bench-windows-x64.txt"
@@ -346,54 +346,54 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $bundle = "dist\openvmm-fastdesk-windows-x64"
+          $bundle = "dist\velovm-windows-x64"
           $fwDir = Join-Path $bundle "firmware"
           if (Test-Path $bundle) { Remove-Item -Recurse -Force $bundle }
           New-Item -ItemType Directory -Force -Path $bundle, $fwDir | Out-Null
 
           Copy-Item -Force "openvmm\target\release\openvmm.exe" $bundle
           Copy-Item -Force "openvmm\target\release\openvmm-img.exe" $bundle
-          Copy-Item -Force "fastdesk-viewer\target\release\fastdesk-viewer.exe" $bundle
-          Copy-Item -Force "openvmms\target\release\openvmmsd.exe" $bundle
-          Copy-Item -Force "openvmms\target\release\openvmms.exe" $bundle
-          Copy-Item -Force "openvmms\target\release\openvmms-gui.exe" $bundle
+          Copy-Item -Force "velovm-viewer\target\release\velovm-viewer.exe" $bundle
+          Copy-Item -Force "velovm\target\release\velovmd.exe" $bundle
+          Copy-Item -Force "velovm\target\release\velovm.exe" $bundle
+          Copy-Item -Force "velovm\target\release\velovm-gui.exe" $bundle
           Copy-Item -Force "openvmm\.packages\hyperv.uefi.mscoreuefi.x64.RELEASE\MsvmX64\RELEASE_VS2022\FV\MSVM.fd" (Join-Path $fwDir "MSVM.fd")
-          Copy-Item -Force "scripts\Start-OpenVmmFastDesktop.ps1" $bundle
+          Copy-Item -Force "scripts\Start-VeloVM.ps1" $bundle
           Copy-Item -Force "scripts\Setup-HyperVGpuPvAndHvsock.ps1" $bundle
           Copy-Item -Force "README.md" $bundle
 
           $benchText = Get-Content -Raw (Join-Path $env:RUNNER_TEMP "bench-windows-x64.txt")
           $utcNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
           @(
-            "OpenVMM FastDesk & OpenVMMS Bundle (Windows x64)"
+            "VeloVM Bundle (Windows x64)"
             "Commit: $($env:GITHUB_SHA)"
             "Ref: $($env:GITHUB_REF_NAME)"
             "Built (UTC): $utcNow"
             "Target: x86_64-pc-windows-msvc"
             "UEFI Firmware: microsoft/mu_msvm v$($env:MU_MSVM_VERSION) (firmware\MSVM.fd)"
             ""
-            "Quickstart (OpenVMMS GUI & CLI on Windows 11 with WHP enabled):"
-            "  .\openvmms-gui.exe"
-            "  .\openvmms.exe vm create Win11-Dev --preset win11 --create-disk 64G --iso C:\ISOs\Win11.iso"
-            "  .\openvmms.exe vm start Win11-Dev"
-            "  .\openvmms.exe vm connect Win11-Dev"
+            "Quickstart (VeloVM GUI & CLI on Windows 11 with WHP enabled):"
+            "  .\velovm-gui.exe"
+            "  .\velovm.exe vm create Win11-Dev --preset win11 --create-disk 64G --iso C:\ISOs\Win11.iso"
+            "  .\velovm.exe vm start Win11-Dev"
+            "  .\velovm.exe vm connect Win11-Dev"
             ""
             "Standalone Script Quickstart:"
-            "  .\Start-OpenVmmFastDesktop.ps1 -DiskPath C:\VMs\win11.vhdx -Memory 8G -Processors 4"
+            "  .\Start-VeloVM.ps1 -DiskPath C:\VMs\win11.vhdx -Memory 8G -Processors 4"
             ""
             "Self-Test Benchmark (1920x1080, 200 frames):"
             $benchText.TrimEnd()
           ) | Set-Content -Path (Join-Path $bundle "BUILD_INFO.txt") -Encoding utf8
 
           if ($env:GITHUB_REF -like "refs/tags/v*") {
-            Compress-Archive -Force -Path $bundle -DestinationPath "dist\openvmm-fastdesk-windows-x64.zip"
+            Compress-Archive -Force -Path $bundle -DestinationPath "dist\velovm-windows-x64.zip"
           }
 
       - name: Upload Windows x64 artifact bundle
         uses: actions/upload-artifact@v7
         with:
-          name: openvmm-fastdesk-windows-x64
-          path: dist/openvmm-fastdesk-windows-x64/*
+          name: velovm-windows-x64
+          path: dist/velovm-windows-x64/*
           if-no-files-found: error
 
       - name: Upload Windows x64 release zip
@@ -401,7 +401,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-archive-windows-x64
-          path: dist/openvmm-fastdesk-windows-x64.zip
+          path: dist/velovm-windows-x64.zip
           if-no-files-found: error
 
   build-linux-x64:
@@ -429,13 +429,13 @@ jobs:
           workspaces: |
             openvmm -> openvmm/target
             openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
-            fastdesk-viewer -> fastdesk-viewer/target
-            openvmms -> openvmms/target
+            velovm-viewer -> velovm-viewer/target
+            velovm -> velovm/target
 
       - name: Download protoc and mu_msvm x64 UEFI firmware
         run: |
           set -euo pipefail
-          TOOLS_ROOT="$RUNNER_TEMP/fastdesk-tools"
+          TOOLS_ROOT="$RUNNER_TEMP/velovm-tools"
           PROTOC_DIR="$TOOLS_ROOT/protoc"
           MSVM_DIR="$TOOLS_ROOT/mu_msvm"
           mkdir -p "$PROTOC_DIR" "$MSVM_DIR"
@@ -471,8 +471,8 @@ jobs:
         working-directory: openvmm
         run: cargo test -p mesh_rpc -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
 
-      - name: Run fastdesk-viewer tests
-        working-directory: fastdesk-viewer
+      - name: Run velovm-viewer tests
+        working-directory: velovm-viewer
         run: cargo test
 
       - name: Build OpenVMM release binaries
@@ -481,8 +481,8 @@ jobs:
           cargo build -p openvmm --features tpm --release
           cargo build -p openvmm-img --release
 
-      - name: Build fastdesk-viewer release binary
-        working-directory: fastdesk-viewer
+      - name: Build velovm-viewer release binary
+        working-directory: velovm-viewer
         run: cargo build --release
 
       - name: Enable KVM access for real-OpenVMM tests
@@ -493,15 +493,15 @@ jobs:
           fi
           sudo chmod 666 /dev/kvm
 
-      - name: Run openvmms tests
-        working-directory: openvmms
+      - name: Run velovm tests
+        working-directory: velovm
         env:
           OPENVMM_REQUIRE_REAL_BINARY: "1"
           OPENVMM_REQUIRE_REAL_KVM_TEST: "1"
         run: cargo test
 
-      - name: Build openvmms release binaries
-        working-directory: openvmms
+      - name: Build velovm release binaries
+        working-directory: velovm
         run: cargo build --release
 
       - name: Smoke-test and benchmark Linux x64 binaries
@@ -516,28 +516,28 @@ jobs:
           done
 
           ./openvmm/target/release/openvmm-img --help >/dev/null
-          ./openvmms/target/release/openvmmsd --help >/dev/null
-          ./openvmms/target/release/openvmms --help >/dev/null
-          ./openvmms/target/release/openvmms-gui --self-test | grep "SELF-TEST OK" >/dev/null
+          ./velovm/target/release/velovmd --help >/dev/null
+          ./velovm/target/release/velovm --help >/dev/null
+          ./velovm/target/release/velovm-gui --self-test | grep "SELF-TEST OK" >/dev/null
 
-          AUTO_DIR="$RUNNER_TEMP/openvmms-autostart-linux"
+          AUTO_DIR="$RUNNER_TEMP/velovm-autostart-linux"
           rm -rf "$AUTO_DIR"
           mkdir -p "$AUTO_DIR"
           cleanup_auto() {
-            ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --no-auto-start daemon stop >/dev/null 2>&1 || true
+            ./velovm/target/release/velovm --data-dir "$AUTO_DIR" --no-auto-start daemon stop >/dev/null 2>&1 || true
             rm -rf "$AUTO_DIR"
           }
           trap cleanup_auto EXIT
-          AUTO_OUT="$(timeout 15s ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --json vm list)"
+          AUTO_OUT="$(timeout 15s ./velovm/target/release/velovm --data-dir "$AUTO_DIR" --json vm list)"
           echo "$AUTO_OUT" | grep -q '\[\]'
           cleanup_auto
           trap - EXIT
 
-          SMOKE_DIR="$RUNNER_TEMP/openvmms-smoke-linux"
+          SMOKE_DIR="$RUNNER_TEMP/velovm-smoke-linux"
           rm -rf "$SMOKE_DIR"
           mkdir -p "$SMOKE_DIR"
           SMOKE_PORT=47692
-          ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+          ./velovm/target/release/velovmd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
             >"$SMOKE_DIR/daemon1.log" 2>&1 &
           SMOKE_PID=$!
           cleanup_smoke() {
@@ -554,7 +554,7 @@ jobs:
               fi
               sleep 0.1
             done
-            echo "Timed out waiting for openvmmsd /api/v1/health ($log_file):" >&2
+            echo "Timed out waiting for velovmd /api/v1/health ($log_file):" >&2
             cat "$log_file" >&2 || true
             return 1
           }
@@ -567,7 +567,7 @@ jobs:
               fi
               sleep 0.1
             done
-            echo "Timed out waiting for openvmmsd PID $pid to exit" >&2
+            echo "Timed out waiting for velovmd PID $pid to exit" >&2
             kill -9 "$pid" 2>/dev/null || true
             return 1
           }
@@ -577,34 +577,34 @@ jobs:
             exit 1
           fi
           sudo chmod 666 /dev/kvm
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.img" --size 16M --format raw >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.vhdx" --size 64M --format vhdx >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             disk info "$SMOKE_DIR/smoke.vhdx" | grep '"format": "vhdx"' >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm list | grep "Smoke-VM" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm start "Smoke-VM" >/dev/null
-          SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
+          SHOW_JSON="$(./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
           echo "$SHOW_JSON" | grep -q '"status": "running"'
           echo "$SHOW_JSON" | grep -q '"fastdesk_endpoint": "tcp://'
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm pause "Smoke-VM" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm show "Smoke-VM" | grep '"status": "paused"' >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm resume "Smoke-VM" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
           # Default daemon stop must exit promptly while preserving the running VM across restart.
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop >/dev/null
           wait_for_pid_exit "$SMOKE_PID"
-          RUST_LOG=info ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+          RUST_LOG=info ./velovm/target/release/velovmd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
             >"$SMOKE_DIR/daemon2.log" 2>&1 &
           SMOKE_PID=$!
           wait_for_health "$SMOKE_DIR/daemon2.log"
@@ -626,29 +626,29 @@ jobs:
             cat "$SMOKE_DIR/daemon2.log" >&2
             exit 1
           fi
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm stop "Smoke-VM" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm show "Smoke-VM" | grep '"status": "off"' >/dev/null
           # Verify win11 preset enables vTPM 2.0 and boots openvmm with --tpm.
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-Win11-TPM" --preset win11 --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.vhdx" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm show "Smoke-Win11-TPM" | grep '"tpm_enabled": true' >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm start "Smoke-Win11-TPM" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm show "Smoke-Win11-TPM" | grep '"status": "running"' >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop --stop-vms >/dev/null
           wait_for_pid_exit "$SMOKE_PID"
           trap - EXIT
           rm -rf "$SMOKE_DIR"
 
           BENCH_FILE="$RUNNER_TEMP/bench-linux-x64.txt"
-          ./fastdesk-viewer/target/release/fastdesk-viewer \
+          ./velovm-viewer/target/release/velovm-viewer \
             --bench --self-test --frames 200 --resolution 1920x1080 | tee "$BENCH_FILE"
           grep -q "CHECKSUM OK" "$BENCH_FILE"
 
@@ -662,58 +662,58 @@ jobs:
       - name: Stage turnkey Linux x64 bundle
         run: |
           set -euo pipefail
-          BUNDLE="dist/openvmm-fastdesk-linux-x64"
+          BUNDLE="dist/velovm-linux-x64"
           rm -rf "$BUNDLE"
           mkdir -p "$BUNDLE/firmware"
 
           cp -f "openvmm/target/release/openvmm" "$BUNDLE/openvmm"
           cp -f "openvmm/target/release/openvmm-img" "$BUNDLE/openvmm-img"
-          cp -f "fastdesk-viewer/target/release/fastdesk-viewer" "$BUNDLE/fastdesk-viewer"
-          cp -f "openvmms/target/release/openvmmsd" "$BUNDLE/openvmmsd"
-          cp -f "openvmms/target/release/openvmms" "$BUNDLE/openvmms"
-          cp -f "openvmms/target/release/openvmms-gui" "$BUNDLE/openvmms-gui"
+          cp -f "velovm-viewer/target/release/velovm-viewer" "$BUNDLE/velovm-viewer"
+          cp -f "velovm/target/release/velovmd" "$BUNDLE/velovmd"
+          cp -f "velovm/target/release/velovm" "$BUNDLE/velovm"
+          cp -f "velovm/target/release/velovm-gui" "$BUNDLE/velovm-gui"
           strip --strip-debug \
-            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/fastdesk-viewer" \
-            "$BUNDLE/openvmmsd" "$BUNDLE/openvmms" "$BUNDLE/openvmms-gui"
+            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/velovm-viewer" \
+            "$BUNDLE/velovmd" "$BUNDLE/velovm" "$BUNDLE/velovm-gui"
           chmod +x \
-            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/fastdesk-viewer" \
-            "$BUNDLE/openvmmsd" "$BUNDLE/openvmms" "$BUNDLE/openvmms-gui"
+            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/velovm-viewer" \
+            "$BUNDLE/velovmd" "$BUNDLE/velovm" "$BUNDLE/velovm-gui"
 
           cp -f "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd" "$BUNDLE/firmware/MSVM.fd"
-          cp -f "scripts/start-openvmm-fastdesk.sh" "$BUNDLE/start-openvmm-fastdesk.sh"
-          chmod +x "$BUNDLE/start-openvmm-fastdesk.sh"
+          cp -f "scripts/start-velovm.sh" "$BUNDLE/start-velovm.sh"
+          chmod +x "$BUNDLE/start-velovm.sh"
           cp -f "README.md" "$BUNDLE/README.md"
 
           {
-            echo "OpenVMM FastDesk & OpenVMMS Bundle (Linux x64)"
+            echo "VeloVM Bundle (Linux x64)"
             echo "Commit: $GITHUB_SHA"
             echo "Ref: $GITHUB_REF_NAME"
             echo "Built (UTC): $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "Target: x86_64-unknown-linux-gnu"
             echo "UEFI Firmware: microsoft/mu_msvm v${MU_MSVM_VERSION} (firmware/MSVM.fd)"
             echo ""
-            echo "Quickstart (OpenVMMS GUI & CLI):"
-            echo "  ./openvmms-gui"
-            echo "  ./openvmms vm create Linux-Dev --preset linux --create-disk 32G --iso /path/to/ubuntu.iso"
-            echo "  ./openvmms vm start Linux-Dev"
-            echo "  ./openvmms vm connect Linux-Dev"
+            echo "Quickstart (VeloVM GUI & CLI):"
+            echo "  ./velovm-gui"
+            echo "  ./velovm vm create Linux-Dev --preset linux --create-disk 32G --iso /path/to/ubuntu.iso"
+            echo "  ./velovm vm start Linux-Dev"
+            echo "  ./velovm vm connect Linux-Dev"
             echo ""
             echo "Standalone Script Quickstart:"
-            echo "  ./start-openvmm-fastdesk.sh --disk /path/to/win11.vhdx --memory 8G --cpus 4"
+            echo "  ./start-velovm.sh --disk /path/to/win11.vhdx --memory 8G --cpus 4"
             echo ""
             echo "Self-Test Benchmark (1920x1080, 200 frames):"
             cat "$RUNNER_TEMP/bench-linux-x64.txt"
           } > "$BUNDLE/BUILD_INFO.txt"
 
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            tar -C dist -czf dist/openvmm-fastdesk-linux-x64.tar.gz openvmm-fastdesk-linux-x64
+            tar -C dist -czf dist/velovm-linux-x64.tar.gz velovm-linux-x64
           fi
 
       - name: Upload Linux x64 artifact bundle
         uses: actions/upload-artifact@v7
         with:
-          name: openvmm-fastdesk-linux-x64
-          path: dist/openvmm-fastdesk-linux-x64/*
+          name: velovm-linux-x64
+          path: dist/velovm-linux-x64/*
           if-no-files-found: error
 
       - name: Upload Linux x64 release archive
@@ -721,7 +721,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-archive-linux-x64
-          path: dist/openvmm-fastdesk-linux-x64.tar.gz
+          path: dist/velovm-linux-x64.tar.gz
           if-no-files-found: error
 
   build-macos-arm64:
@@ -815,8 +815,8 @@ jobs:
           workspaces: |
             openvmm -> openvmm/target
             openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
-            fastdesk-viewer -> fastdesk-viewer/target
-            openvmms -> openvmms/target
+            velovm-viewer -> velovm-viewer/target
+            velovm -> velovm/target
 
       - name: Download protoc and mu_msvm ARM64 UEFI firmware
         run: |
@@ -857,8 +857,8 @@ jobs:
         working-directory: openvmm
         run: cargo test -p mesh_rpc -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
 
-      - name: Run fastdesk-viewer tests
-        working-directory: fastdesk-viewer
+      - name: Run velovm-viewer tests
+        working-directory: velovm-viewer
         run: cargo test
 
       - name: Build and sign OpenVMM release binaries
@@ -869,18 +869,18 @@ jobs:
           codesign --entitlements build_support/macos/entitlements.xml -f -s - target/release/openvmm
           codesign -d --entitlements :- target/release/openvmm
 
-      - name: Build fastdesk-viewer release binary
-        working-directory: fastdesk-viewer
+      - name: Build velovm-viewer release binary
+        working-directory: velovm-viewer
         run: cargo build --release
 
-      - name: Run openvmms tests
-        working-directory: openvmms
+      - name: Run velovm tests
+        working-directory: velovm
         env:
           OPENVMM_REQUIRE_REAL_BINARY: "1"
         run: cargo test
 
-      - name: Build openvmms release binaries
-        working-directory: openvmms
+      - name: Build velovm release binaries
+        working-directory: velovm
         run: cargo build --release
 
       - name: Smoke-test and benchmark macOS arm64 binaries
@@ -895,18 +895,18 @@ jobs:
           done
 
           ./openvmm/target/release/openvmm-img --help >/dev/null
-          ./openvmms/target/release/openvmmsd --help >/dev/null
-          ./openvmms/target/release/openvmms --help >/dev/null
-          ./openvmms/target/release/openvmms-gui --self-test | grep "SELF-TEST OK" >/dev/null
+          ./velovm/target/release/velovmd --help >/dev/null
+          ./velovm/target/release/velovm --help >/dev/null
+          ./velovm/target/release/velovm-gui --self-test | grep "SELF-TEST OK" >/dev/null
 
-          /bin/bash -n scripts/start-openvmm-fastdesk.sh
-          /bin/bash scripts/start-openvmm-fastdesk.sh --help >/dev/null
+          /bin/bash -n scripts/start-velovm.sh
+          /bin/bash scripts/start-velovm.sh --help >/dev/null
 
-          AUTO_DIR="$RUNNER_TEMP/openvmms-autostart-macos"
+          AUTO_DIR="$RUNNER_TEMP/velovm-autostart-macos"
           rm -rf "$AUTO_DIR"
           mkdir -p "$AUTO_DIR"
           cleanup_auto() {
-            ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --no-auto-start daemon stop >/dev/null 2>&1 || true
+            ./velovm/target/release/velovm --data-dir "$AUTO_DIR" --no-auto-start daemon stop >/dev/null 2>&1 || true
             rm -rf "$AUTO_DIR"
           }
           trap cleanup_auto EXIT
@@ -914,7 +914,7 @@ jobs:
           import subprocess, sys
           auto_dir = sys.argv[1]
           res = subprocess.run(
-              ["./openvmms/target/release/openvmms", "--data-dir", auto_dir, "--json", "vm", "list"],
+              ["./velovm/target/release/velovm", "--data-dir", auto_dir, "--json", "vm", "list"],
               capture_output=True,
               text=True,
               timeout=15,
@@ -925,11 +925,11 @@ jobs:
           cleanup_auto
           trap - EXIT
 
-          SMOKE_DIR="/tmp/openvmms-smoke-macos-$$"
+          SMOKE_DIR="/tmp/velovm-smoke-macos-$$"
           rm -rf "$SMOKE_DIR"
           mkdir -p "$SMOKE_DIR"
           SMOKE_PORT=47693
-          ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+          ./velovm/target/release/velovmd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
             >"$SMOKE_DIR/daemon1.log" 2>&1 &
           SMOKE_PID=$!
           cleanup_smoke() {
@@ -946,7 +946,7 @@ jobs:
               fi
               sleep 0.1
             done
-            echo "Timed out waiting for openvmmsd /api/v1/health ($log_file):" >&2
+            echo "Timed out waiting for velovmd /api/v1/health ($log_file):" >&2
             cat "$log_file" >&2 || true
             return 1
           }
@@ -959,41 +959,41 @@ jobs:
               fi
               sleep 0.1
             done
-            echo "Timed out waiting for openvmmsd PID $pid to exit" >&2
+            echo "Timed out waiting for velovmd PID $pid to exit" >&2
             kill -9 "$pid" 2>/dev/null || true
             return 1
           }
           wait_for_health "$SMOKE_DIR/daemon1.log"
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.img" --size 16M --format raw >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             disk create "$SMOKE_DIR/smoke.vhdx" --size 64M --format vhdx >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             disk info "$SMOKE_DIR/smoke.vhdx" | grep '"format": "vhdx"' >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
             vm list | grep "Smoke-VM" >/dev/null
 
-          if ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          if ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               vm start "Smoke-VM" >/dev/null 2>&1; then
             echo "macOS smoke check branch: HVF available — Smoke-VM booted and running"
-            SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
+            SHOW_JSON="$(./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
             echo "$SHOW_JSON" | grep -q '"status": "running"'
             echo "$SHOW_JSON" | grep -q '"fastdesk_endpoint": "tcp://'
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               vm pause "Smoke-VM" >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
               vm show "Smoke-VM" | grep '"status": "paused"' >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               vm resume "Smoke-VM" >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
               vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
 
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               daemon stop >/dev/null
             wait_for_pid_exit "$SMOKE_PID"
-            RUST_LOG=info ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+            RUST_LOG=info ./velovm/target/release/velovmd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
               >"$SMOKE_DIR/daemon2.log" 2>&1 &
             SMOKE_PID=$!
             wait_for_health "$SMOKE_DIR/daemon2.log"
@@ -1015,50 +1015,50 @@ jobs:
               cat "$SMOKE_DIR/daemon2.log" >&2
               exit 1
             fi
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
               vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               vm stop "Smoke-VM" >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
               vm show "Smoke-VM" | grep '"status": "off"' >/dev/null
 
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               vm create "Smoke-Win11-TPM" --preset win11 --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.vhdx" >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
               vm show "Smoke-Win11-TPM" | grep '"tpm_enabled": true' >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               vm start "Smoke-Win11-TPM" >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
               vm show "Smoke-Win11-TPM" | grep '"status": "running"' >/dev/null
           else
             echo "macOS smoke check branch: runner lacks nested HVF — verifying clean VM error recovery"
-            SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
+            SHOW_JSON="$(./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
             echo "$SHOW_JSON" | grep -q '"status": "error"'
             if ! echo "$SHOW_JSON" | grep -qiE "hypervisor|hvf|hv_|entitled|unsupported"; then
               echo "Unexpected Smoke-VM error without nested HVF: $SHOW_JSON" >&2
               exit 1
             fi
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               vm stop "Smoke-VM" >/dev/null
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
               daemon stop >/dev/null
             wait_for_pid_exit "$SMOKE_PID"
-            RUST_LOG=info ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+            RUST_LOG=info ./velovm/target/release/velovmd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
               >"$SMOKE_DIR/daemon2.log" 2>&1 &
             SMOKE_PID=$!
             wait_for_health "$SMOKE_DIR/daemon2.log"
-            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
               vm show "Smoke-VM" | grep '"name": "Smoke-VM"' >/dev/null
           fi
 
-          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+          ./velovm/target/release/velovm --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
             daemon stop --stop-vms >/dev/null
           wait_for_pid_exit "$SMOKE_PID"
           trap - EXIT
           rm -rf "$SMOKE_DIR"
 
           BENCH_FILE="$RUNNER_TEMP/bench-macos-arm64.txt"
-          ./fastdesk-viewer/target/release/fastdesk-viewer \
+          ./velovm-viewer/target/release/velovm-viewer \
             --bench --self-test --frames 200 --resolution 1920x1080 | tee "$BENCH_FILE"
           grep -q "CHECKSUM OK" "$BENCH_FILE"
 
@@ -1072,30 +1072,30 @@ jobs:
       - name: Stage turnkey macOS arm64 bundle
         run: |
           set -euo pipefail
-          BUNDLE="dist/openvmm-fastdesk-macos-arm64"
+          BUNDLE="dist/velovm-macos-arm64"
           rm -rf "$BUNDLE"
           mkdir -p "$BUNDLE/firmware"
 
           cp -f "openvmm/target/release/openvmm" "$BUNDLE/openvmm"
           cp -f "openvmm/target/release/openvmm-img" "$BUNDLE/openvmm-img"
-          cp -f "fastdesk-viewer/target/release/fastdesk-viewer" "$BUNDLE/fastdesk-viewer"
-          cp -f "openvmms/target/release/openvmmsd" "$BUNDLE/openvmmsd"
-          cp -f "openvmms/target/release/openvmms" "$BUNDLE/openvmms"
-          cp -f "openvmms/target/release/openvmms-gui" "$BUNDLE/openvmms-gui"
+          cp -f "velovm-viewer/target/release/velovm-viewer" "$BUNDLE/velovm-viewer"
+          cp -f "velovm/target/release/velovmd" "$BUNDLE/velovmd"
+          cp -f "velovm/target/release/velovm" "$BUNDLE/velovm"
+          cp -f "velovm/target/release/velovm-gui" "$BUNDLE/velovm-gui"
           chmod +x \
-            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/fastdesk-viewer" \
-            "$BUNDLE/openvmmsd" "$BUNDLE/openvmms" "$BUNDLE/openvmms-gui"
+            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/velovm-viewer" \
+            "$BUNDLE/velovmd" "$BUNDLE/velovm" "$BUNDLE/velovm-gui"
           codesign --entitlements openvmm/build_support/macos/entitlements.xml -f -s - "$BUNDLE/openvmm"
           codesign -d --entitlements :- "$BUNDLE/openvmm"
 
           cp -f "openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd" "$BUNDLE/firmware/MSVM.fd"
           cp -f "openvmm/build_support/macos/entitlements.xml" "$BUNDLE/entitlements.xml"
-          cp -f "scripts/start-openvmm-fastdesk.sh" "$BUNDLE/start-openvmm-fastdesk.sh"
-          chmod +x "$BUNDLE/start-openvmm-fastdesk.sh"
+          cp -f "scripts/start-velovm.sh" "$BUNDLE/start-velovm.sh"
+          chmod +x "$BUNDLE/start-velovm.sh"
           cp -f "README.md" "$BUNDLE/README.md"
 
           {
-            echo "OpenVMM FastDesk & OpenVMMS Bundle (macOS Apple Silicon)"
+            echo "VeloVM Bundle (macOS Apple Silicon)"
             echo "Commit: $GITHUB_SHA"
             echo "Ref: $GITHUB_REF_NAME"
             echo "Built (UTC): $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -1106,28 +1106,28 @@ jobs:
             echo "  xattr -dr com.apple.quarantine ."
             echo "  codesign --entitlements entitlements.xml -f -s - ./openvmm  # already ad-hoc signed in bundle"
             echo ""
-            echo "Quickstart (OpenVMMS GUI & CLI, ARM64 guests on macOS 13+ Apple Silicon):"
-            echo "  ./openvmms-gui"
-            echo "  ./openvmms vm create Linux-ARM64 --preset linux --create-disk 32G --iso /path/to/ubuntu-arm64.iso"
-            echo "  ./openvmms vm start Linux-ARM64"
-            echo "  ./openvmms vm connect Linux-ARM64"
+            echo "Quickstart (VeloVM GUI & CLI, ARM64 guests on macOS 13+ Apple Silicon):"
+            echo "  ./velovm-gui"
+            echo "  ./velovm vm create Linux-ARM64 --preset linux --create-disk 32G --iso /path/to/ubuntu-arm64.iso"
+            echo "  ./velovm vm start Linux-ARM64"
+            echo "  ./velovm vm connect Linux-ARM64"
             echo ""
             echo "Standalone Script Quickstart:"
-            echo "  ./start-openvmm-fastdesk.sh --disk /path/to/arm64.vhdx --memory 8G --cpus 4"
+            echo "  ./start-velovm.sh --disk /path/to/arm64.vhdx --memory 8G --cpus 4"
             echo ""
             echo "Self-Test Benchmark (1920x1080, 200 frames):"
             cat "$RUNNER_TEMP/bench-macos-arm64.txt"
           } > "$BUNDLE/BUILD_INFO.txt"
 
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            tar -C dist -czf dist/openvmm-fastdesk-macos-arm64.tar.gz openvmm-fastdesk-macos-arm64
+            tar -C dist -czf dist/velovm-macos-arm64.tar.gz velovm-macos-arm64
           fi
 
       - name: Upload macOS arm64 artifact bundle
         uses: actions/upload-artifact@v7
         with:
-          name: openvmm-fastdesk-macos-arm64
-          path: dist/openvmm-fastdesk-macos-arm64/*
+          name: velovm-macos-arm64
+          path: dist/velovm-macos-arm64/*
           if-no-files-found: error
 
       - name: Upload macOS arm64 release archive
@@ -1135,7 +1135,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-archive-macos-arm64
-          path: dist/openvmm-fastdesk-macos-arm64.tar.gz
+          path: dist/velovm-macos-arm64.tar.gz
           if-no-files-found: error
 
   release:
@@ -1158,7 +1158,7 @@ jobs:
       - name: Generate SHA256 checksums
         working-directory: release-assets
         run: |
-          sha256sum openvmm-fastdesk-* > SHA256SUMS.txt
+          sha256sum velovm-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
           ls -lh
 
@@ -1166,8 +1166,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            release-assets/openvmm-fastdesk-windows-x64.zip
-            release-assets/openvmm-fastdesk-linux-x64.tar.gz
-            release-assets/openvmm-fastdesk-macos-arm64.tar.gz
+            release-assets/velovm-windows-x64.zip
+            release-assets/velovm-linux-x64.tar.gz
+            release-assets/velovm-macos-arm64.tar.gz
             release-assets/SHA256SUMS.txt
           generate_release_notes: true

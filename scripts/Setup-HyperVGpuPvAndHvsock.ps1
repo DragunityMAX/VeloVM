@@ -151,7 +151,7 @@ if (-not (Test-Path $regBase)) {
 if (-not (Test-Path $svcKey)) {
     New-Item -Path $svcKey -Force | Out-Null
 }
-Set-ItemProperty -Path $svcKey -Name "ElementName" -Value "OpenVMM FastDesk Display Stream" -Type String
+Set-ItemProperty -Path $svcKey -Name "ElementName" -Value "VeloVM FastDesk Display Stream" -Type String
 Write-Host "Registered AF_HYPERV GuestCommunicationServices GUID: $serviceGuid" -ForegroundColor Green
 
 if ($RegisterHvsockOnly) {
