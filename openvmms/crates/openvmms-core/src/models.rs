@@ -1085,7 +1085,13 @@ impl VmConfig {
                 bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
             }
             if !self.fastdesk.listen_addr.trim().is_empty() {
-                parse_loopback_listen_addr(&self.fastdesk.listen_addr)
+                let raw = self.fastdesk.listen_addr.trim();
+                if raw.contains("://") || raw.ends_with('/') {
+                    bail!(
+                        "invalid fastdesk.listen_addr '{raw}': expected host:port socket address without URL scheme"
+                    );
+                }
+                parse_loopback_listen_addr(raw)
                     .context("invalid fastdesk.listen_addr")?;
             }
         }
@@ -1200,7 +1206,14 @@ impl VmConfig {
                                     "TAP interface name '{name}' cannot have leading or trailing whitespace"
                                 );
                             }
-                            if name.is_empty() || name.contains('/') || name.contains('\0') {
+                            if name.is_empty()
+                                || name == "."
+                                || name == ".."
+                                || name.len() > 15
+                                || name.contains('/')
+                                || name.contains('\0')
+                                || name.chars().any(char::is_whitespace)
+                            {
                                 bail!("invalid TAP interface name '{name}'");
                             }
                             #[cfg(target_os = "linux")]
@@ -2350,5 +2363,45 @@ mod tests {
         assert!(v4_loopback.overlaps(&mapped_loopback));
         assert!(mapped_loopback.overlaps(&v4_wild));
         assert!(v4_wild.overlaps(&mapped_loopback));
+    }
+
+    #[test]
+    fn validates_fastdesk_listen_addr_rejects_urls_and_tap_rejects_dot_names() {
+        let mut cfg = VmConfig::from_preset(
+            "FastdeskAndTapValidation",
+            VmPreset::Custom,
+            &std::env::temp_dir().join("vm"),
+        );
+
+        for bad_addr in [
+            "http://127.0.0.1:5900",
+            "http://localhost:5900/",
+            "127.0.0.1:5900/",
+        ] {
+            cfg.fastdesk.listen_addr = bad_addr.into();
+            assert!(
+                cfg.validate().is_err(),
+                "expected fastdesk.listen_addr '{bad_addr}' to be rejected"
+            );
+        }
+        cfg.fastdesk.listen_addr = "127.0.0.1:5900".into();
+        cfg.validate().unwrap();
+
+        #[cfg(not(windows))]
+        {
+            for bad_tap in [".", "..", "tap with space", "this_tap_name_is_too_long"] {
+                cfg.nics[0].backend = NicBackendConfig::Tap {
+                    name: bad_tap.into(),
+                };
+                assert!(
+                    cfg.validate().is_err(),
+                    "expected TAP name '{bad_tap}' to be rejected"
+                );
+            }
+            cfg.nics[0].backend = NicBackendConfig::Tap {
+                name: "tap0".into(),
+            };
+            cfg.validate().unwrap();
+        }
     }
 }
