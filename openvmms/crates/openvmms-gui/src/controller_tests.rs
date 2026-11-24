@@ -3698,6 +3698,7 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
             write_mock_json(&mut stream, status, &body);
         })
     };
+
     store
         .write_runtime_listen_addr(&server.addr.to_string())
         .unwrap();
@@ -3753,4 +3754,228 @@ fn sse_line_buffer_caps_unbounded_growth_and_strips_eof_cr() {
     assert!(lb.push_chunk(b"0123456789"));
     assert!(!lb.push_chunk(b"abcdefg"));
     assert_eq!(lb.finish(), None);
+}
+
+#[test]
+fn token_rotation_on_same_url_switches_sse_without_backoff_and_does_not_clobber_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+    let _lock = store.try_acquire_daemon_lock().unwrap();
+
+    let token1 = store.load_or_create_token().unwrap();
+    let daemon1_id = Uuid::new_v4();
+    let daemon2_id = Uuid::new_v4();
+    let active_token = Arc::new(Mutex::new(token1.clone()));
+    let active_instance = Arc::new(Mutex::new(daemon1_id));
+    let drop_sse1 = Arc::new(AtomicBool::new(false));
+    let sse_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (sse1_connected_tx, sse1_connected_rx) = mpsc::channel::<()>();
+    let sse1_connected_tx = Arc::new(Mutex::new(Some(sse1_connected_tx)));
+    let (pause_entered_tx, pause_entered_rx) = mpsc::channel::<()>();
+    let pause_entered_tx = Arc::new(Mutex::new(Some(pause_entered_tx)));
+    let (pause_release_tx, pause_release_rx) = mpsc::channel::<()>();
+    let pause_release_rx = Arc::new(Mutex::new(pause_release_rx));
+
+    let server = {
+        let active_token = Arc::clone(&active_token);
+        let active_instance = Arc::clone(&active_instance);
+        let drop_sse1 = Arc::clone(&drop_sse1);
+        let sse_count = Arc::clone(&sse_count);
+        let sse1_connected_tx = Arc::clone(&sse1_connected_tx);
+        let pause_entered_tx = Arc::clone(&pause_entered_tx);
+        let pause_release_rx = Arc::clone(&pause_release_rx);
+        let store_dir = dir.path().to_path_buf();
+        TestMockServer::spawn(move |mut stream, req, addr, stop| {
+            let tok = active_token.lock().unwrap().clone();
+            let inst = *active_instance.lock().unwrap();
+            if req.target == "/api/v1/events" {
+                let conn_num = sse_count.fetch_add(1, Ordering::SeqCst);
+                if !write_sse_ok_headers(&mut stream) {
+                    return;
+                }
+                if conn_num == 0 {
+                    if let Some(tx) = sse1_connected_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    use std::io::Write;
+                    while !stop.load(Ordering::Acquire) && !drop_sse1.load(Ordering::Acquire) {
+                        if stream.write_all(b": keepalive\n\n").is_err() {
+                            break;
+                        }
+                        let _ = stream.flush();
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                } else {
+                    stream_sse_keepalives(&mut stream, stop, Duration::from_millis(15));
+                }
+                return;
+            }
+            if req.target == "/api/v1/host/info" {
+                let info = HostInfo {
+                    hostname: "test".into(),
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    cpu_count: 4,
+                    daemon_version: "0.1.0".into(),
+                    data_dir: store_dir.clone(),
+                    runtime_dir: store_dir.clone(),
+                    listen_addr: addr.to_string(),
+                    daemon_instance_id: Some(inst),
+                    event_revision: 1,
+                    resolved_paths: Default::default(),
+                };
+                write_mock_json(&mut stream, "200 OK", &serde_json::to_string(&info).unwrap());
+                return;
+            }
+            if req.target == "/api/v1/vms" {
+                write_mock_json(&mut stream, "200 OK", "[]");
+                return;
+            }
+            if req.target.ends_with("/pause") {
+                if let Some(tx) = pause_entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = pause_release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                return;
+            }
+            let (status, body) = mock_common_endpoint(&req.target, &tok, addr, &store_dir)
+                .unwrap_or(("404 Not Found", "{}".into()));
+            write_mock_json(&mut stream, status, &body);
+        })
+    };
+
+    let url = format!("http://{}", server.addr);
+    store
+        .write_runtime_listen_addr(&server.addr.to_string())
+        .unwrap();
+
+    // Use a huge SSE initial backoff (10s): detecting same-URL token rotation must bypass backoff.
+    let backend = BackendHandle::spawn_with_sse_timing(
+        Some(dir.path().to_path_buf()),
+        None,
+        egui::Context::default(),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    );
+    backend.send(GuiRequest::ConnectOrStartDaemon);
+    match recv_until(&backend, Duration::from_secs(3), |u| {
+        matches!(u, GuiUpdate::DaemonConnected { .. })
+    }) {
+        GuiUpdate::DaemonConnected { host_info, .. } => {
+            assert_eq!(host_info.daemon_instance_id, Some(daemon1_id));
+        }
+        _ => unreachable!(),
+    }
+    sse1_connected_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+
+    // Rotate daemon.token on the exact same listen_addr and drop the old SSE stream.
+    std::fs::remove_file(store.token_path()).unwrap();
+    let token2 = store.load_or_create_token().unwrap();
+    assert_ne!(token1, token2);
+    *active_token.lock().unwrap() = token2.clone();
+    *active_instance.lock().unwrap() = daemon2_id;
+    store
+        .write_runtime_listen_addr(&server.addr.to_string())
+        .unwrap();
+    drop_sse1.store(true, Ordering::Release);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut switched = false;
+    while std::time::Instant::now() < deadline && !switched {
+        while let Some(upd) = backend.try_recv() {
+            match upd {
+                GuiUpdate::DaemonDisconnected(reason) => {
+                    panic!("same-URL token rotation triggered unexpected DaemonDisconnected: {reason}");
+                }
+                GuiUpdate::DaemonConnected { host_info, .. }
+                    if host_info.daemon_instance_id == Some(daemon2_id) =>
+                {
+                    switched = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !switched {
+            thread::sleep(Duration::from_millis(15));
+        }
+    }
+    assert!(
+        switched,
+        "SSE listener did not reconnect promptly with rotated token on same URL"
+    );
+
+    // Also verify a failing stale-token request cannot clear state.client once rotated to token2.
+    let (upd_tx, _upd_rx) = mpsc::channel();
+    let state = Arc::new(BackendState {
+        data_dir: Some(dir.path().to_path_buf()),
+        daemon_url: None,
+        client: RwLock::new(Some(ApiClient::new(&url, &token1).unwrap())),
+        shared_endpoint: Arc::new(RwLock::new(Some((url.clone(), token1.clone())))),
+        sse_active: AtomicBool::new(false),
+        notified_connected: AtomicBool::new(true),
+        shutdown: AtomicBool::new(false),
+        sse_wake: (Mutex::new(0), Condvar::new()),
+        connect_in_flight: AtomicBool::new(false),
+        snapshot_seq: std::sync::atomic::AtomicU64::new(0),
+        snapshot_sync_lock: Mutex::new(()),
+        snapshot_sync: Mutex::new(SnapshotSyncState::default()),
+        daemon_instance_id: Mutex::new((0, Some(daemon1_id))),
+        host_cfg_lock: Mutex::new(()),
+        logs_in_flight: Mutex::new(HashSet::new()),
+        details_in_flight: Mutex::new(HashSet::new()),
+        attach_disk_in_flight: Mutex::new(HashSet::new()),
+        mount_iso_in_flight: Mutex::new(HashSet::new()),
+        sse_read_timeout: Duration::from_secs(2),
+        sse_backoff_initial: Duration::from_millis(50),
+        sse_backoff_max: Duration::from_secs(1),
+        sse_backoff_stable_after: Duration::from_secs(5),
+        upd_tx,
+        repaint_ctx: egui::Context::default(),
+    });
+
+    let state_req = Arc::clone(&state);
+    let vm_id = Uuid::new_v4();
+    let req_thread = thread::spawn(move || {
+        state_req.process_request(GuiRequest::PauseVm { id: vm_id });
+    });
+    pause_entered_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+
+    // Another thread rotates state.client / shared_endpoint to (same_url, token2) via disconnect helper.
+    assert!(maybe_switch_endpoint_on_disconnect(&url, &token1, &state).unwrap());
+    assert_eq!(
+        state
+            .client
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.token().to_string()),
+        Some(token2.clone())
+    );
+
+    // Stale token1 request now fails (stream dropped + health fails auth proof against token2).
+    let _ = pause_release_tx.send(());
+    req_thread.join().unwrap();
+
+    assert_eq!(
+        state
+            .client
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.token().to_string()),
+        Some(token2),
+        "stale failing token1 request must not clear rotated token2 client"
+    );
+
+    drop(backend);
+    drop(server);
 }
