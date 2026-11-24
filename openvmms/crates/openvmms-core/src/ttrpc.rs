@@ -23,7 +23,7 @@ const MESSAGE_TYPE_REQUEST: u8 = 1;
 const MESSAGE_TYPE_RESPONSE: u8 = 2;
 const MAX_MESSAGE_SIZE: usize = 0x00ff_ffff;
 const SERVICE_VM: &str = "vmservice.VM";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_POLL_SLICE: Duration = Duration::from_millis(50);
 // socket2 truncates timeouts to whole milliseconds on Windows (microseconds on Unix),
