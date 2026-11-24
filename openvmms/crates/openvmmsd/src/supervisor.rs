@@ -3251,7 +3251,7 @@ impl Supervisor {
                 .await?
             }
             Ok((attachment, sock, rpc_gen, mut pending_guard)) => {
-                TtrpcClient::new(sock.clone())
+                if let Err(err) = TtrpcClient::new(sock.clone())
                     .modify_resource(vmservice::ModifyResourceRequest {
                         r#type: vmservice::ModifyType::Add as i32,
                         resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
@@ -3259,7 +3259,23 @@ impl Supervisor {
                         )),
                     })
                     .await
-                    .context("hot-adding SCSI disk to running VM")?;
+                    .context("hot-adding SCSI disk to running VM")
+                {
+                    if !openvmms_core::ttrpc::is_ttrpc_definite_not_applied(&err)
+                        && self.is_same_live_vm(id, rpc_gen)
+                        && !rollback_hot_added_disk(&sock, id, attachment.lun).await
+                    {
+                        warn!(
+                            vm_id = %id,
+                            lun = attachment.lun,
+                            path = %attachment.path.display(),
+                            error = %err,
+                            "hot-add SCSI disk RPC failed ambiguously and rollback did not succeed; retaining pending disk reservation until VM stops"
+                        );
+                        pending_guard.disarm();
+                    }
+                    return Err(err);
+                }
 
                 let lun = attachment.lun;
                 let res = self
@@ -3945,7 +3961,7 @@ impl Supervisor {
                     vmservice::ModifyType::Remove as i32
                 };
                 let proto_port = to_proto_port_config(&port);
-                TtrpcClient::new(sock.clone())
+                if let Err(err) = TtrpcClient::new(sock.clone())
                     .modify_resource(vmservice::ModifyResourceRequest {
                         r#type: modify_type,
                         resource: Some(vmservice::modify_resource_request::Resource::NicConfig(
@@ -3962,7 +3978,25 @@ impl Supervisor {
                         )),
                     })
                     .await
-                    .context("updating Consomme port forward on running VM")?;
+                    .context("updating Consomme port forward on running VM")
+                {
+                    if add
+                        && !openvmms_core::ttrpc::is_ttrpc_definite_not_applied(&err)
+                        && self.is_same_live_vm(id, rpc_gen)
+                        && !rollback_port_forward(&sock, id, nic_id, add, proto_port).await
+                        && let Some(pg) = pending_guard.as_mut()
+                    {
+                        warn!(
+                            vm_id = %id,
+                            nic_id = %nic_id,
+                            host_port = port.host_port,
+                            error = %err,
+                            "hot-add Consomme port forward RPC failed ambiguously and rollback did not succeed; retaining pending port reservation until VM stops"
+                        );
+                        pg.disarm();
+                    }
+                    return Err(err);
+                }
 
                 let res = self
                     .commit_online_vm_mutation(
@@ -4971,6 +5005,13 @@ async fn rollback_hot_added_disk(sock: &Path, id: Uuid, lun: u32) -> bool {
         })
         .await
     {
+        if rb_err
+            .chain()
+            .filter_map(|c| c.downcast_ref::<openvmms_core::ttrpc::TtrpcRpcError>())
+            .any(|rpc_err| rpc_err.code == 5)
+        {
+            return true;
+        }
         warn!(
             vm_id = %id,
             lun,
@@ -5031,6 +5072,14 @@ async fn rollback_port_forward(
         })
         .await
     {
+        if added
+            && rb_err
+                .chain()
+                .filter_map(|c| c.downcast_ref::<openvmms_core::ttrpc::TtrpcRpcError>())
+                .any(|rpc_err| rpc_err.code == 5)
+        {
+            return true;
+        }
         warn!(
             vm_id = %id,
             nic_id = %nic_id,
@@ -7571,5 +7620,467 @@ mod tests {
         assert_eq!(updated.fastdesk_viewer_bin, None);
         assert_eq!(updated.openvmm_img_bin, None);
         assert_eq!(updated.uefi_firmware_path, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_hotadd_drop_attempts_rollback_and_retains_reservation_when_rollback_fails() {
+        use openvmms_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let shared_disk = dir.path().join("ambiguous-shared.img");
+        fs::write(&shared_disk, vec![0u8; 4096]).unwrap();
+
+        let vm1 = sup
+            .create_vm(CreateVmPayload {
+                name: "VM1-Ambiguous".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm2 = sup
+            .create_vm(CreateVmPayload {
+                name: "VM2-Ambiguous".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm1_id = vm1.config.id;
+        let vm1_nic = vm1.config.nics[0].id;
+        let vm2_id = vm2.config.id;
+        let vm2_nic = vm2.config.nics[0].id;
+
+        let sock_path = dir.path().join("vm1-ambiguous.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_srv = Arc::clone(&call_count);
+        let server = std::thread::spawn(move || {
+            for idx in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let Ok((stream_id, _, _)) = read_frame(&mut stream) else {
+                    break;
+                };
+                call_count_srv.fetch_add(1, Ordering::SeqCst);
+                if idx % 2 == 0 {
+                    // Initial hot-add: drop connection without replying (ambiguous EOF).
+                    drop(stream);
+                } else {
+                    // Rollback attempt: return explicit failure.
+                    let resp = TestWireResponse {
+                        result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                            code: 13,
+                            message: "injected rollback failure".into(),
+                            details: Vec::new(),
+                        })),
+                    };
+                    if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                        let _ = stream.write_all(&frame);
+                        let _ = stream.flush();
+                    }
+                }
+            }
+        });
+
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let m1 = guard.get_mut(&vm1_id).unwrap();
+            m1.runtime.status = VmStatus::Running;
+            m1.runtime.rpc_socket_path = Some(sock_path);
+            m1.generation = 1;
+        }
+
+        // 1. Disk hot-add drops without replying -> rollback fails -> pending disk reservation retained.
+        let disk_err = sup
+            .attach_disk(
+                &vm1_id.to_string(),
+                AttachDiskPayload {
+                    lun: Some(1),
+                    path: shared_disk.clone(),
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(!format!("{disk_err:#}").is_empty());
+
+        let conflict_disk = sup
+            .attach_disk(
+                &vm2_id.to_string(),
+                AttachDiskPayload {
+                    lun: Some(1),
+                    path: shared_disk.clone(),
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict_disk.downcast_ref::<ApiErrorKind>(),
+            Some(ApiErrorKind::Conflict(_))
+        ));
+
+        // 2. Port-forward hot-add drops without replying -> rollback fails -> pending port retained.
+        let pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 19023,
+            guest_port: 23,
+        };
+        let pf_err = sup
+            .add_port_forward(&vm1_id.to_string(), vm1_nic, pf.clone())
+            .await
+            .unwrap_err();
+        assert!(!format!("{pf_err:#}").is_empty());
+
+        sup.add_port_forward(&vm2_id.to_string(), vm2_nic, pf)
+            .await
+            .unwrap();
+        let conflict_start = sup.start_vm(&vm2_id.to_string()).await.unwrap_err();
+        assert!(matches!(
+            conflict_start.downcast_ref::<ApiErrorKind>(),
+            Some(ApiErrorKind::Conflict(_))
+        ));
+        assert_eq!(call_count.load(Ordering::SeqCst), 4);
+
+        sup.stop_vm(&vm1_id.to_string()).await.unwrap();
+        sup.attach_disk(
+            &vm2_id.to_string(),
+            AttachDiskPayload {
+                lun: Some(1),
+                path: shared_disk,
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn definite_hotadd_rpc_error_releases_pending_reservation() {
+        use openvmms_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let shared_disk = dir.path().join("definite-shared.img");
+        fs::write(&shared_disk, vec![0u8; 4096]).unwrap();
+
+        let vm1 = sup
+            .create_vm(CreateVmPayload {
+                name: "VM1-Definite".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm2 = sup
+            .create_vm(CreateVmPayload {
+                name: "VM2-Definite".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm1_id = vm1.config.id;
+        let vm1_nic = vm1.config.nics[0].id;
+        let vm2_id = vm2.config.id;
+        let vm2_nic = vm2.config.nics[0].id;
+
+        let sock_path = dir.path().join("vm1-definite.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let Ok((stream_id, _, _)) = read_frame(&mut stream) else {
+                    break;
+                };
+                let resp = TestWireResponse {
+                    result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                        code: 3,
+                        message: "explicitly rejected by vm".into(),
+                        details: Vec::new(),
+                    })),
+                };
+                if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                    let _ = stream.write_all(&frame);
+                    let _ = stream.flush();
+                }
+            }
+        });
+
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let m1 = guard.get_mut(&vm1_id).unwrap();
+            m1.runtime.status = VmStatus::Running;
+            m1.runtime.rpc_socket_path = Some(sock_path);
+            m1.generation = 1;
+        }
+
+        let _ = sup
+            .attach_disk(
+                &vm1_id.to_string(),
+                AttachDiskPayload {
+                    lun: Some(1),
+                    path: shared_disk.clone(),
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                },
+            )
+            .await
+            .unwrap_err();
+        let pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 19024,
+            guest_port: 24,
+        };
+        let _ = sup
+            .add_port_forward(&vm1_id.to_string(), vm1_nic, pf.clone())
+            .await
+            .unwrap_err();
+
+        {
+            let guard = sup.vms.read().unwrap();
+            let m1 = guard.get(&vm1_id).unwrap();
+            assert!(m1.pending_disks.is_empty());
+            assert!(m1.pending_port_forwards.is_empty());
+        }
+
+        // VM2 can immediately attach the shared disk and add the port forward.
+        sup.attach_disk(
+            &vm2_id.to_string(),
+            AttachDiskPayload {
+                lun: Some(1),
+                path: shared_disk,
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+        .unwrap();
+        sup.add_port_forward(&vm2_id.to_string(), vm2_nic, pf)
+            .await
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_hotadd_rollback_not_found_and_presend_connect_error_release_reservations() {
+        use openvmms_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let shared_disk = dir.path().join("rollback-nf-shared.img");
+        fs::write(&shared_disk, vec![0u8; 4096]).unwrap();
+
+        let vm1 = sup
+            .create_vm(CreateVmPayload {
+                name: "VM1-RollbackNF".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm2 = sup
+            .create_vm(CreateVmPayload {
+                name: "VM2-RollbackNF".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm1_id = vm1.config.id;
+        let vm1_nic = vm1.config.nics[0].id;
+        let vm2_id = vm2.config.id;
+        let vm2_nic = vm2.config.nics[0].id;
+
+        // Missing socket: pre-send TtrpcConnectError releases reservation immediately without rollback.
+        let missing_sock = dir.path().join("missing.sock");
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let m1 = guard.get_mut(&vm1_id).unwrap();
+            m1.runtime.status = VmStatus::Running;
+            m1.runtime.rpc_socket_path = Some(missing_sock);
+            m1.generation = 1;
+        }
+        let _ = sup
+            .attach_disk(
+                &vm1_id.to_string(),
+                AttachDiskPayload {
+                    lun: Some(1),
+                    path: shared_disk.clone(),
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                },
+            )
+            .await
+            .unwrap_err();
+        let pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 19025,
+            guest_port: 25,
+        };
+        let _ = sup
+            .add_port_forward(&vm1_id.to_string(), vm1_nic, pf.clone())
+            .await
+            .unwrap_err();
+        {
+            let guard = sup.vms.read().unwrap();
+            let m1 = guard.get(&vm1_id).unwrap();
+            assert!(m1.pending_disks.is_empty());
+            assert!(m1.pending_port_forwards.is_empty());
+        }
+
+        // Mock server: hot-add drops connection (ambiguous), rollback returns NOT_FOUND (code 5).
+        let sock_path = dir.path().join("vm1-rollback-nf.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let conn_count = Arc::new(AtomicUsize::new(0));
+        let conn_count_srv = Arc::clone(&conn_count);
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let idx = conn_count_srv.fetch_add(1, Ordering::Relaxed);
+                let (stream_id, _, _) = read_frame(&mut stream).unwrap();
+                if idx % 2 == 0 {
+                    // Ambiguous EOF on Add
+                    drop(stream);
+                } else {
+                    // Rollback Remove returns NOT_FOUND (code 5) -> treated as cleaned up
+                    let resp = TestWireResponse {
+                        result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                            code: 5,
+                            message: "not found".into(),
+                            details: Vec::new(),
+                        })),
+                    };
+                    let frame = encode_frame(stream_id, 2, &resp.encode_to_vec()).unwrap();
+                    stream.write_all(&frame).unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let m1 = guard.get_mut(&vm1_id).unwrap();
+            m1.runtime.rpc_socket_path = Some(sock_path);
+        }
+
+        let _ = sup
+            .attach_disk(
+                &vm1_id.to_string(),
+                AttachDiskPayload {
+                    lun: Some(1),
+                    path: shared_disk.clone(),
+                    read_only: false,
+                    format: Some(DiskFormat::Raw),
+                },
+            )
+            .await
+            .unwrap_err();
+        let _ = sup
+            .add_port_forward(&vm1_id.to_string(), vm1_nic, pf.clone())
+            .await
+            .unwrap_err();
+
+        assert_eq!(conn_count.load(Ordering::Relaxed), 4);
+        {
+            let guard = sup.vms.read().unwrap();
+            let m1 = guard.get(&vm1_id).unwrap();
+            assert!(m1.pending_disks.is_empty());
+            assert!(m1.pending_port_forwards.is_empty());
+        }
+
+        // VM2 can attach the shared disk and add the port forward immediately.
+        sup.attach_disk(
+            &vm2_id.to_string(),
+            AttachDiskPayload {
+                lun: Some(1),
+                path: shared_disk,
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+        .unwrap();
+        sup.add_port_forward(&vm2_id.to_string(), vm2_nic, pf)
+            .await
+            .unwrap();
+        server.join().unwrap();
     }
 }

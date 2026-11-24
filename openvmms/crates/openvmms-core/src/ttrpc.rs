@@ -90,6 +90,38 @@ pub struct TtrpcRpcError {
     pub message: String,
 }
 
+#[derive(Debug)]
+struct TtrpcConnectError(anyhow::Error);
+
+impl std::fmt::Display for TtrpcConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for TtrpcConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Returns `true` when `err` came from an explicit remote ttrpc error status
+/// returned by the server (as opposed to a transport/timeout failure).
+pub fn is_ttrpc_remote_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<TtrpcRpcError>().is_some())
+}
+
+/// Returns `true` when `err` guarantees the server did not apply the RPC:
+/// either the connection failed before any request bytes were sent, or the
+/// server returned an explicit ttrpc error status.
+pub fn is_ttrpc_definite_not_applied(err: &anyhow::Error) -> bool {
+    is_ttrpc_remote_error(err)
+        || err
+            .chain()
+            .any(|c| c.downcast_ref::<TtrpcConnectError>().is_some())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitVmOutcome {
     Exited,
@@ -813,7 +845,7 @@ fn call_blocking_cancellable(
     active_sock: &Mutex<Option<Arc<Socket>>>,
 ) -> anyhow::Result<Vec<u8>> {
     if cancelled.load(Ordering::Acquire) {
-        bail!("ttrpc call cancelled");
+        return Err(anyhow!(TtrpcConnectError(anyhow!("ttrpc call cancelled"))));
     }
     let deadline = timeout.map(|t| Instant::now() + t);
     let connect_deadline = deadline
@@ -821,18 +853,21 @@ fn call_blocking_cancellable(
         .unwrap_or_else(|| Instant::now() + CONNECT_TIMEOUT);
 
     let sock = Socket::new(Domain::UNIX, Type::STREAM, None)
-        .context("creating AF_UNIX socket for ttrpc")?;
+        .context("creating AF_UNIX socket for ttrpc")
+        .map_err(|e| anyhow!(TtrpcConnectError(e)))?;
     let addr = SockAddr::unix(socket_path)
-        .with_context(|| format!("invalid AF_UNIX path {}", socket_path.display()))?;
+        .with_context(|| format!("invalid AF_UNIX path {}", socket_path.display()))
+        .map_err(|e| anyhow!(TtrpcConnectError(e)))?;
     connect_cancellable(&sock, &addr, cancelled, connect_deadline)
-        .with_context(|| format!("connecting to OpenVMM RPC socket {}", socket_path.display()))?;
+        .with_context(|| format!("connecting to OpenVMM RPC socket {}", socket_path.display()))
+        .map_err(|e| anyhow!(TtrpcConnectError(e)))?;
 
     let sock = Arc::new(sock);
     {
         let mut slot = active_sock.lock().unwrap();
         if cancelled.load(Ordering::Acquire) {
             let _ = sock.shutdown(Shutdown::Both);
-            bail!("ttrpc call cancelled");
+            return Err(anyhow!(TtrpcConnectError(anyhow!("ttrpc call cancelled"))));
         }
         *slot = Some(Arc::clone(&sock));
     }
@@ -855,7 +890,8 @@ fn call_blocking_cancellable(
         metadata: Vec::new(),
     };
     let req_envelope = wire_req.encode_to_vec();
-    let frame = encode_frame(1, MESSAGE_TYPE_REQUEST, &req_envelope)?;
+    let frame = encode_frame(1, MESSAGE_TYPE_REQUEST, &req_envelope)
+        .map_err(|e| anyhow!(TtrpcConnectError(e)))?;
     write_all_cancellable(&sock, &frame, cancelled, deadline).context("writing ttrpc request")?;
     let _ = (&*sock).flush();
 
