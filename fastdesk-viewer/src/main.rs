@@ -121,6 +121,26 @@ where
 #[cfg(any(windows, test))]
 const WIN32_HTCLIENT: u32 = 1;
 
+#[cfg(any(target_os = "macos", test))]
+fn should_hide_macos_cursor(
+    is_active: bool,
+    win_size: (usize, usize),
+    mouse_pos: Option<(f32, f32)>,
+) -> bool {
+    if !is_active || win_size.0 == 0 || win_size.1 == 0 {
+        return false;
+    }
+    let Some((mx, my)) = mouse_pos else {
+        return false;
+    };
+    mx.is_finite()
+        && my.is_finite()
+        && mx >= 0.0
+        && my >= 0.0
+        && mx < win_size.0 as f32
+        && my < win_size.1 as f32
+}
+
 #[cfg(any(windows, test))]
 fn should_hide_win32_cursor_for_setcursor(
     hide_client_cursor: bool,
@@ -349,7 +369,10 @@ impl NativeCursorController {
     }
 
     fn on_window_created(&mut self, window: &mut impl CursorVisibilityTarget) {
+        #[cfg(not(target_os = "macos"))]
         self.sync(window, true);
+        #[cfg(target_os = "macos")]
+        let _ = window;
     }
 
     fn before_window_recreate(&mut self, old_window: &mut impl CursorVisibilityTarget) {
@@ -578,6 +601,16 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
             if drain_outcome == DrainOutcome::Disconnected {
                 anyhow::bail!("server connection closed");
             }
+
+            #[cfg(target_os = "macos")]
+            native_cursor.sync(
+                &mut window,
+                should_hide_macos_cursor(
+                    window.is_active(),
+                    window.get_size(),
+                    window.get_unscaled_mouse_pos(minifb::MouseMode::Pass),
+                ),
+            );
 
             for msg in input.poll(&window, comp.width, comp.height) {
                 write_client_msg(&mut writer_stream, &msg)?;
@@ -835,27 +868,82 @@ mod tests {
         let mut ctrl = NativeCursorController::default();
         let mut win1 = MockCursorWindow::default();
 
-        // Initial creation hides native cursor once; duplicate calls are idempotent.
-        ctrl.on_window_created(&mut win1);
-        ctrl.on_window_created(&mut win1);
-        assert_eq!(win1.calls, vec![false]);
-        assert_eq!(win1.show_cursor_count, -1);
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Initial creation hides native cursor once; duplicate calls are idempotent.
+            ctrl.on_window_created(&mut win1);
+            ctrl.on_window_created(&mut win1);
+            assert_eq!(win1.calls, vec![false]);
+            assert_eq!(win1.show_cursor_count, -1);
 
-        // Resolution change recreates window: restore old window, hide new window.
-        ctrl.before_window_recreate(&mut win1);
-        assert_eq!(win1.calls, vec![false, true]);
-        assert_eq!(win1.show_cursor_count, 0);
+            // Resolution change recreates window: restore old window, hide new window.
+            ctrl.before_window_recreate(&mut win1);
+            assert_eq!(win1.calls, vec![false, true]);
+            assert_eq!(win1.show_cursor_count, 0);
 
-        let mut win2 = MockCursorWindow::default();
-        ctrl.on_window_created(&mut win2);
-        assert_eq!(win2.calls, vec![false]);
-        assert_eq!(win2.show_cursor_count, -1);
+            let mut win2 = MockCursorWindow::default();
+            ctrl.on_window_created(&mut win2);
+            assert_eq!(win2.calls, vec![false]);
+            assert_eq!(win2.show_cursor_count, -1);
 
-        // Exit restores native cursor cleanly (and repeated restore is a no-op).
-        ctrl.restore(&mut win2);
-        ctrl.restore(&mut win2);
-        assert_eq!(win2.calls, vec![false, true]);
-        assert_eq!(win2.show_cursor_count, 0);
+            // Exit restores native cursor cleanly (and repeated restore is a no-op).
+            ctrl.restore(&mut win2);
+            ctrl.restore(&mut win2);
+            assert_eq!(win2.calls, vec![false, true]);
+            assert_eq!(win2.show_cursor_count, 0);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            ctrl.on_window_created(&mut win1);
+            assert!(win1.calls.is_empty());
+            ctrl.sync(&mut win1, true);
+            ctrl.sync(&mut win1, true);
+            assert_eq!(win1.calls, vec![false]);
+            assert_eq!(win1.show_cursor_count, -1);
+            ctrl.before_window_recreate(&mut win1);
+            assert_eq!(win1.calls, vec![false, true]);
+            assert_eq!(win1.show_cursor_count, 0);
+            let mut win2 = MockCursorWindow::default();
+            ctrl.sync(&mut win2, true);
+            ctrl.restore(&mut win2);
+            ctrl.restore(&mut win2);
+            assert_eq!(win2.calls, vec![false, true]);
+            assert_eq!(win2.show_cursor_count, 0);
+        }
+    }
+
+    #[test]
+    fn macos_cursor_hiding_requires_active_window_and_in_bounds_pointer() {
+        assert!(should_hide_macos_cursor(true, (1920, 1080), Some((0.0, 0.0))));
+        assert!(should_hide_macos_cursor(
+            true,
+            (1920, 1080),
+            Some((1919.5, 1079.5))
+        ));
+        assert!(!should_hide_macos_cursor(false, (1920, 1080), Some((100.0, 100.0))));
+        assert!(!should_hide_macos_cursor(true, (0, 1080), Some((0.0, 0.0))));
+        assert!(!should_hide_macos_cursor(true, (1920, 1080), None));
+        assert!(!should_hide_macos_cursor(
+            true,
+            (1920, 1080),
+            Some((-1.0, 100.0))
+        ));
+        assert!(!should_hide_macos_cursor(
+            true,
+            (1920, 1080),
+            Some((1920.0, 100.0))
+        ));
+        assert!(!should_hide_macos_cursor(
+            true,
+            (1920, 1080),
+            Some((100.0, 1080.0))
+        ));
+        assert!(!should_hide_macos_cursor(
+            true,
+            (1920, 1080),
+            Some((f32::NAN, 100.0))
+        ));
     }
 
     #[test]

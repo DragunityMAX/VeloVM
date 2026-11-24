@@ -931,17 +931,30 @@ mod tests {
         ]
         .into_iter()
         .find(|p| p.is_file());
-        let msvm_fd = repo_root.join(
-            "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
-        );
+        let msvm_fd = repo_root.join(if cfg!(target_arch = "aarch64") {
+            "openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd"
+        } else {
+            "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd"
+        });
         #[cfg(target_os = "linux")]
-        let kvm_ready = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .is_ok();
-        #[cfg(not(target_os = "linux"))]
-        let kvm_ready = cfg!(windows);
+        let (hypervisor_ready, hypervisor_reason) = (
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/kvm")
+                .is_ok(),
+            "/dev/kvm is not accessible read/write",
+        );
+        #[cfg(windows)]
+        let (hypervisor_ready, hypervisor_reason) = (true, "");
+        #[cfg(target_os = "macos")]
+        let (hypervisor_ready, hypervisor_reason) = (
+            cfg!(target_arch = "aarch64"),
+            "macOS HVF requires Apple Silicon (aarch64)",
+        );
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+        let (hypervisor_ready, hypervisor_reason) =
+            (false, "no supported hypervisor on this platform");
 
         let missing_reason = if openvmm_bin.is_none() {
             Some(format!(
@@ -950,8 +963,8 @@ mod tests {
             ))
         } else if !msvm_fd.is_file() {
             Some(format!("UEFI firmware not found at {}", msvm_fd.display()))
-        } else if !kvm_ready {
-            Some("/dev/kvm is not accessible read/write".into())
+        } else if !hypervisor_ready {
+            Some(hypervisor_reason.into())
         } else {
             None
         };
@@ -1031,16 +1044,23 @@ mod tests {
         if let Err(err) = client.create_vm(create_req).await {
             let msg = format!("{err:#}");
             let lower = msg.to_ascii_lowercase();
-            let hypervisor_missing = cfg!(windows)
+            let hypervisor_missing = (cfg!(windows) || cfg!(target_os = "macos"))
                 && (lower.contains("hypervisor")
                     || lower.contains("whp")
+                    || lower.contains("hvf")
+                    || lower.contains("hv_denied")
+                    || lower.contains("hv_unsupported")
+                    || lower.contains("hv_error")
+                    || lower.contains("entitled")
+                    || lower.contains("unsupported")
                     || lower.contains("partition")
                     || lower.contains("virtualization")
                     || lower.contains("not present")
                     || lower.contains("not enabled"));
             if hypervisor_missing && std::env::var_os("OPENVMM_REQUIRE_REAL_KVM_TEST").is_none() {
+                let hv_name = if cfg!(target_os = "macos") { "HVF" } else { "WHP" };
                 eprintln!(
-                    "skipping rest of real_openvmm_wait_vm_cancels_on_disconnect_and_reattaches after spawning openvmm.exe --rpc (WHP unavailable): {msg}"
+                    "skipping rest of real_openvmm_wait_vm_cancels_on_disconnect_and_reattaches after spawning openvmm --rpc ({hv_name} unavailable): {msg}"
                 );
                 let _ = client.quit().await;
                 let status = child_guard.0.take().unwrap().wait().unwrap();

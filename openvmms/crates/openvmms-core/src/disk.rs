@@ -330,6 +330,40 @@ fn allocate_fixed_raw(
             file.seek(SeekFrom::Start(0))?;
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(total_i64) = libc::off_t::try_from(size_bytes) {
+            if cancelled.load(Ordering::Acquire) {
+                bail!("disk creation cancelled");
+            }
+            let mut store = libc::fstore_t {
+                fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
+                fst_posmode: libc::F_PEOFPOSMODE,
+                fst_offset: 0,
+                fst_length: total_i64,
+                fst_bytesalloc: 0,
+            };
+            let mut rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+            if rc == -1 {
+                store.fst_flags = libc::F_ALLOCATEALL;
+                rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+            }
+            if rc != -1 {
+                file.set_len(size_bytes)?;
+                file.sync_all()?;
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if !matches!(
+                err.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::ENOTSUP | libc::EINVAL | libc::ENOSYS)
+            ) {
+                return Err(err.into());
+            }
+            file.seek(SeekFrom::Start(0))?;
+        }
+    }
     write_fixed_raw_zeros(file, size_bytes, cancelled)
 }
 

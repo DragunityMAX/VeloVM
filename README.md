@@ -16,6 +16,9 @@ The GitHub Actions workflow ([`.github/workflows/build.yml`](.github/workflows/b
   - `Setup-HyperVGpuPvAndHvsock.ps1`
 - **Linux x64 bundle (`openvmm-fastdesk-linux-x64`)**:
   - `openvmm`, `openvmm-img`, `fastdesk-viewer`, `openvmmsd`, `openvmms`, `openvmms-gui`, `firmware/MSVM.fd`, and `start-openvmm-fastdesk.sh`
+- **macOS Apple Silicon bundle (`openvmm-fastdesk-macos-arm64`)**:
+  - `openvmm` (`aarch64-apple-darwin` with Hypervisor.framework `virt_hvf` + FastDesk + vTPM 2.0 + RPC extensions, ad-hoc signed with `com.apple.security.hypervisor`)
+  - `openvmm-img`, `fastdesk-viewer` (Cocoa + zero-copy shared VRAM), `openvmmsd`, `openvmms`, `openvmms-gui`, `firmware/MSVM.fd` (`microsoft/mu_msvm` `v26.0.44` ARM64 UEFI firmware), and `start-openvmm-fastdesk.sh`
 
 ### Quickstart with OpenVMMS (Hyper-V-Style Manager GUI & CLI)
 
@@ -55,9 +58,31 @@ Or create a new raw disk and install Windows 11 from an ISO:
 .\Start-OpenVmmFastDesktop.ps1 -DiskPath C:\VMs\win11.img -CreateDiskSize 64G -IsoPath C:\ISOs\Win11.iso -Memory 8G -Processors 4
 ```
 
+### Quickstart on macOS (Apple Silicon / macOS 13+ Ventura or Newer)
+
+- **Requirements:** Apple Silicon (`arm64` / `aarch64-apple-darwin`) running macOS 13 or newer, and **ARM64** guest images/ISOs (Windows 11 ARM64 or Linux ARM64; Intel `x86_64` macOS hosts and x86_64 guests are not supported by Hypervisor.framework).
+- **Gatekeeper & Hypervisor Entitlements:** The release bundle ad-hoc signs `openvmm` with `com.apple.security.hypervisor`. If you downloaded the archive with a web browser, clear the quarantine attribute before running:
+  ```bash
+  xattr -dr com.apple.quarantine /path/to/openvmm-fastdesk-macos-arm64
+  ```
+  If you rebuild `openvmm` from source, sign the binary with `openvmm/build_support/macos/entitlements.xml` (otherwise `hv_vm_create` fails with `HV_DENIED`):
+  ```bash
+  codesign --entitlements openvmm/build_support/macos/entitlements.xml -f -s - ./openvmm/target/release/openvmm
+  ```
+- **Launch via OpenVMMS or Standalone Script:**
+  ```bash
+  ./openvmms-gui
+  # Or via CLI:
+  ./openvmms vm create Linux-ARM64 --preset linux --cpus 4 --memory 8G --create-disk 32G --iso /path/to/ubuntu-arm64.iso
+  ./openvmms vm start Linux-ARM64
+  ./openvmms vm connect Linux-ARM64
+  # Or standalone launcher (runs on stock /bin/bash):
+  ./start-openvmm-fastdesk.sh --disk /path/to/arm64.vhdx --memory 8G --cpus 4
+  ```
+
 ### Triggering CI Builds & Releases
-- **Any push or PR** to `main` / `master` (or **Run workflow** in the GitHub Actions tab) builds and uploads `openvmm-fastdesk-windows-x64` and `openvmm-fastdesk-linux-x64` workflow artifacts.
-- **Tagging a release** automatically attaches `openvmm-fastdesk-windows-x64.zip`, `openvmm-fastdesk-linux-x64.tar.gz`, and `SHA256SUMS.txt` to a GitHub Release:
+- **Any push or PR** to `main` / `master` (or **Run workflow** in the GitHub Actions tab) builds and uploads `openvmm-fastdesk-windows-x64`, `openvmm-fastdesk-linux-x64`, and `openvmm-fastdesk-macos-arm64` workflow artifacts.
+- **Tagging a release** automatically attaches `openvmm-fastdesk-windows-x64.zip`, `openvmm-fastdesk-linux-x64.tar.gz`, `openvmm-fastdesk-macos-arm64.tar.gz`, and `SHA256SUMS.txt` to a GitHub Release:
   ```bash
   git tag v0.1.0
   git push origin v0.1.0

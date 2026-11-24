@@ -14,6 +14,9 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+#[cfg(target_os = "macos")]
+use std::os::unix::io::AsRawFd;
+
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
@@ -77,10 +80,22 @@ impl AdoptedProcess {
             rc == WAIT_TIMEOUT
         }
 
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(target_os = "macos")]
         {
-            // Non-Linux Unix process adoption is currently unsupported (`verify_linux_or_unix_identity`
-            // returns `false`), so this fallback path is unreachable via `open_verified_pid`.
+            if is_macos_zombie_or_dead(self.pid) {
+                return false;
+            }
+            if let Some(expected) = self.expected_start {
+                return process_start_token(self.pid) == Some(expected);
+            }
+            is_pid_alive_raw(self.pid)
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        {
+            // Other non-Linux/macOS Unix process adoption is currently unsupported
+            // (`verify_linux_or_unix_identity` returns `false`), so this fallback path
+            // is unreachable via `open_verified_pid`.
             is_pid_alive_raw(self.pid)
         }
     }
@@ -160,7 +175,7 @@ impl AdoptedProcess {
                 libc::kill(self.pid as libc::pid_t, libc::SIGTERM);
             }
             for _ in 0..10 {
-                if !is_pid_alive_raw(self.pid) {
+                if !self.is_alive() {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -182,6 +197,12 @@ impl AdoptedProcess {
         }
         verify_linux_or_unix_identity(self.pid, self.expected_bin.as_deref())
     }
+}
+
+/// Returns the current effective user ID on Unix.
+#[cfg(unix)]
+pub fn current_euid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
 }
 
 /// Configures process-group isolation and an owner-only `umask(0o077)` on Unix
@@ -292,7 +313,16 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
         Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_proc_bsdinfo(pid).map(|info| {
+            info.pbi_start_tvsec
+                .wrapping_mul(1_000_000)
+                .wrapping_add(info.pbi_start_tvusec)
+        })
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         let _ = pid;
         None
@@ -398,7 +428,27 @@ pub fn open_verified_pid(pid_path: &Path, expected_bin: Option<&Path>) -> Option
         }))
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        if is_macos_zombie_or_dead(pid) {
+            return None;
+        }
+        if let Some(expected) = expected_start
+            && process_start_token(pid) != Some(expected)
+        {
+            return None;
+        }
+        if !verify_linux_or_unix_identity(pid, expected_bin) {
+            return None;
+        }
+        Some(Arc::new(AdoptedProcess {
+            pid,
+            expected_start,
+            expected_bin: expected_bin.map(Path::to_path_buf),
+        }))
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         if !is_pid_alive_raw(pid) {
             return None;
@@ -464,7 +514,38 @@ pub fn open_verified_pid_or_socket_peer(
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    if let Some(sock) = sock_path
+        && let Ok(stream) = std::os::unix::net::UnixStream::connect(sock)
+    {
+        let mut peer_pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut peer_pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 && len as usize == std::mem::size_of::<libc::pid_t>() && peer_pid > 1 {
+            let pid = peer_pid as u32;
+            if pid != std::process::id()
+                && !is_macos_zombie_or_dead(pid)
+                && verify_linux_or_unix_identity(pid, expected_bin)
+            {
+                let expected_start = process_start_token(pid);
+                return Some(Arc::new(AdoptedProcess {
+                    pid,
+                    expected_start,
+                    expected_bin: expected_bin.map(Path::to_path_buf),
+                }));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = sock_path;
 
     None
@@ -503,6 +584,47 @@ fn is_linux_zombie_or_dead(pid: u32) -> bool {
     };
     let rest = stat[rparen + 1..].trim_start();
     matches!(rest.chars().next(), Some('Z' | 'X'))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_proc_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let pid_i32 = i32::try_from(pid).ok()?;
+    if pid_i32 <= 0 {
+        return None;
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid_i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if rc == size { Some(info) } else { None }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_proc_path(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid_i32 = i32::try_from(pid).ok()?;
+    if pid_i32 <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let rc = unsafe { libc::proc_pidpath(pid_i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if rc <= 0 {
+        return None;
+    }
+    let len = (rc as usize).min(buf.len());
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_zombie_or_dead(pid: u32) -> bool {
+    macos_proc_bsdinfo(pid).is_none_or(|info| info.pbi_status == libc::SZOMB)
 }
 
 #[cfg(unix)]
@@ -556,7 +678,40 @@ fn verify_linux_or_unix_identity(pid: u32, expected_bin: Option<&Path>) -> bool 
         false
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        let Some(exe_path) = macos_proc_path(pid) else {
+            return false;
+        };
+        let exe_name = exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if exe_name == "openvmm" || exe_name == "openvmm.exe" {
+            return true;
+        }
+        if let Some(exp) = expected_bin
+            && pid != std::process::id()
+        {
+            if exp == exe_path {
+                return true;
+            }
+            if let (Ok(exp_canon), Ok(exe_canon)) =
+                (fs::canonicalize(exp), fs::canonicalize(&exe_path))
+                && exp_canon == exe_canon
+            {
+                return true;
+            }
+            if exp.components().count() == 1
+                && exp.file_name().and_then(|n| n.to_str()) == Some(exe_name)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         let _ = (pid, expected_bin);
         false
@@ -610,9 +765,7 @@ mod tests {
         assert!(open_verified_pid(&pid_path, None).is_none());
     }
 
-    // Non-Linux Unix adoption is unsupported (`verify_linux_or_unix_identity` returns `false`),
-    // so `AdoptedProcess::is_alive` only handles zombies on Linux.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn adopted_process_is_alive_returns_false_when_child_exits_unreaped() {
         let mut child = std::process::Command::new("/bin/sh")
@@ -672,5 +825,34 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_open_verified_pid_and_terminate_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("sleep.pid");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep child");
+        let pid = child.id();
+
+        write_pid_file(&pid_path, pid).unwrap();
+        let (parsed_pid, start_tok) = read_pid_file(&pid_path).unwrap();
+        assert_eq!(parsed_pid, pid);
+        assert!(start_tok.is_some());
+
+        let adopted = open_verified_pid(&pid_path, Some(Path::new("/bin/sleep")))
+            .expect("open_verified_pid should adopt /bin/sleep");
+        assert!(adopted.is_alive());
+
+        let wrong_start = start_tok.unwrap().wrapping_add(1);
+        fs::write(&pid_path, format!("{pid}\n{wrong_start}")).unwrap();
+        assert!(open_verified_pid(&pid_path, Some(Path::new("/bin/sleep"))).is_none());
+
+        adopted.terminate();
+        let _ = child.wait();
+        assert!(!adopted.is_alive());
     }
 }
