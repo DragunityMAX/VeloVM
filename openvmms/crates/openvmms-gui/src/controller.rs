@@ -41,8 +41,16 @@ pub enum GuiRequest {
     FetchVmDetails { id: Uuid },
     FetchVmLogs { id: Uuid },
     CreateVm { wizard_id: Uuid, payload: CreateVmPayload },
-    UpdateVm { id: Uuid, payload: UpdateVmPayload },
-    DeleteVm { id: Uuid, delete_disks: bool },
+    UpdateVm {
+        dialog_id: Uuid,
+        id: Uuid,
+        payload: UpdateVmPayload,
+    },
+    DeleteVm {
+        dialog_id: Uuid,
+        id: Uuid,
+        delete_disks: bool,
+    },
     StartVm { id: Uuid },
     StopVm { id: Uuid },
     ShutdownVm { id: Uuid, acpi: bool, force: bool },
@@ -62,7 +70,10 @@ pub enum GuiRequest {
     RemovePortForward { id: Uuid, nic_id: Uuid, port: PortForward },
     CreateDisk(CreateDiskPayload),
     InspectDisk(PathBuf),
-    SaveHostConfig(HostConfigPatch),
+    SaveHostConfig {
+        dialog_id: Uuid,
+        patch: HostConfigPatch,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +86,7 @@ pub enum StorageOpKind {
 pub enum DialogKind {
     NewVmWizard(Uuid),
     VmSettings(Uuid),
-    HostSettings,
+    HostSettings(Uuid),
     DeleteVm(Uuid),
 }
 
@@ -282,9 +293,9 @@ impl Drop for ResetBoolGuard<'_> {
 fn request_dialog_kind(req: &GuiRequest) -> Option<DialogKind> {
     match req {
         GuiRequest::CreateVm { wizard_id, .. } => Some(DialogKind::NewVmWizard(*wizard_id)),
-        GuiRequest::UpdateVm { id, .. } => Some(DialogKind::VmSettings(*id)),
-        GuiRequest::SaveHostConfig(_) => Some(DialogKind::HostSettings),
-        GuiRequest::DeleteVm { id, .. } => Some(DialogKind::DeleteVm(*id)),
+        GuiRequest::UpdateVm { dialog_id, .. } => Some(DialogKind::VmSettings(*dialog_id)),
+        GuiRequest::SaveHostConfig { dialog_id, .. } => Some(DialogKind::HostSettings(*dialog_id)),
+        GuiRequest::DeleteVm { dialog_id, .. } => Some(DialogKind::DeleteVm(*dialog_id)),
         _ => None,
     }
 }
@@ -1010,7 +1021,7 @@ impl BackendState {
                 });
                 Ok(())
             }
-            GuiRequest::UpdateVm { id, payload } => {
+            GuiRequest::UpdateVm { id, payload, .. } => {
                 let vm = client.update_vm(&id.to_string(), &payload)?;
                 self.emit(GuiUpdate::StatusMessage(format!(
                     "Updated settings for '{}'",
@@ -1024,7 +1035,9 @@ impl BackendState {
                 });
                 Ok(())
             }
-            GuiRequest::DeleteVm { id, delete_disks } => {
+            GuiRequest::DeleteVm {
+                id, delete_disks, ..
+            } => {
                 client.delete_vm(&id.to_string(), delete_disks)?;
                 self.emit(GuiUpdate::StatusMessage("Deleted virtual machine".to_string()));
                 self.emit(GuiUpdate::VmDeleted {
@@ -1230,7 +1243,7 @@ impl BackendState {
                 self.emit(GuiUpdate::DiskInspected(info));
                 Ok(())
             }
-            GuiRequest::SaveHostConfig(patch) => {
+            GuiRequest::SaveHostConfig { patch, .. } => {
                 let _guard = self.host_cfg_lock.lock().unwrap();
                 let pre_patch_seq = self.next_snapshot_seq();
                 let updated = client.patch_host_config(&patch)?;
