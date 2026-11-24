@@ -26,19 +26,41 @@ enum StreamInner {
     Socket(socket2::Socket),
 }
 
+fn connect_tcp_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> anyhow::Result<TcpStream> {
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Err(err) => {
+                last_err = Some(anyhow::Error::new(err).context(format!("connecting to {addr}")));
+            }
+        }
+    }
+    match last_err {
+        Some(err) => Err(err),
+        None if !any => bail!("no addresses resolved"),
+        None => unreachable!(),
+    }
+}
+
 impl TransportStream {
     pub fn connect(uri: &str) -> anyhow::Result<Self> {
         let endpoint = parse_endpoint(uri)?;
         match endpoint {
             Endpoint::Tcp(addr_str) => {
-                let addr: SocketAddr = addr_str
+                let addrs: Vec<SocketAddr> = addr_str
                     .to_socket_addrs()
                     .with_context(|| format!("resolving TCP address '{addr_str}'"))?
-                    .next()
-                    .ok_or_else(|| anyhow!("no addresses resolved for '{addr_str}'"))?;
-                let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-                    .with_context(|| format!("connecting to {addr}"))?;
-                stream.set_nodelay(true)?;
+                    .collect();
+                if addrs.is_empty() {
+                    bail!("no addresses resolved for '{addr_str}'");
+                }
+                let stream = connect_tcp_addrs(addrs)?;
                 Ok(Self {
                     inner: StreamInner::Tcp(stream),
                 })
@@ -290,5 +312,28 @@ mod tests {
             }
             other => panic!("unexpected endpoint: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tcp_connect_tries_subsequent_resolved_addresses_on_failure() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        // Bind and drop a listener to obtain a closed loopback port ahead of the live listener.
+        let closed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unreachable_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let stream = connect_tcp_addrs([unreachable_addr, bound_addr]).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), bound_addr);
+        drop(stream);
+
+        let localhost_stream =
+            TransportStream::connect(&format!("tcp://localhost:{}", bound_addr.port())).unwrap();
+        drop(localhost_stream);
+
+        assert!(connect_tcp_addrs(std::iter::empty()).is_err());
     }
 }
