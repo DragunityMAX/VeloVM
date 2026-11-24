@@ -87,7 +87,7 @@ impl ApiClient {
         daemon_url_override: Option<&str>,
     ) -> anyhow::Result<Self> {
         let validated_override = daemon_url_override
-            .map(crate::models::parse_loopback_listen_addr)
+            .map(parse_daemon_client_addr)
             .transpose()?;
         let dir = data_dir
             .map(resolve_client_path)
@@ -688,12 +688,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn parse_daemon_base_url(raw: &str) -> anyhow::Result<(String, std::net::SocketAddr)> {
+fn parse_daemon_client_addr(raw: &str) -> anyhow::Result<std::net::SocketAddr> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         bail!("daemon URL cannot be empty");
     }
     let addr = crate::models::parse_loopback_listen_addr(trimmed)?;
+    if addr.port() == 0 {
+        bail!("daemon URL port must be between 1 and 65535");
+    }
+    Ok(addr)
+}
+
+fn parse_daemon_base_url(raw: &str) -> anyhow::Result<(String, std::net::SocketAddr)> {
+    let addr = parse_daemon_client_addr(raw)?;
     Ok((format!("http://{addr}"), addr))
 }
 
@@ -842,7 +850,7 @@ pub fn ensure_daemon_running(
     static SPAWN_STDIO_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
     if let Some(url) = daemon_url_override {
-        let _ = crate::models::parse_loopback_listen_addr(url)?;
+        let _ = parse_daemon_client_addr(url)?;
     }
     match ApiClient::from_data_dir(data_dir, daemon_url_override) {
         Ok(client) if client.health().is_ok() => return Ok(client),
@@ -890,7 +898,7 @@ pub fn ensure_daemon_running(
     let mut cmd = Command::new(&daemon_bin);
     cmd.arg("--data-dir").arg(&dir);
     if let Some(url) = daemon_url_override {
-        let listen = crate::models::parse_loopback_listen_addr(url)?.to_string();
+        let listen = parse_daemon_client_addr(url)?.to_string();
         cmd.arg("--listen").arg(listen);
     } else {
         let listen = match std::net::TcpListener::bind(&cfg.listen_addr) {
@@ -2071,5 +2079,27 @@ mod tests {
             msg.contains("hard-linked") && msg.contains("daemon.token"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    fn client_and_ensure_daemon_running_reject_port_zero_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let _ = store.load_or_create_token().unwrap();
+
+        let err_new = ApiClient::new("http://127.0.0.1:0", "tok").unwrap_err();
+        assert!(format!("{err_new:#}").contains("1 and 65535"), "{err_new:#}");
+
+        let err_from = ApiClient::from_data_dir(Some(dir.path()), Some("127.0.0.1:0")).unwrap_err();
+        assert!(format!("{err_from:#}").contains("1 and 65535"), "{err_from:#}");
+
+        let start = std::time::Instant::now();
+        let err_ensure = ensure_daemon_running(Some(dir.path()), Some("[::1]:0")).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            format!("{err_ensure:#}").contains("1 and 65535"),
+            "{err_ensure:#}"
+        );
+        assert!(!store.is_daemon_locked());
     }
 }
