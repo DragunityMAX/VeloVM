@@ -63,6 +63,11 @@ fn run_single_self_test(
     width: u16,
     height: u16,
 ) -> anyhow::Result<BenchResult> {
+    anyhow::ensure!(frames > 0, "--frames must be at least 1");
+    anyhow::ensure!(
+        width >= 384 && height >= 288,
+        "--resolution must be at least 384x288 for self-test"
+    );
     let stride = width as u32 * 4;
     let vram_size = width as usize * height as usize * 4;
     let tmp = tempfile::NamedTempFile::new()?;
@@ -436,4 +441,17 @@ pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyho
         wire_bytes as f64 / (1024.0 * 1024.0)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_test_rejects_zero_frames_and_small_resolutions() {
+        assert!(run_self_test(0, 1920, 1080).is_err());
+        assert!(run_self_test(10, 320, 240).is_err());
+        assert!(run_self_test(10, 360, 288).is_err());
+        assert!(run_self_test(10, 384, 260).is_err());
+    }
 }
