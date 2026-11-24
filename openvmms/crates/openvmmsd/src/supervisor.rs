@@ -2428,13 +2428,28 @@ impl Supervisor {
         }
     }
 
-    async fn monitor_vm(
+    fn monitor_vm(
+        self: Arc<Self>,
+        id: Uuid,
+        run_gen: u64,
+        sock_path: PathBuf,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.monitor_vm_with_backoff(id, run_gen, sock_path, cancel_rx, Duration::ZERO)
+    }
+
+    fn monitor_vm_with_backoff(
         self: Arc<Self>,
         id: Uuid,
         run_gen: u64,
         sock_path: PathBuf,
         mut cancel_rx: watch::Receiver<bool>,
-    ) {
+        initial_delay: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+        if !initial_delay.is_zero() && sleep_or_cancel(initial_delay, &mut cancel_rx).await {
+            return;
+        }
         let client = TtrpcClient::new(&sock_path);
         let (wait_res, mut props) = loop {
             if *cancel_rx.borrow() || !self.is_monitor_generation_active(id, run_gen) {
@@ -2631,9 +2646,32 @@ impl Supervisor {
                 vm.runtime.last_error = Some(
                     "OpenVMM process is still running and could not be terminated".to_string(),
                 );
-                vm.monitor_cancel = None;
-                vm.monitor_handle = None;
                 vm.stop_wait = None;
+                if let Some(sock) = vm.runtime.rpc_socket_path.clone() {
+                    const MONITOR_RESPAWN_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+                    const MONITOR_RESPAWN_MAX_BACKOFF: Duration = Duration::from_secs(30);
+                    let next_delay = if initial_delay.is_zero() {
+                        MONITOR_RESPAWN_INITIAL_BACKOFF
+                    } else {
+                        initial_delay
+                            .saturating_mul(2)
+                            .min(MONITOR_RESPAWN_MAX_BACKOFF)
+                    };
+                    let (mon_cancel_tx, mon_cancel_rx) = watch::channel(false);
+                    let mon_sup = Arc::clone(&self);
+                    let handle = tokio::spawn(mon_sup.monitor_vm_with_backoff(
+                        id,
+                        run_gen,
+                        sock,
+                        mon_cancel_rx,
+                        next_delay,
+                    ));
+                    vm.monitor_cancel = Some(mon_cancel_tx);
+                    vm.monitor_handle = Some(handle);
+                } else {
+                    vm.monitor_cancel = None;
+                    vm.monitor_handle = None;
+                }
             } else {
                 cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
                 vm.adopted_proc = None;
@@ -2678,6 +2716,7 @@ impl Supervisor {
         });
         let _ = stop_done_tx.send(StopOutcome::Done(done_summary));
         self.emit(DaemonEvent::VmUpdated { vm: summary });
+        })
     }
 
     pub async fn stop_vm(self: &Arc<Self>, id_or_name: &str) -> anyhow::Result<VmSummary> {
@@ -8970,6 +9009,196 @@ mod tests {
         assert_eq!(
             windows_powershell_path_from(Some(dir.path().as_os_str())),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn monitor_vm_respawns_monitor_when_unterminated_adopted_vm_restored_to_running() {
+        use openvmms_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "AdoptedMonitorRespawn".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm_id = vm.config.id;
+        let sock_path = dir.path().join("adopted-respawn.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let keep_accepting = Arc::new(AtomicBool::new(true));
+        let keep_accepting_srv = Arc::clone(&keep_accepting);
+        let sock_path_srv = sock_path.clone();
+        let server = std::thread::spawn(move || {
+            let mut handled_first_wait = false;
+            while keep_accepting_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                        if let Ok((stream_id, _, _)) = read_frame(&mut stream) {
+                            let resp = if !handled_first_wait {
+                                handled_first_wait = true;
+                                // Return an error on WaitVM so monitor_vm enters teardown/wait_or_terminate.
+                                TestWireResponse {
+                                    result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                                        code: 14,
+                                        message: "wait aborted".into(),
+                                        details: Vec::new(),
+                                    })),
+                                }
+                            } else {
+                                // Keep subsequent PropertiesVM/TeardownVM/Quit/WaitVM failing while socket stays open.
+                                TestWireResponse {
+                                    result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                                        code: 2,
+                                        message: "still running".into(),
+                                        details: Vec::new(),
+                                    })),
+                                }
+                            };
+                            if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                                let _ = stream.write_all(&frame);
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(listener);
+            let _ = fs::remove_file(&sock_path_srv);
+        });
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let entry = guard.get_mut(&vm_id).unwrap();
+            entry.runtime.status = VmStatus::Running;
+            entry.runtime.rpc_socket_path = Some(sock_path.clone());
+            entry.generation = 1;
+        }
+
+        let mon_sup = Arc::clone(&sup);
+        let sock_for_mon = sock_path.clone();
+        let first_mon = tokio::spawn(mon_sup.monitor_vm(vm_id, 1, sock_for_mon, cancel_rx));
+
+        // Wait until monitor_vm finishes its 5s termination check, restores Running, and respawns a monitor.
+        let respawn_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        let mut respawned = false;
+        while tokio::time::Instant::now() < respawn_deadline {
+            let (status, has_err, has_handle, has_cancel) = {
+                let guard = sup.vms.read().unwrap();
+                let entry = guard.get(&vm_id).unwrap();
+                (
+                    entry.runtime.status,
+                    entry.runtime.last_error.is_some(),
+                    entry.monitor_handle.is_some(),
+                    entry.monitor_cancel.is_some(),
+                )
+            };
+            if status == VmStatus::Running && has_err && has_handle && has_cancel {
+                respawned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(respawned, "expected monitor_vm to respawn monitor_handle/monitor_cancel");
+        first_mon.await.unwrap();
+
+        // Now close the mock socket; the respawned monitor must transition the VM out of Running after its backoff.
+        keep_accepting.store(false, Ordering::Relaxed);
+        server.join().unwrap();
+
+        let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        let mut exited_cleanly = false;
+        while tokio::time::Instant::now() < exit_deadline {
+            let status = sup.vms.read().unwrap().get(&vm_id).unwrap().runtime.status;
+            if matches!(status, VmStatus::Off | VmStatus::Error) {
+                exited_cleanly = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(exited_cleanly, "expected respawned monitor to transition VM to Off/Error");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn monitor_vm_with_backoff_cancels_immediately_without_probing_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "BackoffCancel".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm_id = vm.config.id;
+        let sock_path = dir.path().join("missing.sock");
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let entry = guard.get_mut(&vm_id).unwrap();
+            entry.runtime.status = VmStatus::Running;
+            entry.runtime.rpc_socket_path = Some(sock_path.clone());
+            entry.generation = 1;
+        }
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let handle = tokio::spawn(Arc::clone(&sup).monitor_vm_with_backoff(
+            vm_id,
+            1,
+            sock_path,
+            cancel_rx,
+            Duration::from_secs(30),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // During backoff, VM must still be Running (has not probed missing socket).
+        assert_eq!(
+            sup.vms.read().unwrap().get(&vm_id).unwrap().runtime.status,
+            VmStatus::Running
+        );
+
+        let _ = cancel_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("backoff sleep should cancel promptly")
+            .unwrap();
+        assert_eq!(
+            sup.vms.read().unwrap().get(&vm_id).unwrap().runtime.status,
+            VmStatus::Running
         );
     }
 }
