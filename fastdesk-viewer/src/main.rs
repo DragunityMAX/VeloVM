@@ -398,6 +398,10 @@ fn detect_window_resize(last_size: &mut (usize, usize), current_size: (usize, us
     }
 }
 
+fn compute_rtt_us(now_us: u64, echoed_us: u64) -> u64 {
+    now_us.saturating_sub(echoed_us)
+}
+
 fn parse_resolution(s: &str) -> anyhow::Result<(u16, u16)> {
     let (w, h) = s
         .split_once('x')
@@ -475,6 +479,7 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
 
     let mut last_win_size = window.get_size();
     let mut frame_count = 0u64;
+    let session_start = Instant::now();
     let mut stat_window_start = Instant::now();
     let mut last_ping = Instant::now();
     let mut last_rtt_us = 0u64;
@@ -563,8 +568,8 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
                             dirty = true;
                         }
                         ServerMsg::Pong { client_time_us, .. } => {
-                            let now_us = stat_window_start.elapsed().as_micros() as u64;
-                            last_rtt_us = now_us.saturating_sub(client_time_us);
+                            let now_us = session_start.elapsed().as_micros() as u64;
+                            last_rtt_us = compute_rtt_us(now_us, client_time_us);
                         }
                     }
                     Ok(())
@@ -583,7 +588,7 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
                 write_client_msg(
                     &mut writer_stream,
                     &ClientMsg::Ping {
-                        client_time_us: stat_window_start.elapsed().as_micros() as u64,
+                        client_time_us: session_start.elapsed().as_micros() as u64,
                     },
                 )?;
             }
@@ -918,5 +923,25 @@ mod tests {
             0,
             WIN32_HTCLIENT as isize
         ));
+    }
+
+    #[test]
+    fn rtt_uses_monotonic_session_clock_across_stat_window_resets() {
+        let session_start = Instant::now();
+        let mut stat_window_start = Instant::now();
+
+        std::thread::sleep(Duration::from_millis(5));
+        let ping_sent_us = session_start.elapsed().as_micros() as u64;
+
+        // Simulate stat_window_start resetting in the same loop iteration as Ping.
+        let _ = stat_window_start.elapsed();
+        stat_window_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = stat_window_start.elapsed();
+
+        let pong_recv_us = session_start.elapsed().as_micros() as u64;
+        let rtt_us = compute_rtt_us(pong_recv_us, ping_sent_us);
+        assert!(rtt_us >= 4_000, "expected RTT >= 4000 us, got {rtt_us}");
+        assert_eq!(compute_rtt_us(100, 200), 0);
     }
 }
