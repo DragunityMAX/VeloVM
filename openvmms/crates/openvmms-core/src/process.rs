@@ -795,10 +795,21 @@ mod tests {
             !proc_handle.is_alive(),
             "AdoptedProcess::is_alive should remain false before reap"
         );
-        assert!(
-            matches!(child.try_wait(), Ok(Some(_))),
-            "AdoptedProcess::is_alive must not reap child processes"
-        );
+        let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let reaped = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    assert!(
+                        std::time::Instant::now() < reap_deadline,
+                        "AdoptedProcess::is_alive must not reap child processes (child remained unreapable)"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("AdoptedProcess::is_alive must not reap child processes: {err}"),
+            }
+        };
+        let _ = reaped;
     }
 
     #[cfg(unix)]

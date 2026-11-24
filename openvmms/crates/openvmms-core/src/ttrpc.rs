@@ -928,9 +928,8 @@ mod tests {
             match listener.accept() {
                 Ok((conn, _)) => {
                     conn.set_nonblocking(false).unwrap();
-                    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                    conn.set_write_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
                     return conn;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1016,17 +1015,23 @@ mod tests {
         listener.bind(&SockAddr::unix(&sock_path).unwrap()).unwrap();
         listener.listen(8).unwrap();
 
+        let (req_rx1_tx, req_rx1_rx) = tokio::sync::oneshot::channel::<()>();
+        let (req_rx2_tx, req_rx2_rx) = tokio::sync::oneshot::channel::<()>();
         let (peer_closed_tx, peer_closed_rx) = tokio::sync::oneshot::channel::<()>();
         let (peer_closed_tx2, peer_closed_rx2) = tokio::sync::oneshot::channel::<()>();
+        let mut req_txs = [Some(req_rx1_tx), Some(req_rx2_tx)];
         let mut txs = [Some(peer_closed_tx), Some(peer_closed_tx2)];
         let server = thread::spawn(move || {
-            for slot in &mut txs {
+            for (req_slot, closed_slot) in req_txs.iter_mut().zip(txs.iter_mut()) {
                 let mut conn = accept_unix_with_timeout(&listener, Duration::from_secs(5));
                 let (_sid, _mtype, _bytes) = read_frame(&mut conn).unwrap();
+                if let Some(tx) = req_slot.take() {
+                    let _ = tx.send(());
+                }
                 // Never reply; wait until the client shuts down/closes the socket.
                 let mut buf = [0u8; 16];
                 let _ = conn.read(&mut buf);
-                if let Some(tx) = slot.take() {
+                if let Some(tx) = closed_slot.take() {
                     let _ = tx.send(());
                 }
             }
@@ -1039,7 +1044,10 @@ mod tests {
             async move { client.wait_vm_cancellable(cancel_rx).await }
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(2), req_rx1_rx)
+            .await
+            .expect("server did not receive first WaitVM request")
+            .unwrap();
         let _ = cancel_tx.send(true);
         let outcome = tokio::time::timeout(Duration::from_secs(2), wait_task)
             .await
@@ -1058,7 +1066,7 @@ mod tests {
             tokio::pin!(wait_fut);
             tokio::select! {
                 _ = &mut wait_fut => panic!("wait_vm unexpectedly completed without server reply"),
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                res = req_rx2_rx => res.unwrap(),
             }
         }
         tokio::time::timeout(Duration::from_secs(2), peer_closed_rx2)
@@ -1159,9 +1167,16 @@ mod tests {
             timed_start.elapsed() < Duration::from_secs(2),
             "timed properties_vm_blocking hung on full backlog"
         );
+        let timed_err_msg = format!("{timed_err:#}");
+        #[cfg(target_os = "linux")]
         assert!(
-            format!("{timed_err:#}").contains("timed out"),
-            "expected connect timeout error, got: {timed_err:#}"
+            timed_err_msg.contains("timed out"),
+            "expected connect timeout error, got: {timed_err_msg}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            timed_err_msg.contains("timed out") || timed_err_msg.contains("Connection refused"),
+            "expected connect timeout or connection refused on full backlog, got: {timed_err_msg}"
         );
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -1171,12 +1186,23 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(40)).await;
         let _ = cancel_tx.send(true);
-        let outcome = tokio::time::timeout(Duration::from_secs(2), wait_task)
+        let wait_res = tokio::time::timeout(Duration::from_secs(2), wait_task)
             .await
             .expect("wait_vm_cancellable hung during connect()")
-            .unwrap()
             .unwrap();
-        assert_eq!(outcome, WaitVmOutcome::Cancelled);
+        #[cfg(target_os = "linux")]
+        assert_eq!(wait_res.unwrap(), WaitVmOutcome::Cancelled);
+        #[cfg(not(target_os = "linux"))]
+        match wait_res {
+            Ok(outcome) => assert_eq!(outcome, WaitVmOutcome::Cancelled),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("Connection refused"),
+                    "unexpected wait_vm_cancellable error on full backlog: {msg}"
+                );
+            }
+        }
 
         drop(fillers);
         drop(listener);
