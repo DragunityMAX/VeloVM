@@ -184,6 +184,16 @@ impl OpenVmmsApp {
         }
     }
 
+    fn sync_vm_settings_from_vm(dlg: &mut Option<VmSettingsDialog>, vm: &VmSummary) {
+        if let Some(dlg) = dlg.as_mut()
+            && dlg.vm_id == vm.config.id
+        {
+            dlg.base_fastdesk = vm.config.fastdesk.clone();
+            dlg.nics = vm.config.nics.clone();
+            dlg.is_offline = matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error);
+        }
+    }
+
     fn process_updates(&mut self) {
         while let Some(upd) = self.backend.try_recv() {
             self.apply_update(upd);
@@ -317,6 +327,19 @@ impl OpenVmmsApp {
                 {
                     self.selected_vm = self.vms.first().map(|v| v.config.id);
                 }
+                if let Some(dlg_vm_id) = self.vm_settings_dlg.as_ref().map(|d| d.vm_id) {
+                    if let Some(vm) = self.vms.iter().find(|v| v.config.id == dlg_vm_id) {
+                        Self::sync_vm_settings_from_vm(&mut self.vm_settings_dlg, vm);
+                    } else if daemon_changed
+                        && let Some(dlg) = self.vm_settings_dlg.as_mut()
+                    {
+                        if dlg.submitting {
+                            dlg.error = Some("VM no longer exists on this daemon.".to_string());
+                        } else {
+                            self.vm_settings_dlg = None;
+                        }
+                    }
+                }
             }
             GuiUpdate::DaemonDisconnected(reason) => {
                 self.connected = false;
@@ -351,15 +374,8 @@ impl OpenVmmsApp {
                     if rev > 0 {
                         self.vm_revisions.insert(id, rev);
                     }
-                    if let Some(dlg) = self.vm_settings_dlg.as_mut()
-                        && dlg.vm_id == id
-                    {
-                        dlg.base_fastdesk = vm.config.fastdesk.clone();
-                        dlg.nics = vm.config.nics.clone();
-                        dlg.is_offline =
-                            matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error);
-                    }
                     *slot = vm;
+                    Self::sync_vm_settings_from_vm(&mut self.vm_settings_dlg, slot);
                     if select {
                         self.selected_vm = Some(id);
                     }
@@ -2550,5 +2566,56 @@ mod tests {
             patch.openvmm_bin,
             Some(Some(PathBuf::from("/bad/openvmm")))
         );
+    }
+
+    #[test]
+    fn daemon_connected_syncs_open_vm_settings_dialog() {
+        use openvmms_core::models::{FastDeskTransport, NicAttachment};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let daemon_id = Uuid::new_v4();
+        let vm_id = Uuid::new_v4();
+
+        let initial_vm = make_test_vm(vm_id, "Alpha", VmStatus::Running, 1);
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:47620".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![initial_vm.clone()],
+            snapshot_seq: 1,
+        });
+
+        let mut dlg = VmSettingsDialog::from_config(&initial_vm.config, initial_vm.runtime.status);
+        assert!(!dlg.is_offline);
+        dlg.vram_mb = initial_vm.config.fastdesk.vram_mb + 32;
+        app.vm_settings_dlg = Some(dlg);
+
+        // VM stops and gains an external fastdesk transport change + NIC while resyncing.
+        let mut updated_vm = make_test_vm(vm_id, "Alpha", VmStatus::Off, 2);
+        updated_vm.config.fastdesk.transport = FastDeskTransport::HvSock;
+        updated_vm.config.nics.push(NicAttachment {
+            id: Uuid::new_v4(),
+            name: "ext-nic".into(),
+            mac_address: "00:15:5d:01:02:03".into(),
+            backend: NicBackendConfig::Tap {
+                name: "tap9".into(),
+            },
+        });
+        let expected_nics = updated_vm.config.nics.clone();
+
+        app.apply_update(GuiUpdate::DaemonConnected {
+            base_url: "http://127.0.0.1:47620".into(),
+            host_info: make_host_info(Some(daemon_id)),
+            host_config: HostConfig::default(),
+            switches: vec![],
+            vms: vec![updated_vm],
+            snapshot_seq: 2,
+        });
+
+        let dlg = app.vm_settings_dlg.as_ref().unwrap();
+        assert!(dlg.is_offline);
+        assert_eq!(dlg.base_fastdesk.transport, FastDeskTransport::HvSock);
+        assert_eq!(dlg.nics, expected_nics);
     }
 }
