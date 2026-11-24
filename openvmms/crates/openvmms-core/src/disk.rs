@@ -342,7 +342,7 @@ fn allocate_fixed_raw(
                 fst_bytesalloc: 0,
             };
             let mut try_preallocate =
-                |flags: libc::c_int| -> anyhow::Result<Result<(), std::io::Error>> {
+                |flags: libc::c_uint| -> anyhow::Result<Result<(), std::io::Error>> {
                     store.fst_flags = flags;
                     loop {
                         if cancelled.load(Ordering::Acquire) {
