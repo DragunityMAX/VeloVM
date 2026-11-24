@@ -408,8 +408,11 @@ struct MultiClientServer<T: Listener> {
     clients: unicycle::FuturesUnordered<Pin<Box<dyn Future<Output = u64>>>>,
     next_client_id: u64,
     max_clients: usize,
+    handshake_timeout: Duration,
     start_time: Instant,
 }
+
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<T: Listener> MultiClientServer<T> {
     fn new(
@@ -463,6 +466,7 @@ impl<T: Listener> MultiClientServer<T> {
             clients: unicycle::FuturesUnordered::new(),
             next_client_id: 0,
             max_clients,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             start_time: Instant::now(),
         }
     }
@@ -697,7 +701,7 @@ impl<T: Listener> MultiClientServer<T> {
                     let sock: socket2::Socket = socket.into();
                     let _ = sock.set_tcp_nodelay(true);
                     match PolledSocket::new(driver, sock) {
-                        Ok(socket) => self.spawn_client(socket, remote_addr),
+                        Ok(socket) => self.spawn_client(socket, remote_addr, driver),
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
@@ -824,6 +828,7 @@ impl<T: Listener> MultiClientServer<T> {
         &mut self,
         socket: PolledSocket<socket2::Socket>,
         remote_addr: impl std::fmt::Debug,
+        driver: &LocalDriver,
     ) {
         let id = self.next_client_id;
         self.next_client_id += 1;
@@ -859,6 +864,8 @@ impl<T: Listener> MultiClientServer<T> {
             wakeup_recv,
             missed_dirty,
             device_dirty_seen: self.device_dirty_seen.clone(),
+            timer: PolledTimer::new(driver),
+            handshake_timeout: self.handshake_timeout,
             start_time: self.start_time,
         };
 
@@ -906,6 +913,8 @@ struct ClientContext {
     wakeup_recv: async_channel::Receiver<()>,
     missed_dirty: Arc<AtomicBool>,
     device_dirty_seen: Arc<AtomicBool>,
+    timer: PolledTimer,
+    handshake_timeout: Duration,
     start_time: Instant,
 }
 
@@ -1058,7 +1067,7 @@ async fn read_client_frame(
 ) -> anyhow::Result<ClientMsg> {
     let mut hdr = [0u8; 5];
     socket.read_exact(&mut hdr).await?;
-    let (msg_type, payload_len) = fastdesk_proto::decode_frame_header(&hdr)?;
+    let (msg_type, payload_len) = fastdesk_proto::decode_client_frame_header(&hdr)?;
     let mut payload = vec![0u8; payload_len];
     socket.read_exact(&mut payload).await?;
     Ok(decode_client_msg(msg_type, &payload)?)
@@ -1080,16 +1089,11 @@ async fn read_client_frame_or_eof(
     }
     let mut len_buf = [0u8; 4];
     socket.read_exact(&mut len_buf).await?;
-    let payload_len = u32::from_le_bytes(len_buf) as usize;
-    if payload_len > fastdesk_proto::MAX_FRAME_PAYLOAD_BYTES {
-        anyhow::bail!("client frame payload too large: {payload_len}");
-    }
+    let hdr = [msg_type[0], len_buf[0], len_buf[1], len_buf[2], len_buf[3]];
+    let (_, payload_len) = fastdesk_proto::decode_client_frame_header(&hdr)?;
     payload.resize(payload_len, 0);
     socket.read_exact(payload).await?;
     let msg = decode_client_msg(msg_type[0], payload)?;
-    if payload.capacity() > 64 * 1024 {
-        *payload = Vec::new();
-    }
     Ok(Some(msg))
 }
 
@@ -1113,10 +1117,27 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
         },
         &mut out_buf,
     )?;
-    ctx.socket.write_all(&out_buf).await?;
 
     let shm_available = ctx.shm_path.is_some();
-    let use_shm = match read_client_frame(&mut ctx.socket).await? {
+    let mut handshake_timer = ctx.timer;
+    let handshake_timeout = ctx.handshake_timeout;
+    let client_hello = {
+        let socket = &mut ctx.socket;
+        let handshake_fut = async {
+            socket.write_all(&out_buf).await?;
+            read_client_frame(socket).await
+        }
+        .fuse();
+        futures::pin_mut!(handshake_fut);
+        let timeout_fut = handshake_timer.sleep(handshake_timeout).fuse();
+        futures::pin_mut!(timeout_fut);
+
+        futures::select! {
+            res = handshake_fut => res?,
+            _ = timeout_fut => anyhow::bail!("FastDesk client handshake timed out"),
+        }
+    };
+    let use_shm = match client_hello {
         ClientMsg::ClientHello { prefer_shm, .. } => prefer_shm && shm_available,
         other => anyhow::bail!("expected ClientHello, got {other:?}"),
     };
@@ -1581,6 +1602,26 @@ mod tests {
         shm_file: Option<&std::path::Path>,
         max_clients: usize,
     ) -> TestServer {
+        start_test_server_with_options(
+            width,
+            height,
+            initial_offset,
+            vram_size,
+            shm_file,
+            max_clients,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+        )
+    }
+
+    fn start_test_server_with_options(
+        width: u16,
+        height: u16,
+        initial_offset: usize,
+        vram_size: usize,
+        shm_file: Option<&std::path::Path>,
+        max_clients: usize,
+        handshake_timeout: Duration,
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1630,6 +1671,7 @@ mod tests {
                     Some(cursor_recv),
                     max_clients,
                 );
+                server.handshake_timeout = handshake_timeout;
                 futures::select! {
                     r = server.process(&driver).fuse() => r,
                     _ = stop_recv.fuse() => Ok(()),
@@ -3153,5 +3195,127 @@ mod tests {
                 "expected {fatal_kind:?} to be fatal"
             );
         }
+    }
+
+    #[test]
+    fn oversized_client_frame_header_disconnects_immediately_without_allocating() {
+        use std::io::Read;
+        use std::io::Write;
+
+        let server = start_test_server(64, 64, None);
+
+        // Case 1: Oversized frame header during initial ClientHello handshake.
+        {
+            let mut stream = TcpStream::connect(server.addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let _hello = read_server_msg(&mut stream).unwrap();
+            let mut bad_hdr = [101u8, 0, 0, 0, 0];
+            bad_hdr[1..5].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+            stream.write_all(&bad_hdr).unwrap();
+            stream.flush().unwrap();
+
+            let mut buf = [0u8; 16];
+            match stream.read(&mut buf) {
+                Ok(0) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("expected disconnect after oversized handshake header, got {other:?}"),
+            }
+        }
+
+        // Case 2: Oversized frame header after handshake completes.
+        {
+            let (mut stream, _) = connect_client(server.addr, false);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert!(matches!(
+                read_server_msg(&mut stream).unwrap(),
+                ServerMsg::FrameBatch { .. }
+            ));
+
+            let mut bad_hdr = [105u8, 0, 0, 0, 0];
+            bad_hdr[1..5].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+            stream.write_all(&bad_hdr).unwrap();
+            stream.flush().unwrap();
+
+            let mut buf = [0u8; 16];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        break;
+                    }
+                    other => panic!("expected disconnect after oversized post-handshake header, got {other:?}"),
+                }
+            }
+        }
+
+        server.stop();
+    }
+
+    #[test]
+    fn silent_handshake_times_out_and_frees_client_slot() {
+        use std::io::Read;
+
+        let server = start_test_server_with_options(
+            64,
+            64,
+            0,
+            FRAMEBUFFER_SIZE,
+            None,
+            1,
+            Duration::from_millis(120),
+        );
+
+        // Connect and read ServerHello, then stay silent past handshake_timeout.
+        let mut silent = TcpStream::connect(server.addr).unwrap();
+        silent
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(matches!(
+            read_server_msg(&mut silent).unwrap(),
+            ServerMsg::ServerHello { .. }
+        ));
+
+        let mut eof_buf = [0u8; 8];
+        match silent.read(&mut eof_buf) {
+            Ok(0) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!("expected silent client to be dropped on timeout, got {other:?}"),
+        }
+        drop(silent);
+
+        // Give the server loop a brief moment to reap ClientDone, then verify slot is free.
+        thread::sleep(Duration::from_millis(50));
+        let (mut good, hello) = connect_client(server.addr, false);
+        assert!(matches!(hello, ServerMsg::ServerHello { .. }));
+        assert!(matches!(
+            read_server_msg(&mut good).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+        drop(good);
+        server.stop();
     }
 }

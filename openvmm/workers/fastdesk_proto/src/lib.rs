@@ -21,6 +21,7 @@ pub use wire::ClientMsg;
 pub use wire::EncodedRect;
 pub use wire::ProtoError;
 pub use wire::ServerMsg;
+pub use wire::decode_client_frame_header;
 pub use wire::decode_client_msg;
 pub use wire::decode_frame_header;
 pub use wire::decode_server_msg;
@@ -72,6 +73,9 @@ pub const MAX_RECTS_PER_BATCH: usize = 4096;
 
 /// Maximum wire frame payload size (64 MiB).
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum wire payload size for client-to-server control/input messages (1 KiB).
+pub const MAX_CLIENT_MSG_PAYLOAD_BYTES: usize = 1024;
 
 /// Maximum cursor width or height in pixels (SynthVid limit).
 pub const MAX_CURSOR_DIM: u16 = 96;
@@ -269,5 +273,27 @@ mod tests {
                 h: 16,
             }]
         );
+    }
+
+    #[test]
+    fn decode_client_frame_header_rejects_oversized_payload() {
+        let mut hdr = [101u8, 0, 0, 0, 0];
+        hdr[1..5].copy_from_slice(&(MAX_CLIENT_MSG_PAYLOAD_BYTES as u32).to_le_bytes());
+        assert_eq!(
+            decode_client_frame_header(&hdr).unwrap(),
+            (101, MAX_CLIENT_MSG_PAYLOAD_BYTES)
+        );
+
+        hdr[1..5].copy_from_slice(&((MAX_CLIENT_MSG_PAYLOAD_BYTES as u32) + 1).to_le_bytes());
+        assert!(matches!(
+            decode_client_frame_header(&hdr),
+            Err(ProtoError::FrameTooLarge(n)) if n == MAX_CLIENT_MSG_PAYLOAD_BYTES + 1
+        ));
+
+        hdr[1..5].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+        assert!(matches!(
+            decode_client_frame_header(&hdr),
+            Err(ProtoError::FrameTooLarge(n)) if n == 64 * 1024 * 1024
+        ));
     }
 }
