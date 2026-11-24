@@ -32,6 +32,23 @@ jobs:
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+
+      - name: Expose llvm-objcopy and llvm-nm for vTPM build
+        run: |
+          set -euo pipefail
+          HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+          LLVM_TOOLS_BIN="$(rustc --print sysroot)/lib/rustlib/${HOST_TRIPLE}/bin"
+          LLVM_SHIM_DIR="$RUNNER_TEMP/llvm-binutils"
+          mkdir -p "$LLVM_SHIM_DIR"
+          ln -sf "$LLVM_TOOLS_BIN/llvm-objcopy" "$LLVM_SHIM_DIR/llvm-objcopy"
+          ln -sf "$LLVM_TOOLS_BIN/llvm-nm" "$LLVM_SHIM_DIR/llvm-nm"
+          test -x "$LLVM_SHIM_DIR/llvm-objcopy"
+          test -x "$LLVM_SHIM_DIR/llvm-nm"
+          "$LLVM_SHIM_DIR/llvm-objcopy" --version
+          "$LLVM_SHIM_DIR/llvm-nm" --version
+          echo "$LLVM_SHIM_DIR" >> "$GITHUB_PATH"
 
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -422,6 +439,23 @@ jobs:
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+
+      - name: Expose llvm-objcopy and llvm-nm for vTPM build
+        run: |
+          set -euo pipefail
+          HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+          LLVM_TOOLS_BIN="$(rustc --print sysroot)/lib/rustlib/${HOST_TRIPLE}/bin"
+          LLVM_SHIM_DIR="$RUNNER_TEMP/llvm-binutils"
+          mkdir -p "$LLVM_SHIM_DIR"
+          ln -sf "$LLVM_TOOLS_BIN/llvm-objcopy" "$LLVM_SHIM_DIR/llvm-objcopy"
+          ln -sf "$LLVM_TOOLS_BIN/llvm-nm" "$LLVM_SHIM_DIR/llvm-nm"
+          test -x "$LLVM_SHIM_DIR/llvm-objcopy"
+          test -x "$LLVM_SHIM_DIR/llvm-nm"
+          "$LLVM_SHIM_DIR/llvm-objcopy" --version
+          "$LLVM_SHIM_DIR/llvm-nm" --version
+          echo "$LLVM_SHIM_DIR" >> "$GITHUB_PATH"
 
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -739,6 +773,23 @@ jobs:
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+
+      - name: Expose llvm-objcopy and llvm-nm for vTPM build
+        run: |
+          set -euo pipefail
+          HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+          LLVM_TOOLS_BIN="$(rustc --print sysroot)/lib/rustlib/${HOST_TRIPLE}/bin"
+          LLVM_SHIM_DIR="$RUNNER_TEMP/llvm-binutils"
+          mkdir -p "$LLVM_SHIM_DIR"
+          ln -sf "$LLVM_TOOLS_BIN/llvm-objcopy" "$LLVM_SHIM_DIR/llvm-objcopy"
+          ln -sf "$LLVM_TOOLS_BIN/llvm-nm" "$LLVM_SHIM_DIR/llvm-nm"
+          test -x "$LLVM_SHIM_DIR/llvm-objcopy"
+          test -x "$LLVM_SHIM_DIR/llvm-nm"
+          "$LLVM_SHIM_DIR/llvm-objcopy" --version
+          "$LLVM_SHIM_DIR/llvm-nm" --version
+          echo "$LLVM_SHIM_DIR" >> "$GITHUB_PATH"
 
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
