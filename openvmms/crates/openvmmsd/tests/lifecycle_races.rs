@@ -19,6 +19,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+fn test_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "macos")]
+    {
+        tempfile::tempdir_in("/tmp").unwrap()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tempfile::tempdir().unwrap()
+    }
+}
+
 const MESSAGE_TYPE_REQUEST: u8 = 1;
 const MESSAGE_TYPE_RESPONSE: u8 = 2;
 
@@ -558,7 +569,7 @@ async fn wait_for_file(path: &Path) {
 }
 
 async fn test_dropping_start_vm_future_does_not_leave_vm_stuck_in_starting() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let store = RegistryStore::new(dir.path()).unwrap();
     let fake_uefi = dir.path().join("MSVM.fd");
     fs::write(&fake_uefi, b"FAKE_UEFI").unwrap();
@@ -605,7 +616,7 @@ async fn test_dropping_start_vm_future_does_not_leave_vm_stuck_in_starting() {
 }
 
 async fn test_stopping_vm_during_startup_then_restarting_preserves_replacement_vm() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
@@ -677,7 +688,7 @@ async fn test_stopping_vm_during_startup_then_restarting_preserves_replacement_v
 }
 
 async fn test_concurrent_stop_requests_wait_for_cleanup_and_preserve_restarted_vm() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
@@ -777,7 +788,7 @@ async fn test_concurrent_stop_requests_wait_for_cleanup_and_preserve_restarted_v
 }
 
 async fn test_delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
@@ -913,7 +924,7 @@ async fn test_delayed_pause_and_resume_rpcs_do_not_break_concurrent_stop_and_res
 }
 
 async fn test_wait_vm_transient_error_does_not_teardown_healthy_vm() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
@@ -967,7 +978,7 @@ async fn test_wait_vm_transient_error_does_not_teardown_healthy_vm() {
 }
 
 async fn test_readopted_vm_whose_initial_properties_failed_gets_monitored_and_transitions_on_exit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
 
@@ -1041,7 +1052,7 @@ async fn test_readopted_vm_whose_initial_properties_failed_gets_monitored_and_tr
 }
 
 async fn test_daemon_stop_without_stop_vms_preserves_running_vm_and_readopts_on_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
 
@@ -1252,7 +1263,7 @@ fn configure_real_daemon_stub_host(
 }
 
 async fn test_real_daemon_process_exits_on_default_stop_and_sigterm_while_vm_running_and_readopts_cleanly() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
     let log_path = dir.path().join("daemon.stderr.log");
@@ -1354,7 +1365,7 @@ async fn test_real_daemon_process_exits_on_default_stop_and_sigterm_while_vm_run
 }
 
 async fn test_failed_daemon_start_preserves_running_vm_runtime_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
     let log_path = dir.path().join("daemon.stderr.log");
@@ -1455,7 +1466,7 @@ async fn test_failed_daemon_start_preserves_running_vm_runtime_files() {
 }
 
 async fn test_disconnecting_mid_disk_hotplug_and_port_forward_still_commits_config() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let store = RegistryStore::new(dir.path()).unwrap();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
@@ -1586,7 +1597,7 @@ async fn test_disconnecting_mid_disk_hotplug_and_port_forward_still_commits_conf
 }
 
 async fn test_slow_reclaim_start_does_not_clobber_replacement_start() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
@@ -1779,7 +1790,7 @@ async fn test_slow_reclaim_start_does_not_clobber_replacement_start() {
 }
 
 async fn test_concurrent_pause_and_resume_preserve_actual_vm_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
@@ -1865,7 +1876,7 @@ async fn test_concurrent_pause_and_resume_preserve_actual_vm_state() {
 }
 
 async fn test_runtime_dir_change_is_rejected_while_vm_is_starting() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
         .await
         .unwrap();
@@ -1923,7 +1934,7 @@ async fn test_runtime_dir_change_is_rejected_while_vm_is_starting() {
 }
 
 async fn test_start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let store = RegistryStore::new(dir.path()).unwrap();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
@@ -2005,7 +2016,7 @@ async fn test_start_vm_rejected_during_daemon_shutdown_and_detach_never_kills_vm
 }
 
 async fn test_hotplug_commit_failure_rolls_back_and_detach_expected_path_enforces_match() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
 
@@ -2144,7 +2155,7 @@ async fn test_hotplug_commit_failure_rolls_back_and_detach_expected_path_enforce
 
 async fn test_shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit() {
     // 1. Bounded listener drain + shutdown cancelling create_disk.
-    let dir1 = tempfile::tempdir().unwrap();
+    let dir1 = test_tempdir();
     let daemon1 = TestDaemonHandle::spawn(dir1.path().to_path_buf())
         .await
         .unwrap();
@@ -2206,7 +2217,7 @@ async fn test_shutdown_cancels_disk_create_and_stop_waits_for_adopted_exit() {
     );
 
     // 2. Stopping an adopted VM waits until the adopted process finishes exiting.
-    let dir2 = tempfile::tempdir().unwrap();
+    let dir2 = test_tempdir();
     let fw_path2 = dir2.path().join("MSVM.fd");
     fs::write(&fw_path2, b"FAKE_UEFI").unwrap();
 
@@ -2276,7 +2287,7 @@ async fn test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_p
     //    re-adopted --rpc child that ignores TeardownVM/Quit.
     #[cfg(target_os = "linux")]
     {
-        let dir1 = tempfile::tempdir().unwrap();
+        let dir1 = test_tempdir();
         let fw_path1 = dir1.path().join("MSVM.fd");
         fs::write(&fw_path1, b"FAKE_UEFI").unwrap();
 
@@ -2328,7 +2339,7 @@ async fn test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_p
 
     // 2. When no verified process handle can be obtained and the socket stays alive ignoring Quit,
     //    stop fails (does not report Off), preserves .sock/.pid, and start is rejected.
-    let dir2 = tempfile::tempdir().unwrap();
+    let dir2 = test_tempdir();
     let fw_path2 = dir2.path().join("MSVM.fd");
     fs::write(&fw_path2, b"FAKE_UEFI").unwrap();
 
@@ -2494,7 +2505,7 @@ async fn test_adopted_vm_stop_preserves_state_when_unterminated_and_terminates_p
 }
 
 async fn test_online_hotplug_in_flight_does_not_hit_restarted_vm() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
 
@@ -2590,7 +2601,7 @@ async fn test_online_hotplug_in_flight_does_not_hit_restarted_vm() {
 }
 
 async fn test_concurrent_online_hot_add_same_writable_disk_blocks_second_rpc() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let fw_path = dir.path().join("MSVM.fd");
     fs::write(&fw_path, b"FAKE_UEFI").unwrap();
 

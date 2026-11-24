@@ -656,6 +656,17 @@ async fn vm_logs(
 #[cfg(test)]
 mod tests {
     use crate::TestDaemonHandle;
+
+    fn short_tempdir() -> tempfile::TempDir {
+        #[cfg(target_os = "macos")]
+        {
+            tempfile::tempdir_in("/tmp").unwrap()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tempfile::tempdir().unwrap()
+        }
+    }
     use openvmms_core::models::CreateDiskPayload;
     use openvmms_core::models::CreateVmPayload;
     use openvmms_core::models::DiskFormat;
@@ -1945,7 +1956,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_config_rejects_non_loopback_listen_addr_and_runtime_dir_change_while_active() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_tempdir();
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
@@ -2485,7 +2496,7 @@ mod tests {
     async fn start_vm_preserves_existing_custom_runtime_dir_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_tempdir();
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
@@ -3261,7 +3272,7 @@ mod tests {
     async fn unix_default_runtime_dir_trailing_slash_gets_0700_and_worker_umask_is_0077() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_tempdir();
         let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
             .await
             .unwrap();
