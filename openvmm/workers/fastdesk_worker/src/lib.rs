@@ -561,6 +561,7 @@ impl<T: Listener> MultiClientServer<T> {
         enum Event<A> {
             Accepted(A),
             AcceptTransientError(std::io::Error),
+            AcceptBackoffElapsed,
             ClientDone(u64),
             DirtyRects(Vec<DirtyRect>),
             Cursor(CursorUpdate),
@@ -569,6 +570,8 @@ impl<T: Listener> MultiClientServer<T> {
         }
 
         let mut timer = PolledTimer::new(driver);
+        let mut accept_timer = PolledTimer::new(driver);
+        let mut accept_backoff_until: Option<pal_async::timer::Instant> = None;
 
         loop {
             let listener = &mut self.listener;
@@ -579,6 +582,20 @@ impl<T: Listener> MultiClientServer<T> {
             let fallback_active =
                 !self.device_dirty_seen.load(Ordering::Acquire) && !self.client_handles.is_empty();
 
+            let accept_fut = async {
+                if let Some(deadline) = accept_backoff_until {
+                    accept_timer.sleep_until(deadline).await;
+                    Ok(Event::AcceptBackoffElapsed)
+                } else {
+                    match listener.accept().await {
+                        Ok((socket, addr)) => Ok(Event::Accepted((socket, addr))),
+                        Err(e) if is_transient_accept_error(&e) => {
+                            Ok(Event::AcceptTransientError(e))
+                        }
+                        Err(e) => Err(anyhow::Error::from(e)),
+                    }
+                }
+            };
             let dirty_fut = async {
                 match dirty_recv {
                     Some(recv) => recv.recv().await,
@@ -613,11 +630,7 @@ impl<T: Listener> MultiClientServer<T> {
             };
 
             let event = futures::select! {
-                accept = listener.accept().fuse() => match accept {
-                    Ok((socket, addr)) => Event::Accepted((socket, addr)),
-                    Err(e) if is_transient_accept_error(&e) => Event::AcceptTransientError(e),
-                    Err(e) => return Err(e.into()),
-                },
+                accept_ev = accept_fut.fuse() => accept_ev?,
                 id = client_done.fuse() => Event::ClientDone(id),
                 msg = dirty_fut.fuse() => match msg {
                     Ok(rects) => Event::DirtyRects(rects),
@@ -713,8 +726,12 @@ impl<T: Listener> MultiClientServer<T> {
                 Event::AcceptTransientError(e) => {
                     tracing::warn!(error = %e, "FastDesk accept failed; continuing");
                     if is_resource_exhaustion_accept_error(&e) {
-                        timer.sleep(Duration::from_millis(50)).await;
+                        accept_backoff_until =
+                            Some(pal_async::timer::Instant::now() + Duration::from_millis(50));
                     }
+                }
+                Event::AcceptBackoffElapsed => {
+                    accept_backoff_until = None;
                 }
                 Event::ClientDone(id) => {
                     self.client_handles.retain(|c| c.id != id);
@@ -1488,6 +1505,9 @@ async fn run_client(mut ctx: ClientContext) -> anyhow::Result<()> {
 }
 
 fn is_resource_exhaustion_accept_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::OutOfMemory {
+        return true;
+    }
     #[cfg(unix)]
     {
         matches!(
@@ -1503,7 +1523,6 @@ fn is_resource_exhaustion_accept_error(err: &std::io::Error) -> bool {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = err;
         false
     }
 }
@@ -1515,7 +1534,6 @@ fn is_transient_accept_error(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::Interrupted
             | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::OutOfMemory
     ) || is_resource_exhaustion_accept_error(err)
 }
 
@@ -1624,7 +1642,30 @@ mod tests {
     ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        start_test_server_with_listener(
+            listener,
+            addr,
+            width,
+            height,
+            initial_offset,
+            vram_size,
+            shm_file,
+            max_clients,
+            handshake_timeout,
+        )
+    }
 
+    fn start_test_server_with_listener<L: Listener + Send + 'static>(
+        listener: L,
+        addr: SocketAddr,
+        width: u16,
+        height: u16,
+        initial_offset: usize,
+        vram_size: usize,
+        shm_file: Option<&std::path::Path>,
+        max_clients: usize,
+        handshake_timeout: Duration,
+    ) -> TestServer {
         let (vram, shm_path_str) = if let Some(path) = shm_file {
             let f = std::fs::OpenOptions::new()
                 .read(true)
@@ -3174,11 +3215,20 @@ mod tests {
             ErrorKind::Interrupted,
             ErrorKind::WouldBlock,
         ] {
+            let err = Error::from(kind);
             assert!(
-                is_transient_accept_error(&Error::from(kind)),
+                is_transient_accept_error(&err),
                 "expected {kind:?} to be transient"
             );
+            assert!(
+                !is_resource_exhaustion_accept_error(&err),
+                "expected {kind:?} not to trigger resource-exhaustion backoff"
+            );
         }
+
+        let oom = Error::from(ErrorKind::OutOfMemory);
+        assert!(is_transient_accept_error(&oom));
+        assert!(is_resource_exhaustion_accept_error(&oom));
 
         #[cfg(unix)]
         {
@@ -3189,7 +3239,11 @@ mod tests {
             }
         }
 
-        for fatal_kind in [ErrorKind::PermissionDenied, ErrorKind::InvalidInput, ErrorKind::Other] {
+        for fatal_kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
             assert!(
                 !is_transient_accept_error(&Error::from(fatal_kind)),
                 "expected {fatal_kind:?} to be fatal"
@@ -3316,6 +3370,181 @@ mod tests {
             ServerMsg::FrameBatch { .. }
         ));
         drop(good);
+        server.stop();
+    }
+
+    #[test]
+    fn resource_exhaustion_accept_backoff_does_not_stall_existing_clients() {
+        use pal_async::socket::AsSockRef;
+        use std::sync::atomic::AtomicUsize;
+
+        struct FaultyListener {
+            inner: TcpListener,
+            inject_errors: Arc<Mutex<VecDeque<std::io::Error>>>,
+            error_tx: std::sync::mpsc::Sender<(Instant, usize)>,
+            accept_calls: Arc<AtomicUsize>,
+        }
+
+        impl AsSockRef for FaultyListener {
+            fn as_sock_ref(&self) -> socket2::SockRef<'_> {
+                self.inner.as_sock_ref()
+            }
+        }
+
+        impl Listener for FaultyListener {
+            type Socket = TcpStream;
+            type Address = SocketAddr;
+
+            fn accept(&self) -> std::io::Result<(Self::Socket, Self::Address)> {
+                let calls = self.accept_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                if let Some(err) = self.inject_errors.lock().pop_front() {
+                    let _ = self.error_tx.send((Instant::now(), calls));
+                    return Err(err);
+                }
+                self.inner.accept()
+            }
+
+            fn local_addr(&self) -> std::io::Result<Self::Address> {
+                self.inner.local_addr()
+            }
+        }
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let inject_errors = Arc::new(Mutex::new(VecDeque::new()));
+        let accept_calls = Arc::new(AtomicUsize::new(0));
+        let (error_tx, error_rx) = std::sync::mpsc::channel();
+        let listener = FaultyListener {
+            inner: tcp_listener,
+            inject_errors: inject_errors.clone(),
+            error_tx,
+            accept_calls: accept_calls.clone(),
+        };
+
+        let mut server = start_test_server_with_listener(
+            listener,
+            addr,
+            64,
+            64,
+            0,
+            FRAMEBUFFER_SIZE,
+            None,
+            8,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+        );
+
+        let (mut stream1, hello1) = connect_client(server.addr, false);
+        assert!(matches!(hello1, ServerMsg::ServerHello { .. }));
+        assert!(matches!(
+            read_server_msg(&mut stream1).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+
+        // Inject a resource-exhaustion accept error (OutOfMemory) and trigger accept()
+        // by opening a second connection.
+        inject_errors
+            .lock()
+            .push_back(std::io::Error::from(std::io::ErrorKind::OutOfMemory));
+        let stream2_raw = TcpStream::connect(server.addr).unwrap();
+        stream2_raw.set_nodelay(true).unwrap();
+        stream2_raw
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream2_raw
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let (err_at, calls_at_err) = error_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // While accept() is in its 50ms backoff window, existing clients must still receive
+        // dirty-rect updates immediately without waiting for the backoff timer.
+        let px = [0x44u8, 0x55, 0x66, 0xff];
+        let row_bytes = 64 * 4;
+        for y in 0..8usize {
+            for x in 0..8usize {
+                server.vram.write_at(y * row_bytes + x * 4, &px).unwrap();
+            }
+        }
+        let sent_at = Instant::now();
+        server.dirty_send.send(vec![DirtyRect {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 8,
+        }]);
+        assert!(matches!(
+            read_server_msg(&mut stream1).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+        let frame_elapsed = sent_at.elapsed();
+        assert!(
+            frame_elapsed < Duration::from_millis(35),
+            "existing client stalled during accept backoff: {frame_elapsed:?}"
+        );
+        // accept() must not be called again while the 50ms backoff timer is active.
+        assert_eq!(accept_calls.load(Ordering::Acquire), calls_at_err);
+
+        // Existing client disconnects (and held key release) must also be reaped during backoff.
+        write_client_msg(
+            &mut stream1,
+            &ClientMsg::KeyEvent {
+                scancode: 0x2a,
+                make: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_millis(200)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x2a,
+                make: true
+            }))
+        ));
+        let drop_at = Instant::now();
+        drop(stream1);
+        assert!(matches!(
+            recv_input_with_timeout(&mut server.input_recv, Duration::from_millis(35)),
+            Some(InputData::Keyboard(KeyboardData {
+                code: 0x2a,
+                make: false
+            }))
+        ));
+        let drop_elapsed = drop_at.elapsed();
+        assert!(
+            drop_elapsed < Duration::from_millis(35),
+            "client disconnect stalled during accept backoff: {drop_elapsed:?}"
+        );
+
+        // Once the 50ms backoff elapses, stream2 should be accepted cleanly.
+        let mut stream2 = stream2_raw;
+        let hello2 = read_server_msg(&mut stream2).unwrap();
+        assert!(matches!(hello2, ServerMsg::ServerHello { .. }));
+        write_client_msg(
+            &mut stream2,
+            &ClientMsg::ClientHello {
+                capabilities: CAP_ALL,
+                prefer_shm: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_server_msg(&mut stream2).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+        assert!(
+            err_at.elapsed() >= Duration::from_millis(40),
+            "accept resumed too early without 50ms backoff: {:?}",
+            err_at.elapsed()
+        );
+        let calls_after_resume = accept_calls.load(Ordering::Acquire);
+        assert!(
+            (calls_at_err + 1..=calls_at_err + 2).contains(&calls_after_resume),
+            "expected 1 accept (plus optional WouldBlock drain), got {} (from {})",
+            calls_after_resume,
+            calls_at_err
+        );
+
+        drop(stream2);
         server.stop();
     }
 }
