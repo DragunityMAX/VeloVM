@@ -15,6 +15,36 @@ struct CursorState {
     prev_drawn: Option<(i32, i32, u16, u16)>,
 }
 
+pub const MAX_FB_DIM: u16 = 16384;
+pub const MAX_FB_PIXELS: usize = 16384 * 8640;
+
+fn validate_dims(width: u16, height: u16, stride: u32) -> anyhow::Result<usize> {
+    if width == 0
+        || height == 0
+        || width > MAX_FB_DIM
+        || height > MAX_FB_DIM
+        || (stride as usize) < (width as usize * 4)
+    {
+        anyhow::bail!(
+            "invalid compositor dimensions: {}x{} stride {}",
+            width,
+            height,
+            stride
+        );
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow::anyhow!("compositor pixel count overflow: {width}x{height}"))?;
+    if pixels > MAX_FB_PIXELS {
+        anyhow::bail!(
+            "compositor framebuffer exceeds pixel limit: {}x{} ({pixels} > {MAX_FB_PIXELS})",
+            width,
+            height
+        );
+    }
+    Ok(pixels)
+}
+
 pub struct DesktopCompositor {
     pub width: u16,
     pub height: u16,
@@ -35,15 +65,7 @@ impl DesktopCompositor {
         shm_path: Option<&str>,
         allow_shm: bool,
     ) -> anyhow::Result<Self> {
-        if width == 0 || height == 0 || (stride as usize) < (width as usize * 4) {
-            anyhow::bail!(
-                "invalid compositor dimensions: {}x{} stride {}",
-                width,
-                height,
-                stride
-            );
-        }
-        let len = width as usize * height as usize;
+        let len = validate_dims(width, height, stride)?;
         let mut comp = Self {
             width,
             height,
@@ -98,12 +120,12 @@ impl DesktopCompositor {
         offset: u32,
         shm_path: Option<&str>,
         allow_shm: bool,
-    ) {
+    ) -> anyhow::Result<()> {
+        let len = validate_dims(width, height, stride)?;
         self.width = width;
         self.height = height;
         self.stride = stride;
         self.offset = offset;
-        let len = width as usize * height as usize;
         self.backing_fb.resize(len, 0);
         self.backing_fb.fill(0);
         self.present_fb.resize(len, 0);
@@ -118,6 +140,7 @@ impl DesktopCompositor {
         } else {
             self.shm_mmap = None;
         }
+        Ok(())
     }
 
     pub fn set_cursor_position(&mut self, visible: bool, x: i32, y: i32) {
@@ -539,5 +562,40 @@ mod tests {
         assert_eq!(comp.cursor.width, 2);
         assert_eq!(comp.cursor.height, 2);
         assert_eq!(comp.cursor.bgra, valid_raw);
+    }
+
+    #[test]
+    fn new_and_resize_reject_invalid_and_oversized_dimensions_without_mutating_state() {
+        assert!(DesktopCompositor::new(0, 1080, 1920 * 4, 0, None, false).is_err());
+        assert!(DesktopCompositor::new(1920, 0, 1920 * 4, 0, None, false).is_err());
+        assert!(DesktopCompositor::new(1920, 1080, 4, 0, None, false).is_err());
+        assert!(DesktopCompositor::new(65535, 65535, 65535 * 4, 0, None, false).is_err());
+        assert!(DesktopCompositor::new(16384, 16384, 16384 * 4, 0, None, false).is_err());
+
+        let mut comp = DesktopCompositor::new(16, 16, 16 * 4, 128, None, false).unwrap();
+        comp.backing_fb[0] = 0x00abcdef;
+        comp.present_fb[0] = 0x00abcdef;
+
+        for (w, h, stride) in [
+            (0u16, 0u16, 0u32),
+            (0, 16, 64),
+            (16, 0, 64),
+            (16, 16, 16 * 4 - 1),
+            (65535, 65535, 65535 * 4),
+            (16384, 16384, 16384 * 4),
+        ] {
+            assert!(
+                comp.resize(w, h, stride, 0, None, false).is_err(),
+                "expected resize({w}, {h}, {stride}) to fail"
+            );
+            assert_eq!(comp.width, 16);
+            assert_eq!(comp.height, 16);
+            assert_eq!(comp.stride, 64);
+            assert_eq!(comp.offset, 128);
+            assert_eq!(comp.backing_fb.len(), 256);
+            assert_eq!(comp.present_fb.len(), 256);
+            assert_eq!(comp.backing_fb[0], 0x00abcdef);
+            assert_eq!(comp.present_fb[0], 0x00abcdef);
+        }
     }
 }
