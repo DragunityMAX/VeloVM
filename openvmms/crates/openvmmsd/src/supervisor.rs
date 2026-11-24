@@ -119,6 +119,21 @@ struct ManagedVm {
     deleting: bool,
 }
 
+impl ManagedVm {
+    fn next_free_lun(&self) -> u32 {
+        (0..=255)
+            .find(|&l| {
+                !self
+                    .config
+                    .disks
+                    .iter()
+                    .chain(self.pending_disks.iter())
+                    .any(|d| d.lun == l)
+            })
+            .unwrap_or(256)
+    }
+}
+
 impl Drop for ManagedVm {
     fn drop(&mut self) {
         if let Some(tx) = self.monitor_cancel.take() {
@@ -3330,17 +3345,7 @@ impl Supervisor {
                         .get(&id)
                         .ok_or_else(|| err_not_found("VM not found"))?;
                     let active_sock = vm.active_rpc_socket("attach disk")?;
-                    let lun = req.lun.unwrap_or_else(|| {
-                        (0..=255)
-                            .find(|&l| {
-                                !vm.config
-                                    .disks
-                                    .iter()
-                                    .chain(vm.pending_disks.iter())
-                                    .any(|d| d.lun == l)
-                            })
-                            .unwrap_or(256)
-                    });
+                    let lun = req.lun.unwrap_or_else(|| vm.next_free_lun());
                     if lun > 255 {
                         return Err(err_bad_request(format!(
                             "SCSI LUN must be 0..=255 (got {lun})"
@@ -3916,19 +3921,24 @@ impl Supervisor {
                         .ok_or_else(|| err_not_found("VM not found"))?;
                     let active_sock = vm.active_rpc_socket("mount ISO")?;
                     let (target_lun, previous_dvd) = match req.lun {
-                        Some(l) => match vm.config.disks.iter().find(|d| d.lun == l) {
-                            Some(d) if d.kind != DiskKind::Dvd => {
-                                return Err(err_conflict(format!(
-                                    "SCSI LUN {l} is occupied by a non-DVD disk ({}); specify a different LUN or omit --lun",
-                                    d.path.display()
-                                )));
+                        Some(l) => {
+                            if vm.pending_disks.iter().any(|d| d.lun == l) {
+                                return Err(err_conflict(format!("SCSI LUN {l} is already occupied")));
                             }
-                            Some(d) => (d.lun, Some(d.clone())),
-                            None => (l, None),
-                        },
+                            match vm.config.disks.iter().find(|d| d.lun == l) {
+                                Some(d) if d.kind != DiskKind::Dvd => {
+                                    return Err(err_conflict(format!(
+                                        "SCSI LUN {l} is occupied by a non-DVD disk ({}); specify a different LUN or omit --lun",
+                                        d.path.display()
+                                    )));
+                                }
+                                Some(d) => (d.lun, Some(d.clone())),
+                                None => (l, None),
+                            }
+                        }
                         None => match vm.config.disks.iter().find(|d| d.kind == DiskKind::Dvd) {
                             Some(d) => (d.lun, Some(d.clone())),
-                            None => (vm.config.next_free_lun(), None),
+                            None => (vm.next_free_lun(), None),
                         },
                     };
                     if target_lun > 255 {
@@ -9293,5 +9303,124 @@ mod tests {
         );
         sup.mark_shutting_down();
         sup.join_all_listeners().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mount_iso_skips_pending_disk_luns_when_auto_allocating() {
+        use openvmms_core::ttrpc::{encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let os_disk = dir.path().join("os.img");
+        let pending_disk = dir.path().join("pending.img");
+        let iso_path = dir.path().join("installer.iso");
+        fs::write(&os_disk, vec![0u8; 4096]).unwrap();
+        fs::write(&pending_disk, vec![0u8; 4096]).unwrap();
+        fs::write(&iso_path, vec![0u8; 4096]).unwrap();
+
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "IsoPendingLun".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm_id = vm.config.id;
+        sup.attach_disk(
+            &vm_id.to_string(),
+            AttachDiskPayload {
+                lun: Some(0),
+                path: os_disk,
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+        .unwrap();
+
+        let sock_path = dir.path().join("iso-pending-lun.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (stream_id, _, _) = read_frame(&mut stream).unwrap();
+            let resp = TestWireResponse {
+                result: Some(test_wire_response::Result::Payload(Vec::new())),
+            };
+            let frame = encode_frame(stream_id, 2, &resp.encode_to_vec()).unwrap();
+            stream.write_all(&frame).unwrap();
+            stream.flush().unwrap();
+        });
+
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let entry = guard.get_mut(&vm_id).unwrap();
+            entry.runtime.status = VmStatus::Running;
+            entry.runtime.rpc_socket_path = Some(sock_path);
+            entry.generation = 1;
+            entry.pending_disks.push(DiskAttachment {
+                lun: 1,
+                kind: DiskKind::HardDisk,
+                path: pending_disk,
+                read_only: false,
+                format: DiskFormat::Raw,
+            });
+        }
+
+        // Explicit LUN 1 targeting a pending reservation must return 409 Conflict.
+        let err = sup
+            .mount_iso(
+                &vm_id.to_string(),
+                MountIsoPayload {
+                    path: iso_path.clone(),
+                    lun: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::Conflict(_))),
+            "expected Conflict error, got {err:#}"
+        );
+
+        // Auto-allocated LUN (`lun: None`) must skip LUN 0 (config) and LUN 1 (pending) -> LUN 2.
+        let updated = sup
+            .mount_iso(
+                &vm_id.to_string(),
+                MountIsoPayload {
+                    path: iso_path,
+                    lun: None,
+                },
+            )
+            .await
+            .unwrap();
+        let dvd = updated
+            .config
+            .disks
+            .iter()
+            .find(|d| d.kind == DiskKind::Dvd)
+            .expect("DVD disk should be attached");
+        assert_eq!(dvd.lun, 2);
+        server.join().unwrap();
     }
 }
