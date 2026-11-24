@@ -238,7 +238,7 @@ fn libc_einval() -> i32 {
 
 #[cfg(not(windows))]
 fn connect_hvsock(_vm_id: [u8; 16], _service_id: [u8; 16]) -> anyhow::Result<TransportStream> {
-    bail!("hvsock:// is only supported on Windows hosts/guests")
+    bail!("hvsock:// is only supported on Windows; use tcp:// (+ --shm) on Linux and macOS")
 }
 
 #[cfg(target_os = "linux")]
@@ -276,7 +276,9 @@ fn connect_vsock(cid: u32, port: u32) -> anyhow::Result<TransportStream> {
 
 #[cfg(not(target_os = "linux"))]
 fn connect_vsock(_cid: u32, _port: u32) -> anyhow::Result<TransportStream> {
-    bail!("vsock:// is only supported on Linux; use hvsock:// on Windows")
+    bail!(
+        "vsock:// is only supported on Linux; use hvsock:// on Windows or tcp:// (+ --shm) on macOS"
+    )
 }
 
 #[cfg(test)]

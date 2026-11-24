@@ -724,12 +724,426 @@ jobs:
           path: dist/openvmm-fastdesk-linux-x64.tar.gz
           if-no-files-found: error
 
+  build-macos-arm64:
+    name: Build & Package macOS Apple Silicon (HVF)
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install system build dependencies
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+
+      - name: Expose llvm-objcopy and llvm-nm for vTPM build
+        run: |
+          set -euo pipefail
+          HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+          LLVM_TOOLS_BIN="$(rustc --print sysroot)/lib/rustlib/${HOST_TRIPLE}/bin"
+          LLVM_SHIM_DIR="$RUNNER_TEMP/llvm-binutils"
+          mkdir -p "$LLVM_SHIM_DIR"
+          test -x "$LLVM_TOOLS_BIN/llvm-objcopy"
+          test -x "$LLVM_TOOLS_BIN/llvm-nm"
+
+          cat > "$LLVM_SHIM_DIR/llvm-nm" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          REAL_NM="$LLVM_TOOLS_BIN/llvm-nm"
+          has_posix=0
+          for arg in "\$@"; do
+            if [[ "\$arg" == "--format=posix" ]]; then
+              has_posix=1
+              break
+            fi
+          done
+          if [[ "\$has_posix" -eq 1 ]]; then
+            "\$REAL_NM" "\$@" | awk '!/:$/ && /^[ \t]*_/ { sub(/^[ \t]*_/, "") } { print }'
+          else
+            exec "\$REAL_NM" "\$@"
+          fi
+          EOF
+
+          cat > "$LLVM_SHIM_DIR/llvm-objcopy" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          REAL_OBJCOPY="$LLVM_TOOLS_BIN/llvm-objcopy"
+          TMP_MAP=""
+          cleanup() {
+            if [[ -n "\$TMP_MAP" ]]; then
+              rm -f "\$TMP_MAP"
+            fi
+          }
+          trap cleanup EXIT
+          ARGS=()
+          for arg in "\$@"; do
+            case "\$arg" in
+              --redefine-syms=*)
+                SRC="\${arg#--redefine-syms=}"
+                TMP_MAP="\$(mktemp)"
+                awk 'NF >= 2 { print "_" \$1 " _" \$2 }' "\$SRC" > "\$TMP_MAP"
+                ARGS+=("--redefine-syms=\$TMP_MAP")
+                ;;
+              *)
+                ARGS+=("\$arg")
+                ;;
+            esac
+          done
+          if [[ -n "\$TMP_MAP" ]]; then
+            "\$REAL_OBJCOPY" "\${ARGS[@]}"
+          else
+            exec "\$REAL_OBJCOPY" "\$@"
+          fi
+          EOF
+
+          chmod +x "$LLVM_SHIM_DIR/llvm-objcopy" "$LLVM_SHIM_DIR/llvm-nm"
+          "$LLVM_SHIM_DIR/llvm-objcopy" --version
+          "$LLVM_SHIM_DIR/llvm-nm" --version
+          echo "$LLVM_SHIM_DIR" >> "$GITHUB_PATH"
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            openvmm -> openvmm/target
+            openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
+            fastdesk-viewer -> fastdesk-viewer/target
+            openvmms -> openvmms/target
+
+      - name: Download protoc and mu_msvm ARM64 UEFI firmware
+        run: |
+          set -euo pipefail
+          TOOLS_ROOT="$RUNNER_TEMP/fastdesk-tools"
+          PROTOC_DIR="$TOOLS_ROOT/protoc"
+          MSVM_DIR="$TOOLS_ROOT/mu_msvm"
+          mkdir -p "$PROTOC_DIR" "$MSVM_DIR"
+
+          # 1. protoc (Google.Protobuf.Tools layout used by openvmm/.cargo/config.toml)
+          curl --fail --retry 3 -sSLo "$TOOLS_ROOT/protoc-macos.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-universal_binary.zip"
+          unzip -q -o "$TOOLS_ROOT/protoc-macos.zip" -d "$PROTOC_DIR"
+          chmod +x "$PROTOC_DIR/bin/protoc"
+
+          PROTOC_TOOLS="$PWD/openvmm/.packages/Google.Protobuf.Tools/tools"
+          mkdir -p "$PROTOC_TOOLS"
+          ln -sf "$PROTOC_DIR/bin/protoc" "$PROTOC_TOOLS/protoc"
+          rm -rf "$PROTOC_TOOLS/include"
+          ln -s "$PROTOC_DIR/include" "$PROTOC_TOOLS/include"
+          echo "$PROTOC_TOOLS" >> "$GITHUB_PATH"
+
+          # 2. mu_msvm AARCH64 UEFI firmware (MSVM.fd)
+          curl --fail --retry 3 -sSLo "$TOOLS_ROOT/mu_msvm.tar.gz" \
+            "https://github.com/microsoft/mu_msvm/releases/download/v${MU_MSVM_VERSION}/firmware-RELEASE-AARCH64-CLANGPDB.tar.gz"
+          tar -xzf "$TOOLS_ROOT/mu_msvm.tar.gz" -C "$MSVM_DIR"
+          test -f "$MSVM_DIR/FV/MSVM.fd"
+
+          MSVM_MAGIC_DIR="openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV"
+          mkdir -p "$MSVM_MAGIC_DIR"
+          cp -f "$MSVM_DIR/FV/MSVM.fd" "$MSVM_MAGIC_DIR/MSVM.fd"
+
+      - name: Run fastdesk_proto tests
+        working-directory: openvmm/workers/fastdesk_proto
+        run: cargo test
+
+      - name: Run OpenVMM display and FastDesk worker tests
+        working-directory: openvmm
+        run: cargo test -p mesh_rpc -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
+
+      - name: Run fastdesk-viewer tests
+        working-directory: fastdesk-viewer
+        run: cargo test
+
+      - name: Build and sign OpenVMM release binaries
+        working-directory: openvmm
+        run: |
+          cargo build -p openvmm --features tpm --release
+          cargo build -p openvmm-img --release
+          codesign --entitlements build_support/macos/entitlements.xml -f -s - target/release/openvmm
+          codesign -d --entitlements :- target/release/openvmm
+
+      - name: Build fastdesk-viewer release binary
+        working-directory: fastdesk-viewer
+        run: cargo build --release
+
+      - name: Run openvmms tests
+        working-directory: openvmms
+        env:
+          OPENVMM_REQUIRE_REAL_BINARY: "1"
+        run: cargo test
+
+      - name: Build openvmms release binaries
+        working-directory: openvmms
+        run: cargo build --release
+
+      - name: Smoke-test and benchmark macOS arm64 binaries
+        run: |
+          set -euo pipefail
+          HELP_TEXT="$(./openvmm/target/release/openvmm --help)"
+          for flag in --fastdesk --fastdesk-shm --fastdesk-vsock-port --vram-mb --tpm; do
+            if [[ "$HELP_TEXT" != *"$flag"* ]]; then
+              echo "Missing expected flag: $flag" >&2
+              exit 1
+            fi
+          done
+
+          ./openvmm/target/release/openvmm-img --help >/dev/null
+          ./openvmms/target/release/openvmmsd --help >/dev/null
+          ./openvmms/target/release/openvmms --help >/dev/null
+          ./openvmms/target/release/openvmms-gui --self-test | grep "SELF-TEST OK" >/dev/null
+
+          /bin/bash -n scripts/start-openvmm-fastdesk.sh
+          /bin/bash scripts/start-openvmm-fastdesk.sh --help >/dev/null
+
+          AUTO_DIR="$RUNNER_TEMP/openvmms-autostart-macos"
+          rm -rf "$AUTO_DIR"
+          mkdir -p "$AUTO_DIR"
+          cleanup_auto() {
+            ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --no-auto-start daemon stop >/dev/null 2>&1 || true
+            rm -rf "$AUTO_DIR"
+          }
+          trap cleanup_auto EXIT
+          python3 - "$AUTO_DIR" <<'PY'
+          import subprocess, sys
+          auto_dir = sys.argv[1]
+          res = subprocess.run(
+              ["./openvmms/target/release/openvmms", "--data-dir", auto_dir, "--json", "vm", "list"],
+              capture_output=True,
+              text=True,
+              timeout=15,
+          )
+          if res.returncode != 0 or "[]" not in res.stdout:
+              raise SystemExit(f"auto-start check failed (rc={res.returncode}):\nstdout={res.stdout}\nstderr={res.stderr}")
+          PY
+          cleanup_auto
+          trap - EXIT
+
+          SMOKE_DIR="/tmp/openvmms-smoke-macos-$$"
+          rm -rf "$SMOKE_DIR"
+          mkdir -p "$SMOKE_DIR"
+          SMOKE_PORT=47693
+          ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+            >"$SMOKE_DIR/daemon1.log" 2>&1 &
+          SMOKE_PID=$!
+          cleanup_smoke() {
+            kill "$SMOKE_PID" 2>/dev/null || true
+            wait "$SMOKE_PID" 2>/dev/null || true
+            rm -rf "$SMOKE_DIR"
+          }
+          trap cleanup_smoke EXIT
+          wait_for_health() {
+            local log_file="$1"
+            for _ in $(seq 1 150); do
+              if curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/v1/health" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 0.1
+            done
+            echo "Timed out waiting for openvmmsd /api/v1/health ($log_file):" >&2
+            cat "$log_file" >&2 || true
+            return 1
+          }
+          wait_for_pid_exit() {
+            local pid="$1"
+            for _ in $(seq 1 150); do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid"
+                return $?
+              fi
+              sleep 0.1
+            done
+            echo "Timed out waiting for openvmmsd PID $pid to exit" >&2
+            kill -9 "$pid" 2>/dev/null || true
+            return 1
+          }
+          wait_for_health "$SMOKE_DIR/daemon1.log"
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            disk create "$SMOKE_DIR/smoke.img" --size 16M --format raw >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            disk create "$SMOKE_DIR/smoke.vhdx" --size 64M --format vhdx >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            disk info "$SMOKE_DIR/smoke.vhdx" | grep '"format": "vhdx"' >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm list | grep "Smoke-VM" >/dev/null
+
+          if ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              vm start "Smoke-VM" >/dev/null 2>&1; then
+            echo "macOS smoke check branch: HVF available — Smoke-VM booted and running"
+            SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
+            echo "$SHOW_JSON" | grep -q '"status": "running"'
+            echo "$SHOW_JSON" | grep -q '"fastdesk_endpoint": "tcp://'
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              vm pause "Smoke-VM" >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-VM" | grep '"status": "paused"' >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              vm resume "Smoke-VM" >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
+
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              daemon stop >/dev/null
+            wait_for_pid_exit "$SMOKE_PID"
+            RUST_LOG=info ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+              >"$SMOKE_DIR/daemon2.log" 2>&1 &
+            SMOKE_PID=$!
+            wait_for_health "$SMOKE_DIR/daemon2.log"
+            READOPTED=0
+            for _ in $(seq 1 100); do
+              if grep -q "re-adopted running OpenVMM VM" "$SMOKE_DIR/daemon2.log"; then
+                READOPTED=1
+                break
+              fi
+              sleep 0.1
+            done
+            if [ "$READOPTED" -ne 1 ]; then
+              echo "Timed out waiting for re-adoption log line in daemon2.log:" >&2
+              cat "$SMOKE_DIR/daemon2.log" >&2
+              exit 1
+            fi
+            if grep -qiE "wait VM already in flight|WaitVM returned error" "$SMOKE_DIR/daemon2.log"; then
+              echo "Unexpected WaitVM error after daemon restart in daemon2.log:" >&2
+              cat "$SMOKE_DIR/daemon2.log" >&2
+              exit 1
+            fi
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-VM" | grep '"status": "running"' >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              vm stop "Smoke-VM" >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-VM" | grep '"status": "off"' >/dev/null
+
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              vm create "Smoke-Win11-TPM" --preset win11 --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.vhdx" >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-Win11-TPM" | grep '"tpm_enabled": true' >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              vm start "Smoke-Win11-TPM" >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-Win11-TPM" | grep '"status": "running"' >/dev/null
+          else
+            echo "macOS smoke check branch: runner lacks nested HVF — verifying clean VM error recovery"
+            SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
+            echo "$SHOW_JSON" | grep -q '"status": "error"'
+            if ! echo "$SHOW_JSON" | grep -qiE "hypervisor|hvf|hv_|entitled|unsupported"; then
+              echo "Unexpected Smoke-VM error without nested HVF: $SHOW_JSON" >&2
+              exit 1
+            fi
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              vm stop "Smoke-VM" >/dev/null
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+              daemon stop >/dev/null
+            wait_for_pid_exit "$SMOKE_PID"
+            RUST_LOG=info ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+              >"$SMOKE_DIR/daemon2.log" 2>&1 &
+            SMOKE_PID=$!
+            wait_for_health "$SMOKE_DIR/daemon2.log"
+            ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+              vm show "Smoke-VM" | grep '"name": "Smoke-VM"' >/dev/null
+          fi
+
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            daemon stop --stop-vms >/dev/null
+          wait_for_pid_exit "$SMOKE_PID"
+          trap - EXIT
+          rm -rf "$SMOKE_DIR"
+
+          BENCH_FILE="$RUNNER_TEMP/bench-macos-arm64.txt"
+          ./fastdesk-viewer/target/release/fastdesk-viewer \
+            --bench --self-test --frames 200 --resolution 1920x1080 | tee "$BENCH_FILE"
+          grep -q "CHECKSUM OK" "$BENCH_FILE"
+
+          {
+            echo "## macOS Apple Silicon (\`aarch64-apple-darwin\`) Self-Test Benchmark"
+            echo '```text'
+            cat "$BENCH_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage turnkey macOS arm64 bundle
+        run: |
+          set -euo pipefail
+          BUNDLE="dist/openvmm-fastdesk-macos-arm64"
+          rm -rf "$BUNDLE"
+          mkdir -p "$BUNDLE/firmware"
+
+          cp -f "openvmm/target/release/openvmm" "$BUNDLE/openvmm"
+          cp -f "openvmm/target/release/openvmm-img" "$BUNDLE/openvmm-img"
+          cp -f "fastdesk-viewer/target/release/fastdesk-viewer" "$BUNDLE/fastdesk-viewer"
+          cp -f "openvmms/target/release/openvmmsd" "$BUNDLE/openvmmsd"
+          cp -f "openvmms/target/release/openvmms" "$BUNDLE/openvmms"
+          cp -f "openvmms/target/release/openvmms-gui" "$BUNDLE/openvmms-gui"
+          chmod +x \
+            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/fastdesk-viewer" \
+            "$BUNDLE/openvmmsd" "$BUNDLE/openvmms" "$BUNDLE/openvmms-gui"
+          codesign --entitlements openvmm/build_support/macos/entitlements.xml -f -s - "$BUNDLE/openvmm"
+          codesign -d --entitlements :- "$BUNDLE/openvmm"
+
+          cp -f "openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd" "$BUNDLE/firmware/MSVM.fd"
+          cp -f "openvmm/build_support/macos/entitlements.xml" "$BUNDLE/entitlements.xml"
+          cp -f "scripts/start-openvmm-fastdesk.sh" "$BUNDLE/start-openvmm-fastdesk.sh"
+          chmod +x "$BUNDLE/start-openvmm-fastdesk.sh"
+          cp -f "README.md" "$BUNDLE/README.md"
+
+          {
+            echo "OpenVMM FastDesk & OpenVMMS Bundle (macOS Apple Silicon)"
+            echo "Commit: $GITHUB_SHA"
+            echo "Ref: $GITHUB_REF_NAME"
+            echo "Built (UTC): $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Target: aarch64-apple-darwin"
+            echo "UEFI Firmware: microsoft/mu_msvm v${MU_MSVM_VERSION} ARM64 (firmware/MSVM.fd)"
+            echo ""
+            echo "First-run Gatekeeper / Entitlement note (if downloaded from a browser):"
+            echo "  xattr -dr com.apple.quarantine ."
+            echo "  codesign --entitlements entitlements.xml -f -s - ./openvmm  # already ad-hoc signed in bundle"
+            echo ""
+            echo "Quickstart (OpenVMMS GUI & CLI, ARM64 guests on macOS 13+ Apple Silicon):"
+            echo "  ./openvmms-gui"
+            echo "  ./openvmms vm create Linux-ARM64 --preset linux --create-disk 32G --iso /path/to/ubuntu-arm64.iso"
+            echo "  ./openvmms vm start Linux-ARM64"
+            echo "  ./openvmms vm connect Linux-ARM64"
+            echo ""
+            echo "Standalone Script Quickstart:"
+            echo "  ./start-openvmm-fastdesk.sh --disk /path/to/arm64.vhdx --memory 8G --cpus 4"
+            echo ""
+            echo "Self-Test Benchmark (1920x1080, 200 frames):"
+            cat "$RUNNER_TEMP/bench-macos-arm64.txt"
+          } > "$BUNDLE/BUILD_INFO.txt"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tar -C dist -czf dist/openvmm-fastdesk-macos-arm64.tar.gz openvmm-fastdesk-macos-arm64
+          fi
+
+      - name: Upload macOS arm64 artifact bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: openvmm-fastdesk-macos-arm64
+          path: dist/openvmm-fastdesk-macos-arm64/*
+          if-no-files-found: error
+
+      - name: Upload macOS arm64 release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-archive-macos-arm64
+          path: dist/openvmm-fastdesk-macos-arm64.tar.gz
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: [build-windows-x64, build-linux-x64]
+    needs: [build-windows-x64, build-linux-x64, build-macos-arm64]
     permissions:
       contents: write
 
@@ -754,5 +1168,6 @@ jobs:
           files: |
             release-assets/openvmm-fastdesk-windows-x64.zip
             release-assets/openvmm-fastdesk-linux-x64.tar.gz
+            release-assets/openvmm-fastdesk-macos-arm64.tar.gz
             release-assets/SHA256SUMS.txt
           generate_release_notes: true

@@ -1992,15 +1992,87 @@ impl Supervisor {
             }
             let path_keys = precompute_disk_path_keys(all_disk_paths);
             let existed_before = runtime_dir_to_prepare.exists();
-            fs::create_dir_all(&runtime_dir_to_prepare).with_context(|| {
+            #[cfg(unix)]
+            let is_managed_default =
+                openvmms_core::models::normalize_path_key(&runtime_dir_to_prepare)
+                    == openvmms_core::models::normalize_path_key(&managed_default_runtime_dir);
+            #[cfg(unix)]
+            if is_managed_default {
+                use std::os::unix::fs::MetadataExt;
+                let euid = openvmms_core::process::current_euid();
+                let mut check_dirs = vec![runtime_dir_to_prepare.clone()];
+                if let Some(parent) = runtime_dir_to_prepare.parent()
+                    && parent.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("openvmms-"))
+                {
+                    check_dirs.push(parent.to_path_buf());
+                }
+                for dir in &check_dirs {
+                    if let Ok(meta) = fs::symlink_metadata(dir) {
+                        if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != euid {
+                            anyhow::bail!(
+                                "unsafe managed runtime directory {} (must be an owned directory, not a symlink)",
+                                dir.display()
+                            );
+                        }
+                    }
+                }
+            }
+            let create_runtime_dir_res = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = fs::DirBuilder::new();
+                    builder.recursive(true);
+                    if is_managed_default || !existed_before {
+                        builder.mode(0o700);
+                    }
+                    builder.create(&runtime_dir_to_prepare)
+                }
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir_all(&runtime_dir_to_prepare)
+                }
+            };
+            create_runtime_dir_res.with_context(|| {
                 format!("creating runtime dir {}", runtime_dir_to_prepare.display())
             })?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let is_managed_default =
-                    openvmms_core::models::normalize_path_key(&runtime_dir_to_prepare)
-                        == openvmms_core::models::normalize_path_key(&managed_default_runtime_dir);
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if is_managed_default {
+                    let euid = openvmms_core::process::current_euid();
+                    let meta = fs::symlink_metadata(&runtime_dir_to_prepare).with_context(|| {
+                        format!("inspecting runtime dir {}", runtime_dir_to_prepare.display())
+                    })?;
+                    if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != euid {
+                        anyhow::bail!(
+                            "unsafe managed runtime directory {} (must be an owned directory, not a symlink)",
+                            runtime_dir_to_prepare.display()
+                        );
+                    }
+                    if let Some(parent) = runtime_dir_to_prepare.parent()
+                        && parent.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("openvmms-"))
+                    {
+                        let pmeta = fs::symlink_metadata(parent).with_context(|| {
+                            format!("inspecting runtime parent dir {}", parent.display())
+                        })?;
+                        if pmeta.file_type().is_symlink() || !pmeta.is_dir() || pmeta.uid() != euid {
+                            anyhow::bail!(
+                                "unsafe managed runtime parent directory {}",
+                                parent.display()
+                            );
+                        }
+                        if let Err(err) =
+                            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                        {
+                            warn!(
+                                path = %parent.display(),
+                                error = %err,
+                                "failed to set 0700 permissions on managed runtime parent dir"
+                            );
+                        }
+                    }
+                }
                 if !existed_before || is_managed_default {
                     if let Err(err) = fs::set_permissions(
                         &runtime_dir_to_prepare,

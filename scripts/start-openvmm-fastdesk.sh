@@ -22,7 +22,7 @@ Options:
   --memory <SIZE>     Guest RAM size (default: $MEMORY)
   --cpus <N>          Virtual processor count (default: $CPUS)
   --vram-mb <MB>      SynthVid framebuffer VRAM in MiB (default: $VRAM_MB)
-  --shm <PATH>        Shared-memory VRAM file path (default: unique /dev/shm/openvmm-fastdesk-<uid>/vram.shm.*, mode 0600)
+  --shm <PATH>        Shared-memory VRAM file path (default: unique /dev/shm or \$TMPDIR/openvmm-fastdesk-<uid>/vram.shm, mode 0600)
   --listen <ADDR>     FastDesk TCP listen address (default: $LISTEN_ADDR)
   -h, --help          Show this help
 EOF
@@ -130,27 +130,36 @@ VIEWER_BIN="$(resolve_first \
     exit 1
 }
 
+case "$(uname -m)" in
+    arm64|aarch64)
+        ARCH_UEFI_PKG="$SCRIPT_DIR/../openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd"
+        ;;
+    *)
+        ARCH_UEFI_PKG="$SCRIPT_DIR/../openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd"
+        ;;
+esac
+
 UEFI_FD="$(resolve_first \
     "$SCRIPT_DIR/firmware/MSVM.fd" \
-    "$SCRIPT_DIR/../openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd")" || {
+    "$ARCH_UEFI_PKG")" || {
     echo "Error: UEFI firmware MSVM.fd not found at $SCRIPT_DIR/firmware/MSVM.fd." >&2
     exit 1
 }
 
 VMM_PID=""
-VMM_READ_FD=""
-VMM_STDIN_FD=""
+VMM_READ_FD_OPEN=0
+VMM_STDIN_FD_OPEN=0
 VMM_FIFO_DIR=""
 SHM_RUN_DIR=""
 SHM_AUTO_CLEANUP=0
 cleanup() {
-    if [[ -n "${VMM_READ_FD:-}" ]]; then
-        exec {VMM_READ_FD}<&- 2>/dev/null || true
-        VMM_READ_FD=""
+    if [[ "$VMM_READ_FD_OPEN" -eq 1 ]]; then
+        exec 8<&- 2>/dev/null || true
+        VMM_READ_FD_OPEN=0
     fi
-    if [[ -n "${VMM_STDIN_FD:-}" ]]; then
-        exec {VMM_STDIN_FD}>&- 2>/dev/null || true
-        VMM_STDIN_FD=""
+    if [[ "$VMM_STDIN_FD_OPEN" -eq 1 ]]; then
+        exec 9>&- 2>/dev/null || true
+        VMM_STDIN_FD_OPEN=0
     fi
     if [[ -n "${VMM_FIFO_DIR:-}" ]]; then
         rm -rf -- "$VMM_FIFO_DIR" 2>/dev/null || true
@@ -178,7 +187,9 @@ if [[ "$SHM_CUSTOM" -eq 0 ]]; then
     if [[ -d /dev/shm && -w /dev/shm ]]; then
         SHM_BASE="/dev/shm"
     else
-        SHM_BASE="${XDG_RUNTIME_DIR:-/tmp}"
+        SHM_BASE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+        SHM_BASE="${SHM_BASE%/}"
+        [[ -z "$SHM_BASE" ]] && SHM_BASE="/tmp"
     fi
     SHM_DIR="${SHM_BASE}/openvmm-fastdesk-$(id -u)"
     (umask 077 && mkdir -p "$SHM_DIR")
@@ -256,7 +267,7 @@ if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 655
     exit 1
 fi
 
-LISTEN_HOST_LC="${LISTEN_HOST,,}"
+LISTEN_HOST_LC="$(printf '%s' "$LISTEN_HOST" | tr '[:upper:]' '[:lower:]')"
 if [[ "$LISTEN_HOST_LC" == "0.0.0.0" || "$LISTEN_HOST_LC" == "::ffff:0.0.0.0" || "$LISTEN_HOST_LC" == "0:0:0:0:0:ffff:0.0.0.0" ]]; then
     VIEWER_ADDR="127.0.0.1:${LISTEN_PORT}"
 elif [[ "$LISTEN_HOST_LC" == *:*:* && "$LISTEN_HOST_LC" =~ ^[0:]+$ ]]; then
@@ -311,30 +322,38 @@ is_tcp_listening() {
     elif command -v ss >/dev/null 2>&1; then
         ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep "LISTEN" >/dev/null
         return $?
+    elif command -v lsof >/dev/null 2>&1; then
+        [[ -n "${VMM_PID:-}" ]] && lsof -nP -a -p "$VMM_PID" -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
     fi
     return 1
 }
 
-VMM_FIFO_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/openvmm-fastdesk-stdin.XXXXXXXXXX")"
+FIFO_TMP="${TMPDIR:-/tmp}"
+FIFO_TMP="${FIFO_TMP%/}"
+[[ -z "$FIFO_TMP" ]] && FIFO_TMP="/tmp"
+VMM_FIFO_DIR="$(umask 077 && mktemp -d "${FIFO_TMP}/openvmm-fastdesk-stdin.XXXXXXXXXX")"
 VMM_FIFO_PATH="${VMM_FIFO_DIR}/stdin.fifo"
 mkfifo -m 0600 "$VMM_FIFO_PATH"
-exec {VMM_HOLD_FD}<>"$VMM_FIFO_PATH"
-exec {VMM_READ_FD}<"$VMM_FIFO_PATH"
-exec {VMM_STDIN_FD}>"$VMM_FIFO_PATH"
-exec {VMM_HOLD_FD}>&-
+exec 7<>"$VMM_FIFO_PATH"
+exec 8<"$VMM_FIFO_PATH"
+VMM_READ_FD_OPEN=1
+exec 9>"$VMM_FIFO_PATH"
+VMM_STDIN_FD_OPEN=1
+exec 7>&-
 rm -rf -- "$VMM_FIFO_DIR"
 VMM_FIFO_DIR=""
 
 echo "Starting OpenVMM FastDesk (${VRAM_MB} MiB VRAM, SHM=${SHM_PATH})..."
 (
-    exec <&"$VMM_READ_FD"
-    exec {VMM_READ_FD}<&-
-    exec {VMM_STDIN_FD}>&-
+    exec <&8
+    exec 8<&-
+    exec 9>&-
     exec "$OPENVMM_BIN" "${VMM_ARGS[@]}"
 ) &
 VMM_PID=$!
-exec {VMM_READ_FD}<&-
-VMM_READ_FD=""
+exec 8<&-
+VMM_READ_FD_OPEN=0
 
 echo "Waiting for OpenVMM FastDesk listener on ${LISTEN_ADDR}..."
 START_MS="$(now_ms)"

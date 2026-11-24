@@ -177,7 +177,29 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 pub fn default_runtime_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("run")
+    #[cfg(target_os = "macos")]
+    {
+        use sha2::Digest;
+        let uid = unsafe { libc::geteuid() };
+        let base = PathBuf::from(format!("/tmp/openvmms-{uid}"));
+        if data_dir == default_data_dir() {
+            return base;
+        }
+        let candidate = data_dir.join("run");
+        if validate_runtime_dir(&candidate).is_ok() {
+            return candidate;
+        }
+        let digest = sha2::Sha256::digest(data_dir.to_string_lossy().as_bytes());
+        let prefix = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            digest[0], digest[1], digest[2], digest[3]
+        );
+        base.join(prefix)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        data_dir.join("run")
+    }
 }
 
 /// Validates that `runtime_dir` can host OpenVMM `AF_UNIX` ttrpc sockets and
@@ -340,17 +362,32 @@ pub fn resolve_host_paths(cfg: &HostConfig) -> ResolvedHostPaths {
         ],
     );
 
+    let (fw_env_var, fw_rel_paths): (&str, &[&str]) = if cfg!(target_arch = "aarch64") {
+        (
+            "AARCH64_OPENVMM_UEFI_FIRMWARE",
+            &[
+                "firmware/MSVM.fd",
+                "openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd",
+            ],
+        )
+    } else {
+        (
+            "X86_64_OPENVMM_UEFI_FIRMWARE",
+            &[
+                "firmware/MSVM.fd",
+                "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
+            ],
+        )
+    };
+
     let uefi_firmware_path = resolve_file_candidate(
         cfg.uefi_firmware_path.as_deref(),
         exe_dir.as_deref(),
         cwd.as_deref(),
-        std::env::var_os("X86_64_OPENVMM_UEFI_FIRMWARE")
+        std::env::var_os(fw_env_var)
             .map(PathBuf::from)
             .as_deref(),
-        &[
-            "firmware/MSVM.fd",
-            "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd",
-        ],
+        fw_rel_paths,
     );
 
     ResolvedHostPaths {
@@ -2403,5 +2440,50 @@ mod tests {
             };
             cfg.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn default_runtime_dir_for_default_data_dir_passes_af_unix_validation() {
+        let rt = default_runtime_dir(&default_data_dir());
+        validate_runtime_dir(&rt).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                rt.to_string_lossy().starts_with("/tmp/openvmms-"),
+                "expected short /tmp/openvmms-<uid> runtime_dir on macOS, got {}",
+                rt.display()
+            );
+            let long_data = PathBuf::from(format!("/Users/someone/Library/Application Support/{}", "a".repeat(60)));
+            let hashed = default_runtime_dir(&long_data);
+            validate_runtime_dir(&hashed).unwrap();
+            assert!(hashed.starts_with(&rt));
+        }
+    }
+
+    #[test]
+    fn resolve_file_candidate_discovers_arch_appropriate_msvm_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_ws = dir.path().join("repo/openvmms");
+        let exe_dir = cargo_ws.join("target/debug/deps");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(cargo_ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let rel = if cfg!(target_arch = "aarch64") {
+            "openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd"
+        } else {
+            "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd"
+        };
+        let fw = dir.path().join("repo").join(rel);
+        std::fs::create_dir_all(fw.parent().unwrap()).unwrap();
+        std::fs::write(&fw, b"uefi").unwrap();
+
+        let found = resolve_file_candidate(
+            None,
+            Some(&exe_dir),
+            None,
+            None,
+            &["firmware/MSVM.fd", rel],
+        );
+        assert_eq!(found, Some(fw));
     }
 }

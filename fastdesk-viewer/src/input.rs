@@ -26,6 +26,7 @@ pub enum ScrollBackend {
     X11,
     Wayland,
     Windows,
+    AppKit,
     Other,
 }
 
@@ -35,6 +36,7 @@ impl ScrollBackend {
             Ok(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_)) => Self::X11,
             Ok(RawDisplayHandle::Wayland(_)) => Self::Wayland,
             Ok(RawDisplayHandle::Windows(_)) => Self::Windows,
+            Ok(RawDisplayHandle::AppKit(_)) => Self::AppKit,
             _ => Self::Other,
         }
     }
@@ -47,6 +49,8 @@ impl ScrollBackend {
             Self::Windows => raw_dy / 12.0,
             // minifb Wayland passes surface-space wl_pointer::Axis directly (+ is down, ~10 per detent).
             Self::Wayland => -raw_dy / 10.0,
+            // minifb macOS passes NSEvent.deltaY directly.
+            Self::AppKit => raw_dy,
             Self::Other => raw_dy,
         }
     }
@@ -551,6 +555,12 @@ mod tests {
         let mut x11 = InputTracker::default();
         assert_eq!(x11.accumulate_scroll(1.0, ScrollBackend::X11), 1);
         assert_eq!(x11.accumulate_scroll(-1.0, ScrollBackend::X11), -1);
+
+        let mut appkit = InputTracker::default();
+        assert_eq!(appkit.accumulate_scroll(1.0, ScrollBackend::AppKit), 1);
+        assert_eq!(appkit.accumulate_scroll(-1.0, ScrollBackend::AppKit), -1);
+        assert_eq!(appkit.accumulate_scroll(0.5, ScrollBackend::AppKit), 0);
+        assert_eq!(appkit.accumulate_scroll(0.5, ScrollBackend::AppKit), 1);
 
         let mut win = InputTracker::default();
         assert_eq!(win.accumulate_scroll(12.0, ScrollBackend::Windows), 1);

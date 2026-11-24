@@ -13,10 +13,12 @@ lz4_flex = { version = "0.11", default-features = false, features = ["safe-encod
 memmap2 = "0.9"
 minifb = "0.29"
 raw-window-handle = "0.6"
-socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
