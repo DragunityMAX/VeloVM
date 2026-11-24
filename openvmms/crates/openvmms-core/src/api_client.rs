@@ -48,6 +48,7 @@ pub fn is_pre_request_connect_error(err: &anyhow::Error) -> bool {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     base_url: String,
+    expected_addr: std::net::SocketAddr,
     token: String,
     client: reqwest::blocking::Client,
 }
@@ -63,9 +64,10 @@ struct HealthCheckBody {
 
 impl ApiClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> anyhow::Result<Self> {
-        let base_url = validate_daemon_base_url(&base_url.into())?;
+        let (base_url, expected_addr) = parse_daemon_base_url(&base_url.into())?;
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             // Disable reqwest's 30 s default client timeout so `post_no_timeout` (fixed disk
             // creation) can wait arbitrarily long; every other call sets its own timeout.
@@ -74,6 +76,7 @@ impl ApiClient {
             .context("building HTTP client")?;
         Ok(Self {
             base_url,
+            expected_addr,
             token: token.into(),
             client,
         })
@@ -144,6 +147,12 @@ impl ApiClient {
         let remote_addr = resp
             .remote_addr()
             .context("cannot verify daemon health proof without remote socket address")?;
+        if remote_addr != self.expected_addr {
+            bail!(
+                "daemon health response came from unexpected address {remote_addr} (expected {})",
+                self.expected_addr
+            );
+        }
         let body: HealthCheckBody = resp
             .json()
             .context("decoding openvmmsd health response")?;
@@ -679,13 +688,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn validate_daemon_base_url(raw: &str) -> anyhow::Result<String> {
+fn parse_daemon_base_url(raw: &str) -> anyhow::Result<(String, std::net::SocketAddr)> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         bail!("daemon URL cannot be empty");
     }
     let addr = crate::models::parse_loopback_listen_addr(trimmed)?;
-    Ok(format!("http://{addr}"))
+    Ok((format!("http://{addr}"), addr))
 }
 
 pub fn normalize_base_url(listen_or_url: &str) -> String {
@@ -1379,6 +1388,75 @@ mod tests {
         );
         real_srv.join().unwrap();
         relay_srv.join().unwrap();
+    }
+
+    #[test]
+    fn client_rejects_health_redirect_and_does_not_leak_token() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let real_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let real_addr = real_listener.local_addr().unwrap();
+        let redirect_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let token = "secret-bearer-token";
+
+        let saw_auth = Arc::new(AtomicBool::new(false));
+        let saw_auth_srv = Arc::clone(&saw_auth);
+        let saw_real_hit = Arc::new(AtomicBool::new(false));
+        let saw_real_hit_srv = Arc::clone(&saw_real_hit);
+
+        let real_srv = std::thread::spawn(move || {
+            real_listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_millis(300);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = real_listener.accept() {
+                    saw_real_hit_srv.store(true, Ordering::SeqCst);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let redirect_srv = std::thread::spawn(move || {
+            let mut stream = accept_with_timeout(&redirect_listener, Duration::from_secs(5));
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.to_ascii_lowercase().contains("authorization:") {
+                saw_auth_srv.store(true, Ordering::SeqCst);
+            }
+            let first_line = req.lines().next().unwrap_or("");
+            let path_and_query = first_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/api/v1/health");
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{real_addr}{path_and_query}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = ApiClient::new(format!("http://{redirect_addr}"), token).unwrap();
+        let err = client.list_vms().unwrap_err();
+        assert!(format!("{err:#}").contains("302"), "{err:#}");
+        assert!(
+            !saw_auth.load(Ordering::SeqCst),
+            "client transmitted bearer token to redirecting listener!"
+        );
+        assert!(
+            !saw_real_hit.load(Ordering::SeqCst),
+            "client followed HTTP redirect on health check!"
+        );
+        redirect_srv.join().unwrap();
+        real_srv.join().unwrap();
     }
 
     #[test]
