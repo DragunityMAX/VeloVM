@@ -189,8 +189,8 @@ impl DesktopCompositor {
         let fb_h = self.height as i32;
         let x0 = cx.max(0);
         let y0 = cy.max(0);
-        let x1 = (cx + cw as i32).min(fb_w);
-        let y1 = (cy + ch as i32).min(fb_h);
+        let x1 = cx.saturating_add(cw as i32).min(fb_w);
+        let y1 = cy.saturating_add(ch as i32).min(fb_h);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -311,13 +311,21 @@ impl DesktopCompositor {
         let fb_w = self.width as i32;
         let fb_h = self.height as i32;
 
+        if origin_x >= fb_w
+            || origin_y >= fb_h
+            || origin_x.saturating_add(cw as i32) <= 0
+            || origin_y.saturating_add(ch as i32) <= 0
+        {
+            return;
+        }
+
         for cy in 0..ch as i32 {
-            let dst_y = origin_y + cy;
+            let dst_y = origin_y.saturating_add(cy);
             if dst_y < 0 || dst_y >= fb_h {
                 continue;
             }
             for cx in 0..cw as i32 {
-                let dst_x = origin_x + cx;
+                let dst_x = origin_x.saturating_add(cx);
                 if dst_x < 0 || dst_x >= fb_w {
                     continue;
                 }
@@ -596,6 +604,34 @@ mod tests {
             assert_eq!(comp.present_fb.len(), 256);
             assert_eq!(comp.backing_fb[0], 0x00abcdef);
             assert_eq!(comp.present_fb[0], 0x00abcdef);
+        }
+    }
+
+    #[test]
+    fn cursor_extreme_coordinates_do_not_overflow() {
+        let mut comp = DesktopCompositor::new(16, 16, 16 * 4, 0, None, false).unwrap();
+        comp.backing_fb.fill(0x00112233);
+        comp.present_fb.fill(0x00112233);
+
+        let cursor_raw = [0xaa, 0xbb, 0xcc, 0xff].repeat(4 * 4);
+        let cursor_lz4 = lz4_flex::compress_prepend_size(&cursor_raw);
+        comp.set_cursor_shape(4, 4, 0, 0, &cursor_lz4).unwrap();
+
+        for (x, y) in [
+            (i32::MAX, i32::MAX),
+            (i32::MAX - 1, i32::MAX - 1),
+            (i32::MIN, i32::MIN),
+            (i32::MAX, 0),
+            (0, i32::MAX),
+        ] {
+            comp.set_cursor_position(true, x, y);
+            comp.composite_cursor();
+            assert!(comp.present_fb.iter().all(|&px| px == 0x00112233));
+
+            // Also directly test restore_cursor_backing with extreme prev_drawn coords.
+            comp.cursor.prev_drawn = Some((x, y, 4, 4));
+            comp.restore_cursor_backing();
+            assert!(comp.present_fb.iter().all(|&px| px == 0x00112233));
         }
     }
 }
