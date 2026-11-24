@@ -404,7 +404,7 @@ pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyho
                     stride,
                     offset,
                     shm_path,
-                } => comp.resize(width, height, stride, offset, shm_path.as_deref(), allow_shm),
+                } => comp.resize(width, height, stride, offset, shm_path.as_deref(), allow_shm)?,
                 ServerMsg::CursorShape {
                     width,
                     height,

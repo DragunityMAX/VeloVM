@@ -504,7 +504,7 @@ fn run_gui(args: Args) -> anyhow::Result<()> {
                                 offset,
                                 shm_path.as_deref(),
                                 shm_enabled,
-                            );
+                            )?;
                             if shm_enabled && !comp.is_shm_active() {
                                 shm_enabled = false;
                                 write_client_msg(
