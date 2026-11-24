@@ -155,7 +155,7 @@ impl Default for InputTracker {
             key_events: Arc::new(Mutex::new(VecDeque::new())),
             held_keys: Vec::new(),
             was_active: false,
-            unfocused: false,
+            unfocused: true,
             suppressed_buttons: 0,
             last_x: 0,
             last_y: 0,
@@ -172,7 +172,7 @@ impl InputTracker {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.was_active = window.is_active();
-        self.unfocused = false;
+        self.unfocused = !self.was_active;
         self.suppressed_buttons = 0;
         window.set_input_callback(Box::new(KeyEventCollector(Arc::clone(&self.key_events))));
     }
@@ -288,10 +288,9 @@ impl InputTracker {
                 });
             }
             return msgs;
-        }
-
-        if self.unfocused {
-            self.suppressed_buttons &= snap.raw_buttons;
+        } else {
+            self.unfocused = true;
+            self.suppressed_buttons = snap.raw_buttons;
             return msgs;
         }
 
@@ -694,6 +693,58 @@ mod tests {
         let _ = tracker.poll_snapshot(snap(true, 0), 800, 600);
         let clicked = tracker.poll_snapshot(snap(true, BTN_LEFT), 800, 600);
         assert!(clicked.iter().any(|m| matches!(
+            m,
+            ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn unfocused_startup_drops_keyboard_and_pointer_events_and_suppresses_held_buttons() {
+        let mut tracker = InputTracker::default();
+        tracker.push_key_event(Key::A, true);
+
+        // Window starts unfocused with BTN_LEFT already held: emit nothing.
+        let initial_unfocused = tracker.poll_snapshot(snap(false, BTN_LEFT), 800, 600);
+        assert!(initial_unfocused.is_empty());
+
+        // Second unfocused poll with another key-down also emits nothing.
+        tracker.push_key_event(Key::B, true);
+        let still_unfocused = tracker.poll_snapshot(snap(false, BTN_LEFT), 800, 600);
+        assert!(still_unfocused.is_empty());
+
+        // Focusing while BTN_LEFT is still held must suppress BTN_LEFT until released.
+        let focused_held = tracker.poll_snapshot(snap(true, BTN_LEFT), 800, 600);
+        assert!(!focused_held.iter().any(|m| matches!(
+            m,
+            ClientMsg::PointerEvent { button_mask, .. } if *button_mask != 0
+        )));
+
+        // Releasing BTN_LEFT and clicking again sends BTN_LEFT normally.
+        let _ = tracker.poll_snapshot(snap(true, 0), 800, 600);
+        let clicked = tracker.poll_snapshot(snap(true, BTN_LEFT), 800, 600);
+        assert!(clicked.iter().any(|m| matches!(
+            m,
+            ClientMsg::PointerEvent {
+                button_mask: BTN_LEFT,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn button_released_while_unfocused_does_not_suppress_click_on_focus() {
+        let mut tracker = InputTracker::default();
+
+        // Button pressed while unfocused, then released while still unfocused.
+        assert!(tracker.poll_snapshot(snap(false, BTN_LEFT), 800, 600).is_empty());
+        assert!(tracker.poll_snapshot(snap(false, 0), 800, 600).is_empty());
+
+        // Clicking to focus with BTN_LEFT must not be swallowed by stale suppression.
+        let clicked_on_focus = tracker.poll_snapshot(snap(true, BTN_LEFT), 800, 600);
+        assert!(clicked_on_focus.iter().any(|m| matches!(
             m,
             ClientMsg::PointerEvent {
                 button_mask: BTN_LEFT,
