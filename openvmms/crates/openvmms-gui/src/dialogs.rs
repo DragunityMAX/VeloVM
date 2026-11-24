@@ -115,7 +115,21 @@ fn resolve_picker_dir(path: &std::path::Path) -> PathBuf {
     if path.as_os_str().is_empty() {
         return PathBuf::new();
     }
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    // `std::path::absolute` preserves `..` (`ParentDir`) components on Unix, which would cause
+    // `Path::parent()` in `navigate_up` to strip `..` and descend back into the original dir.
+    // Only canonicalize existing directories that contain `..` on Unix (avoiding Windows `\\?\`
+    // verbatim prefixes and preserving symlink paths that do not involve `..`).
+    #[cfg(unix)]
+    if abs.is_dir()
+        && abs
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && let Ok(canon) = std::fs::canonicalize(&abs)
+    {
+        return canon;
+    }
+    abs
 }
 
 impl FilePickerModal {
@@ -160,7 +174,7 @@ impl FilePickerModal {
                 && parent.is_dir()
             {
                 (
-                    parent.to_path_buf(),
+                    resolve_picker_dir(parent),
                     resolved_initial
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -2608,6 +2622,89 @@ mod tests {
         assert_eq!(picker_file.current_dir, cwd.join("src"));
         assert_eq!(picker_file.filename_input, "new_disk.vhdx");
         assert!(picker_file.error.is_none());
+    }
+
+    #[test]
+    fn file_picker_resolves_parent_dir_segments_and_navigates_up_cleanly() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected_parent = cwd.parent().unwrap().to_path_buf();
+        let expected_grandparent = expected_parent.parent().unwrap().to_path_buf();
+
+        // 1. Opening with ".." resolves to the parent directory without `..` segments, so Up goes to grandparent.
+        let mut picker =
+            FilePickerModal::open(FilePickerTarget::WizardExistingDisk, "..", false, vec![]);
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, expected_parent);
+        assert!(
+            !picker
+                .current_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        );
+        assert!(picker.error.is_none());
+
+        assert!(picker.navigate_up());
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, expected_grandparent);
+        assert_ne!(picker.current_dir, cwd);
+        assert!(picker.error.is_none());
+
+        // 2. Navigating to ".." also strips `..` so subsequent Up navigates to grandparent.
+        picker.navigate_to(PathBuf::from(".."));
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, expected_parent);
+        assert!(
+            !picker
+                .current_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        );
+        assert!(picker.error.is_none());
+
+        assert!(picker.navigate_up());
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, expected_grandparent);
+        assert!(picker.error.is_none());
+
+        // 3. Mid-path ".." ("src/..") resolves to CWD and navigates Up to parent.
+        picker.navigate_to(PathBuf::from("src/.."));
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, cwd);
+        assert!(
+            !picker
+                .current_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        );
+        assert!(picker.error.is_none());
+
+        assert!(picker.navigate_up());
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, expected_parent);
+        assert!(picker.error.is_none());
+
+        // 4. Opening with a nonexistent file under ".." ("../new_disk.vhdx") resolves parent cleanly.
+        let mut picker_parent_file = FilePickerModal::open(
+            FilePickerTarget::WizardNewDiskPath,
+            "../new_disk.vhdx",
+            true,
+            vec!["vhdx"],
+        );
+        wait_file_picker_loaded(&mut picker_parent_file);
+        assert_eq!(picker_parent_file.current_dir, expected_parent);
+        assert_eq!(picker_parent_file.filename_input, "new_disk.vhdx");
+        assert!(
+            !picker_parent_file
+                .current_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        );
+        assert!(picker_parent_file.error.is_none());
+
+        assert!(picker_parent_file.navigate_up());
+        wait_file_picker_loaded(&mut picker_parent_file);
+        assert_eq!(picker_parent_file.current_dir, expected_grandparent);
+        assert!(picker_parent_file.error.is_none());
     }
 
     #[cfg(unix)]
