@@ -498,6 +498,7 @@ impl NewVmWizard {
 }
 
 pub struct VmSettingsDialog {
+    pub dialog_id: Uuid,
     pub vm_id: Uuid,
     pub is_offline: bool,
     pub initial_config: VmConfig,
@@ -531,6 +532,7 @@ impl VmSettingsDialog {
             Some(NicBackendConfig::Tap { name }) => name.clone(),
         };
         Self {
+            dialog_id: Uuid::new_v4(),
             vm_id: cfg.id,
             is_offline: matches!(status, VmStatus::Off | VmStatus::Error),
             initial_config: cfg.clone(),
@@ -658,6 +660,7 @@ impl DiskManagerDialog {
 }
 
 pub struct HostSettingsDialog {
+    pub dialog_id: Uuid,
     pub listen_addr: String,
     pub openvmm_bin: String,
     pub fastdesk_viewer_bin: String,
@@ -682,6 +685,7 @@ impl HostSettingsDialog {
         let openvmm_img_bin = opt_to_string(cfg.openvmm_img_bin.as_deref());
         let uefi_firmware_path = opt_to_string(cfg.uefi_firmware_path.as_deref());
         Self {
+            dialog_id: Uuid::new_v4(),
             initial_listen_addr: listen_addr.clone(),
             initial_openvmm_bin: openvmm_bin.clone(),
             initial_fastdesk_viewer_bin: fastdesk_viewer_bin.clone(),
@@ -836,11 +840,25 @@ impl HostSettingsDialog {
 }
 
 pub struct DeleteVmDialog {
+    pub dialog_id: Uuid,
     pub vm_id: Uuid,
     pub vm_name: String,
     pub delete_disks: bool,
     pub submitting: bool,
     pub error: Option<String>,
+}
+
+impl DeleteVmDialog {
+    pub fn new(vm_id: Uuid, vm_name: String) -> Self {
+        Self {
+            dialog_id: Uuid::new_v4(),
+            vm_id,
+            vm_name,
+            delete_disks: false,
+            submitting: false,
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1549,6 +1567,7 @@ pub fn render_vm_settings_dialog(
                             d.error = None;
                             d.submitting = true;
                             backend.send(GuiRequest::UpdateVm {
+                                dialog_id: d.dialog_id,
                                 id: d.vm_id,
                                 payload,
                             });
@@ -1787,7 +1806,10 @@ pub fn render_host_settings_dialog(
                         } else {
                             d.error = None;
                             d.submitting = true;
-                            backend.send(GuiRequest::SaveHostConfig(patch));
+                            backend.send(GuiRequest::SaveHostConfig {
+                                dialog_id: d.dialog_id,
+                                patch,
+                            });
                         }
                     }
                     if ui.add_enabled(!d.submitting, egui::Button::new("Cancel")).clicked() {
@@ -1860,6 +1882,7 @@ pub fn render_delete_vm_dialog(
                         d.error = None;
                         d.submitting = true;
                         backend.send(GuiRequest::DeleteVm {
+                            dialog_id: d.dialog_id,
                             id: d.vm_id,
                             delete_disks: d.delete_disks,
                         });

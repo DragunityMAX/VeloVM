@@ -194,6 +194,12 @@ impl OpenVmmsApp {
         }
     }
 
+    fn open_host_settings_dialog(&mut self) {
+        if self.host_settings_dlg.is_none() {
+            self.host_settings_dlg = Some(HostSettingsDialog::from_config(&self.host_config));
+        }
+    }
+
     fn process_updates(&mut self) {
         while let Some(upd) = self.backend.try_recv() {
             self.apply_update(upd);
@@ -494,35 +500,53 @@ impl OpenVmmsApp {
                             w.error = Some(err);
                         }
                     }
-                    (DialogKind::VmSettings(id), None) => {
-                        if self.vm_settings_dlg.as_ref().is_some_and(|d| d.vm_id == id) {
+                    (DialogKind::VmSettings(dialog_id), None) => {
+                        if self
+                            .vm_settings_dlg
+                            .as_ref()
+                            .is_some_and(|d| d.dialog_id == dialog_id)
+                        {
                             self.vm_settings_dlg = None;
                         }
                     }
-                    (DialogKind::VmSettings(id), Some(err)) => {
+                    (DialogKind::VmSettings(dialog_id), Some(err)) => {
                         if let Some(d) = self.vm_settings_dlg.as_mut()
-                            && d.vm_id == id
+                            && d.dialog_id == dialog_id
                         {
                             d.submitting = false;
                             d.error = Some(err);
                         }
                     }
-                    (DialogKind::HostSettings, None) => self.host_settings_dlg = None,
-                    (DialogKind::HostSettings, Some(err)) => {
-                        if let Some(d) = self.host_settings_dlg.as_mut() {
+                    (DialogKind::HostSettings(dialog_id), None) => {
+                        if self
+                            .host_settings_dlg
+                            .as_ref()
+                            .is_some_and(|d| d.dialog_id == dialog_id)
+                        {
+                            self.host_settings_dlg = None;
+                        }
+                    }
+                    (DialogKind::HostSettings(dialog_id), Some(err)) => {
+                        if let Some(d) = self.host_settings_dlg.as_mut()
+                            && d.dialog_id == dialog_id
+                        {
                             d.submitting = false;
                             d.error = Some(err);
                             d.sync_from_config(&self.host_config);
                         }
                     }
-                    (DialogKind::DeleteVm(id), None) => {
-                        if self.delete_vm_dlg.as_ref().is_some_and(|d| d.vm_id == id) {
+                    (DialogKind::DeleteVm(dialog_id), None) => {
+                        if self
+                            .delete_vm_dlg
+                            .as_ref()
+                            .is_some_and(|d| d.dialog_id == dialog_id)
+                        {
                             self.delete_vm_dlg = None;
                         }
                     }
-                    (DialogKind::DeleteVm(id), Some(err)) => {
+                    (DialogKind::DeleteVm(dialog_id), Some(err)) => {
                         if let Some(d) = self.delete_vm_dlg.as_mut()
-                            && d.vm_id == id
+                            && d.dialog_id == dialog_id
                         {
                             d.submitting = false;
                             d.error = Some(err);
@@ -680,8 +704,7 @@ impl OpenVmmsApp {
                     .on_disabled_hover_text("Connect to openvmmsd before editing host settings")
                     .clicked()
                 {
-                    self.host_settings_dlg =
-                        Some(HostSettingsDialog::from_config(&self.host_config));
+                    self.open_host_settings_dialog();
                 }
                 if ui.button("↻ Refresh").clicked() {
                     self.backend.send(GuiRequest::RefreshAll);
@@ -786,8 +809,7 @@ impl OpenVmmsApp {
                     .on_disabled_hover_text("Connect to openvmmsd before editing host settings")
                     .clicked()
                 {
-                    self.host_settings_dlg =
-                        Some(HostSettingsDialog::from_config(&self.host_config));
+                    self.open_host_settings_dialog();
                 }
 
                 ui.add_space(10.0);
@@ -860,7 +882,12 @@ impl OpenVmmsApp {
                         });
                     }
                     ui.separator();
-                    if ui.button("⚙ Settings…").clicked() {
+                    if ui.button("⚙ Settings…").clicked()
+                        && self
+                            .vm_settings_dlg
+                            .as_ref()
+                            .is_none_or(|d| !d.submitting && d.vm_id != id)
+                    {
                         self.vm_settings_dlg =
                             Some(VmSettingsDialog::from_config(&vm.config, status));
                     }
@@ -870,14 +897,13 @@ impl OpenVmmsApp {
                             egui::Button::new(RichText::new("🗑 Delete…").color(Color32::LIGHT_RED)),
                         )
                         .clicked()
+                        && self
+                            .delete_vm_dlg
+                            .as_ref()
+                            .is_none_or(|d| !d.submitting && d.vm_id != id)
                     {
-                        self.delete_vm_dlg = Some(DeleteVmDialog {
-                            vm_id: id,
-                            vm_name: vm.config.name.clone(),
-                            delete_disks: false,
-                            submitting: false,
-                            error: None,
-                        });
+                        self.delete_vm_dlg =
+                            Some(DeleteVmDialog::new(id, vm.config.name.clone()));
                     }
                 } else {
                     ui.label("Select a VM to see actions.");
@@ -1611,9 +1637,11 @@ fn run_self_test() -> anyhow::Result<()> {
     settings_dlg.description = "Headless UI self-test".to_string();
     settings_dlg.vcpus = 2;
     let update_payload = settings_dlg.build_update_payload(&app.switches);
+    let settings_dialog_id = settings_dlg.dialog_id;
     app.vm_settings_dlg = Some(settings_dlg);
     let _ = step_headless_ui(&ctx, &mut app, 2);
     app.backend.send(GuiRequest::UpdateVm {
+        dialog_id: settings_dialog_id,
         id: vm_id,
         payload: update_payload,
     });
@@ -1691,10 +1719,13 @@ fn run_self_test() -> anyhow::Result<()> {
 
     // Render HostSettingsDialog and verify saving config keeps client connected on daemon's actual URL.
     let host_dlg = HostSettingsDialog::from_config(&app.host_config);
+    let host_dialog_id = host_dlg.dialog_id;
     app.host_settings_dlg = Some(host_dlg);
     let _ = step_headless_ui(&ctx, &mut app, 2);
-    app.backend
-        .send(GuiRequest::SaveHostConfig(HostConfigPatch::default()));
+    app.backend.send(GuiRequest::SaveHostConfig {
+        dialog_id: host_dialog_id,
+        patch: HostConfigPatch::default(),
+    });
     wait_for_app(&ctx, &mut app, Duration::from_secs(15), "host settings save", |a| {
         a.host_settings_dlg.is_none()
     })?;
@@ -1715,15 +1746,12 @@ fn run_self_test() -> anyhow::Result<()> {
     let _ = step_headless_ui(&ctx, &mut app, 1);
     app.confirm_action_dlg = None;
 
-    app.delete_vm_dlg = Some(DeleteVmDialog {
-        vm_id,
-        vm_name: "SelfTest-VM".to_string(),
-        delete_disks: false,
-        submitting: false,
-        error: None,
-    });
+    let delete_dlg = DeleteVmDialog::new(vm_id, "SelfTest-VM".to_string());
+    let delete_dialog_id = delete_dlg.dialog_id;
+    app.delete_vm_dlg = Some(delete_dlg);
     let _ = step_headless_ui(&ctx, &mut app, 2);
     app.backend.send(GuiRequest::DeleteVm {
+        dialog_id: delete_dialog_id,
         id: vm_id,
         delete_disks: false,
     });
@@ -2530,6 +2558,7 @@ mod tests {
         });
 
         let mut dlg = HostSettingsDialog::from_config(&app.host_config);
+        let dialog_id = dlg.dialog_id;
         dlg.openvmm_bin = "/bad/openvmm".into();
         dlg.submitting = true;
         app.host_settings_dlg = Some(dlg);
@@ -2550,7 +2579,7 @@ mod tests {
 
         // Save fails: dialog clears submitting, shows error, and syncs unedited/initial fields.
         app.apply_update(GuiUpdate::DialogFinished {
-            kind: DialogKind::HostSettings,
+            kind: DialogKind::HostSettings(dialog_id),
             error: Some("invalid openvmm path".into()),
         });
 
@@ -2617,5 +2646,114 @@ mod tests {
         assert!(dlg.is_offline);
         assert_eq!(dlg.base_fastdesk.transport, FastDeskTransport::HvSock);
         assert_eq!(dlg.nics, expected_nics);
+    }
+
+    #[test]
+    fn stale_dialog_finished_does_not_close_or_corrupt_reopened_dialogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = OpenVmmsApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+        let vm_id = Uuid::new_v4();
+        let vm = make_test_vm(vm_id, "Reopened", VmStatus::Off, 1);
+
+        // 1. HostSettingsDialog
+        let old_host = HostSettingsDialog::from_config(&app.host_config);
+        let old_host_id = old_host.dialog_id;
+        app.host_settings_dlg = Some(old_host);
+        // open_host_settings_dialog must not overwrite an already-open HostSettingsDialog.
+        app.host_settings_dlg.as_mut().unwrap().openvmm_bin = "/edited".into();
+        app.open_host_settings_dialog();
+        assert_eq!(
+            app.host_settings_dlg.as_ref().unwrap().openvmm_bin,
+            "/edited"
+        );
+        app.host_settings_dlg = Some(HostSettingsDialog::from_config(&app.host_config));
+        let new_host_id = app.host_settings_dlg.as_ref().unwrap().dialog_id;
+        assert_ne!(old_host_id, new_host_id);
+
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::HostSettings(old_host_id),
+            error: Some("stale host error".into()),
+        });
+        assert!(
+            app.host_settings_dlg
+                .as_ref()
+                .is_some_and(|d| d.dialog_id == new_host_id && d.error.is_none())
+        );
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::HostSettings(old_host_id),
+            error: None,
+        });
+        assert!(
+            app.host_settings_dlg
+                .as_ref()
+                .is_some_and(|d| d.dialog_id == new_host_id)
+        );
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::HostSettings(new_host_id),
+            error: None,
+        });
+        assert!(app.host_settings_dlg.is_none());
+
+        // 2. VmSettingsDialog
+        let old_vm_id = VmSettingsDialog::from_config(&vm.config, vm.runtime.status).dialog_id;
+        let new_vm_dlg = VmSettingsDialog::from_config(&vm.config, vm.runtime.status);
+        let new_vm_id = new_vm_dlg.dialog_id;
+        assert_ne!(old_vm_id, new_vm_id);
+        app.vm_settings_dlg = Some(new_vm_dlg);
+
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::VmSettings(old_vm_id),
+            error: Some("stale vm settings error".into()),
+        });
+        assert!(
+            app.vm_settings_dlg
+                .as_ref()
+                .is_some_and(|d| d.dialog_id == new_vm_id && d.error.is_none())
+        );
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::VmSettings(old_vm_id),
+            error: None,
+        });
+        assert!(
+            app.vm_settings_dlg
+                .as_ref()
+                .is_some_and(|d| d.dialog_id == new_vm_id)
+        );
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::VmSettings(new_vm_id),
+            error: None,
+        });
+        assert!(app.vm_settings_dlg.is_none());
+
+        // 3. DeleteVmDialog
+        let old_del_id = DeleteVmDialog::new(vm_id, "Reopened".into()).dialog_id;
+        let new_del_dlg = DeleteVmDialog::new(vm_id, "Reopened".into());
+        let new_del_id = new_del_dlg.dialog_id;
+        assert_ne!(old_del_id, new_del_id);
+        app.delete_vm_dlg = Some(new_del_dlg);
+
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::DeleteVm(old_del_id),
+            error: Some("stale delete error".into()),
+        });
+        assert!(
+            app.delete_vm_dlg
+                .as_ref()
+                .is_some_and(|d| d.dialog_id == new_del_id && d.error.is_none())
+        );
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::DeleteVm(old_del_id),
+            error: None,
+        });
+        assert!(
+            app.delete_vm_dlg
+                .as_ref()
+                .is_some_and(|d| d.dialog_id == new_del_id)
+        );
+        app.apply_update(GuiUpdate::DialogFinished {
+            kind: DialogKind::DeleteVm(new_del_id),
+            error: None,
+        });
+        assert!(app.delete_vm_dlg.is_none());
     }
 }

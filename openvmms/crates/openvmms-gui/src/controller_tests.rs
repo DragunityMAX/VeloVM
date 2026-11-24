@@ -359,6 +359,7 @@ fn backend_handle_follows_external_daemon_port_change_for_requests_and_events() 
 
     // GUI mutation request after port change must also succeed on the new endpoint.
     backend.send(GuiRequest::UpdateVm {
+        dialog_id: Uuid::new_v4(),
         id: created.config.id,
         payload: UpdateVmPayload {
             description: Some("updated via GUI after port change".into()),
@@ -576,7 +577,11 @@ fn save_host_config_on_ephemeral_port_stays_on_daemon_addr_and_never_contacts_co
     let mut edited = host_cfg.clone();
     edited.openvmm_bin = Some(dir.path().join("custom-openvmm"));
     let patch = HostConfigPatch::from_diff(&host_cfg, &edited);
-    backend.send(GuiRequest::SaveHostConfig(patch));
+    let host_dialog_id = Uuid::new_v4();
+    backend.send(GuiRequest::SaveHostConfig {
+        dialog_id: host_dialog_id,
+        patch,
+    });
 
     let mut saw_updated = false;
     let mut saw_dialog_ok = false;
@@ -590,9 +595,9 @@ fn save_host_config_on_ephemeral_port_stays_on_daemon_addr_and_never_contacts_co
                     saw_updated = true;
                 }
                 GuiUpdate::DialogFinished {
-                    kind: DialogKind::HostSettings,
+                    kind: DialogKind::HostSettings(did),
                     error: None,
-                } => {
+                } if did == host_dialog_id => {
                     saw_dialog_ok = true;
                 }
                 _ => {}
@@ -892,7 +897,9 @@ fn non_idempotent_create_and_delete_are_not_retried_after_port_change() {
 
     // Next send DeleteVm on port2; port2 switches daemon.addr to port3 and drops the
     // connection before replying. The GUI must refresh onto port3 without retrying DELETE.
+    let del_dialog_id = Uuid::new_v4();
     backend.send(GuiRequest::DeleteVm {
+        dialog_id: del_dialog_id,
         id: vm_id,
         delete_disks: false,
     });
@@ -906,9 +913,9 @@ fn non_idempotent_create_and_delete_are_not_retried_after_port_change() {
                     saw_url3 = true;
                 }
                 GuiUpdate::DialogFinished {
-                    kind: DialogKind::DeleteVm(id),
+                    kind: DialogKind::DeleteVm(did),
                     error: Some(_),
-                } if id == vm_id => {
+                } if did == del_dialog_id => {
                     saw_delete_err = true;
                 }
                 _ => {}
@@ -1297,7 +1304,10 @@ fn host_config_patch_preserves_concurrent_cli_changes() {
     let mut edited = opened_cfg.clone();
     edited.openvmm_bin = Some(gui_openvmm.clone());
     let patch = HostConfigPatch::from_diff(&opened_cfg, &edited);
-    backend.send(GuiRequest::SaveHostConfig(patch));
+    backend.send(GuiRequest::SaveHostConfig {
+        dialog_id: Uuid::new_v4(),
+        patch,
+    });
 
     let updated_cfg = match recv_until(&backend, Duration::from_secs(5), |u| {
         matches!(u, GuiUpdate::HostConfigUpdated { .. })
@@ -2056,7 +2066,11 @@ fn save_host_config_succeeds_when_followup_host_info_fails() {
         openvmm_bin: Some(Some(new_bin.clone())),
         ..Default::default()
     };
-    backend.send(GuiRequest::SaveHostConfig(patch));
+    let host_dialog_id = Uuid::new_v4();
+    backend.send(GuiRequest::SaveHostConfig {
+        dialog_id: host_dialog_id,
+        patch,
+    });
 
     let mut saw_host_cfg = false;
     let mut saw_dialog_ok = false;
@@ -2077,9 +2091,9 @@ fn save_host_config_succeeds_when_followup_host_info_fails() {
                     saw_host_cfg = true;
                 }
                 GuiUpdate::DialogFinished {
-                    kind: DialogKind::HostSettings,
+                    kind: DialogKind::HostSettings(did),
                     error,
-                } => {
+                } if did == host_dialog_id => {
                     assert_eq!(error, None);
                     saw_dialog_ok = true;
                 }
@@ -2383,10 +2397,13 @@ fn save_host_config_takes_snapshot_seq_after_patch() {
         _ => unreachable!(),
     };
 
-    backend.send(GuiRequest::SaveHostConfig(HostConfigPatch {
-        openvmm_bin: Some(Some(new_bin.clone())),
-        ..Default::default()
-    }));
+    backend.send(GuiRequest::SaveHostConfig {
+        dialog_id: Uuid::new_v4(),
+        patch: HostConfigPatch {
+            openvmm_bin: Some(Some(new_bin.clone())),
+            ..Default::default()
+        },
+    });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !patch_started.load(Ordering::Acquire) {
@@ -2684,10 +2701,13 @@ fn save_host_config_fetches_fresher_cli_change_after_patch() {
         matches!(u, GuiUpdate::DaemonConnected { .. })
     });
 
-    backend.send(GuiRequest::SaveHostConfig(HostConfigPatch {
-        openvmm_bin: Some(Some(gui_bin.clone())),
-        ..Default::default()
-    }));
+    backend.send(GuiRequest::SaveHostConfig {
+        dialog_id: Uuid::new_v4(),
+        patch: HostConfigPatch {
+            openvmm_bin: Some(Some(gui_bin.clone())),
+            ..Default::default()
+        },
+    });
 
     let updated_cfg = match recv_until(&backend, Duration::from_secs(5), |u| {
         matches!(u, GuiUpdate::HostConfigUpdated { .. })
