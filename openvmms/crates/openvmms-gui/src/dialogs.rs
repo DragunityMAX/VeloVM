@@ -111,6 +111,13 @@ pub struct FilePickerModal {
     ignore_file_clicks_until: Option<std::time::Instant>,
 }
 
+fn resolve_picker_dir(path: &std::path::Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl FilePickerModal {
     pub fn open(
         target: FilePickerTarget,
@@ -143,23 +150,25 @@ impl FilePickerModal {
         };
         let filter_exts_owned = modal.filter_exts.clone();
         modal.start_load(trimmed.clone(), move |seq| {
-            let initial = PathBuf::from(&trimmed);
-            let (start_dir, fname) = if !trimmed.is_empty() && initial.is_dir() {
-                (initial, String::new())
+            let resolved_initial = resolve_picker_dir(std::path::Path::new(&trimmed));
+            let (start_dir, fname) = if !trimmed.is_empty() && resolved_initial.is_dir() {
+                (resolved_initial, String::new())
             } else if !trimmed.is_empty()
-                && let Some(parent) = initial.parent()
+                && let Some(parent) = resolved_initial
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
                 && parent.is_dir()
             {
                 (
                     parent.to_path_buf(),
-                    initial
+                    resolved_initial
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                 )
             } else {
                 let home = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                (home, String::new())
+                (resolve_picker_dir(&home), String::new())
             };
             let dir_str = start_dir.to_string_lossy().into_owned();
             let (entries, error) = read_dir_entries(&start_dir, &filter_exts_owned);
@@ -230,6 +239,7 @@ impl FilePickerModal {
     }
 
     pub fn navigate_to(&mut self, dir: PathBuf) {
+        let dir = resolve_picker_dir(&dir);
         let dir_str = dir.to_string_lossy().into_owned();
         self.dir_input = dir_str.clone();
         self.dir_input_edited = false;
@@ -254,6 +264,20 @@ impl FilePickerModal {
                 }
             }
         });
+    }
+
+    pub fn navigate_up(&mut self) -> bool {
+        if let Some(parent) = self
+            .current_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+        {
+            self.navigate_to(parent);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn reload(&mut self) {
@@ -995,10 +1019,8 @@ pub fn render_file_picker(
         .default_size([620.0, 440.0])
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("⬆ Up").clicked()
-                    && let Some(parent) = picker.current_dir.parent().map(PathBuf::from)
-                {
-                    picker.navigate_to(parent);
+                if ui.button("⬆ Up").clicked() {
+                    picker.navigate_up();
                 }
                 let dir_resp =
                     ui.add(egui::TextEdit::singleline(&mut picker.dir_input).desired_width(400.0));
@@ -2544,6 +2566,48 @@ mod tests {
             });
         });
         assert!(ok_rect.is_some());
+    }
+
+    #[test]
+    fn file_picker_resolves_relative_paths_and_navigates_up_cleanly() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected_parent = cwd.parent().unwrap().to_path_buf();
+
+        // 1. Opening with "." resolves to an absolute CWD and Up navigates to its real parent.
+        let mut picker = FilePickerModal::open(FilePickerTarget::WizardExistingDisk, ".", false, vec![]);
+        wait_file_picker_loaded(&mut picker);
+        assert!(picker.current_dir.is_absolute());
+        assert_eq!(picker.current_dir, cwd);
+        assert!(picker.error.is_none());
+
+        assert!(picker.navigate_up());
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, expected_parent);
+        assert!(!picker.dir_input.is_empty());
+        assert!(picker.error.is_none());
+
+        // 2. Navigating to a relative subdirectory ("src") resolves to an absolute path and navigates Up to CWD.
+        picker.navigate_to(PathBuf::from("src"));
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, cwd.join("src"));
+        assert!(picker.error.is_none());
+
+        assert!(picker.navigate_up());
+        wait_file_picker_loaded(&mut picker);
+        assert_eq!(picker.current_dir, cwd);
+        assert!(picker.error.is_none());
+
+        // 3. Opening with a relative file path ("./src/new_disk.vhdx") resolves parent dir and keeps filename.
+        let mut picker_file = FilePickerModal::open(
+            FilePickerTarget::WizardNewDiskPath,
+            "./src/new_disk.vhdx",
+            true,
+            vec!["vhdx"],
+        );
+        wait_file_picker_loaded(&mut picker_file);
+        assert_eq!(picker_file.current_dir, cwd.join("src"));
+        assert_eq!(picker_file.filename_input, "new_disk.vhdx");
+        assert!(picker_file.error.is_none());
     }
 
     #[cfg(unix)]
