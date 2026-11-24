@@ -976,26 +976,64 @@ pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
             path.display()
         );
     }
-    let mut opts = fs::OpenOptions::new();
-    opts.read(true).write(true).create(true).truncate(true);
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = opts
+            .open(path)
+            .with_context(|| format!("creating FastDesk SHM file {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("inspecting FastDesk SHM file {}", path.display()))?;
+        if !meta.file_type().is_file() {
+            bail!(
+                "refusing to use non-regular FastDesk SHM path {}",
+                path.display()
+            );
+        }
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            bail!(
+                "refusing to use FastDesk SHM file {} owned by uid {} (expected {})",
+                path.display(),
+                meta.uid(),
+                euid
+            );
+        }
+        if meta.nlink() > 1 {
+            bail!(
+                "refusing to use hard-linked FastDesk SHM file {}",
+                path.display()
+            );
+        }
+        file.set_len(0)
+            .with_context(|| format!("truncating FastDesk SHM file {}", path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on FastDesk SHM file {}", path.display()))?;
+        Ok(file)
     }
-    let file = opts
-        .open(path)
-        .with_context(|| format!("creating FastDesk SHM file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-    }
+
     #[cfg(windows)]
     {
-        set_path_owner_only_windows(path)?;
+        open_shm_file_nofollow_windows(path)
     }
-    Ok(file)
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(true);
+        opts.open(path)
+            .with_context(|| format!("creating FastDesk SHM file {}", path.display()))
+    }
 }
 
 #[cfg(windows)]
@@ -1059,47 +1097,196 @@ fn build_owner_only_dacl_windows(
 }
 
 #[cfg(windows)]
+struct OwnerOnlySecurityDescriptor {
+    _token_buf: Vec<std::mem::MaybeUninit<windows_sys::Win32::Security::TOKEN_USER>>,
+    dacl: LocalFreeAcl,
+    sd: windows_sys::Win32::Security::SECURITY_DESCRIPTOR,
+}
+
+#[cfg(windows)]
+impl OwnerOnlySecurityDescriptor {
+    fn new() -> anyhow::Result<Self> {
+        use windows_sys::Win32::Security::{
+            InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+            SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+            SetSecurityDescriptorOwner,
+        };
+        const SECURITY_DESCRIPTOR_REVISION_1: u32 = 1;
+
+        let token_buf = current_user_token_buf()?;
+        let token_user = unsafe { token_buf[0].assume_init_ref() };
+        let user_sid = token_user.User.Sid;
+        let dacl = build_owner_only_dacl_windows(user_sid)?;
+        let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let sd_ptr: PSECURITY_DESCRIPTOR = (&raw mut sd).cast();
+        if unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION_1) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("InitializeSecurityDescriptor failed");
+        }
+        if unsafe { SetSecurityDescriptorOwner(sd_ptr, user_sid, 0) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("SetSecurityDescriptorOwner failed");
+        }
+        if unsafe { SetSecurityDescriptorDacl(sd_ptr, 1, dacl.0.cast_const(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error()).context("SetSecurityDescriptorDacl failed");
+        }
+        if unsafe { SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("SetSecurityDescriptorControl failed");
+        }
+        Ok(Self {
+            _token_buf: token_buf,
+            dacl,
+            sd,
+        })
+    }
+
+    fn security_attributes(&mut self) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: (&raw mut self.sd).cast(),
+            bInheritHandle: 0,
+        }
+    }
+
+    fn user_sid(&self) -> windows_sys::Win32::Security::PSID {
+        let token_user = unsafe { self._token_buf[0].assume_init_ref() };
+        token_user.User.Sid
+    }
+}
+
+#[cfg(windows)]
+fn open_shm_file_nofollow_windows(path: &Path) -> anyhow::Result<fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, EqualSid, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_ALWAYS, WRITE_DAC,
+    };
+
+    let mut owner_sd = OwnerOnlySecurityDescriptor::new()?;
+    let sa = owner_sd.security_attributes();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &sa,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("creating FastDesk SHM file {}", path.display()));
+    }
+    let file = unsafe { fs::File::from_raw_handle(handle as RawHandle) };
+
+    let meta = file
+        .metadata()
+        .with_context(|| format!("inspecting FastDesk SHM file {}", path.display()))?;
+    if !meta.file_type().is_file() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        bail!(
+            "refusing to use non-regular or symlinked FastDesk SHM path {}",
+            path.display()
+        );
+    }
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("GetFileInformationByHandle failed for {}", path.display()));
+    }
+    if info.nNumberOfLinks > 1 {
+        bail!(
+            "refusing to use hard-linked FastDesk SHM file {}",
+            path.display()
+        );
+    }
+
+    let mut owner_sid: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let err = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(err as i32))
+            .with_context(|| format!("GetSecurityInfo failed for {}", path.display()));
+    }
+    let owner_ok = !owner_sid.is_null() && unsafe { EqualSid(owner_sid, owner_sd.user_sid()) } != 0;
+    if !sd.is_null() {
+        unsafe {
+            LocalFree(sd);
+        }
+    }
+    if !owner_ok {
+        bail!(
+            "refusing to use FastDesk SHM file {} owned by a different Windows user",
+            path.display()
+        );
+    }
+
+    let acl_err = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            owner_sd.dacl.0,
+            std::ptr::null_mut(),
+        )
+    };
+    if acl_err != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(acl_err as i32))
+            .with_context(|| format!("SetSecurityInfo failed for {}", path.display()));
+    }
+
+    file.set_len(0)
+        .with_context(|| format!("truncating FastDesk SHM file {}", path.display()))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
 fn create_owner_only_temp_file_windows(parent: &Path) -> anyhow::Result<(PathBuf, fs::File)> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, RawHandle};
     use windows_sys::Win32::Foundation::{
         ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::Security::{
-        InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-        SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-        SetSecurityDescriptorOwner,
-    };
     use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
 
-    const SECURITY_DESCRIPTOR_REVISION_1: u32 = 1;
-
-    let token_buf = current_user_token_buf()?;
-    let token_user = unsafe { token_buf[0].assume_init_ref() };
-    let user_sid = token_user.User.Sid;
-    let dacl = build_owner_only_dacl_windows(user_sid)?;
-    let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
-    let sd_ptr: PSECURITY_DESCRIPTOR = (&raw mut sd).cast();
-    if unsafe { InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION_1) } == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("InitializeSecurityDescriptor failed");
-    }
-    if unsafe { SetSecurityDescriptorOwner(sd_ptr, user_sid, 0) } == 0 {
-        return Err(std::io::Error::last_os_error()).context("SetSecurityDescriptorOwner failed");
-    }
-    if unsafe { SetSecurityDescriptorDacl(sd_ptr, 1, dacl.0.cast_const(), 0) } == 0 {
-        return Err(std::io::Error::last_os_error()).context("SetSecurityDescriptorDacl failed");
-    }
-    if unsafe { SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0
-    {
-        return Err(std::io::Error::last_os_error())
-            .context("SetSecurityDescriptorControl failed");
-    }
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd_ptr,
-        bInheritHandle: 0,
-    };
+    let mut owner_sd = OwnerOnlySecurityDescriptor::new()?;
+    let sa = owner_sd.security_attributes();
 
     for _ in 0..8 {
         let tmp_path = parent.join(format!(".openvmms-tmp-{}", Uuid::new_v4()));
@@ -1969,6 +2156,43 @@ mod tests {
         assert_eq!(fs::read_to_string(&link).unwrap(), original);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn open_shm_file_nofollow_rejects_symlinks_fifos_and_hard_links() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Symlink rejected without touching target.
+        let target = dir.path().join("victim.shm");
+        fs::write(&target, b"keep-me").unwrap();
+        let sym = dir.path().join("sym.shm");
+        symlink(&target, &sym).unwrap();
+        assert!(open_shm_file_nofollow(&sym).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep-me");
+
+        // 2. FIFO rejected without blocking.
+        let fifo = dir.path().join("pipe.shm");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(open_shm_file_nofollow(&fifo).is_err());
+
+        // 3. Hard-linked regular file rejected without truncating.
+        let linked = dir.path().join("linked.shm");
+        fs::write(&linked, b"shared-data").unwrap();
+        fs::hard_link(&linked, dir.path().join("linked-alias.shm")).unwrap();
+        assert!(open_shm_file_nofollow(&linked).is_err());
+        assert_eq!(fs::read(&linked).unwrap(), b"shared-data");
+
+        // 4. Fresh regular file succeeds with 0600 permissions.
+        let fresh = dir.path().join("fresh.shm");
+        let f = open_shm_file_nofollow(&fresh).unwrap();
+        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_owner_mismatch_produces_token_security_error() {
@@ -2003,5 +2227,36 @@ mod tests {
 
         let err = open_and_read_token_windows_with_sid(&store.token_path(), world_sid).unwrap_err();
         assert!(err.chain().any(|c| c.is::<TokenSecurityError>()), "{err:#}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_shm_file_nofollow_windows_rejects_symlinks_hard_links_and_enforces_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Fresh file is created atomically with owner-only ACL.
+        let fresh = dir.path().join("fresh.shm");
+        let file = open_shm_file_nofollow(&fresh).unwrap();
+        assert_eq!(
+            check_handle_owner_only_windows(&file, &fresh).unwrap(),
+            WindowsTokenAclStatus::OwnerOnly
+        );
+        drop(file);
+
+        // 2. Hard-linked file rejected without truncating.
+        let linked = dir.path().join("linked.shm");
+        fs::write(&linked, b"shared-data").unwrap();
+        fs::hard_link(&linked, dir.path().join("linked-alias.shm")).unwrap();
+        assert!(open_shm_file_nofollow(&linked).is_err());
+        assert_eq!(fs::read(&linked).unwrap(), b"shared-data");
+
+        // 3. Directory junction / symlink (if permitted) is rejected without touching target.
+        let target = dir.path().join("victim.shm");
+        fs::write(&target, b"keep-me").unwrap();
+        let sym = dir.path().join("sym.shm");
+        if std::os::windows::fs::symlink_file(&target, &sym).is_ok() {
+            assert!(open_shm_file_nofollow(&sym).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"keep-me");
+        }
     }
 }
