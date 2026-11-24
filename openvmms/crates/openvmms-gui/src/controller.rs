@@ -17,7 +17,6 @@ use openvmms_core::models::UpdateVmPayload;
 use openvmms_core::models::VirtualSwitchInfo;
 use openvmms_core::models::VmSummary;
 use std::collections::HashSet;
-use std::io::BufRead;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1335,11 +1334,104 @@ fn sleep_backoff(state: &BackendState, start_wake_gen: u64, dur: Duration) -> bo
     }
 }
 
+const MAX_SSE_LINE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+struct SseLineBuffer {
+    buf: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl SseLineBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_bytes,
+        }
+    }
+
+    fn decode_line(mut line_bytes: Vec<u8>) -> String {
+        if line_bytes.ends_with(b"\n") {
+            line_bytes.pop();
+        }
+        if line_bytes.ends_with(b"\r") {
+            line_bytes.pop();
+        }
+        String::from_utf8_lossy(&line_bytes).into_owned()
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) -> bool {
+        if self
+            .buf
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|n| n > self.max_bytes)
+        {
+            self.buf.clear();
+            return false;
+        }
+        self.buf.extend_from_slice(chunk);
+        true
+    }
+
+    fn take_line(&mut self) -> Option<String> {
+        let pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
+        Some(Self::decode_line(line_bytes))
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let tail = std::mem::take(&mut self.buf);
+        Some(Self::decode_line(tail))
+    }
+}
+
+struct SseLineReader {
+    resp: reqwest::Response,
+    line_buf: SseLineBuffer,
+}
+
+impl SseLineReader {
+    fn new(resp: reqwest::Response) -> Self {
+        Self {
+            resp,
+            line_buf: SseLineBuffer::new(MAX_SSE_LINE_BUFFER_BYTES),
+        }
+    }
+
+    fn next_line(&mut self, rt: &tokio::runtime::Runtime) -> Option<String> {
+        loop {
+            if let Some(line) = self.line_buf.take_line() {
+                return Some(line);
+            }
+            match rt.block_on(self.resp.chunk()) {
+                Ok(Some(chunk)) => {
+                    if !self.line_buf.push_chunk(&chunk) {
+                        return None;
+                    }
+                }
+                Ok(None) => return self.line_buf.finish(),
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
 fn spawn_sse_listener(state: Arc<BackendState>) {
     thread::spawn(move || {
-        let http = match reqwest::blocking::Client::builder()
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            state.sse_active.store(false, Ordering::SeqCst);
+            return;
+        };
+        let http = match reqwest::Client::builder()
             .no_proxy()
-            .timeout(Some(state.sse_read_timeout))
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(state.sse_read_timeout)
             .build()
         {
             Ok(c) => c,
@@ -1458,7 +1550,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
             let url = format!("{base_url}/api/v1/events");
             let mut switched_endpoint = false;
             let mut saw_daemon_stopping = false;
-            match http.get(&url).bearer_auth(&token).send() {
+            match rt.block_on(async { http.get(&url).bearer_auth(&token).send().await }) {
                 Ok(resp) if resp.status().is_success() => {
                     let sync_res = ApiClient::new(&base_url, &token)
                         .and_then(|c| state.sync_snapshot_once(&c, false));
@@ -1493,9 +1585,9 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                         }
                     };
                     let stream_connected_at = std::time::Instant::now();
-                    let reader = std::io::BufReader::new(resp);
+                    let mut sse_reader = SseLineReader::new(resp);
                     let mut sse_send_closed = false;
-                    for line in reader.lines().map_while(Result::ok) {
+                    while let Some(line) = sse_reader.next_line(&rt) {
                         if state.shutdown.load(Ordering::Acquire) {
                             break;
                         }

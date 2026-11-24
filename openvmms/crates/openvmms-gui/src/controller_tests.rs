@@ -3582,3 +3582,155 @@ fn pre_sse_refresh_does_not_suppress_leading_resync_and_retry_refresh_fetches_on
     drop(srv_mid2);
     drop(srv_b);
 }
+
+#[test]
+fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idle_timeout() {
+    use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = openvmms_core::store::RegistryStore::new(dir.path()).unwrap();
+    let _lock = store.try_acquire_daemon_lock().unwrap();
+    let token = store.load_or_create_token().unwrap();
+
+    let sse_count = Arc::new(AtomicUsize::new(0));
+    let vms_fetches = Arc::new(AtomicUsize::new(0));
+    let vms_stage = Arc::new(AtomicUsize::new(0));
+
+    let vm_id = Uuid::new_v4();
+    let mut base_cfg = openvmms_core::models::VmConfig::from_preset(
+        "KeepAlive-VM",
+        VmPreset::Custom,
+        Path::new("/tmp/vm"),
+    );
+    base_cfg.id = vm_id;
+
+    let server = {
+        let token = token.clone();
+        let sse_count = Arc::clone(&sse_count);
+        let vms_fetches = Arc::clone(&vms_fetches);
+        let vms_stage = Arc::clone(&vms_stage);
+        let store_dir = dir.path().to_path_buf();
+        let cfg_for_srv = base_cfg.clone();
+        TestMockServer::spawn(move |mut stream, req, addr, stop| {
+            let target = req.target.as_str();
+            if target == "/api/v1/events" {
+                let idx = sse_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if !write_sse_ok_headers(&mut stream) {
+                    return;
+                }
+                let leading_json = serde_json::to_string(&DaemonEvent::Resync).unwrap();
+                let _ = stream.write_all(format!("data: {leading_json}\n\n").as_bytes());
+                let _ = stream.flush();
+                if idx == 1 {
+                    // Send keep-alives every 100ms for 700ms (~3x the 250ms read timeout).
+                    for _ in 0..7 {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                        if stream.write_all(b": keep-alive\n\n").is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
+                    }
+                    let updated_vm = VmSummary {
+                        config: cfg_for_srv.clone(),
+                        runtime: openvmms_core::models::VmRuntimeState {
+                            status: VmStatus::Running,
+                            revision: 2,
+                            ..Default::default()
+                        },
+                    };
+                    let ev_json =
+                        serde_json::to_string(&DaemonEvent::VmUpdated { vm: updated_vm }).unwrap();
+                    let _ = stream.write_all(format!("data: {ev_json}\n\n").as_bytes());
+                    let _ = stream.flush();
+                    // Now go completely silent so idle read_timeout fires and triggers reconnect/reconcile.
+                    vms_stage.store(1, Ordering::Release);
+                }
+                while !stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                return;
+            }
+
+            let (status, body) = if target == "/api/v1/vms" {
+                vms_fetches.fetch_add(1, Ordering::SeqCst);
+                let stage = vms_stage.load(Ordering::Acquire);
+                let summary = VmSummary {
+                    config: cfg_for_srv.clone(),
+                    runtime: openvmms_core::models::VmRuntimeState {
+                        status: if stage > 0 {
+                            VmStatus::Paused
+                        } else {
+                            VmStatus::Off
+                        },
+                        revision: (stage as u64) + 1,
+                        ..Default::default()
+                    },
+                };
+                ("200 OK", serde_json::to_string(&vec![summary]).unwrap())
+            } else {
+                mock_common_endpoint(target, &token, addr, &store_dir)
+                    .unwrap_or(("404 Not Found", "{}".into()))
+            };
+            write_mock_json(&mut stream, status, &body);
+        })
+    };
+    store
+        .write_runtime_listen_addr(&server.addr.to_string())
+        .unwrap();
+
+    let backend = BackendHandle::spawn_with_sse_timeout(
+        Some(dir.path().to_path_buf()),
+        None,
+        egui::Context::default(),
+        Duration::from_millis(250),
+    );
+    backend.send(GuiRequest::ConnectOrStartDaemon);
+
+    let _ = recv_until(&backend, Duration::from_secs(5), |u| {
+        matches!(u, GuiUpdate::DaemonConnected { .. })
+    });
+
+    // VmUpdated arrives after ~700ms of keep-alives without any reconnect or second snapshot fetch.
+    let updated = recv_until(&backend, Duration::from_secs(5), |u| {
+        matches!(
+            u,
+            GuiUpdate::VmUpdated { vm: v, .. } if v.runtime.status == VmStatus::Running
+        )
+    });
+    assert!(matches!(
+        updated,
+        GuiUpdate::VmUpdated { vm: v, .. } if v.runtime.revision == 2
+    ));
+    assert_eq!(sse_count.load(Ordering::SeqCst), 1);
+    assert_eq!(vms_fetches.load(Ordering::SeqCst), 1);
+
+    // Once keep-alives stop, idle read_timeout fires and reconnects + reconciles to stage 1 (Paused).
+    let reconciled = recv_until(&backend, Duration::from_secs(5), |u| {
+        matches!(u, GuiUpdate::DaemonConnected { vms, .. } if vms.iter().any(|v| v.runtime.status == VmStatus::Paused))
+    });
+    assert!(matches!(reconciled, GuiUpdate::DaemonConnected { .. }));
+    assert!(sse_count.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn sse_line_buffer_caps_unbounded_growth_and_strips_eof_cr() {
+    let mut lb = SseLineBuffer::new(16);
+    assert!(lb.push_chunk(b"data: ok\r\n"));
+    assert_eq!(lb.take_line().as_deref(), Some("data: ok"));
+    assert_eq!(lb.take_line(), None);
+
+    // Trailing CR at EOF without LF must be stripped consistently with take_line().
+    assert!(lb.push_chunk(b"data: tail\r"));
+    assert_eq!(lb.take_line(), None);
+    assert_eq!(lb.finish().as_deref(), Some("data: tail"));
+    assert_eq!(lb.finish(), None);
+
+    // Overflowing max_bytes without newline rejects and clears buffer so listener reconnects.
+    assert!(lb.push_chunk(b"0123456789"));
+    assert!(!lb.push_chunk(b"abcdefg"));
+    assert_eq!(lb.finish(), None);
+}
