@@ -263,12 +263,17 @@ elif [[ "$LISTEN_HOST_LC" == *:*:* && "$LISTEN_HOST_LC" =~ ^[0:]+$ ]]; then
     VIEWER_ADDR="[::1]:${LISTEN_PORT}"
 fi
 
+parse_epochrealtime_ms() {
+    local raw="$1"
+    local sec frac
+    IFS='.,' read -r sec frac <<< "$raw"
+    frac="${frac}000"
+    echo $(( 10#$sec * 1000 + 10#${frac:0:3} ))
+}
+
 now_ms() {
     if [[ -n "${EPOCHREALTIME:-}" ]]; then
-        local sec frac
-        IFS='.' read -r sec frac <<< "$EPOCHREALTIME"
-        frac="${frac}000"
-        echo $(( sec * 1000 + 10#${frac:0:3} ))
+        parse_epochrealtime_ms "$EPOCHREALTIME"
     else
         echo $(( $(date +%s) * 1000 ))
     fi
