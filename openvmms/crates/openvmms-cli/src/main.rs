@@ -796,31 +796,17 @@ fn handle_vm(cli: &Cli, action: &VmCmd) -> anyhow::Result<()> {
             delete_disks,
             yes,
         } => {
-            if *delete_disks && !*yes {
-                let summary = client.get_vm(vm)?;
-                let writable_disks: Vec<PathBuf> = summary
-                    .config
-                    .disks
-                    .iter()
-                    .filter(|d| d.kind == DiskKind::HardDisk && !d.read_only)
-                    .map(|d| d.path.clone())
-                    .collect();
-                if !writable_disks.is_empty() {
-                    use std::io::IsTerminal;
-                    if cli.json || !std::io::stdin().is_terminal() {
-                        bail!(
-                            "refusing to delete disk files without confirmation in non-interactive mode; pass --yes to confirm"
-                        );
-                    }
-                    confirm_disk_deletion(
-                        &summary.config.name,
-                        &writable_disks,
-                        &mut std::io::stdin().lock(),
-                        &mut std::io::stderr(),
-                    )?;
-                }
-            }
-            client.delete_vm(vm, *delete_disks)?;
+            use std::io::IsTerminal;
+            delete_vm_with_confirm(
+                &client,
+                vm,
+                *delete_disks,
+                *yes,
+                cli.json,
+                std::io::stdin().is_terminal(),
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr(),
+            )?;
             if cli.json {
                 println!("{}", serde_json::to_string(&serde_json::json!({ "deleted": vm }))?);
             } else {
@@ -965,6 +951,40 @@ fn disk_attachment_from_cli_path(lun: u32, path: &Path) -> DiskAttachment {
         read_only,
         format,
     }
+}
+
+fn delete_vm_with_confirm<R: std::io::BufRead, W: std::io::Write>(
+    client: &ApiClient,
+    vm: &str,
+    delete_disks: bool,
+    yes: bool,
+    json: bool,
+    is_tty: bool,
+    reader: &mut R,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    let target_id = if delete_disks && !yes {
+        let summary = client.get_vm(vm)?;
+        let writable_disks: Vec<PathBuf> = summary
+            .config
+            .disks
+            .iter()
+            .filter(|d| d.kind == DiskKind::HardDisk && !d.read_only)
+            .map(|d| d.path.clone())
+            .collect();
+        if !writable_disks.is_empty() {
+            if json || !is_tty {
+                bail!(
+                    "refusing to delete disk files without confirmation in non-interactive mode; pass --yes to confirm"
+                );
+            }
+            confirm_disk_deletion(&summary.config.name, &writable_disks, reader, writer)?;
+        }
+        summary.config.id.to_string()
+    } else {
+        vm.to_string()
+    };
+    client.delete_vm(&target_id, delete_disks)
 }
 
 fn confirm_disk_deletion(
@@ -1464,5 +1484,97 @@ mod tests {
         assert_eq!(patch.fastdesk_viewer_bin, Some(None));
         assert_eq!(patch.openvmm_img_bin, Some(None));
         assert_eq!(patch.uefi_firmware_path, Some(None));
+    }
+
+    #[test]
+    fn delete_vm_with_confirm_targets_resolved_uuid_after_confirmation() {
+        use openvmms_core::models::{
+            DiskAttachment, DiskFormat, VmConfig, VmPreset, VmRuntimeState, VmSummary,
+        };
+        use std::io::{Cursor, Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let mut cfg = VmConfig::from_preset("TargetVm", VmPreset::Custom, Path::new("/tmp"));
+        cfg.disks.push(DiskAttachment {
+            lun: 0,
+            path: PathBuf::from("/tmp/target.vhdx"),
+            kind: DiskKind::HardDisk,
+            format: DiskFormat::Vhdx,
+            read_only: false,
+        });
+        let expected_uuid = cfg.id;
+        let summary_json = serde_json::to_string(&VmSummary {
+            config: cfg,
+            runtime: VmRuntimeState::default(),
+        })
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "cli-delete-test-token";
+        let delete_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let delete_paths_srv = Arc::clone(&delete_paths);
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path_and_query = parts.next().unwrap_or("");
+
+                let (status_line, body) = if path_and_query.starts_with("/api/v1/health?") {
+                    let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
+                    let challenge = query
+                        .split('&')
+                        .filter_map(|kv| kv.split_once('='))
+                        .find(|(k, _)| *k == "challenge")
+                        .map(|(_, v)| v)
+                        .unwrap_or("");
+                    let proof =
+                        openvmms_core::models::compute_health_auth_proof(token, addr, challenge);
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"{{"status":"ok","service":"openvmmsd","auth_proof":"{proof}"}}"#
+                        ),
+                    )
+                } else if method == "GET" && path_and_query == "/api/v1/vms/TargetVm" {
+                    ("HTTP/1.1 200 OK", summary_json.clone())
+                } else if method == "DELETE" {
+                    delete_paths_srv
+                        .lock()
+                        .unwrap()
+                        .push(path_and_query.to_string());
+                    ("HTTP/1.1 200 OK", "{}".to_string())
+                } else {
+                    ("HTTP/1.1 404 Not Found", r#"{"error":"unexpected"}"#.to_string())
+                };
+
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = ApiClient::new(format!("http://{addr}"), token).unwrap();
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut out = Vec::new();
+        delete_vm_with_confirm(&client, "TargetVm", true, false, false, true, &mut input, &mut out)
+            .unwrap();
+        srv.join().unwrap();
+
+        let paths = delete_paths.lock().unwrap();
+        assert_eq!(
+            paths.as_slice(),
+            &[format!("/api/v1/vms/{expected_uuid}?delete_disks=true")]
+        );
     }
 }
