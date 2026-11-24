@@ -338,6 +338,17 @@ impl RegistryStore {
     fn load_or_create_token_default(&self) -> anyhow::Result<String> {
         let path = self.token_path();
         if let Some(read) = open_and_read_token(&path, false)? {
+            if read.has_hard_links {
+                let a = Uuid::new_v4().as_u128();
+                let b = Uuid::new_v4().as_u128();
+                let new_token = format!("{a:032x}{b:032x}");
+                tracing::warn!(
+                    path = %path.display(),
+                    "rotating daemon.token after detecting hard-linked token file"
+                );
+                atomic_write(&path, new_token.as_bytes(), true)?;
+                return Ok(new_token);
+            }
             if read.was_permissive {
                 #[cfg(windows)]
                 if !read.token.is_empty() {
@@ -737,6 +748,7 @@ fn current_user_token_buf()
     Ok(buf)
 }
 
+#[derive(Debug)]
 struct TokenRead {
     token: String,
     was_permissive: bool,
@@ -749,10 +761,9 @@ fn validate_token_uid(file_uid: u32, euid: u32, allow_root: bool) -> bool {
 }
 
 fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<Option<TokenRead>> {
-    use std::io::Read;
-
     #[cfg(unix)]
     {
+        use std::io::Read;
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
@@ -834,61 +845,92 @@ fn open_and_read_token(path: &Path, allow_root_reader: bool) -> anyhow::Result<O
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-
         let _ = allow_root_reader;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let token_buf = current_user_token_buf()?;
+        let token_user = unsafe { token_buf[0].assume_init_ref() };
+        open_and_read_token_windows_with_sid(path, token_user.User.Sid)
+    }
+}
 
-        let sym_meta = match fs::symlink_metadata(path) {
-            Ok(m) => m,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(err).with_context(|| format!("inspecting {}", path.display()));
-            }
-        };
-        if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
-            return Err(anyhow::Error::new(TokenSecurityError(format!(
-                "refusing to use non-regular or symlinked daemon token file {}",
-                path.display()
-            ))));
-        }
+#[cfg(windows)]
+fn open_and_read_token_windows_with_sid(
+    path: &Path,
+    expected_owner_sid: windows_sys::Win32::Security::PSID,
+) -> anyhow::Result<Option<TokenRead>> {
+    use std::io::Read;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
 
-        let mut opts = fs::OpenOptions::new();
-        opts.read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        let mut file = match opts.open(path) {
-            Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
-        };
-        let meta = file
-            .metadata()
-            .with_context(|| format!("inspecting {}", path.display()))?;
-        if !meta.file_type().is_file()
-            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-        {
-            return Err(anyhow::Error::new(TokenSecurityError(format!(
-                "refusing to use non-regular or symlinked daemon token file {}",
-                path.display()
-            ))));
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+    let sym_meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting {}", path.display()));
         }
-        let mut was_permissive = false;
-        if !is_handle_owner_only_windows(&file, path)? {
-            was_permissive = true;
+    };
+    if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+        return Err(anyhow::Error::new(TokenSecurityError(format!(
+            "refusing to use non-regular or symlinked daemon token file {}",
+            path.display()
+        ))));
+    }
+
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut file = match opts.open(path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    if !meta.file_type().is_file() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(anyhow::Error::new(TokenSecurityError(format!(
+            "refusing to use non-regular or symlinked daemon token file {}",
+            path.display()
+        ))));
+    }
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("GetFileInformationByHandle failed for {}", path.display()));
+    }
+    let has_hard_links = info.nNumberOfLinks > 1;
+
+    let was_permissive = match check_handle_owner_only_windows_for_sid(&file, path, expected_owner_sid)? {
+        WindowsTokenAclStatus::OwnerOnly => false,
+        WindowsTokenAclStatus::PermissiveDacl => {
             tracing::warn!(
                 path = %path.display(),
                 "daemon.token has overly permissive Windows ACL (expected owner-only)"
             );
+            true
         }
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .with_context(|| format!("reading {}", path.display()))?;
-        Ok(Some(TokenRead {
-            token: content.trim().to_string(),
-            was_permissive,
-            has_hard_links: false,
-        }))
-    }
+        WindowsTokenAclStatus::OwnerMismatch => {
+            return Err(anyhow::Error::new(TokenSecurityError(format!(
+                "refusing to use daemon token file {} owned by a different Windows user",
+                path.display()
+            ))));
+        }
+    };
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(TokenRead {
+        token: content.trim().to_string(),
+        was_permissive,
+        has_hard_links,
+    }))
 }
 
 pub fn save_pending_disks_journal(
@@ -1121,6 +1163,23 @@ fn persist_temp_file_windows(tmp_path: &Path, dest: &Path) -> anyhow::Result<()>
 }
 
 #[cfg(windows)]
+fn is_acl_unsupported_windows_error(err: &anyhow::Error) -> bool {
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    const ERROR_EAS_NOT_SUPPORTED: i32 = 282;
+
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+            io_err.kind() == std::io::ErrorKind::Unsupported
+                || matches!(
+                    io_err.raw_os_error(),
+                    Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_EAS_NOT_SUPPORTED)
+                )
+        })
+    })
+}
+
+#[cfg(windows)]
 fn try_rotate_token_if_owner_only_enforced_windows(
     path: &Path,
     new_token: &str,
@@ -1131,11 +1190,15 @@ fn try_rotate_token_if_owner_only_enforced_windows(
     let mut tmp_guard = TempPathGuard(None);
     let (tmp_path, mut tmp_file) = match create_owner_only_temp_file_windows(parent) {
         Ok(pair) => pair,
-        Err(_) => return Ok(false),
+        Err(err) if is_acl_unsupported_windows_error(&err) => return Ok(false),
+        Err(err) => return Err(err),
     };
     tmp_guard.0 = Some(tmp_path.clone());
-    if !matches!(is_handle_owner_only_windows(&tmp_file, &tmp_path), Ok(true)) {
-        return Ok(false);
+    match check_handle_owner_only_windows(&tmp_file, &tmp_path) {
+        Ok(WindowsTokenAclStatus::OwnerOnly) => {}
+        Ok(_) => return Ok(false),
+        Err(err) if is_acl_unsupported_windows_error(&err) => return Ok(false),
+        Err(err) => return Err(err),
     }
     tmp_file
         .write_all(new_token.as_bytes())
@@ -1179,7 +1242,29 @@ where
 }
 
 #[cfg(windows)]
-fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsTokenAclStatus {
+    OwnerOnly,
+    PermissiveDacl,
+    OwnerMismatch,
+}
+
+#[cfg(windows)]
+fn check_handle_owner_only_windows(
+    file: &fs::File,
+    path: &Path,
+) -> anyhow::Result<WindowsTokenAclStatus> {
+    let token_buf = current_user_token_buf()?;
+    let token_user = unsafe { token_buf[0].assume_init_ref() };
+    check_handle_owner_only_windows_for_sid(file, path, token_user.User.Sid)
+}
+
+#[cfg(windows)]
+fn check_handle_owner_only_windows_for_sid(
+    file: &fs::File,
+    path: &Path,
+    expected_owner_sid: windows_sys::Win32::Security::PSID,
+) -> anyhow::Result<WindowsTokenAclStatus> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
@@ -1224,10 +1309,8 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
     }
     let _sd_guard = LocalFreeSd(sd);
 
-    let token_buf = current_user_token_buf()?;
-    let token_user = unsafe { token_buf[0].assume_init_ref() };
-    if owner_sid.is_null() || unsafe { EqualSid(owner_sid, token_user.User.Sid) } == 0 {
-        return Ok(false);
+    if owner_sid.is_null() || unsafe { EqualSid(owner_sid, expected_owner_sid) } == 0 {
+        return Ok(WindowsTokenAclStatus::OwnerMismatch);
     }
 
     let mut control = 0u16;
@@ -1236,7 +1319,7 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
         return Err(std::io::Error::last_os_error()).context("GetSecurityDescriptorControl failed");
     }
     if (control & SE_DACL_PROTECTED) == 0 || dacl.is_null() {
-        return Ok(false);
+        return Ok(WindowsTokenAclStatus::PermissiveDacl);
     }
 
     let mut size_info = ACL_SIZE_INFORMATION {
@@ -1256,7 +1339,7 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
         return Err(std::io::Error::last_os_error()).context("GetAclInformation failed");
     }
     if size_info.AceCount != 1 {
-        return Ok(false);
+        return Ok(WindowsTokenAclStatus::PermissiveDacl);
     }
 
     let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -1265,12 +1348,16 @@ fn is_handle_owner_only_windows(file: &fs::File, path: &Path) -> anyhow::Result<
     }
     let ace = unsafe { &*(ace_ptr.cast::<ACCESS_ALLOWED_ACE>()) };
     if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE {
-        return Ok(false);
+        return Ok(WindowsTokenAclStatus::PermissiveDacl);
     }
     let ace_sid = (&raw const ace.SidStart)
         .cast::<core::ffi::c_void>()
         .cast_mut();
-    Ok(unsafe { EqualSid(ace_sid, token_user.User.Sid) } != 0)
+    if unsafe { EqualSid(ace_sid, expected_owner_sid) } != 0 {
+        Ok(WindowsTokenAclStatus::OwnerOnly)
+    } else {
+        Ok(WindowsTokenAclStatus::PermissiveDacl)
+    }
 }
 
 #[cfg(windows)]
@@ -1852,12 +1939,69 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&token_path).unwrap(), "rotated-token");
         let file = fs::File::open(&token_path).unwrap();
-        assert!(is_handle_owner_only_windows(&file, &token_path).unwrap());
+        assert_eq!(
+            check_handle_owner_only_windows(&file, &token_path).unwrap(),
+            WindowsTokenAclStatus::OwnerOnly
+        );
 
         let entries: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, vec!["daemon.token".to_string()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_token_rejects_hard_linked_file_and_load_or_create_rotates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let original = store.load_or_create_token().unwrap();
+        let link = dir.path().join("token-link");
+        fs::hard_link(store.token_path(), &link).unwrap();
+
+        let err = store.read_token().unwrap_err();
+        assert!(err.chain().any(|c| c.is::<TokenSecurityError>()), "{err:#}");
+
+        let rotated = store.load_or_create_token().unwrap();
+        assert_ne!(rotated, original);
+        assert_eq!(store.read_token().unwrap(), rotated);
+        assert_eq!(fs::read_to_string(&link).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_mismatch_produces_token_security_error() {
+        use windows_sys::Win32::Security::{
+            AllocateAndInitializeSid, FreeSid, PSID, SID_IDENTIFIER_AUTHORITY,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        let _ = store.load_or_create_token().unwrap();
+
+        // Construct the Everyone (S-1-1-0) SID as a distinct non-owner expected SID.
+        let mut world_auth = SID_IDENTIFIER_AUTHORITY {
+            Value: [0, 0, 0, 0, 0, 1],
+        };
+        let mut world_sid: PSID = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                AllocateAndInitializeSid(&mut world_auth, 1, 0, 0, 0, 0, 0, 0, 0, 0, &mut world_sid)
+            },
+            0
+        );
+        struct FreeSidGuard(PSID);
+        impl Drop for FreeSidGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    FreeSid(self.0);
+                }
+            }
+        }
+        let _guard = FreeSidGuard(world_sid);
+
+        let err = open_and_read_token_windows_with_sid(&store.token_path(), world_sid).unwrap_err();
+        assert!(err.chain().any(|c| c.is::<TokenSecurityError>()), "{err:#}");
     }
 }
