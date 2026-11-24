@@ -1123,6 +1123,24 @@ impl OpenVmmsApp {
 
     fn render_storage_tab(&mut self, ui: &mut egui::Ui, vm: &VmSummary) {
         let id = vm.config.id;
+        if !vm.runtime.orphaned_disks.is_empty() {
+            ui.group(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(245, 180, 60),
+                    "Warning: Failed hot-add rollback left orphaned disk reservation(s) active until this VM is stopped:",
+                );
+                for d in &vm.runtime.orphaned_disks {
+                    ui.monospace(format!(
+                        "LUN {}: [{:?}] {} ({})",
+                        d.lun,
+                        d.kind,
+                        d.path.display(),
+                        if d.read_only { "RO" } else { "RW" }
+                    ));
+                }
+            });
+            ui.add_space(6.0);
+        }
         egui::Grid::new("storage_tab_grid")
             .striped(true)
             .num_columns(5)
@@ -1240,6 +1258,25 @@ impl OpenVmmsApp {
 
     fn render_networking_tab(&mut self, ui: &mut egui::Ui, vm: &VmSummary) {
         let id = vm.config.id;
+        if !vm.runtime.orphaned_port_forwards.is_empty() {
+            ui.group(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(245, 180, 60),
+                    "Warning: Failed hot-add rollback left orphaned port-forward reservation(s) active until this VM is stopped:",
+                );
+                for p in &vm.runtime.orphaned_port_forwards {
+                    let nic_label = vm
+                        .config
+                        .nics
+                        .iter()
+                        .find(|n| n.id == p.nic_id)
+                        .map(|n| format!("{} ({})", n.name, p.nic_id))
+                        .unwrap_or_else(|| p.nic_id.to_string());
+                    ui.monospace(format!("NIC {nic_label}: {}", p.forward));
+                }
+            });
+            ui.add_space(6.0);
+        }
         for nic in &vm.config.nics {
             ui.group(|ui| {
                 ui.horizontal(|ui| {

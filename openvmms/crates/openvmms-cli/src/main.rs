@@ -1132,12 +1132,37 @@ fn print_vm_summary(vm: &VmSummary, json: bool) -> anyhow::Result<()> {
                 );
             }
         }
+        if !vm.runtime.orphaned_disks.is_empty() {
+            println!("Orphaned Disk Reservations (live until VM stops):");
+            for d in &vm.runtime.orphaned_disks {
+                println!(
+                    "  LUN {}: [{:?}] {} ({})",
+                    d.lun,
+                    d.kind,
+                    d.path.display(),
+                    if d.read_only { "RO" } else { "RW" }
+                );
+            }
+        }
         println!("Networking:");
         if vm.config.nics.is_empty() {
             println!("  (none)");
         } else {
             for n in &vm.config.nics {
                 println!("  {} [{}] {:?}", n.name, n.mac_address, n.backend);
+            }
+        }
+        if !vm.runtime.orphaned_port_forwards.is_empty() {
+            println!("Orphaned Port-Forward Reservations (live until VM stops):");
+            for p in &vm.runtime.orphaned_port_forwards {
+                let nic_label = vm
+                    .config
+                    .nics
+                    .iter()
+                    .find(|n| n.id == p.nic_id)
+                    .map(|n| format!("{} ({})", n.name, p.nic_id))
+                    .unwrap_or_else(|| p.nic_id.to_string());
+                println!("  NIC {nic_label}: {}", p.forward);
             }
         }
     }

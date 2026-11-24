@@ -19,6 +19,7 @@ use openvmms_core::models::LiveVmProperties;
 use openvmms_core::models::MountIsoPayload;
 use openvmms_core::models::NicAttachment;
 use openvmms_core::models::NicBackendConfig;
+use openvmms_core::models::OrphanedPortForward;
 use openvmms_core::models::PortForward;
 use openvmms_core::models::ResolvedHostPaths;
 use openvmms_core::models::SecureBootTemplateConfig;
@@ -112,6 +113,8 @@ struct ManagedVm {
     hotplug_lock: Arc<tokio::sync::Mutex<()>>,
     pending_disks: Vec<DiskAttachment>,
     pending_port_forwards: Vec<(Uuid, PortForward)>,
+    orphaned_disks: Vec<DiskAttachment>,
+    orphaned_port_forwards: Vec<OrphanedPortForward>,
     detach_on_drop: bool,
     deleting: bool,
 }
@@ -145,10 +148,23 @@ struct ActiveListener {
 
 impl ManagedVm {
     fn summary(&self) -> VmSummary {
+        let mut runtime = self.runtime.clone();
+        runtime.orphaned_disks = self.orphaned_disks.clone();
+        runtime.orphaned_port_forwards = self.orphaned_port_forwards.clone();
         VmSummary {
             config: self.config.clone(),
-            runtime: self.runtime.clone(),
+            runtime,
         }
+    }
+
+    fn clear_pending_reservations(&mut self) -> bool {
+        let had_orphans =
+            !self.orphaned_disks.is_empty() || !self.orphaned_port_forwards.is_empty();
+        self.pending_disks.clear();
+        self.pending_port_forwards.clear();
+        self.orphaned_disks.clear();
+        self.orphaned_port_forwards.clear();
+        had_orphans
     }
 
     fn active_rpc_socket(&self, action: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -227,6 +243,8 @@ impl Supervisor {
                     hotplug_lock: Arc::new(tokio::sync::Mutex::new(())),
                     pending_disks: Vec::new(),
                     pending_port_forwards: Vec::new(),
+                    orphaned_disks: Vec::new(),
+                    orphaned_port_forwards: Vec::new(),
                     detach_on_drop: false,
                     deleting: false,
                 },
@@ -1178,6 +1196,8 @@ impl Supervisor {
                             hotplug_lock: Arc::new(tokio::sync::Mutex::new(())),
                             pending_disks: Vec::new(),
                             pending_port_forwards: Vec::new(),
+                            orphaned_disks: Vec::new(),
+                            orphaned_port_forwards: Vec::new(),
                             detach_on_drop: false,
                             deleting: false,
                         };
@@ -2255,8 +2275,7 @@ impl Supervisor {
             vm.runtime.fastdesk_endpoint = None;
             vm.runtime.status = VmStatus::Error;
             vm.runtime.last_error = Some(err_msg.to_string());
-            vm.pending_disks.clear();
-            vm.pending_port_forwards.clear();
+            vm.clear_pending_reservations();
             vm.runtime.revision = self.next_revision();
             let summary = vm.summary();
             drop(guard);
@@ -2568,8 +2587,7 @@ impl Supervisor {
                 vm.monitor_cancel = None;
                 vm.monitor_handle = None;
                 vm.stop_wait = None;
-                vm.pending_disks.clear();
-                vm.pending_port_forwards.clear();
+                vm.clear_pending_reservations();
 
                 let halt_reason = props.as_ref().and_then(|p| p.halt_reason.clone());
                 let is_halted = props
@@ -2619,12 +2637,11 @@ impl Supervisor {
                 )));
             }
             if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
-                let changed =
+                let mut changed =
                     vm.runtime.status != VmStatus::Off || vm.runtime.last_error.is_some();
                 vm.runtime.status = VmStatus::Off;
                 vm.runtime.last_error = None;
-                vm.pending_disks.clear();
-                vm.pending_port_forwards.clear();
+                changed |= vm.clear_pending_reservations();
                 if changed {
                     vm.runtime.revision = self.next_revision();
                 }
@@ -2796,8 +2813,7 @@ impl Supervisor {
                             vm.runtime.live_properties = None;
                             vm.runtime.last_error = None;
                             vm.stop_wait = None;
-                            vm.pending_disks.clear();
-                            vm.pending_port_forwards.clear();
+                            vm.clear_pending_reservations();
                             vm.runtime.revision = sup.next_revision();
                             let stopped_summary = vm.summary();
                             let emit_summary = (!vm.deleting).then(|| stopped_summary.clone());
@@ -2852,12 +2868,11 @@ impl Supervisor {
                             vm.config.name
                         )));
                     } else if matches!(vm.runtime.status, VmStatus::Off | VmStatus::Error) {
-                        let changed = vm.runtime.status != VmStatus::Off
+                        let mut changed = vm.runtime.status != VmStatus::Off
                             || vm.runtime.last_error.is_some();
                         vm.runtime.status = VmStatus::Off;
                         vm.runtime.last_error = None;
-                        vm.pending_disks.clear();
-                        vm.pending_port_forwards.clear();
+                        changed |= vm.clear_pending_reservations();
                         if changed {
                             vm.runtime.revision = self.next_revision();
                         }
@@ -3265,14 +3280,18 @@ impl Supervisor {
                         && self.is_same_live_vm(id, rpc_gen)
                         && !rollback_hot_added_disk(&sock, id, attachment.lun).await
                     {
-                        warn!(
-                            vm_id = %id,
-                            lun = attachment.lun,
-                            path = %attachment.path.display(),
-                            error = %err,
-                            "hot-add SCSI disk RPC failed ambiguously and rollback did not succeed; retaining pending disk reservation until VM stops"
-                        );
-                        pending_guard.disarm();
+                        let lun = attachment.lun;
+                        let disk_path = attachment.path.clone();
+                        if self.retain_orphaned_disk(id, rpc_gen, attachment) {
+                            warn!(
+                                vm_id = %id,
+                                lun,
+                                path = %disk_path.display(),
+                                error = %err,
+                                "hot-add SCSI disk RPC failed ambiguously and rollback did not succeed; retaining pending disk reservation until VM stops"
+                            );
+                            pending_guard.disarm();
+                        }
                     }
                     return Err(err);
                 }
@@ -3359,7 +3378,7 @@ impl Supervisor {
                         summary
                     }
                     Err((err, retain_reservation)) => {
-                        if retain_reservation {
+                        if retain_reservation && self.retain_orphaned_disk(id, rpc_gen, attachment) {
                             pending_guard.disarm();
                         }
                         return Err(err);
@@ -3985,6 +4004,7 @@ impl Supervisor {
                         && self.is_same_live_vm(id, rpc_gen)
                         && !rollback_port_forward(&sock, id, nic_id, add, proto_port).await
                         && let Some(pg) = pending_guard.as_mut()
+                        && self.retain_orphaned_port_forward(id, rpc_gen, nic_id, port.clone())
                     {
                         warn!(
                             vm_id = %id,
@@ -4052,6 +4072,7 @@ impl Supervisor {
                         if retain_reservation
                             && add
                             && let Some(pg) = pending_guard.as_mut()
+                            && self.retain_orphaned_port_forward(id, rpc_gen, nic_id, port)
                         {
                             pg.disarm();
                         }
@@ -4067,10 +4088,68 @@ impl Supervisor {
         Ok(summary)
     }
 
+    fn retain_orphaned_disk(&self, id: Uuid, rpc_gen: u64, disk: DiskAttachment) -> bool {
+        let summary = {
+            let mut guard = self.vms.write().unwrap();
+            let Some(vm) = guard.get_mut(&id) else {
+                return false;
+            };
+            if ensure_same_live_vm(vm, rpc_gen, "disk attach").is_err() {
+                return false;
+            }
+            if !vm
+                .orphaned_disks
+                .iter()
+                .any(|d| d.lun == disk.lun && d.path == disk.path)
+            {
+                vm.orphaned_disks.push(disk);
+            }
+            vm.runtime.revision = self.next_revision();
+            vm.summary()
+        };
+        self.emit(DaemonEvent::VmUpdated { vm: summary });
+        true
+    }
+
+    fn retain_orphaned_port_forward(
+        &self,
+        id: Uuid,
+        rpc_gen: u64,
+        nic_id: Uuid,
+        forward: PortForward,
+    ) -> bool {
+        let summary = {
+            let mut guard = self.vms.write().unwrap();
+            let Some(vm) = guard.get_mut(&id) else {
+                return false;
+            };
+            if ensure_same_live_vm(vm, rpc_gen, "port forward update").is_err() {
+                return false;
+            }
+            let entry = OrphanedPortForward { nic_id, forward };
+            if !vm.orphaned_port_forwards.contains(&entry) {
+                vm.orphaned_port_forwards.push(entry);
+            }
+            vm.runtime.revision = self.next_revision();
+            vm.summary()
+        };
+        self.emit(DaemonEvent::VmUpdated { vm: summary });
+        true
+    }
+
     #[cfg(test)]
     pub fn set_vm_status_for_test(&self, id: Uuid, status: VmStatus) {
         if let Some(vm) = self.vms.write().unwrap().get_mut(&id) {
             vm.runtime.status = status;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_vm_running_socket_for_test(&self, id: Uuid, sock_path: PathBuf) {
+        if let Some(vm) = self.vms.write().unwrap().get_mut(&id) {
+            vm.runtime.status = VmStatus::Running;
+            vm.runtime.rpc_socket_path = Some(sock_path);
+            vm.generation += 1;
         }
     }
 
@@ -7255,6 +7334,7 @@ mod tests {
             .open(vm1_dir.join(".probe"))
             .is_ok();
         if !can_write_vm1_dir {
+            let mut events_rx = sup.subscribe();
             // 1. Hot-add disk succeeds, save fails, rollback fails -> reservation must remain active.
             let disk_err = sup
                 .attach_disk(
@@ -7269,6 +7349,17 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(!format!("{disk_err:#}").is_empty());
+
+            let summary_after_disk = sup.get_vm(&vm1_id.to_string()).unwrap();
+            assert_eq!(summary_after_disk.runtime.orphaned_disks.len(), 1);
+            assert_eq!(
+                summary_after_disk.runtime.orphaned_disks[0].path,
+                shared_disk
+            );
+            assert!(matches!(
+                events_rx.try_recv(),
+                Ok(DaemonEvent::VmUpdated { vm }) if vm.runtime.orphaned_disks.len() == 1
+            ));
 
             // Conflicting attach on VM2 must be rejected with 409 Conflict.
             let conflict_disk = sup
@@ -7304,6 +7395,17 @@ mod tests {
                 .unwrap_err();
             assert!(!format!("{pf_err:#}").is_empty());
 
+            let summary_after_pf = sup.get_vm(&vm1_id.to_string()).unwrap();
+            assert_eq!(summary_after_pf.runtime.orphaned_port_forwards.len(), 1);
+            assert_eq!(
+                summary_after_pf.runtime.orphaned_port_forwards[0].forward,
+                pf
+            );
+            assert!(matches!(
+                events_rx.try_recv(),
+                Ok(DaemonEvent::VmUpdated { vm }) if vm.runtime.orphaned_port_forwards.len() == 1
+            ));
+
             // Starting or adding overlapping port on active VM2 must be rejected with 409 Conflict.
             drop(restore);
             sup.add_port_forward(&vm2_id.to_string(), vm2_nic, pf.clone())
@@ -7318,8 +7420,13 @@ mod tests {
                 "expected 409 conflict for un-rolled-back pending port, got: {conflict_start:#}"
             );
 
-            // Once VM1 stops, pending reservations clear and VM2 can attach the shared disk.
-            sup.stop_vm(&vm1_id.to_string()).await.unwrap();
+            // Once VM1 stops, pending & orphaned reservations clear and VM2 can attach the shared disk.
+            let stopped_vm1 = sup.stop_vm(&vm1_id.to_string()).await.unwrap();
+            assert!(stopped_vm1.runtime.orphaned_disks.is_empty());
+            assert!(stopped_vm1.runtime.orphaned_port_forwards.is_empty());
+            let fetched_vm1 = sup.get_vm(&vm1_id.to_string()).unwrap();
+            assert!(fetched_vm1.runtime.orphaned_disks.is_empty());
+            assert!(fetched_vm1.runtime.orphaned_port_forwards.is_empty());
             sup.attach_disk(
                 &vm2_id.to_string(),
                 AttachDiskPayload {
@@ -7760,7 +7867,7 @@ mod tests {
             .unwrap_err();
         assert!(!format!("{pf_err:#}").is_empty());
 
-        sup.add_port_forward(&vm2_id.to_string(), vm2_nic, pf)
+        sup.add_port_forward(&vm2_id.to_string(), vm2_nic, pf.clone())
             .await
             .unwrap();
         let conflict_start = sup.start_vm(&vm2_id.to_string()).await.unwrap_err();
@@ -7770,7 +7877,25 @@ mod tests {
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 4);
 
+        // Both ambiguous-RPC failed-rollback reservations are exposed in VmSummary while running.
+        let summary_while_running = sup.get_vm(&vm1_id.to_string()).unwrap();
+        assert_eq!(summary_while_running.runtime.orphaned_disks.len(), 1);
+        assert_eq!(
+            summary_while_running.runtime.orphaned_disks[0].path,
+            shared_disk
+        );
+        assert_eq!(
+            summary_while_running.runtime.orphaned_port_forwards,
+            vec![OrphanedPortForward {
+                nic_id: vm1_nic,
+                forward: pf.clone(),
+            }]
+        );
+
         sup.stop_vm(&vm1_id.to_string()).await.unwrap();
+        let summary_after_stop = sup.get_vm(&vm1_id.to_string()).unwrap();
+        assert!(summary_after_stop.runtime.orphaned_disks.is_empty());
+        assert!(summary_after_stop.runtime.orphaned_port_forwards.is_empty());
         sup.attach_disk(
             &vm2_id.to_string(),
             AttachDiskPayload {
@@ -8082,5 +8207,189 @@ mod tests {
             .await
             .unwrap();
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retain_orphaned_skips_when_vm_stops_restarts_or_deletes_during_rollback() {
+        use openvmms_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(openvmms_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let disk_path = dir.path().join("toctou-orphan.img");
+        fs::write(&disk_path, vec![0u8; 4096]).unwrap();
+
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "ToctouOrphan-VM".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm_id = vm.config.id;
+        let nic_id = vm.config.nics[0].id;
+        let vm_dir = openvmms_core::store::RegistryStore::open(dir.path()).vm_dir(vm_id);
+        struct RestorePerm(std::path::PathBuf);
+        impl Drop for RestorePerm {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let restore = RestorePerm(vm_dir.clone());
+        fs::set_permissions(&vm_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let can_write_vm_dir = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(vm_dir.join(".probe"))
+            .is_ok();
+        if !can_write_vm_dir {
+            let sock_path = dir.path().join("toctou-orphan.sock");
+            let listener = UnixListener::bind(&sock_path).unwrap();
+
+            let (rb_entered_tx, rb_entered_rx) = std::sync::mpsc::channel::<()>();
+            let (rb_release_tx, rb_release_rx) = std::sync::mpsc::channel::<()>();
+            let srv = std::thread::spawn(move || {
+                // 1. Hot-add disk succeeds
+                if let Ok((mut s, _)) = listener.accept()
+                    && let Ok((stream_id, _, _)) = read_frame(&mut s)
+                {
+                    let resp = TestWireResponse {
+                        result: Some(test_wire_response::Result::Payload(Vec::new())),
+                    };
+                    if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                        let _ = s.write_all(&frame);
+                        let _ = s.flush();
+                    }
+                }
+                // 2. Rollback hot-add disk pauses until test transitions VM state, then fails
+                if let Ok((mut s, _)) = listener.accept()
+                    && let Ok((stream_id, _, _)) = read_frame(&mut s)
+                {
+                    let _ = rb_entered_tx.send(());
+                    let _ = rb_release_rx.recv_timeout(Duration::from_secs(5));
+                    let resp = TestWireResponse {
+                        result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                            code: 13,
+                            message: "rollback failed".into(),
+                            details: Vec::new(),
+                        })),
+                    };
+                    if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                        let _ = s.write_all(&frame);
+                        let _ = s.flush();
+                    }
+                }
+            });
+
+            sup.set_vm_running_socket_for_test(vm_id, sock_path);
+            let mut events_rx = sup.subscribe();
+            let sup_attach = Arc::clone(&sup);
+            let disk_for_attach = disk_path.clone();
+            let handle = tokio::spawn(async move {
+                sup_attach
+                    .attach_disk(
+                        &vm_id.to_string(),
+                        AttachDiskPayload {
+                            lun: Some(1),
+                            path: disk_for_attach,
+                            read_only: false,
+                            format: Some(DiskFormat::Raw),
+                        },
+                    )
+                    .await
+            });
+
+            // Wait until rollback_hot_added_disk is in flight, then simulate VM restart/stop/deleting.
+            while rb_entered_rx.try_recv().is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            {
+                let mut guard = sup.vms.write().unwrap();
+                let entry = guard.get_mut(&vm_id).unwrap();
+                entry.generation += 1;
+                entry.runtime.status = VmStatus::Off;
+                entry.clear_pending_reservations();
+            }
+            let _ = rb_release_tx.send(());
+            assert!(handle.await.unwrap().is_err());
+
+            let summary = sup.get_vm(&vm_id.to_string()).unwrap();
+            assert!(
+                summary.runtime.orphaned_disks.is_empty(),
+                "stale generation/stopped VM must not retain orphaned_disks"
+            );
+            assert!(
+                matches!(events_rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+                "must not emit VmUpdated when retain_orphaned_disk skips due to state/generation change"
+            );
+            let _ = rb_release_tx.send(());
+            srv.join().unwrap();
+        }
+        drop(restore);
+
+        // Also verify direct guard behavior for deleting / Off / Error / generation-mismatch states.
+        let rpc_gen = sup.generation_for_test(vm_id);
+        let disk = DiskAttachment {
+            lun: 2,
+            path: disk_path,
+            read_only: false,
+            kind: DiskKind::HardDisk,
+            format: DiskFormat::Raw,
+        };
+        let pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 19222,
+            guest_port: 22,
+        };
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let entry = guard.get_mut(&vm_id).unwrap();
+            entry.runtime.status = VmStatus::Running;
+            entry.generation = rpc_gen + 10;
+            entry.deleting = true;
+        }
+        assert!(!sup.retain_orphaned_disk(vm_id, rpc_gen + 10, disk.clone()));
+        assert!(!sup.retain_orphaned_port_forward(vm_id, rpc_gen + 10, nic_id, pf.clone()));
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let entry = guard.get_mut(&vm_id).unwrap();
+            entry.deleting = false;
+            entry.runtime.status = VmStatus::Error;
+        }
+        assert!(!sup.retain_orphaned_disk(vm_id, rpc_gen + 10, disk.clone()));
+        assert!(!sup.retain_orphaned_port_forward(vm_id, rpc_gen + 10, nic_id, pf.clone()));
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let entry = guard.get_mut(&vm_id).unwrap();
+            entry.runtime.status = VmStatus::Running;
+        }
+        assert!(!sup.retain_orphaned_disk(vm_id, rpc_gen + 9, disk));
+        assert!(!sup.retain_orphaned_port_forward(vm_id, rpc_gen + 9, nic_id, pf));
+        let final_summary = sup.get_vm(&vm_id.to_string()).unwrap();
+        assert!(final_summary.runtime.orphaned_disks.is_empty());
+        assert!(final_summary.runtime.orphaned_port_forwards.is_empty());
     }
 }
