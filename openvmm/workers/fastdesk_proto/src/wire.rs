@@ -4,6 +4,7 @@
 //! Binary length-prefixed wire messages between `fastdesk_worker` and `fastdesk-viewer`.
 
 use crate::MAGIC;
+use crate::MAX_CLIENT_MSG_PAYLOAD_BYTES;
 use crate::MAX_CURSOR_DIM;
 use crate::MAX_FRAME_PAYLOAD_BYTES;
 use crate::MAX_RECTS_PER_BATCH;
@@ -206,6 +207,17 @@ pub fn decode_frame_header(header: &[u8; 5]) -> Result<(u8, usize), ProtoError> 
     let msg_type = header[0];
     let payload_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
     if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(ProtoError::FrameTooLarge(payload_len));
+    }
+    Ok((msg_type, payload_len))
+}
+
+/// Decodes a 5-byte client-to-server frame header `[msg_type: u8][payload_len: u32 LE]`,
+/// enforcing [`MAX_CLIENT_MSG_PAYLOAD_BYTES`].
+pub fn decode_client_frame_header(header: &[u8; 5]) -> Result<(u8, usize), ProtoError> {
+    let msg_type = header[0];
+    let payload_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if payload_len > MAX_CLIENT_MSG_PAYLOAD_BYTES {
         return Err(ProtoError::FrameTooLarge(payload_len));
     }
     Ok((msg_type, payload_len))
@@ -592,7 +604,7 @@ pub fn write_client_msg(writer: &mut impl Write, msg: &ClientMsg) -> Result<(), 
 pub fn read_client_msg(reader: &mut impl Read) -> Result<ClientMsg, ProtoError> {
     let mut hdr = [0u8; 5];
     reader.read_exact(&mut hdr)?;
-    let (msg_type, payload_len) = decode_frame_header(&hdr)?;
+    let (msg_type, payload_len) = decode_client_frame_header(&hdr)?;
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload)?;
     decode_client_msg(msg_type, &payload)
