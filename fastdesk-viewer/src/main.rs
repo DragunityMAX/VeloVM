@@ -429,7 +429,10 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u16, u16)> {
     let (w, h) = s
         .split_once('x')
         .ok_or_else(|| anyhow::anyhow!("resolution must be WxH, got '{s}'"))?;
-    Ok((w.parse()?, h.parse()?))
+    let w: u16 = w.parse()?;
+    let h: u16 = h.parse()?;
+    anyhow::ensure!(w > 0 && h > 0, "resolution width and height must be > 0, got '{s}'");
+    Ok((w, h))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1031,5 +1034,13 @@ mod tests {
         let rtt_us = compute_rtt_us(pong_recv_us, ping_sent_us);
         assert!(rtt_us >= 4_000, "expected RTT >= 4000 us, got {rtt_us}");
         assert_eq!(compute_rtt_us(100, 200), 0);
+    }
+
+    #[test]
+    fn parse_resolution_rejects_zero_dimensions() {
+        assert!(parse_resolution("0x1080").is_err());
+        assert!(parse_resolution("1920x0").is_err());
+        assert!(parse_resolution("0x0").is_err());
+        assert_eq!(parse_resolution("1920x1080").unwrap(), (1920, 1080));
     }
 }
