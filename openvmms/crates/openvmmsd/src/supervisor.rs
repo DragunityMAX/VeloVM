@@ -3140,6 +3140,12 @@ impl Supervisor {
         let format = req
             .format
             .unwrap_or_else(|| DiskFormat::from_path(&req.path));
+        if DiskFormat::from_path(&req.path) == DiskFormat::Iso && format != DiskFormat::Iso {
+            return Err(err_bad_request(format!(
+                "ISO image '{}' must be attached as a read-only DVD drive with format 'iso'",
+                req.path.display()
+            )));
+        }
         let kind = if format == DiskFormat::Iso {
             DiskKind::Dvd
         } else {
@@ -4820,11 +4826,29 @@ fn ensure_disk_format_safe(
             path.display()
         )));
     }
+    let lower = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if lower.as_deref() == Some("iso") && format != DiskFormat::Iso {
+        return Err(err_bad_request(format!(
+            "ISO image '{}' must be attached as a read-only DVD drive with format 'iso'",
+            path.display()
+        )));
+    }
+    if format == DiskFormat::Vhdx && matches!(lower.as_deref(), Some("vhd" | "avhd")) {
+        return Err(err_bad_request(format!(
+            "disk path '{}' has a VHD1 extension and is incompatible with format 'vhdx'",
+            path.display()
+        )));
+    }
+    if format == DiskFormat::Vhd && matches!(lower.as_deref(), Some("vhdx" | "avhdx")) {
+        return Err(err_bad_request(format!(
+            "disk path '{}' has a VHDX extension and is incompatible with format 'vhd'",
+            path.display()
+        )));
+    }
     if format == DiskFormat::Raw {
-        let lower = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
         if matches!(
             lower.as_deref(),
             Some("vhdx" | "avhdx" | "vhd" | "avhd" | "vmdk" | "vmgs" | "iso")
