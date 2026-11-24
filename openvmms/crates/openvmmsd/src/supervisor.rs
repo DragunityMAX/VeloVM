@@ -348,6 +348,7 @@ impl Supervisor {
                 return;
             }
         };
+        let original_len = entries.len();
         let surviving: Vec<DiskAttachment> = entries
             .into_iter()
             .filter(|pd| {
@@ -357,6 +358,17 @@ impl Supervisor {
                     .any(|d| d.lun == pd.lun && d.path == pd.path)
             })
             .collect();
+        if surviving.len() != original_len
+            && let Err(err) =
+                openvmms_core::store::save_pending_disks_journal(&journal_path, &surviving)
+        {
+            warn!(
+                vm_id = %vm.config.id,
+                path = %journal_path.display(),
+                error = %err,
+                "failed to prune committed entries from pending disk journal for re-adopted VM"
+            );
+        }
         if !surviving.is_empty() {
             warn!(
                 vm_id = %vm.config.id,
@@ -2112,6 +2124,7 @@ impl Supervisor {
             }
             let _ = fs::remove_file(&sock_path);
             let _ = fs::remove_file(&pid_path);
+            let _ = fs::remove_file(sock_path.with_extension("pending-disks.json"));
 
             let shm_path = if cfg.fastdesk.enabled && cfg.fastdesk.use_shm {
                 let path = runtime_dir.join(format!("vram-{id}.shm"));
@@ -3154,6 +3167,7 @@ impl Supervisor {
         struct PendingDiskGuard<'a> {
             vms: &'a RwLock<HashMap<Uuid, ManagedVm>>,
             vm_id: Uuid,
+            rpc_gen: u64,
             lun: u32,
             path: PathBuf,
             journal_path: PathBuf,
@@ -3169,6 +3183,7 @@ impl Supervisor {
                 if self.armed
                     && let Ok(mut guard) = self.vms.write()
                     && let Some(vm) = guard.get_mut(&self.vm_id)
+                    && vm.generation == self.rpc_gen
                     && let Some(pos) = vm
                         .pending_disks
                         .iter()
@@ -3176,11 +3191,15 @@ impl Supervisor {
                 {
                     vm.pending_disks.remove(pos);
                     let remaining = vm.pending_disks.clone();
+                    let live = !vm.deleting
+                        && matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused);
                     drop(guard);
-                    let _ = openvmms_core::store::save_pending_disks_journal(
-                        &self.journal_path,
-                        &remaining,
-                    );
+                    if remaining.is_empty() || live {
+                        let _ = openvmms_core::store::save_pending_disks_journal(
+                            &self.journal_path,
+                            &remaining,
+                        );
+                    }
                 }
             }
         }
@@ -3265,6 +3284,7 @@ impl Supervisor {
                                 let pending_guard = PendingDiskGuard {
                                     vms: &self.vms,
                                     vm_id: id,
+                                    rpc_gen: vm_gen,
                                     lun: attachment.lun,
                                     path: attachment.path.clone(),
                                     journal_path: journal_path.clone(),
@@ -3464,36 +3484,46 @@ impl Supervisor {
                 match res {
                     Ok(summary) => {
                         pending_guard.disarm();
-                        let remaining_pending = self
-                            .vms
-                            .read()
-                            .unwrap()
-                            .get(&id)
-                            .map(|vm| vm.pending_disks.clone())
-                            .unwrap_or_default();
-                        let journal_for_clear = journal_path;
-                        let clear_res = tokio::task::spawn_blocking(move || {
-                            openvmms_core::store::save_pending_disks_journal(
-                                &journal_for_clear,
-                                &remaining_pending,
-                            )
-                        })
-                        .await;
-                        match clear_res {
-                            Ok(Ok(())) => {}
-                            Ok(Err(journal_err)) => {
-                                warn!(
-                                    vm_id = %id,
-                                    error = %journal_err,
-                                    "failed to clear pending disk journal after commit"
-                                );
+                        let (should_write, remaining_pending) = {
+                            let guard = self.vms.read().unwrap();
+                            match guard.get(&id) {
+                                Some(vm) if vm.generation == rpc_gen => {
+                                    let live = !vm.deleting
+                                        && matches!(
+                                            vm.runtime.status,
+                                            VmStatus::Running | VmStatus::Paused
+                                        );
+                                    let remaining = vm.pending_disks.clone();
+                                    (remaining.is_empty() || live, remaining)
+                                }
+                                _ => (false, Vec::new()),
                             }
-                            Err(join_err) => {
-                                warn!(
-                                    vm_id = %id,
-                                    error = %join_err,
-                                    "pending disk journal clear task failed after commit"
-                                );
+                        };
+                        if should_write {
+                            let journal_for_clear = journal_path;
+                            let clear_res = tokio::task::spawn_blocking(move || {
+                                openvmms_core::store::save_pending_disks_journal(
+                                    &journal_for_clear,
+                                    &remaining_pending,
+                                )
+                            })
+                            .await;
+                            match clear_res {
+                                Ok(Ok(())) => {}
+                                Ok(Err(journal_err)) => {
+                                    warn!(
+                                        vm_id = %id,
+                                        error = %journal_err,
+                                        "failed to clear pending disk journal after commit"
+                                    );
+                                }
+                                Err(join_err) => {
+                                    warn!(
+                                        vm_id = %id,
+                                        error = %join_err,
+                                        "pending disk journal clear task failed after commit"
+                                    );
+                                }
                             }
                         }
                         summary
@@ -8708,5 +8738,161 @@ mod tests {
         stop_srv.store(true, Ordering::Release);
         sup2.detach_all_vms().await;
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_vm_removes_stale_pending_disks_journal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_openvmm = dir.path().join("fake-openvmm.sh");
+        fs::write(&fake_openvmm, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&fake_openvmm, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_uefi = dir.path().join("MSVM.fd");
+        fs::write(&fake_uefi, b"dummy-uefi").unwrap();
+        let stale_disk = dir.path().join("stale-journal-disk.img");
+        fs::write(&stale_disk, vec![0u8; 4096]).unwrap();
+
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        sup.patch_host_config(HostConfigPatch {
+            openvmm_bin: Some(Some(fake_openvmm)),
+            uefi_firmware_path: Some(Some(fake_uefi)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "VM-StaleJournalCleanup".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let runtime_dir = sup.host_config().runtime_dir;
+        fs::create_dir_all(&runtime_dir).unwrap();
+        let sock_path = runtime_dir.join(format!("{}.sock", vm.config.id));
+        let pid_path = sock_path.with_extension("pid");
+        let journal_path = sock_path.with_extension("pending-disks.json");
+        fs::write(&pid_path, "999999\n1").unwrap();
+        openvmms_core::store::save_pending_disks_journal(
+            &journal_path,
+            &[DiskAttachment {
+                lun: 2,
+                path: stale_disk,
+                read_only: false,
+                kind: DiskKind::HardDisk,
+                format: DiskFormat::Raw,
+            }],
+        )
+        .unwrap();
+        assert!(journal_path.exists());
+
+        // Fake openvmm exits immediately so start_vm fails after cleaning stale runtime files.
+        let _ = sup.start_vm(&vm.config.id.to_string()).await;
+        assert!(
+            !journal_path.exists(),
+            "start_vm must remove stale pending-disks.json alongside .sock and .pid"
+        );
+        assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn restore_pending_disks_from_journal_prunes_committed_entries_and_deletes_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let committed_disk = dir.path().join("committed.img");
+        let pending_disk = dir.path().join("still-pending.img");
+        fs::write(&committed_disk, vec![0u8; 4096]).unwrap();
+        fs::write(&pending_disk, vec![0u8; 4096]).unwrap();
+
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "VM-PruneJournal".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let sock_path = sup.host_config().runtime_dir.join(format!("{id}.sock"));
+        let journal_path = sock_path.with_extension("pending-disks.json");
+
+        let committed_entry = DiskAttachment {
+            lun: 1,
+            path: committed_disk,
+            read_only: false,
+            kind: DiskKind::HardDisk,
+            format: DiskFormat::Raw,
+        };
+        let uncommitted_entry = DiskAttachment {
+            lun: 3,
+            path: pending_disk,
+            read_only: false,
+            kind: DiskKind::HardDisk,
+            format: DiskFormat::Raw,
+        };
+
+        // Case 1: one entry is already committed in vm.config.disks, one is still uncommitted.
+        openvmms_core::store::save_pending_disks_journal(
+            &journal_path,
+            &[committed_entry.clone(), uncommitted_entry.clone()],
+        )
+        .unwrap();
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            vm.config.disks.push(committed_entry.clone());
+            Supervisor::restore_pending_disks_from_journal(vm, &sock_path);
+            assert_eq!(vm.pending_disks, vec![uncommitted_entry.clone()]);
+            vm.pending_disks.clear();
+        }
+        let persisted = openvmms_core::store::load_pending_disks_journal(&journal_path).unwrap();
+        assert_eq!(persisted, vec![uncommitted_entry]);
+
+        // Case 2: all entries are already committed -> journal file must be deleted on disk.
+        openvmms_core::store::save_pending_disks_journal(&journal_path, &[committed_entry])
+            .unwrap();
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            Supervisor::restore_pending_disks_from_journal(vm, &sock_path);
+            assert!(vm.pending_disks.is_empty());
+        }
+        assert!(
+            !journal_path.exists(),
+            "journal file must be deleted when all entries are pruned as already committed"
+        );
+    }
+
+    #[test]
+    fn restore_pending_disks_from_journal_handles_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "VM-MalformedJournal".into(),
+                preset: openvmms_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let sock_path = sup.host_config().runtime_dir.join(format!("{id}.sock"));
+        let journal_path = sock_path.with_extension("pending-disks.json");
+        fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+        fs::write(&journal_path, b"{not valid json").unwrap();
+
+        assert!(openvmms_core::store::load_pending_disks_journal(&journal_path).is_err());
+
+        let mut guard = sup.vms.write().unwrap();
+        let vm = guard.get_mut(&id).unwrap();
+        Supervisor::restore_pending_disks_from_journal(vm, &sock_path);
+        assert!(vm.pending_disks.is_empty());
     }
 }
