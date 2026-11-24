@@ -592,10 +592,18 @@ impl VmSettingsDialog {
             || self.transport != self.initial_config.fastdesk.transport;
         let fastdesk_diff = fastdesk_changed.then(|| {
             let mut fastdesk = self.base_fastdesk.clone();
-            fastdesk.enabled = self.fastdesk_enabled;
-            fastdesk.vram_mb = self.vram_mb;
-            fastdesk.use_shm = self.use_shm;
-            fastdesk.transport = self.transport;
+            if self.fastdesk_enabled != self.initial_config.fastdesk.enabled {
+                fastdesk.enabled = self.fastdesk_enabled;
+            }
+            if self.vram_mb != self.initial_config.fastdesk.vram_mb {
+                fastdesk.vram_mb = self.vram_mb;
+            }
+            if self.use_shm != self.initial_config.fastdesk.use_shm {
+                fastdesk.use_shm = self.use_shm;
+            }
+            if self.transport != self.initial_config.fastdesk.transport {
+                fastdesk.transport = self.transport;
+            }
             fastdesk
         });
         let cur_fw = string_to_opt(&self.uefi_firmware);
@@ -2319,6 +2327,24 @@ mod tests {
         assert_eq!(fd.listen_addr, "127.0.0.1:5955");
         assert!(vram_payload.vcpus.is_none());
         assert!(vram_payload.nics.is_none());
+    }
+
+    #[test]
+    fn vm_settings_dialog_preserves_external_fastdesk_fields_when_only_vram_changes() {
+        let cfg = VmConfig::from_preset("FastDeskPartial", VmPreset::Custom, Path::new("/tmp/vm"));
+        let mut dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Off);
+
+        // External CLI edit changes transport/use_shm on the daemon without touching dialog UI.
+        dlg.base_fastdesk.transport = FastDeskTransport::HvSock;
+        dlg.base_fastdesk.use_shm = !cfg.fastdesk.use_shm;
+
+        // User edits only vram_mb.
+        dlg.vram_mb = cfg.fastdesk.vram_mb + 16;
+        let payload = dlg.build_update_payload(&[]);
+        let fd = payload.fastdesk.expect("expected fastdesk diff");
+        assert_eq!(fd.vram_mb, cfg.fastdesk.vram_mb + 16);
+        assert_eq!(fd.transport, FastDeskTransport::HvSock);
+        assert_eq!(fd.use_shm, !cfg.fastdesk.use_shm);
     }
 
     #[test]
