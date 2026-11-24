@@ -830,7 +830,7 @@ impl BackendState {
                             let mut guard = self.client.write().unwrap();
                             if guard
                                 .as_ref()
-                                .is_some_and(|cur| cur.base_url() == c.base_url())
+                                .is_some_and(|cur| cur.base_url() == c.base_url() && cur.token() == c.token())
                             {
                                 *guard = None;
                             }
@@ -1239,7 +1239,8 @@ impl BackendState {
                     self.data_dir.as_deref(),
                     self.daemon_url.as_deref(),
                     &self.shared_endpoint,
-                ) && next_client.base_url() != client.base_url()
+                ) && (next_client.base_url() != client.base_url()
+                    || next_client.token() != client.token())
                 {
                     *client = next_client;
                     *self.client.write().unwrap() = Some(client.clone());
@@ -1298,13 +1299,14 @@ fn resolve_updated_client(
 
 fn maybe_switch_endpoint_on_disconnect(
     current_base_url: &str,
+    current_token: &str,
     state: &BackendState,
 ) -> anyhow::Result<bool> {
     if let Some(c) = reload_client_from_runtime_addr_result(
         state.data_dir.as_deref(),
         state.daemon_url.as_deref(),
         &state.shared_endpoint,
-    )? && c.base_url() != current_base_url
+    )? && (c.base_url() != current_base_url || c.token() != current_token)
     {
         *state.client.write().unwrap() = Some(c);
         return Ok(true);
@@ -1496,7 +1498,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     &state.shared_endpoint,
                 ) {
                     Ok(Some(reloaded)) => {
-                        if reloaded.base_url() != base_url {
+                        if reloaded.base_url() != base_url || reloaded.token() != token {
                             retry_delay = state.sse_backoff_initial;
                         }
                         base_url = reloaded.base_url().to_string();
@@ -1651,18 +1653,19 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                 .ok_or_else(|| anyhow::anyhow!("failed to resolve daemon client"))
                                 .and_then(|c| {
                                     let new_base = c.base_url().to_string();
+                                    let new_token = c.token().to_string();
                                     state
                                         .sync_snapshot_once(&c, true)
-                                        .map(|sync| (sync, new_base))
+                                        .map(|sync| (sync, new_base, new_token))
                                 });
                                 match reload_res {
-                                    Ok((sync, new_base)) => {
+                                    Ok((sync, new_base, new_token)) => {
                                         if !sync.sent {
                                             sse_send_closed = true;
                                             break;
                                         }
                                         sse_instance_id = sync.daemon_instance_id;
-                                        if new_base != base_url {
+                                        if new_base != base_url || new_token != token {
                                             switched_endpoint = true;
                                             break;
                                         }
@@ -1706,8 +1709,11 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                             }
                             continue;
                         }
-                        let switch_err = match maybe_switch_endpoint_on_disconnect(&base_url, &state)
-                        {
+                        let switch_err = match maybe_switch_endpoint_on_disconnect(
+                            &base_url,
+                            &token,
+                            &state,
+                        ) {
                             Ok(true) => {
                                 retry_delay = state.sse_backoff_initial;
                                 continue;
@@ -1746,7 +1752,8 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                     }
                 }
                 sse_res => {
-                    let switch_err = match maybe_switch_endpoint_on_disconnect(&base_url, &state) {
+                    let switch_err =
+                        match maybe_switch_endpoint_on_disconnect(&base_url, &token, &state) {
                         Ok(true) => {
                             retry_delay = state.sse_backoff_initial;
                             continue;
