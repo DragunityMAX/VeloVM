@@ -3613,4 +3613,67 @@ mod tests {
 
         daemon.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn attach_disk_rejects_iso_with_non_iso_formats_on_offline_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let iso_path = dir.path().join("installer.iso");
+        fs::write(&iso_path, vec![0u8; 4096]).unwrap();
+
+        let create_resp: VmSummary = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "IsoFormatGuard".into(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let vm_id = create_resp.config.id;
+
+        for bad_format in [DiskFormat::Vhdx, DiskFormat::Vhd, DiskFormat::Raw] {
+            let resp = client
+                .post(format!("{}/api/v1/vms/{vm_id}/disks", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&openvmms_core::models::AttachDiskPayload {
+                    path: iso_path.clone(),
+                    lun: Some(0),
+                    read_only: false,
+                    format: Some(bad_format),
+                })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "expected 400 Bad Request when attaching .iso as {bad_format:?}"
+            );
+        }
+
+        let summary: VmSummary = client
+            .get(format!("{}/api/v1/vms/{vm_id}", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(summary.config.disks.is_empty());
+
+        daemon.shutdown().await;
+    }
 }
