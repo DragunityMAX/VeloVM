@@ -5741,6 +5741,26 @@ fn windows_hyperv_module_available() -> bool {
 }
 
 #[cfg(windows)]
+fn windows_powershell_path_from(sys_root: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let sys_root = sys_root.filter(|s| !s.is_empty())?;
+    let root_path = Path::new(sys_root);
+    if !root_path.is_absolute() {
+        return None;
+    }
+    let candidate = root_path
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    (candidate.is_absolute() && candidate.is_file()).then_some(candidate)
+}
+
+#[cfg(windows)]
+fn windows_powershell_path() -> Option<PathBuf> {
+    windows_powershell_path_from(std::env::var_os("SystemRoot").as_deref())
+}
+
+#[cfg(windows)]
 fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
     use std::io::Read;
     use std::os::windows::process::CommandExt;
@@ -5769,7 +5789,8 @@ fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
     }];
 
     if windows_hyperv_module_available()
-        && let Ok(mut child) = Command::new("powershell.exe")
+        && let Some(ps_path) = windows_powershell_path()
+        && let Ok(mut child) = Command::new(ps_path)
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -8918,5 +8939,37 @@ mod tests {
         let vm = guard.get_mut(&id).unwrap();
         Supervisor::restore_pending_disks_from_journal(vm, &sock_path);
         assert!(vm.pending_disks.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_path_prefers_system32() {
+        let sys_root = std::env::var_os("SystemRoot").expect("SystemRoot should be set on Windows");
+        let expected = PathBuf::from(sys_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        assert!(expected.is_file(), "expected {} to exist", expected.display());
+        assert_eq!(windows_powershell_path(), Some(expected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_path_from_rejects_missing_relative_and_absent_binary() {
+        use std::ffi::OsStr;
+
+        assert_eq!(windows_powershell_path_from(None), None);
+        assert_eq!(windows_powershell_path_from(Some(OsStr::new(""))), None);
+        assert_eq!(
+            windows_powershell_path_from(Some(OsStr::new("Windows"))),
+            None
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            windows_powershell_path_from(Some(dir.path().as_os_str())),
+            None
+        );
     }
 }
