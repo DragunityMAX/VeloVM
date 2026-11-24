@@ -728,6 +728,8 @@ jobs:
     name: Build & Package macOS Apple Silicon (HVF)
     runs-on: macos-15
     timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
 
     steps:
       - name: Checkout repository
@@ -749,10 +751,60 @@ jobs:
           LLVM_TOOLS_BIN="$(rustc --print sysroot)/lib/rustlib/${HOST_TRIPLE}/bin"
           LLVM_SHIM_DIR="$RUNNER_TEMP/llvm-binutils"
           mkdir -p "$LLVM_SHIM_DIR"
-          ln -sf "$LLVM_TOOLS_BIN/llvm-objcopy" "$LLVM_SHIM_DIR/llvm-objcopy"
-          ln -sf "$LLVM_TOOLS_BIN/llvm-nm" "$LLVM_SHIM_DIR/llvm-nm"
-          test -x "$LLVM_SHIM_DIR/llvm-objcopy"
-          test -x "$LLVM_SHIM_DIR/llvm-nm"
+          test -x "$LLVM_TOOLS_BIN/llvm-objcopy"
+          test -x "$LLVM_TOOLS_BIN/llvm-nm"
+
+          cat > "$LLVM_SHIM_DIR/llvm-nm" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          REAL_NM="$LLVM_TOOLS_BIN/llvm-nm"
+          has_posix=0
+          for arg in "\$@"; do
+            if [[ "\$arg" == "--format=posix" ]]; then
+              has_posix=1
+              break
+            fi
+          done
+          if [[ "\$has_posix" -eq 1 ]]; then
+            "\$REAL_NM" "\$@" | awk '!/:$/ && /^[ \t]*_/ { sub(/^[ \t]*_/, "") } { print }'
+          else
+            exec "\$REAL_NM" "\$@"
+          fi
+          EOF
+
+          cat > "$LLVM_SHIM_DIR/llvm-objcopy" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          REAL_OBJCOPY="$LLVM_TOOLS_BIN/llvm-objcopy"
+          TMP_MAP=""
+          cleanup() {
+            if [[ -n "\$TMP_MAP" ]]; then
+              rm -f "\$TMP_MAP"
+            fi
+          }
+          trap cleanup EXIT
+          ARGS=()
+          for arg in "\$@"; do
+            case "\$arg" in
+              --redefine-syms=*)
+                SRC="\${arg#--redefine-syms=}"
+                TMP_MAP="\$(mktemp)"
+                awk 'NF >= 2 { print "_" \$1 " _" \$2 }' "\$SRC" > "\$TMP_MAP"
+                ARGS+=("--redefine-syms=\$TMP_MAP")
+                ;;
+              *)
+                ARGS+=("\$arg")
+                ;;
+            esac
+          done
+          if [[ -n "\$TMP_MAP" ]]; then
+            "\$REAL_OBJCOPY" "\${ARGS[@]}"
+          else
+            exec "\$REAL_OBJCOPY" "\$@"
+          fi
+          EOF
+
+          chmod +x "$LLVM_SHIM_DIR/llvm-objcopy" "$LLVM_SHIM_DIR/llvm-nm"
           "$LLVM_SHIM_DIR/llvm-objcopy" --version
           "$LLVM_SHIM_DIR/llvm-nm" --version
           echo "$LLVM_SHIM_DIR" >> "$GITHUB_PATH"
