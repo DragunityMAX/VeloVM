@@ -1089,6 +1089,7 @@ jobs:
           codesign -d --entitlements :- "$BUNDLE/openvmm"
 
           cp -f "openvmm/.packages/hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV/MSVM.fd" "$BUNDLE/firmware/MSVM.fd"
+          cp -f "openvmm/build_support/macos/entitlements.xml" "$BUNDLE/entitlements.xml"
           cp -f "scripts/start-openvmm-fastdesk.sh" "$BUNDLE/start-openvmm-fastdesk.sh"
           chmod +x "$BUNDLE/start-openvmm-fastdesk.sh"
           cp -f "README.md" "$BUNDLE/README.md"

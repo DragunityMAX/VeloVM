@@ -323,7 +323,7 @@ is_tcp_listening() {
         ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep "LISTEN" >/dev/null
         return $?
     elif command -v lsof >/dev/null 2>&1; then
-        lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+        [[ -n "${VMM_PID:-}" ]] && lsof -nP -a -p "$VMM_PID" -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
         return $?
     fi
     return 1

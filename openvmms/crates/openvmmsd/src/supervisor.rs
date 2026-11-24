@@ -2017,7 +2017,23 @@ impl Supervisor {
                     }
                 }
             }
-            fs::create_dir_all(&runtime_dir_to_prepare).with_context(|| {
+            let create_runtime_dir_res = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = fs::DirBuilder::new();
+                    builder.recursive(true);
+                    if is_managed_default || !existed_before {
+                        builder.mode(0o700);
+                    }
+                    builder.create(&runtime_dir_to_prepare)
+                }
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir_all(&runtime_dir_to_prepare)
+                }
+            };
+            create_runtime_dir_res.with_context(|| {
                 format!("creating runtime dir {}", runtime_dir_to_prepare.display())
             })?;
             #[cfg(unix)]
@@ -2046,7 +2062,15 @@ impl Supervisor {
                                 parent.display()
                             );
                         }
-                        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                        if let Err(err) =
+                            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                        {
+                            warn!(
+                                path = %parent.display(),
+                                error = %err,
+                                "failed to set 0700 permissions on managed runtime parent dir"
+                            );
+                        }
                     }
                 }
                 if !existed_before || is_managed_default {
