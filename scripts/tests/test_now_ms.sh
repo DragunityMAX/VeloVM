@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LAUNCHER="$SCRIPT_DIR/../start-openvmm-fastdesk.sh"
+LAUNCHER="$SCRIPT_DIR/../start-velovm.sh"
 
 # Extract parse_epochrealtime_ms and now_ms from the launcher without executing it.
 eval "$(sed -n '/^parse_epochrealtime_ms()/,/^}/p; /^now_ms()/,/^}/p' "$LAUNCHER")"
@@ -35,4 +35,4 @@ for loc in C de_DE.UTF-8 fr_FR.UTF-8; do
     fi
 done
 
-echo "PASS: start-openvmm-fastdesk.sh now_ms() locale checks passed"
+echo "PASS: start-velovm.sh now_ms() locale checks passed"
