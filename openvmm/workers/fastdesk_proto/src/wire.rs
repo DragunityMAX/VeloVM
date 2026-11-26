@@ -302,9 +302,10 @@ fn begin_frame(out: &mut Vec<u8>, msg_type: u8) -> usize {
     len_pos
 }
 
-fn finish_frame(out: &mut [u8], len_pos: usize) -> Result<(), ProtoError> {
+fn finish_frame(out: &mut Vec<u8>, len_pos: usize) -> Result<(), ProtoError> {
     let payload_len = out.len() - (len_pos + 4);
     if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+        out.truncate(len_pos - 1);
         return Err(ProtoError::FrameTooLarge(payload_len));
     }
     out[len_pos..len_pos + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());

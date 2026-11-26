@@ -296,4 +296,34 @@ mod tests {
             Err(ProtoError::FrameTooLarge(n)) if n == 64 * 1024 * 1024
         ));
     }
+
+    #[test]
+    fn encode_server_msg_rolls_back_partial_frame_on_frame_too_large() {
+        let mut out = Vec::new();
+        let valid = ServerMsg::Pong {
+            client_time_us: 42,
+            host_time_us: 99,
+        };
+        encode_server_msg(&valid, &mut out).unwrap();
+        let valid_len = out.len();
+
+        let oversized = ServerMsg::CursorShape {
+            width: 1,
+            height: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            lz4_bgra: vec![0u8; MAX_FRAME_PAYLOAD_BYTES],
+        };
+        let err = encode_server_msg(&oversized, &mut out).unwrap_err();
+        assert!(matches!(err, ProtoError::FrameTooLarge(n) if n > MAX_FRAME_PAYLOAD_BYTES));
+        assert_eq!(
+            out.len(),
+            valid_len,
+            "failed encode must roll back partial frame bytes"
+        );
+
+        let mut cursor = std::io::Cursor::new(&out);
+        assert_eq!(read_server_msg(&mut cursor).unwrap(), valid);
+        assert_eq!(cursor.position() as usize, valid_len);
+    }
 }
