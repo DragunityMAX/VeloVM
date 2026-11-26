@@ -349,7 +349,22 @@ pub fn run_self_test(frames: usize, width: u16, height: u16) -> anyhow::Result<(
     Ok(())
 }
 
-pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyhow::Result<()> {
+struct RemoteBenchSummary {
+    width: u16,
+    height: u16,
+    shm_active: bool,
+    elapsed: Duration,
+    wire_bytes: u64,
+    rtts_us: Vec<u64>,
+    p50_us: u64,
+    p99_us: u64,
+}
+
+fn run_remote_bench_inner(
+    endpoint: &str,
+    frames: usize,
+    allow_shm: bool,
+) -> anyhow::Result<RemoteBenchSummary> {
     let mut stream = TransportStream::connect(endpoint)?;
     let (w, h, s, offset, shm_path) = match read_server_msg(&mut stream)? {
         ServerMsg::ServerHello {
@@ -377,11 +392,10 @@ pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyho
     let mut wire_bytes = 0u64;
 
     while got_frames < frames {
-        let ping_sent = Instant::now();
         write_client_msg(
             &mut stream,
             &ClientMsg::Ping {
-                client_time_us: ping_sent.elapsed().as_micros() as u64,
+                client_time_us: start.elapsed().as_micros() as u64,
             },
         )?;
         write_client_msg(
@@ -392,8 +406,9 @@ pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyho
         )?;
         loop {
             match read_server_msg(&mut stream)? {
-                ServerMsg::Pong { .. } => {
-                    rtts_us.push(ping_sent.elapsed().as_micros() as u64);
+                ServerMsg::Pong { client_time_us, .. } => {
+                    let now_us = start.elapsed().as_micros() as u64;
+                    rtts_us.push(now_us.saturating_sub(client_time_us));
                 }
                 ServerMsg::FrameBatch { rects, .. } => {
                     for r in &rects {
@@ -426,19 +441,35 @@ pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyho
     }
 
     rtts_us.sort_unstable();
-    let p50 = rtts_us.get(rtts_us.len() / 2).copied().unwrap_or(0);
-    let p99 = rtts_us
+    let p50_us = rtts_us.get(rtts_us.len() / 2).copied().unwrap_or(0);
+    let p99_us = rtts_us
         .get(((rtts_us.len() * 99) / 100).min(rtts_us.len().saturating_sub(1)))
         .copied()
         .unwrap_or(0);
+    Ok(RemoteBenchSummary {
+        width: comp.width,
+        height: comp.height,
+        shm_active: comp.is_shm_active(),
+        elapsed: start.elapsed(),
+        wire_bytes,
+        rtts_us,
+        p50_us,
+        p99_us,
+    })
+}
+
+pub fn run_remote_bench(endpoint: &str, frames: usize, allow_shm: bool) -> anyhow::Result<()> {
+    let summary = run_remote_bench_inner(endpoint, frames, allow_shm)?;
     println!(
-        "Remote FastDesk Bench ({endpoint}, {}x{}, shm={}): {frames} frames in {:.2}s ({:.1} FPS), ping P50={p50} us P99={p99} us, {:.2} MiB received",
-        comp.width,
-        comp.height,
-        comp.is_shm_active(),
-        start.elapsed().as_secs_f64(),
-        frames as f64 / start.elapsed().as_secs_f64().max(1e-6),
-        wire_bytes as f64 / (1024.0 * 1024.0)
+        "Remote FastDesk Bench ({endpoint}, {}x{}, shm={}): {frames} frames in {:.2}s ({:.1} FPS), ping P50={} us P99={} us, {:.2} MiB received",
+        summary.width,
+        summary.height,
+        summary.shm_active,
+        summary.elapsed.as_secs_f64(),
+        frames as f64 / summary.elapsed.as_secs_f64().max(1e-6),
+        summary.p50_us,
+        summary.p99_us,
+        summary.wire_bytes as f64 / (1024.0 * 1024.0)
     );
     Ok(())
 }
@@ -453,5 +484,102 @@ mod tests {
         assert!(run_self_test(10, 320, 240).is_err());
         assert!(run_self_test(10, 360, 288).is_err());
         assert!(run_self_test(10, 384, 260).is_err());
+    }
+
+    #[test]
+    fn remote_bench_computes_accurate_rtt_when_frame_batch_precedes_pong() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            write_server_msg(
+                &mut stream,
+                &ServerMsg::ServerHello {
+                    capabilities: CAP_ALL,
+                    width: 16,
+                    height: 16,
+                    stride: 16 * 4,
+                    offset: 0,
+                    vram_size: 16 * 16 * 4,
+                    shm_path: None,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                read_client_msg(&mut stream).unwrap(),
+                ClientMsg::ClientHello { .. }
+            ));
+
+            // Frame 1: read Ping + RequestFullFrame, send FrameBatch BEFORE Pong.
+            let ping1_ts = match read_client_msg(&mut stream).unwrap() {
+                ClientMsg::Ping { client_time_us } => client_time_us,
+                other => panic!("expected Ping, got {other:?}"),
+            };
+            assert!(matches!(
+                read_client_msg(&mut stream).unwrap(),
+                ClientMsg::RequestFullFrame { .. }
+            ));
+            write_server_msg(
+                &mut stream,
+                &ServerMsg::FrameBatch {
+                    frame_seq: 1,
+                    host_time_us: 1,
+                    rects: vec![],
+                },
+            )
+            .unwrap();
+
+            // Wait before delivering Pong for Ping 1 so a naive per-iteration clock
+            // would under-report its RTT as near-zero after iteration 2 starts.
+            thread::sleep(Duration::from_millis(25));
+
+            // Frame 2: client sends Ping 2 + RequestFullFrame; deliver delayed Pong 1,
+            // then Pong 2, then FrameBatch 2.
+            let ping2_ts = match read_client_msg(&mut stream).unwrap() {
+                ClientMsg::Ping { client_time_us } => client_time_us,
+                other => panic!("expected Ping, got {other:?}"),
+            };
+            assert!(matches!(
+                read_client_msg(&mut stream).unwrap(),
+                ClientMsg::RequestFullFrame { .. }
+            ));
+            write_server_msg(
+                &mut stream,
+                &ServerMsg::Pong {
+                    client_time_us: ping1_ts,
+                    host_time_us: 2,
+                },
+            )
+            .unwrap();
+            write_server_msg(
+                &mut stream,
+                &ServerMsg::Pong {
+                    client_time_us: ping2_ts,
+                    host_time_us: 3,
+                },
+            )
+            .unwrap();
+            write_server_msg(
+                &mut stream,
+                &ServerMsg::FrameBatch {
+                    frame_seq: 2,
+                    host_time_us: 4,
+                    rects: vec![],
+                },
+            )
+            .unwrap();
+        });
+
+        let endpoint = format!("tcp://{addr}");
+        let summary = run_remote_bench_inner(&endpoint, 2, false).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(summary.rtts_us.len(), 2);
+        assert!(
+            summary.rtts_us[1] >= 20_000,
+            "expected delayed Pong RTT >= 20000 us, got {:?}",
+            summary.rtts_us
+        );
     }
 }
