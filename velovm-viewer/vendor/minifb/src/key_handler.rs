@@ -63,6 +63,14 @@ impl KeyHandler {
         }
     }
 
+    #[inline]
+    #[allow(dead_code)] // used on macOS backend
+    pub fn set_macos_key_state(&mut self, macos_keycode: u32, state: bool) {
+        if let Some(cb) = &mut self.key_callback {
+            cb.set_macos_key_state(macos_keycode, state);
+        }
+    }
+
     pub fn get_keys(&self) -> Vec<Key> {
         let mut keys: Vec<Key> = Vec::new();
 

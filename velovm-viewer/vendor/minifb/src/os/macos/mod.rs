@@ -264,6 +264,7 @@ unsafe extern "C" fn key_callback(window: *mut c_void, key: i32, state: i32) {
     if key < 0 || key >= 128 {
         (*win).key_handler.set_key_state(Key::Unknown, s);
     } else {
+        (*win).key_handler.set_macos_key_state(key as u32, s);
         (*win)
             .key_handler
             .set_key_state(KEY_MAPPINGS[key as usize], s);

@@ -156,13 +156,22 @@ fn should_hide_win32_cursor_for_setcursor(
 }
 
 #[cfg(any(windows, test))]
-fn win32_scancode_to_missing_minifb_key(lparam: isize) -> Option<minifb::Key> {
+fn win32_scancode_to_missing_xt_scancode(lparam: isize) -> Option<u16> {
     let scancode = ((lparam as usize) >> 16) & 0x1ff;
     match scancode {
-        0x038 => Some(minifb::Key::LeftAlt),
-        0x138 => Some(minifb::Key::RightAlt),
-        0x15b => Some(minifb::Key::LeftSuper),
-        0x15c => Some(minifb::Key::RightSuper),
+        0x038 => Some(0x0038), // LeftAlt
+        0x138 => Some(0xe038), // RightAlt (AltGr)
+        0x15b => Some(0xe05b), // LeftSuper
+        0x15c => Some(0xe05c), // RightSuper
+        0x054 => Some(0x0054), // SysRq (Alt+PrintScreen)
+        0x056 => Some(0x0056), // ISO 102nd key (<>/\|)
+        0x070 => Some(0x0070), // JIS Katakana/Hiragana
+        0x073 => Some(0x0073), // JIS/ABNT2 Ro
+        0x079 => Some(0x0079), // JIS Henkan
+        0x07b => Some(0x007b), // JIS Muhenkan
+        0x07d => Some(0x007d), // JIS Yen
+        0x07e => Some(0x007e), // ABNT2 Keypad Comma
+        0x137 => Some(0xe037), // PrintScreen
         _ => None,
     }
 }
@@ -170,7 +179,7 @@ fn win32_scancode_to_missing_minifb_key(lparam: isize) -> Option<minifb::Key> {
 #[cfg(windows)]
 mod win32_cursor {
     use super::should_hide_win32_cursor_for_setcursor;
-    use super::win32_scancode_to_missing_minifb_key;
+    use super::win32_scancode_to_missing_xt_scancode;
     use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -247,8 +256,7 @@ mod win32_cursor {
         };
 
         if matches!(msg, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP)
-            && let Some(mapped_key) = win32_scancode_to_missing_minifb_key(lparam)
-            && let Some(scancode) = super::input::key_to_xt_scancode(mapped_key)
+            && let Some(scancode) = win32_scancode_to_missing_xt_scancode(lparam)
         {
             let is_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
             if let Some(q) = entry.as_ref().and_then(|e| e.key_events.as_ref()) {
@@ -1102,35 +1110,54 @@ mod tests {
     }
 
     #[test]
-    fn win32_scancode_hook_maps_alt_altgr_and_super_keys() {
+    fn win32_scancode_hook_maps_missing_xt_scancodes() {
         // Make events (transition bit 31 = 0).
-        assert_eq!(
-            win32_scancode_to_missing_minifb_key((0x038usize << 16) as isize),
-            Some(minifb::Key::LeftAlt)
-        );
-        assert_eq!(
-            win32_scancode_to_missing_minifb_key((0x138usize << 16) as isize),
-            Some(minifb::Key::RightAlt)
-        );
-        assert_eq!(
-            win32_scancode_to_missing_minifb_key((0x15busize << 16) as isize),
-            Some(minifb::Key::LeftSuper)
-        );
-        assert_eq!(
-            win32_scancode_to_missing_minifb_key((0x15cusize << 16) as isize),
-            Some(minifb::Key::RightSuper)
-        );
+        for (raw_scancode, expected_xt) in [
+            (0x038usize, 0x0038u16), // LeftAlt
+            (0x138, 0xe038),         // RightAlt (AltGr)
+            (0x15b, 0xe05b),         // LeftSuper
+            (0x15c, 0xe05c),         // RightSuper
+            (0x054, 0x0054),         // SysRq
+            (0x056, 0x0056),         // ISO 102nd key (<>/\|)
+            (0x070, 0x0070),         // JIS Katakana/Hiragana
+            (0x073, 0x0073),         // JIS/ABNT2 Ro
+            (0x079, 0x0079),         // JIS Henkan
+            (0x07b, 0x007b),         // JIS Muhenkan
+            (0x07d, 0x007d),         // JIS Yen
+            (0x07e, 0x007e),         // ABNT2 KP Comma
+            (0x137, 0xe037),         // PrintScreen
+        ] {
+            assert_eq!(
+                win32_scancode_to_missing_xt_scancode((raw_scancode << 16) as isize),
+                Some(expected_xt),
+                "unexpected XT mapping for raw Win32 scancode 0x{raw_scancode:03x}"
+            );
+        }
 
         // Break events (bits 30..31 set, sign-extended if negative isize).
         assert_eq!(
-            win32_scancode_to_missing_minifb_key(((0xc000_0000usize | (0x138 << 16)) as u32 as i32) as isize),
-            Some(minifb::Key::RightAlt)
+            win32_scancode_to_missing_xt_scancode(
+                ((0xc000_0000usize | (0x138 << 16)) as u32 as i32) as isize
+            ),
+            Some(0xe038)
+        );
+        assert_eq!(
+            win32_scancode_to_missing_xt_scancode(
+                ((0xc000_0000usize | (0x056 << 16)) as u32 as i32) as isize
+            ),
+            Some(0x0056)
+        );
+        assert_eq!(
+            win32_scancode_to_missing_xt_scancode(
+                ((0xc000_0000usize | (0x137 << 16)) as u32 as i32) as isize
+            ),
+            Some(0xe037)
         );
 
         // Keys already translated by minifb are left untouched.
-        for already_handled in [0x001usize, 0x01e, 0x11d, 0x15d] {
+        for already_handled in [0x001usize, 0x01e, 0x045, 0x11d, 0x15d] {
             assert_eq!(
-                win32_scancode_to_missing_minifb_key((already_handled << 16) as isize),
+                win32_scancode_to_missing_xt_scancode((already_handled << 16) as isize),
                 None
             );
         }
