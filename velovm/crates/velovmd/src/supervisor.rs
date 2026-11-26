@@ -468,6 +468,24 @@ impl Supervisor {
     /// Must only be called after the daemon has validated config and bound its HTTP listener.
     pub fn adopt_running_vms(self: &Arc<Self>) {
         let runtime_dir = self.host_config().runtime_dir;
+        if let Err(err) = fs::symlink_metadata(&runtime_dir)
+            && err.kind() == std::io::ErrorKind::NotFound
+        {
+            return;
+        }
+        let managed_default_runtime_dir =
+            velovm_core::models::default_runtime_dir(self.store.data_dir());
+        if let Err(err) = validate_existing_runtime_dir_for_adoption(
+            &runtime_dir,
+            &managed_default_runtime_dir,
+        ) {
+            tracing::error!(
+                runtime_dir = %runtime_dir.display(),
+                error = %err,
+                "refusing to adopt running VMs from unsafe runtime_dir"
+            );
+            return;
+        }
         let expected_bin = self.resolved_paths().openvmm_bin;
         let mut adopted_vms = Vec::new();
         {
@@ -478,11 +496,34 @@ impl Supervisor {
                 }
                 let id = vm.config.id;
                 let sock_path = runtime_dir.join(format!("{id}.sock"));
-                if !sock_path.exists() {
-                    continue;
+                match fs::symlink_metadata(&sock_path) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        warn!(
+                            vm_id = %id,
+                            sock_path = %sock_path.display(),
+                            "ignoring symlinked VM RPC socket during adoption"
+                        );
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    Ok(meta)
+                        if {
+                            use std::os::unix::fs::MetadataExt;
+                            meta.uid() != velovm_core::process::current_euid()
+                        } =>
+                    {
+                        warn!(
+                            vm_id = %id,
+                            sock_path = %sock_path.display(),
+                            "ignoring VM RPC socket owned by another uid during adoption"
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(_) => continue,
                 }
                 let pid_path = sock_path.with_extension("pid");
-                let shm_candidate = runtime_dir.join(format!("vram-{id}.shm"));
+                let validated_shm_candidate = validate_vm_shm_path(None, &runtime_dir, id);
                 let ttrpc_client = TtrpcClient::new(&sock_path);
                 match ttrpc_client.properties_vm_blocking(Duration::from_secs(2)) {
                     Ok(props)
@@ -506,11 +547,11 @@ impl Supervisor {
                             .fastdesk_listen_addr
                             .as_deref()
                             .map(normalize_fastdesk_endpoint);
-                        vm.runtime.shm_path = props.fastdesk_shm_path.or_else(|| {
-                            shm_candidate
-                                .exists()
-                                .then(|| shm_candidate.to_string_lossy().into_owned())
-                        });
+                        vm.runtime.shm_path = validate_vm_shm_path(
+                            props.fastdesk_shm_path.as_deref(),
+                            &runtime_dir,
+                            id,
+                        );
                         Self::restore_pending_disks_from_journal(vm, &sock_path);
                         Self::restore_pending_port_forwards_from_journal(vm, &sock_path);
                         vm.runtime.revision = self.next_revision();
@@ -525,22 +566,12 @@ impl Supervisor {
                             expected_bin.as_deref(),
                             &AtomicBool::new(false),
                         ) {
-                            cleanup_runtime_files(
-                                Some(sock_path),
-                                shm_candidate
-                                    .exists()
-                                    .then(|| shm_candidate.to_string_lossy().into_owned()),
-                            );
+                            cleanup_runtime_files(Some(sock_path), validated_shm_candidate);
                         }
                     }
                     Err(_) => {
                         if !ttrpc_client.is_socket_accepting() {
-                            cleanup_runtime_files(
-                                Some(sock_path),
-                                shm_candidate
-                                    .exists()
-                                    .then(|| shm_candidate.to_string_lossy().into_owned()),
-                            );
+                            cleanup_runtime_files(Some(sock_path), validated_shm_candidate);
                         } else {
                             let verified = velovm_core::process::open_verified_pid_or_socket_peer(
                                 &pid_path,
@@ -551,9 +582,7 @@ impl Supervisor {
                             vm.runtime.pid = verified.as_ref().map(|p| p.pid());
                             vm.adopted_proc = verified;
                             vm.runtime.rpc_socket_path = Some(sock_path.clone());
-                            vm.runtime.shm_path = shm_candidate
-                                .exists()
-                                .then(|| shm_candidate.to_string_lossy().into_owned());
+                            vm.runtime.shm_path = validated_shm_candidate;
                             Self::restore_pending_disks_from_journal(vm, &sock_path);
                             Self::restore_pending_port_forwards_from_journal(vm, &sock_path);
                             vm.runtime.revision = self.next_revision();
@@ -2436,8 +2465,10 @@ impl Supervisor {
             vm.runtime.status = VmStatus::Running;
             vm.runtime.started_at = Some(Utc::now());
             vm.runtime.fastdesk_endpoint = fastdesk_endpoint;
-            if let Some(shm) = props.fastdesk_shm_path {
-                vm.runtime.shm_path = Some(shm);
+            if let Some(shm) = props.fastdesk_shm_path
+                && let Some(valid_shm) = validate_vm_shm_path(Some(&shm), runtime_dir, id)
+            {
+                vm.runtime.shm_path = Some(valid_shm);
             }
             vm.runtime.revision = self.next_revision();
 
@@ -2631,8 +2662,17 @@ impl Supervisor {
             if vm.runtime.shm_path.is_none()
                 && let Some(shm) = &props.fastdesk_shm_path
             {
-                vm.runtime.shm_path = Some(shm.clone());
-                changed = true;
+                let vm_runtime_dir = vm
+                    .runtime
+                    .rpc_socket_path
+                    .as_deref()
+                    .and_then(|p| p.parent())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.host_config().runtime_dir);
+                if let Some(valid_shm) = validate_vm_shm_path(Some(shm), &vm_runtime_dir, id) {
+                    vm.runtime.shm_path = Some(valid_shm);
+                    changed = true;
+                }
             }
             if changed {
                 vm.runtime.revision = self.next_revision();
@@ -5868,6 +5908,99 @@ fn reclaim_or_verify_inactive_socket(
     false
 }
 
+fn validate_existing_runtime_dir_for_adoption(
+    runtime_dir: &Path,
+    managed_default_runtime_dir: &Path,
+) -> anyhow::Result<()> {
+    let meta = fs::symlink_metadata(runtime_dir).with_context(|| {
+        format!("inspecting runtime directory {}", runtime_dir.display())
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        anyhow::bail!(
+            "unsafe runtime directory {} (must be a directory, not a symlink)",
+            runtime_dir.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let euid = velovm_core::process::current_euid();
+        if meta.uid() != euid {
+            anyhow::bail!(
+                "unsafe runtime directory {} (owned by uid {}, expected {})",
+                runtime_dir.display(),
+                meta.uid(),
+                euid
+            );
+        }
+        let is_managed_default = velovm_core::models::normalize_path_key(runtime_dir)
+            == velovm_core::models::normalize_path_key(managed_default_runtime_dir);
+        if is_managed_default
+            && let Some(parent) = runtime_dir.parent()
+            && parent
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("velovm-"))
+        {
+            let pmeta = fs::symlink_metadata(parent).with_context(|| {
+                format!("inspecting runtime parent directory {}", parent.display())
+            })?;
+            if pmeta.file_type().is_symlink() || !pmeta.is_dir() || pmeta.uid() != euid {
+                anyhow::bail!(
+                    "unsafe managed runtime parent directory {}",
+                    parent.display()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = managed_default_runtime_dir;
+    Ok(())
+}
+
+/// Validates a VM's FastDesk shared-memory path, accepting only the expected regular,
+/// non-symlink `<runtime_dir>/vram-<id>.shm` file.
+fn validate_vm_shm_path(
+    reported_shm: Option<&str>,
+    runtime_dir: &Path,
+    id: Uuid,
+) -> Option<String> {
+    let expected = runtime_dir.join(format!("vram-{id}.shm"));
+    if let Some(raw) = reported_shm {
+        let candidate = Path::new(raw);
+        let matches_expected = velovm_core::models::normalize_path_key(candidate)
+            == velovm_core::models::normalize_path_key(&expected);
+        let candidate_regular = fs::symlink_metadata(candidate)
+            .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.is_file());
+        if !matches_expected || !candidate_regular {
+            warn!(
+                vm_id = %id,
+                reported_shm = raw,
+                expected_shm = %expected.display(),
+                "ignoring unexpected or symlinked fastdesk_shm_path reported by VM RPC socket"
+            );
+            if matches_expected {
+                return None;
+            }
+            return validate_vm_shm_path(None, runtime_dir, id);
+        }
+    }
+    match fs::symlink_metadata(&expected) {
+        Ok(meta) if !meta.file_type().is_symlink() && meta.is_file() => {
+            Some(expected.to_string_lossy().into_owned())
+        }
+        Ok(_) => {
+            warn!(
+                vm_id = %id,
+                shm = %expected.display(),
+                "ignoring non-regular or symlinked FastDesk SHM file"
+            );
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 fn cleanup_runtime_files(sock_path: Option<PathBuf>, shm_path: Option<String>) {
     if let Some(sock) = sock_path {
         let _ = fs::remove_file(sock.with_extension("pid"));
@@ -5875,7 +6008,10 @@ fn cleanup_runtime_files(sock_path: Option<PathBuf>, shm_path: Option<String>) {
         let _ = fs::remove_file(sock.with_extension("pending-ports.json"));
         let _ = fs::remove_file(sock);
     }
-    if let Some(shm) = shm_path {
+    if let Some(shm) = shm_path
+        && fs::symlink_metadata(&shm)
+            .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.is_file())
+    {
         let _ = fs::remove_file(shm);
     }
 }
@@ -9782,6 +9918,172 @@ mod tests {
         assert!(!sock_path.exists());
         assert!(!pid_path.exists());
         assert!(!shm_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopt_running_vms_ignores_arbitrary_and_symlinked_fastdesk_shm_path_and_preserves_victim() {
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use velovm_core::ttrpc::{encode_frame, read_frame};
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(velovm_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("important-victim.txt");
+        fs::write(&victim, b"do-not-delete").unwrap();
+
+        let (vm1_id, vm2_id, runtime_dir) = {
+            let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+            let vm1 = sup
+                .create_vm(CreateVmPayload {
+                    name: "AdoptEvilShm".into(),
+                    preset: velovm_core::models::VmPreset::Custom,
+                    vcpus: Some(2),
+                    memory_mb: Some(1024),
+                    ..Default::default()
+                })
+                .unwrap();
+            let vm2 = sup
+                .create_vm(CreateVmPayload {
+                    name: "AdoptValidShm".into(),
+                    preset: velovm_core::models::VmPreset::Custom,
+                    vcpus: Some(2),
+                    memory_mb: Some(1024),
+                    ..Default::default()
+                })
+                .unwrap();
+            let rt = sup.host_config().runtime_dir;
+            fs::create_dir_all(&rt).unwrap();
+            (vm1.config.id, vm2.config.id, rt)
+        };
+
+        let sock1 = runtime_dir.join(format!("{vm1_id}.sock"));
+        let sock2 = runtime_dir.join(format!("{vm2_id}.sock"));
+        let valid_shm2 = runtime_dir.join(format!("vram-{vm2_id}.shm"));
+        fs::write(&valid_shm2, b"real-shm").unwrap();
+        // Also place a symlinked vram-<vm1_id>.shm inside runtime_dir pointing at victim.
+        let sym_shm1 = runtime_dir.join(format!("vram-{vm1_id}.shm"));
+        std::os::unix::fs::symlink(&victim, &sym_shm1).unwrap();
+
+        let listener1 = UnixListener::bind(&sock1).unwrap();
+        let listener2 = UnixListener::bind(&sock2).unwrap();
+        listener1.set_nonblocking(true).unwrap();
+        listener2.set_nonblocking(true).unwrap();
+
+        let stop_srv = Arc::new(AtomicBool::new(false));
+        let stop1 = Arc::clone(&stop_srv);
+        let victim_str = victim.to_string_lossy().into_owned();
+        let srv1 = std::thread::spawn(move || {
+            while !stop1.load(Ordering::Acquire) {
+                match listener1.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        if let Ok((stream_id, _, _)) = read_frame(&mut stream) {
+                            let payload = vmservice::PropertiesVmResponse {
+                                state: vmservice::VmState::Running as i32,
+                                fastdesk_shm_path: Some(victim_str.clone()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec();
+                            let resp = TestWireResponse {
+                                result: Some(test_wire_response::Result::Payload(payload)),
+                            };
+                            if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                                let _ = stream.write_all(&frame);
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let stop2 = Arc::clone(&stop_srv);
+        let valid_shm2_str = valid_shm2.to_string_lossy().into_owned();
+        let srv2 = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Acquire) {
+                match listener2.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        if let Ok((stream_id, _, _)) = read_frame(&mut stream) {
+                            let payload = vmservice::PropertiesVmResponse {
+                                state: vmservice::VmState::Running as i32,
+                                fastdesk_shm_path: Some(valid_shm2_str.clone()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec();
+                            let resp = TestWireResponse {
+                                result: Some(test_wire_response::Result::Payload(payload)),
+                            };
+                            if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec()) {
+                                let _ = stream.write_all(&frame);
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let sup2 = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        sup2.adopt_running_vms();
+
+        let vm1 = sup2.get_vm(&vm1_id.to_string()).unwrap();
+        assert_eq!(vm1.runtime.status, VmStatus::Running);
+        assert_eq!(
+            vm1.runtime.shm_path, None,
+            "arbitrary/symlinked fastdesk_shm_path must be ignored"
+        );
+
+        let vm2 = sup2.get_vm(&vm2_id.to_string()).unwrap();
+        assert_eq!(vm2.runtime.status, VmStatus::Running);
+        assert_eq!(
+            vm2.runtime.shm_path.as_deref(),
+            Some(valid_shm2.to_string_lossy().as_ref())
+        );
+
+        // Even if cleanup_runtime_files is invoked on vm1, victim must remain untouched.
+        cleanup_runtime_files(Some(sock1.clone()), vm1.runtime.shm_path.clone());
+        cleanup_runtime_files(Some(sock2.clone()), vm2.runtime.shm_path.clone());
+        assert_eq!(fs::read(&victim).unwrap(), b"do-not-delete");
+        assert!(!valid_shm2.exists());
+
+        // Symlinked runtime_dir must refuse adoption entirely.
+        let real_rt = dir.path().join("real-rt");
+        let sym_rt = dir.path().join("sym-rt");
+        fs::create_dir_all(&real_rt).unwrap();
+        std::os::unix::fs::symlink(&real_rt, &sym_rt).unwrap();
+        assert!(
+            validate_existing_runtime_dir_for_adoption(&sym_rt, &runtime_dir).is_err(),
+            "symlinked runtime_dir must be rejected for adoption"
+        );
+
+        stop_srv.store(true, Ordering::Release);
+        srv1.join().unwrap();
+        srv2.join().unwrap();
     }
 
     #[cfg(unix)]
