@@ -76,6 +76,7 @@ function Resolve-ListenEndpoint {
     )
     $trimmed = $Addr.Trim()
     $viewerAddr = $trimmed
+    $vmmListenAddr = $trimmed
     $listenPort = $DefaultPort
     $listenIp = $null
 
@@ -100,8 +101,10 @@ function Resolve-ListenEndpoint {
             $listenIp = $parsed
             if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
                 $viewerAddr = "[$bare]:$DefaultPort"
+                $vmmListenAddr = "[$bare]:$DefaultPort"
             } else {
                 $viewerAddr = "${bare}:$DefaultPort"
+                $vmmListenAddr = "${bare}:$DefaultPort"
             }
         } else {
             $viewerAddr = "${trimmed}:$DefaultPort"
@@ -118,7 +121,7 @@ function Resolve-ListenEndpoint {
     }
 
     return [PSCustomObject]@{
-        ListenAddr = $trimmed
+        ListenAddr = $vmmListenAddr
         ViewerAddr = $viewerAddr
         Port       = $listenPort
         IpAddress  = $listenIp
@@ -278,7 +281,7 @@ try {
         $viewerTarget = "hvsock://loopback/$VsockPort"
     } else {
         $tcpEndpoint = Resolve-ListenEndpoint -Addr $ListenAddr
-        $vmmArgs += @("--fastdesk-listen", $ListenAddr)
+        $vmmArgs += @("--fastdesk-listen", $tcpEndpoint.ListenAddr)
         $viewerTarget = "tcp://$($tcpEndpoint.ViewerAddr)"
     }
 
