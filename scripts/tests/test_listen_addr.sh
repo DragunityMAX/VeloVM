@@ -50,4 +50,44 @@ resolve_listen_endpoint
 assert_eq "$VMM_LISTEN_ADDR" "127.0.0.1" "ipv4-vmm"
 assert_eq "$VIEWER_ADDR" "127.0.0.1:5901" "ipv4-viewer"
 
+# IPv4 with explicit port.
+LISTEN_ADDR="127.0.0.1:6000"
+resolve_listen_endpoint
+assert_eq "$VMM_LISTEN_ADDR" "127.0.0.1:6000" "ipv4-port-vmm"
+assert_eq "$VIEWER_ADDR" "127.0.0.1:6000" "ipv4-port-viewer"
+assert_eq "$LISTEN_PORT" "6000" "ipv4-port-num"
+
+# IPv4-mapped IPv6 wildcard normalizes viewer address to 127.0.0.1.
+LISTEN_ADDR="::ffff:0.0.0.0"
+resolve_listen_endpoint
+assert_eq "$VMM_LISTEN_ADDR" "[::ffff:0.0.0.0]:5901" "ipv4-mapped-any-vmm"
+assert_eq "$VIEWER_ADDR" "127.0.0.1:5901" "ipv4-mapped-any-viewer"
+
+assert_rejects() {
+    local addr="$1"
+    local label="$2"
+    if (
+        LISTEN_ADDR="$addr"
+        resolve_listen_endpoint >/dev/null 2>&1
+    ); then
+        echo "FAIL ($label): expected '$addr' to be rejected" >&2
+        exit 1
+    fi
+}
+
+# Non-IP hostnames, empty hosts, invalid ports, and malformed IP literals must be rejected.
+assert_rejects "localhost:6000" "hostname-localhost-port"
+assert_rejects "LOCALHOST:6000" "hostname-upper-localhost-port"
+assert_rejects "localhost" "hostname-localhost-bare"
+assert_rejects "example.com:6000" "hostname-domain-port"
+assert_rejects "[localhost]:6000" "bracketed-hostname"
+assert_rejects "[127.0.0.1]:6000" "bracketed-ipv4-port"
+assert_rejects ":6000" "empty-host-port"
+assert_rejects "" "empty-addr"
+assert_rejects "999.0.0.1:6000" "invalid-ipv4-octet"
+assert_rejects "01.0.0.1:6000" "leading-zero-ipv4-octet"
+assert_rejects "127.0.0.1:0" "port-zero"
+assert_rejects "127.0.0.1:70000" "port-overflow"
+assert_rejects "127.0.0.1:abc" "port-non-numeric"
+
 echo "PASS: start-velovm.sh resolve_listen_endpoint checks passed"
