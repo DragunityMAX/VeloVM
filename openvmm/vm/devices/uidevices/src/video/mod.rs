@@ -295,11 +295,19 @@ impl CursorAssembler {
         let h = self.height as usize;
 
         let argb_pixels = if self.is_color {
-            let expected = w * h * protocol::CURSOR_ARGB_PIXEL_SIZE;
+            let row_bytes = w * protocol::CURSOR_ARGB_PIXEL_SIZE;
+            let expected = row_bytes * h;
             if self.data.len() < expected {
                 return None;
             }
-            let mut pixels = self.data[..expected].to_vec();
+            // Hyper-V SynthVid sends cursor bitmaps in bottom-up Windows DIB
+            // scanline order while hotspots and coordinates are top-left relative.
+            let mut pixels = Vec::with_capacity(expected);
+            for y in 0..h {
+                let src_y = h - 1 - y;
+                let start = src_y * row_bytes;
+                pixels.extend_from_slice(&self.data[start..start + row_bytes]);
+            }
             let has_alpha = pixels.chunks_exact(4).any(|px| px[3] != 0);
             if !has_alpha {
                 for px in pixels.chunks_exact_mut(4) {
@@ -322,8 +330,9 @@ impl CursorAssembler {
             let xor_mask = &self.data[plane_len..expected];
             let mut pixels = Vec::with_capacity(w * h * 4);
             for y in 0..h {
+                let src_y = h - 1 - y;
                 for x in 0..w {
-                    let byte_idx = y * row_bytes + (x / 8);
+                    let byte_idx = src_y * row_bytes + (x / 8);
                     let bit_mask = 0x80u8 >> (x % 8);
                     let and_bit = (and_mask[byte_idx] & bit_mask) != 0;
                     let xor_bit = (xor_mask[byte_idx] & bit_mask) != 0;
@@ -1640,6 +1649,12 @@ mod tests {
             &color_pixels[32..],
         )
         .await;
+        let expected_top_down_color: Vec<u8> = color_pixels
+            .chunks_exact(4 * 4)
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
         assert_eq!(
             cursor_recv.recv().await.unwrap(),
             CursorUpdate::Shape(CursorShape {
@@ -1647,13 +1662,13 @@ mod tests {
                 height: 4,
                 hotspot_x: 1,
                 hotspot_y: 2,
-                argb_pixels: color_pixels,
+                argb_pixels: expected_top_down_color,
             })
         );
 
-        // Monochrome 2x2 AND/XOR cursor (row_bytes=1, plane_len=2, total=4 bytes):
-        // row 0: AND=0b00_000000 (opaque black at x=0, opaque white at x=1 via XOR)
-        // row 1: AND=0b11_000000 (transparent at x=0, XOR gray at x=1)
+        // Monochrome 2x2 AND/XOR cursor in bottom-up DIB order (row_bytes=1, plane_len=2, total=4 bytes):
+        // bottom wire row (row 0): AND=0b00_000000 (opaque black at x=0, opaque white at x=1 via XOR)
+        // top wire row (row 1):    AND=0b11_000000 (transparent at x=0, XOR gray at x=1)
         let mono_payload = [0b0000_0000u8, 0b1100_0000u8, 0b0100_0000u8, 0b0100_0000u8];
         send_pointer_shape_chunk(
             &mut guest,
@@ -1676,10 +1691,10 @@ mod tests {
                 hotspot_x: 0,
                 hotspot_y: 0,
                 argb_pixels: vec![
-                    0, 0, 0, 255, // (0,0) black
-                    255, 255, 255, 255, // (1,0) white
-                    0, 0, 0, 0, // (0,1) transparent
-                    128, 128, 128, 220, // (1,1) xor gray
+                    0, 0, 0, 0, // top row (0,0) transparent
+                    128, 128, 128, 220, // top row (1,0) xor gray
+                    0, 0, 0, 255, // bottom row (0,1) black
+                    255, 255, 255, 255, // bottom row (1,1) white
                 ],
             })
         );
@@ -1909,5 +1924,60 @@ mod tests {
 
         drop(guest);
         worker.await.unwrap();
+    }
+
+    #[test]
+    fn cursor_assembler_flips_bottom_up_color_and_monochrome_scanlines() {
+        let mut assembler = CursorAssembler::default();
+
+        // 2x3 color cursor in bottom-up DIB scanline order:
+        // wire row 0 (bottom), wire row 1 (middle), wire row 2 (top).
+        let wire_row_0 = [10, 20, 30, 0xff, 11, 21, 31, 0xff];
+        let wire_row_1 = [40, 50, 60, 0xff, 41, 51, 61, 0xff];
+        let wire_row_2 = [70, 80, 90, 0xff, 71, 81, 91, 0xff];
+        let mut color_wire = Vec::new();
+        color_wire.extend_from_slice(&wire_row_0);
+        color_wire.extend_from_slice(&wire_row_1);
+        color_wire.extend_from_slice(&wire_row_2);
+
+        let color_shape = assembler
+            .push_chunk(protocol::CURSOR_COMPLETE, true, 2, 3, 1, 0, &color_wire)
+            .expect("color cursor should decode");
+        assert_eq!(color_shape.hotspot_x, 1);
+        assert_eq!(color_shape.hotspot_y, 0);
+        let mut expected_color = Vec::new();
+        expected_color.extend_from_slice(&wire_row_2);
+        expected_color.extend_from_slice(&wire_row_1);
+        expected_color.extend_from_slice(&wire_row_0);
+        assert_eq!(color_shape.argb_pixels, expected_color);
+
+        // 2x3 monochrome cursor in bottom-up DIB scanline order:
+        // wire row 0 (bottom): transparent, transparent
+        // wire row 1 (middle): black, transparent
+        // wire row 2 (top):    white, xor-gray
+        let mono_wire = [
+            0b1100_0000u8,
+            0b0100_0000u8,
+            0b0100_0000u8, // AND mask (rows 0, 1, 2)
+            0b0000_0000u8,
+            0b0000_0000u8,
+            0b1100_0000u8, // XOR mask (rows 0, 1, 2)
+        ];
+        let mono_shape = assembler
+            .push_chunk(protocol::CURSOR_COMPLETE, false, 2, 3, 0, 1, &mono_wire)
+            .expect("monochrome cursor should decode");
+        assert_eq!(mono_shape.hotspot_x, 0);
+        assert_eq!(mono_shape.hotspot_y, 1);
+        assert_eq!(
+            mono_shape.argb_pixels,
+            vec![
+                255, 255, 255, 255, // top row (x=0): white (AND=0, XOR=1)
+                128, 128, 128, 220, // top row (x=1): xor gray (AND=1, XOR=1)
+                0, 0, 0, 255, // middle row (x=0): black (AND=0, XOR=0)
+                0, 0, 0, 0, // middle row (x=1): transparent (AND=1, XOR=0)
+                0, 0, 0, 0, // bottom row (x=0): transparent (AND=1, XOR=0)
+                0, 0, 0, 0, // bottom row (x=1): transparent (AND=1, XOR=0)
+            ]
+        );
     }
 }

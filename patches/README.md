@@ -1,6 +1,6 @@
 # Vendored OpenVMM Patches
 
-`openvmm/` vendors a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) starting from upstream commit `c4419be15ab702194f0a25c294bd2f6187804824` (with FastDesk integration landed on this repository's `main` branch). Changes made inside vendored crates relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` are tracked here as named patches so they can be audited, preserved, or dropped cleanly during upstream syncs; the only change under `openvmm/` outside these four patches relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` is `openvmm/Cargo.lock`.
+`openvmm/` vendors a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) starting from upstream commit `c4419be15ab702194f0a25c294bd2f6187804824` (with FastDesk integration landed on this repository's `main` branch). Changes made inside vendored crates relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` are tracked here as named patches so they can be audited, preserved, or dropped cleanly during upstream syncs; the only change under `openvmm/` outside these five patches relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` is `openvmm/Cargo.lock`.
 
 ## Patch Inventory
 
@@ -36,6 +36,12 @@
 - **Behavioral impact:** Prevents unbounded allocations / OOM DoS from oversized client-to-server FastDesk frames, leaves output buffers clean after oversized server frame encoding failures, and ensures `fastdesk_worker` builds on Unix targets.
 - **Why carried:** Tracks FastDesk protocol and `fastdesk_worker` build/hardening changes outside the `0003` ttrpc extension patch so re-applying patches onto a clean baseline preserves both security fixes and Unix compilation.
 
+### `0005-uidevices-flip-synthvid-cursor-bitmap-to-top-down.patch`
+- **Target:** `openvmm/vm/devices/uidevices/src/video/mod.rs`
+- **Summary:** Flips bottom-up Windows DIB cursor scanlines (`CursorAssembler::decode_shape`) to top-down row order for both 32bpp color ARGB and 1bpp monochrome AND/XOR cursor shapes while keeping top-left relative `hotspot_x`/`hotspot_y`.
+- **Behavioral impact:** `video_core::CursorShape` delivered by SynthVid is now consistently top-down for `fastdesk_worker` and `velovm-viewer` instead of vertically inverted.
+- **Why carried:** Fixes inverted hardware cursors when connecting to Windows guests whose SynthVid driver emits bottom-up DIB cursor bitmaps.
+
 ## Verifying and Regenerating
 
 From the repository root (against pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610`):
@@ -46,6 +52,7 @@ git apply -R --check patches/0001-mesh-rpc-cancel-pending-rpcs-on-client-disconn
 git apply -R --check patches/0002-disk-writable-image-locking-and-vhdx-open.patch
 git apply -R --check patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
 git apply -R --check patches/0004-fastdesk-client-msg-limit-and-accept-hardening.patch
+git apply -R --check patches/0005-uidevices-flip-synthvid-cursor-bitmap-to-top-down.patch
 
 # Regenerate patches from baseline commit 795181d2a88ddbd3243f494f8706eb27c3cb4610:
 git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/support/mesh/mesh_rpc/src/server.rs \
@@ -56,6 +63,8 @@ git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/openvmm/openvmm_ttr
   > patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
 git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/workers/fastdesk_proto/src/lib.rs openvmm/workers/fastdesk_proto/src/wire.rs openvmm/workers/fastdesk_worker/Cargo.toml \
   > patches/0004-fastdesk-client-msg-limit-and-accept-hardening.patch
+git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/vm/devices/uidevices/src/video/mod.rs \
+  > patches/0005-uidevices-flip-synthvid-cursor-bitmap-to-top-down.patch
 
 # Apply to a clean checkout of the pre-OpenVMMS baseline (then refresh `openvmm/Cargo.lock`
 # because `0002` adds `libc` and `tracing` dependencies to `disklayer_vhdx` before `cargo build --locked`):
