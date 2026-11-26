@@ -203,7 +203,7 @@ mod win32_cursor {
     struct SubclassEntry {
         prev_proc: isize,
         hide_client_cursor: bool,
-        key_events: Option<Arc<Mutex<VecDeque<(minifb::Key, bool)>>>>,
+        key_events: Option<Arc<Mutex<VecDeque<(u16, bool)>>>>,
     }
 
     fn registry() -> &'static Mutex<HashMap<usize, SubclassEntry>> {
@@ -248,12 +248,13 @@ mod win32_cursor {
 
         if matches!(msg, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP)
             && let Some(mapped_key) = win32_scancode_to_missing_minifb_key(lparam)
+            && let Some(scancode) = super::input::key_to_xt_scancode(mapped_key)
         {
             let is_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
             if let Some(q) = entry.as_ref().and_then(|e| e.key_events.as_ref()) {
                 q.lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push_back((mapped_key, is_down));
+                    .push_back((scancode, is_down));
             }
             return 0;
         }
@@ -337,7 +338,7 @@ mod win32_cursor {
         }
     }
 
-    pub fn attach_key_hook(hwnd: HWND, key_events: Arc<Mutex<VecDeque<(minifb::Key, bool)>>>) {
+    pub fn attach_key_hook(hwnd: HWND, key_events: Arc<Mutex<VecDeque<(u16, bool)>>>) {
         ensure_subclassed(hwnd, |entry| {
             entry.key_events = Some(key_events);
         });
