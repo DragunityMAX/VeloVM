@@ -2335,4 +2335,23 @@ mod tests {
             assert_eq!(fs::read(&target).unwrap(), b"keep-me");
         }
     }
+
+    #[test]
+    fn load_host_config_without_data_or_runtime_dir_falls_back_to_store_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+        fs::write(
+            store.host_config_path(),
+            "listen_addr = \"127.0.0.1:47621\"\n",
+        )
+        .unwrap();
+
+        let cfg = store.load_host_config_or_default().unwrap();
+        assert_eq!(cfg.listen_addr, "127.0.0.1:47621");
+        assert_eq!(cfg.data_dir, dir.path());
+        assert_eq!(
+            cfg.runtime_dir,
+            crate::models::default_runtime_dir(dir.path())
+        );
+    }
 }
