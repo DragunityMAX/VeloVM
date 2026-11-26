@@ -548,6 +548,7 @@ pub struct VmSettingsDialog {
     pub secure_boot_enabled: bool,
     pub secure_boot_template: SecureBootTemplateConfig,
     pub tpm_enabled: bool,
+    pub initial_uefi_firmware: String,
     pub uefi_firmware: String,
     pub fastdesk_enabled: bool,
     pub vram_mb: u32,
@@ -569,6 +570,11 @@ impl VmSettingsDialog {
             Some(NicBackendConfig::VmSwitch { switch_id, .. }) => switch_id.clone(),
             Some(NicBackendConfig::Tap { name }) => name.clone(),
         };
+        let uefi_firmware = cfg
+            .uefi_firmware
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Self {
             dialog_id: Uuid::new_v4(),
             vm_id: cfg.id,
@@ -582,11 +588,8 @@ impl VmSettingsDialog {
             secure_boot_enabled: cfg.secure_boot_enabled,
             secure_boot_template: cfg.secure_boot_template,
             tpm_enabled: cfg.tpm_enabled,
-            uefi_firmware: cfg
-                .uefi_firmware
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            initial_uefi_firmware: uefi_firmware.clone(),
+            uefi_firmware,
             fastdesk_enabled: cfg.fastdesk.enabled,
             vram_mb: cfg.fastdesk.vram_mb,
             use_shm: cfg.fastdesk.use_shm,
@@ -604,7 +607,7 @@ impl VmSettingsDialog {
         self.vcpus != self.initial_config.vcpus
             || self.memory_mb != self.initial_config.memory_mb
             || self.nested_virt != self.initial_config.nested_virt
-            || string_to_opt(&self.uefi_firmware) != self.initial_config.uefi_firmware
+            || self.uefi_firmware.trim() != self.initial_uefi_firmware.trim()
             || self.secure_boot_enabled != self.initial_config.secure_boot_enabled
             || self.secure_boot_template != self.initial_config.secure_boot_template
             || self.tpm_enabled != self.initial_config.tpm_enabled
@@ -646,8 +649,8 @@ impl VmSettingsDialog {
             }
             fastdesk
         });
-        let cur_fw = string_to_opt(&self.uefi_firmware);
-        let uefi_firmware = (cur_fw != self.initial_config.uefi_firmware).then_some(cur_fw);
+        let uefi_firmware = (self.uefi_firmware.trim() != self.initial_uefi_firmware.trim())
+            .then(|| string_to_opt(&self.uefi_firmware));
 
         UpdateVmPayload {
             name,
@@ -1271,6 +1274,7 @@ pub fn render_new_vm_wizard(
                                     ui.label("Transport:");
                                     ui.horizontal(|ui| {
                                         ui.radio_value(&mut w.transport, FastDeskTransport::Tcp, "TCP Loopback");
+                                        #[cfg(any(windows, target_os = "linux"))]
                                         ui.radio_value(&mut w.transport, FastDeskTransport::HvSock, "AF_HYPERV / AF_VSOCK");
                                     });
                                     ui.end_row();
@@ -1447,6 +1451,10 @@ impl PartialEq for DiskMode {
     }
 }
 
+fn render_vm_settings_vram_slider(ui: &mut egui::Ui, vram_mb: &mut u32) {
+    ui.add(egui::Slider::new(vram_mb, 8..=256).clamping(egui::SliderClamping::Edits));
+}
+
 pub fn render_vm_settings_dialog(
     ctx: &egui::Context,
     dlg_opt: &mut Option<VmSettingsDialog>,
@@ -1546,7 +1554,7 @@ pub fn render_vm_settings_dialog(
                             ui.end_row();
 
                             ui.label("VRAM (MiB):");
-                            ui.add(egui::Slider::new(&mut d.vram_mb, 8..=256));
+                            render_vm_settings_vram_slider(ui, &mut d.vram_mb);
                             ui.end_row();
 
                             ui.label("Shared VRAM (SHM):");
@@ -2732,6 +2740,41 @@ mod tests {
         assert!(patch.openvmm_bin.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn vm_settings_dialog_does_not_emit_spurious_diff_for_non_utf8_unix_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8_fw = PathBuf::from(OsStr::from_bytes(b"/tmp/fw-\xff\xfe/MSVM.fd"));
+        let mut cfg = VmConfig::from_preset("NonUtf8Fw", VmPreset::Custom, Path::new("/tmp/vm"));
+        cfg.uefi_firmware = Some(non_utf8_fw);
+
+        let mut dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Running);
+        assert!(
+            !dlg.has_hardware_changes(),
+            "untouched non-UTF-8 uefi_firmware must not trigger has_hardware_changes"
+        );
+        assert!(
+            dlg.build_update_payload(&[]).is_empty(),
+            "untouched non-UTF-8 uefi_firmware must not emit a spurious diff"
+        );
+
+        dlg.description = "updated while running".into();
+        assert!(!dlg.has_hardware_changes());
+        let payload = dlg.build_update_payload(&[]);
+        assert_eq!(payload.description.as_deref(), Some("updated while running"));
+        assert!(payload.uefi_firmware.is_none());
+
+        dlg.uefi_firmware = "/tmp/new-MSVM.fd".into();
+        assert!(dlg.has_hardware_changes());
+        let fw_payload = dlg.build_update_payload(&[]);
+        assert_eq!(
+            fw_payload.uefi_firmware,
+            Some(Some(PathBuf::from("/tmp/new-MSVM.fd")))
+        );
+    }
+
     #[test]
     fn host_settings_dialog_sync_from_config_refreshes_unedited_and_warns_on_conflicts() {
         let initial = HostConfig {
@@ -2801,5 +2844,42 @@ mod tests {
         dlg.openvmm_bin = "/cli/openvmm-v2".into();
         dlg.update_conflict_warning();
         assert_eq!(dlg.external_change_warning, None);
+    }
+
+    #[test]
+    fn vm_settings_vram_slider_does_not_clamp_out_of_range_value_on_open() {
+        for (initial_vram, status, enabled_ui) in [
+            (512, VmStatus::Running, false),
+            (512, VmStatus::Off, true),
+            (4, VmStatus::Paused, false),
+        ] {
+            let mut cfg = VmConfig::from_preset("VramClampTest", VmPreset::Custom, Path::new("/tmp/vm"));
+            cfg.fastdesk.enabled = false;
+            cfg.fastdesk.vram_mb = initial_vram;
+
+            let mut dlg = VmSettingsDialog::from_config(&cfg, status);
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_enabled_ui(enabled_ui, |ui| {
+                        render_vm_settings_vram_slider(ui, &mut dlg.vram_mb);
+                    });
+                });
+            });
+
+            assert_eq!(
+                dlg.vram_mb, initial_vram,
+                "rendering settings slider must not clamp untouched vram_mb={initial_vram}"
+            );
+            assert!(!dlg.has_hardware_changes());
+            dlg.description = "edited description".into();
+            assert!(!dlg.has_hardware_changes());
+            let payload = dlg.build_update_payload(&[]);
+            assert_eq!(payload.description.as_deref(), Some("edited description"));
+            assert!(
+                payload.fastdesk.is_none(),
+                "untouched vram_mb must not emit a spurious fastdesk update"
+            );
+        }
     }
 }

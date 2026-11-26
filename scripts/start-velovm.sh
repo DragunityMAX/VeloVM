@@ -224,6 +224,43 @@ else
     fi
 fi
 
+resolve_listen_endpoint() {
+    LISTEN_HOST=""
+    LISTEN_PORT="5901"
+    VIEWER_ADDR="$LISTEN_ADDR"
+    VMM_LISTEN_ADDR="$LISTEN_ADDR"
+    if [[ "$LISTEN_ADDR" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
+        LISTEN_HOST="${BASH_REMATCH[1]}"
+        LISTEN_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$LISTEN_ADDR" =~ ^([^:]+):([0-9]+)$ ]]; then
+        LISTEN_HOST="${BASH_REMATCH[1]}"
+        LISTEN_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$LISTEN_ADDR" == *:* ]]; then
+        LISTEN_HOST="${LISTEN_ADDR#[}"
+        LISTEN_HOST="${LISTEN_HOST%]}"
+        VIEWER_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
+        VMM_LISTEN_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
+    else
+        LISTEN_HOST="$LISTEN_ADDR"
+        VIEWER_ADDR="${LISTEN_ADDR}:${LISTEN_PORT}"
+    fi
+
+    if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 65535 )); then
+        echo "Error: invalid TCP listen port in --listen: $LISTEN_ADDR" >&2
+        exit 1
+    fi
+
+    local listen_host_lc
+    listen_host_lc="$(printf '%s' "$LISTEN_HOST" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$listen_host_lc" == "0.0.0.0" || "$listen_host_lc" == "::ffff:0.0.0.0" || "$listen_host_lc" == "0:0:0:0:0:ffff:0.0.0.0" ]]; then
+        VIEWER_ADDR="127.0.0.1:${LISTEN_PORT}"
+    elif [[ "$listen_host_lc" == *:*:* && "$listen_host_lc" =~ ^[0:]+$ ]]; then
+        VIEWER_ADDR="[::1]:${LISTEN_PORT}"
+    fi
+}
+
+resolve_listen_endpoint
+
 VMM_ARGS=(
     --uefi "firmware=$UEFI_FD"
     -m "$MEMORY"
@@ -235,7 +272,7 @@ VMM_ARGS=(
     --fastdesk
     --vram-mb "$VRAM_MB"
     --fastdesk-shm "$SHM_PATH"
-    --fastdesk-listen "$LISTEN_ADDR"
+    --fastdesk-listen "$VMM_LISTEN_ADDR"
 )
 
 if [[ -n "$ISO_PATH" ]]; then
@@ -243,36 +280,6 @@ if [[ -n "$ISO_PATH" ]]; then
 fi
 
 STARTUP_TIMEOUT_MS="${FASTDESK_STARTUP_TIMEOUT_MS:-30000}"
-
-LISTEN_HOST=""
-LISTEN_PORT="5901"
-VIEWER_ADDR="$LISTEN_ADDR"
-if [[ "$LISTEN_ADDR" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
-    LISTEN_HOST="${BASH_REMATCH[1]}"
-    LISTEN_PORT="${BASH_REMATCH[2]}"
-elif [[ "$LISTEN_ADDR" =~ ^([^:]+):([0-9]+)$ ]]; then
-    LISTEN_HOST="${BASH_REMATCH[1]}"
-    LISTEN_PORT="${BASH_REMATCH[2]}"
-elif [[ "$LISTEN_ADDR" == *:* ]]; then
-    LISTEN_HOST="${LISTEN_ADDR#[}"
-    LISTEN_HOST="${LISTEN_HOST%]}"
-    VIEWER_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
-else
-    LISTEN_HOST="$LISTEN_ADDR"
-    VIEWER_ADDR="${LISTEN_ADDR}:${LISTEN_PORT}"
-fi
-
-if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 65535 )); then
-    echo "Error: invalid TCP listen port in --listen: $LISTEN_ADDR" >&2
-    exit 1
-fi
-
-LISTEN_HOST_LC="$(printf '%s' "$LISTEN_HOST" | tr '[:upper:]' '[:lower:]')"
-if [[ "$LISTEN_HOST_LC" == "0.0.0.0" || "$LISTEN_HOST_LC" == "::ffff:0.0.0.0" || "$LISTEN_HOST_LC" == "0:0:0:0:0:ffff:0.0.0.0" ]]; then
-    VIEWER_ADDR="127.0.0.1:${LISTEN_PORT}"
-elif [[ "$LISTEN_HOST_LC" == *:*:* && "$LISTEN_HOST_LC" =~ ^[0:]+$ ]]; then
-    VIEWER_ADDR="[::1]:${LISTEN_PORT}"
-fi
 
 parse_epochrealtime_ms() {
     local raw="$1"
@@ -288,6 +295,36 @@ now_ms() {
     else
         echo $(( $(date +%s) * 1000 ))
     fi
+}
+
+collect_process_tree_pids() {
+    local root_pid="$1"
+    local queue=("$root_pid")
+    local all_pids=("$root_pid")
+    local idx=0
+    while [[ $idx -lt ${#queue[@]} ]]; do
+        local pid="${queue[$idx]}"
+        idx=$((idx + 1))
+        local child
+        while IFS= read -r child; do
+            [[ "$child" =~ ^[0-9]+$ ]] || continue
+            queue+=("$child")
+            all_pids+=("$child")
+        done < <(pgrep -P "$pid" 2>/dev/null || true)
+    done
+    local IFS=,
+    echo "${all_pids[*]}"
+}
+
+is_tcp_listening_lsof() {
+    if [[ -n "${VMM_PID:-}" ]] && command -v pgrep >/dev/null 2>&1; then
+        local pid_list
+        pid_list="$(collect_process_tree_pids "$VMM_PID")"
+        lsof -nP -a -p "$pid_list" -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+    lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
 }
 
 is_tcp_listening() {
@@ -323,7 +360,7 @@ is_tcp_listening() {
         ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep "LISTEN" >/dev/null
         return $?
     elif command -v lsof >/dev/null 2>&1; then
-        [[ -n "${VMM_PID:-}" ]] && lsof -nP -a -p "$VMM_PID" -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+        is_tcp_listening_lsof
         return $?
     fi
     return 1
@@ -355,7 +392,7 @@ VMM_PID=$!
 exec 8<&-
 VMM_READ_FD_OPEN=0
 
-echo "Waiting for VeloVM FastDesk listener on ${LISTEN_ADDR}..."
+echo "Waiting for VeloVM FastDesk listener on ${VMM_LISTEN_ADDR}..."
 START_MS="$(now_ms)"
 DEADLINE_MS=$(( START_MS + STARTUP_TIMEOUT_MS ))
 while true; do
@@ -368,7 +405,7 @@ while true; do
         break
     fi
     if [[ "$(now_ms)" -ge "$DEADLINE_MS" ]]; then
-        echo "Error: timed out waiting for VeloVM FastDesk to listen on ${LISTEN_ADDR}." >&2
+        echo "Error: timed out waiting for VeloVM FastDesk to listen on ${VMM_LISTEN_ADDR}." >&2
         exit 1
     fi
     sleep 0.05

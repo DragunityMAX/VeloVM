@@ -181,6 +181,11 @@ impl InputTracker {
         window.set_input_callback(Box::new(KeyEventCollector(Arc::clone(&self.key_events))));
     }
 
+    #[cfg(windows)]
+    pub(crate) fn key_events_queue(&self) -> Arc<Mutex<VecDeque<(Key, bool)>>> {
+        Arc::clone(&self.key_events)
+    }
+
     #[cfg(test)]
     pub fn push_key_event(&self, key: Key, is_down: bool) {
         self.key_events
@@ -761,5 +766,40 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn alt_altgr_and_super_keys_emit_xt_scancodes() {
+        let mut tracker = InputTracker::default();
+        let active_snap = snap(true, 0);
+        // Focus the tracker first.
+        let _ = tracker.poll_snapshot(active_snap, 1280, 720);
+
+        for (key, expected_sc) in [
+            (Key::LeftAlt, 0x38u16),
+            (Key::RightAlt, 0xe038u16),
+            (Key::LeftSuper, 0xe05bu16),
+            (Key::RightSuper, 0xe05cu16),
+        ] {
+            tracker.push_key_event(key, true);
+            let down = tracker.poll_snapshot(active_snap, 1280, 720);
+            assert_eq!(
+                down,
+                vec![ClientMsg::KeyEvent {
+                    scancode: expected_sc,
+                    make: true
+                }]
+            );
+
+            tracker.push_key_event(key, false);
+            let up = tracker.poll_snapshot(active_snap, 1280, 720);
+            assert_eq!(
+                up,
+                vec![ClientMsg::KeyEvent {
+                    scancode: expected_sc,
+                    make: false
+                }]
+            );
+        }
     }
 }

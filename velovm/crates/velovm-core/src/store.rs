@@ -107,21 +107,7 @@ impl RegistryStore {
     /// managing the same registry simultaneously.
     pub fn try_acquire_daemon_lock(&self) -> anyhow::Result<fs::File> {
         let path = self.lock_path();
-        let mut opts = fs::OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let file = opts
-            .open(&path)
-            .with_context(|| format!("opening daemon lock at {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-        }
+        let file = open_private_file_nofollow(&path, false, "daemon lock")?;
 
         #[cfg(target_os = "linux")]
         {
@@ -153,10 +139,6 @@ impl RegistryStore {
         loop {
             match file.try_lock() {
                 Ok(()) => {
-                    #[cfg(windows)]
-                    {
-                        set_path_owner_only_windows(&path)?;
-                    }
                     return Ok(file);
                 }
                 Err(fs::TryLockError::WouldBlock) => {
@@ -933,11 +915,12 @@ fn open_and_read_token_windows_with_sid(
     }))
 }
 
-pub fn save_pending_disks_journal(
+fn save_json_journal<T: serde::Serialize>(
     path: &Path,
-    disks: &[crate::models::DiskAttachment],
+    items: &[T],
+    label: &str,
 ) -> anyhow::Result<()> {
-    if disks.is_empty() {
+    if items.is_empty() {
         match fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -950,29 +933,63 @@ pub fn save_pending_disks_journal(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating runtime directory {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec(disks).context("serializing pending disk journal")?;
+    let bytes = serde_json::to_vec(items).with_context(|| format!("serializing {label}"))?;
     atomic_write(path, &bytes, false)
 }
 
-pub fn load_pending_disks_journal(path: &Path) -> anyhow::Result<Vec<crate::models::DiskAttachment>> {
+fn load_json_journal<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<Vec<T>> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("reading pending disk journal {}", path.display()));
+            return Err(err).with_context(|| format!("reading {label} {}", path.display()));
         }
     };
     serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing pending disk journal {}", path.display()))
+        .with_context(|| format!("parsing {label} {}", path.display()))
+}
+
+pub fn save_pending_disks_journal(
+    path: &Path,
+    disks: &[crate::models::DiskAttachment],
+) -> anyhow::Result<()> {
+    save_json_journal(path, disks, "pending disk journal")
+}
+
+pub fn load_pending_disks_journal(path: &Path) -> anyhow::Result<Vec<crate::models::DiskAttachment>> {
+    load_json_journal(path, "pending disk journal")
+}
+
+pub fn save_pending_port_forwards_journal(
+    path: &Path,
+    ports: &[crate::models::OrphanedPortForward],
+) -> anyhow::Result<()> {
+    save_json_journal(path, ports, "pending port-forward journal")
+}
+
+pub fn load_pending_port_forwards_journal(
+    path: &Path,
+) -> anyhow::Result<Vec<crate::models::OrphanedPortForward>> {
+    load_json_journal(path, "pending port-forward journal")
 }
 
 pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
+    open_private_file_nofollow(path, true, "FastDesk SHM")
+}
+
+fn open_private_file_nofollow(
+    path: &Path,
+    truncate: bool,
+    label: &str,
+) -> anyhow::Result<fs::File> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && (meta.file_type().is_symlink() || !meta.file_type().is_file())
     {
         bail!(
-            "refusing to use non-regular or symlinked FastDesk SHM path {}",
+            "refusing to use non-regular or symlinked {label} path {}",
             path.display()
         );
     }
@@ -990,20 +1007,20 @@ pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = opts
             .open(path)
-            .with_context(|| format!("creating FastDesk SHM file {}", path.display()))?;
+            .with_context(|| format!("opening {label} file {}", path.display()))?;
         let meta = file
             .metadata()
-            .with_context(|| format!("inspecting FastDesk SHM file {}", path.display()))?;
+            .with_context(|| format!("inspecting {label} file {}", path.display()))?;
         if !meta.file_type().is_file() {
             bail!(
-                "refusing to use non-regular FastDesk SHM path {}",
+                "refusing to use non-regular {label} path {}",
                 path.display()
             );
         }
         let euid = unsafe { libc::geteuid() };
         if meta.uid() != euid {
             bail!(
-                "refusing to use FastDesk SHM file {} owned by uid {} (expected {})",
+                "refusing to use {label} file {} owned by uid {} (expected {})",
                 path.display(),
                 meta.uid(),
                 euid
@@ -1011,28 +1028,30 @@ pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
         }
         if meta.nlink() > 1 {
             bail!(
-                "refusing to use hard-linked FastDesk SHM file {}",
+                "refusing to use hard-linked {label} file {}",
                 path.display()
             );
         }
-        file.set_len(0)
-            .with_context(|| format!("truncating FastDesk SHM file {}", path.display()))?;
+        if truncate {
+            file.set_len(0)
+                .with_context(|| format!("truncating {label} file {}", path.display()))?;
+        }
         file.set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting permissions on FastDesk SHM file {}", path.display()))?;
+            .with_context(|| format!("setting permissions on {label} file {}", path.display()))?;
         Ok(file)
     }
 
     #[cfg(windows)]
     {
-        open_shm_file_nofollow_windows(path)
+        open_private_file_nofollow_windows(path, truncate, label)
     }
 
     #[cfg(not(any(unix, windows)))]
     {
         let mut opts = fs::OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(true);
+        opts.read(true).write(true).create(true).truncate(truncate);
         opts.open(path)
-            .with_context(|| format!("creating FastDesk SHM file {}", path.display()))
+            .with_context(|| format!("opening {label} file {}", path.display()))
     }
 }
 
@@ -1158,7 +1177,11 @@ impl OwnerOnlySecurityDescriptor {
 }
 
 #[cfg(windows)]
-fn open_shm_file_nofollow_windows(path: &Path) -> anyhow::Result<fs::File> {
+fn open_private_file_nofollow_windows(
+    path: &Path,
+    truncate: bool,
+    label: &str,
+) -> anyhow::Result<fs::File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -1198,16 +1221,16 @@ fn open_shm_file_nofollow_windows(path: &Path) -> anyhow::Result<fs::File> {
     };
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("creating FastDesk SHM file {}", path.display()));
+            .with_context(|| format!("opening {label} file {}", path.display()));
     }
     let file = unsafe { fs::File::from_raw_handle(handle as RawHandle) };
 
     let meta = file
         .metadata()
-        .with_context(|| format!("inspecting FastDesk SHM file {}", path.display()))?;
+        .with_context(|| format!("inspecting {label} file {}", path.display()))?;
     if !meta.file_type().is_file() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
         bail!(
-            "refusing to use non-regular or symlinked FastDesk SHM path {}",
+            "refusing to use non-regular or symlinked {label} path {}",
             path.display()
         );
     }
@@ -1219,7 +1242,7 @@ fn open_shm_file_nofollow_windows(path: &Path) -> anyhow::Result<fs::File> {
     }
     if info.nNumberOfLinks > 1 {
         bail!(
-            "refusing to use hard-linked FastDesk SHM file {}",
+            "refusing to use hard-linked {label} file {}",
             path.display()
         );
     }
@@ -1250,7 +1273,7 @@ fn open_shm_file_nofollow_windows(path: &Path) -> anyhow::Result<fs::File> {
     }
     if !owner_ok {
         bail!(
-            "refusing to use FastDesk SHM file {} owned by a different Windows user",
+            "refusing to use {label} file {} owned by a different Windows user",
             path.display()
         );
     }
@@ -1271,8 +1294,10 @@ fn open_shm_file_nofollow_windows(path: &Path) -> anyhow::Result<fs::File> {
             .with_context(|| format!("SetSecurityInfo failed for {}", path.display()));
     }
 
-    file.set_len(0)
-        .with_context(|| format!("truncating FastDesk SHM file {}", path.display()))?;
+    if truncate {
+        file.set_len(0)
+            .with_context(|| format!("truncating {label} file {}", path.display()))?;
+    }
     Ok(file)
 }
 
@@ -2256,6 +2281,84 @@ mod tests {
         let sym = dir.path().join("sym.shm");
         if std::os::windows::fs::symlink_file(&target, &sym).is_ok() {
             assert!(open_shm_file_nofollow(&sym).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"keep-me");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_lock_rejects_symlinks_fifos_and_hard_links_without_modifying_targets() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+
+        // 1. Symlink target's permissions and contents remain untouched.
+        let target = dir.path().join("victim.txt");
+        fs::write(&target, b"preserve-me").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, store.lock_path()).unwrap();
+        assert!(store.try_acquire_daemon_lock().is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve-me");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::remove_file(store.lock_path()).unwrap();
+
+        // 2. FIFO rejected without blocking.
+        let c_fifo = CString::new(store.lock_path().as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(store.try_acquire_daemon_lock().is_err());
+        fs::remove_file(store.lock_path()).unwrap();
+
+        // 3. Hard-linked daemon.lock rejected without rewriting target permissions.
+        let alias = dir.path().join("lock-alias.txt");
+        fs::write(&alias, b"lock-alias").unwrap();
+        fs::set_permissions(&alias, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&alias, store.lock_path()).unwrap();
+        assert!(store.try_acquire_daemon_lock().is_err());
+        assert_eq!(
+            fs::metadata(&alias).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::remove_file(store.lock_path()).unwrap();
+
+        // 4. Fresh regular daemon.lock succeeds with 0600 permissions.
+        let lock = store.try_acquire_daemon_lock().unwrap();
+        let mode = lock.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_lock_windows_rejects_symlinks_hard_links_and_enforces_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(dir.path()).unwrap();
+
+        // 1. Fresh lock is created with owner-only ACL.
+        let lock = store.try_acquire_daemon_lock().unwrap();
+        assert_eq!(
+            check_handle_owner_only_windows(&lock, &store.lock_path()).unwrap(),
+            WindowsTokenAclStatus::OwnerOnly
+        );
+        drop(lock);
+        fs::remove_file(store.lock_path()).unwrap();
+
+        // 2. Hard-linked daemon.lock is rejected.
+        let alias = dir.path().join("lock-alias.txt");
+        fs::write(&alias, b"alias").unwrap();
+        fs::hard_link(&alias, store.lock_path()).unwrap();
+        assert!(store.try_acquire_daemon_lock().is_err());
+        fs::remove_file(store.lock_path()).unwrap();
+
+        // 3. Symlink (if permitted) is rejected.
+        let target = dir.path().join("victim.txt");
+        fs::write(&target, b"keep-me").unwrap();
+        if std::os::windows::fs::symlink_file(&target, store.lock_path()).is_ok() {
+            assert!(store.try_acquire_daemon_lock().is_err());
             assert_eq!(fs::read(&target).unwrap(), b"keep-me");
         }
     }

@@ -230,16 +230,40 @@ async fn health(
     })
 }
 
-async fn events_handler(
-    State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.supervisor.subscribe();
-    let shutdown_rx = state.supervisor.subscribe_shutdown();
-    let stream = futures_util::stream::unfold(
+fn drain_for_daemon_stopping(
+    rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+) -> Option<Event> {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    loop {
+        match rx.try_recv() {
+            Ok(DaemonEvent::DaemonStopping) => break,
+            Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+        }
+    }
+    serde_json::to_string(&DaemonEvent::DaemonStopping)
+        .ok()
+        .map(|json| Event::default().data(json))
+}
+
+fn build_events_stream(
+    rx: tokio::sync::broadcast::Receiver<DaemonEvent>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    futures_util::stream::unfold(
         (rx, shutdown_rx, true, false),
         |(mut rx, mut shutdown_rx, send_initial_resync, done)| async move {
-            if done || *shutdown_rx.borrow() {
+            if done {
                 return None;
+            }
+            if *shutdown_rx.borrow() {
+                return drain_for_daemon_stopping(&mut rx).map(|ev| {
+                    (
+                        Ok::<Event, Infallible>(ev),
+                        (rx, shutdown_rx, false, true),
+                    )
+                });
             }
             if send_initial_resync
                 && let Ok(json) = serde_json::to_string(&DaemonEvent::Resync)
@@ -266,6 +290,14 @@ async fn events_handler(
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                if *shutdown_rx.borrow() {
+                                    return drain_for_daemon_stopping(&mut rx).map(|ev| {
+                                        (
+                                            Ok::<Event, Infallible>(ev),
+                                            (rx, shutdown_rx, false, true),
+                                        )
+                                    });
+                                }
                                 if let Ok(json) = serde_json::to_string(&DaemonEvent::Resync) {
                                     return Some((
                                         Ok::<Event, Infallible>(Event::default().data(json)),
@@ -273,28 +305,44 @@ async fn events_handler(
                                     ));
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                if *shutdown_rx.borrow() {
+                                    return drain_for_daemon_stopping(&mut rx).map(|ev| {
+                                        (
+                                            Ok::<Event, Infallible>(ev),
+                                            (rx, shutdown_rx, false, true),
+                                        )
+                                    });
+                                }
+                                return None;
+                            }
                         }
                     }
                     changed = shutdown_rx.changed() => {
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            while let Ok(event) = rx.try_recv() {
-                                if matches!(event, DaemonEvent::DaemonStopping)
-                                    && let Ok(json) = serde_json::to_string(&event)
-                                {
-                                    return Some((
-                                        Ok::<Event, Infallible>(Event::default().data(json)),
-                                        (rx, shutdown_rx, false, true),
-                                    ));
-                                }
-                            }
+                        if *shutdown_rx.borrow() {
+                            return drain_for_daemon_stopping(&mut rx).map(|ev| {
+                                (
+                                    Ok::<Event, Infallible>(ev),
+                                    (rx, shutdown_rx, false, true),
+                                )
+                            });
+                        }
+                        if changed.is_err() {
                             return None;
                         }
                     }
                 }
             }
         },
-    );
+    )
+}
+
+async fn events_handler(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.supervisor.subscribe();
+    let shutdown_rx = state.supervisor.subscribe_shutdown();
+    let stream = build_events_stream(rx, shutdown_rx);
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -1388,6 +1436,105 @@ mod tests {
         })
         .await
         .expect("SSE stream and daemon did not shut down within 2s");
+    }
+
+    #[tokio::test]
+    async fn sse_events_stream_delivers_daemon_stopping_when_events_queued_or_lagged_at_shutdown() {
+        use super::build_events_stream;
+        use futures_util::StreamExt;
+        use tokio::sync::{broadcast, watch};
+        use uuid::Uuid;
+        use velovm_core::models::DaemonEvent;
+
+        // Case 1: An ordinary event is queued before DaemonStopping and shutdown watch flipped before polling.
+        {
+            let (tx, rx) = broadcast::channel::<DaemonEvent>(16);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let stream = build_events_stream(rx, shutdown_rx);
+            tokio::pin!(stream);
+
+            // Consume initial Resync so stream enters the select loop on next poll.
+            let first = stream.next().await.unwrap().unwrap();
+            let first_debug = format!("{first:?}");
+            assert!(first_debug.contains("resync"), "unexpected first event: {first_debug}");
+
+            // Queue VmDeleted + HostConfigUpdated followed by DaemonStopping + shutdown watch before polling again.
+            tx.send(DaemonEvent::VmDeleted {
+                id: Uuid::nil(),
+                revision: 1,
+            })
+            .unwrap();
+            tx.send(DaemonEvent::HostConfigUpdated).unwrap();
+            tx.send(DaemonEvent::DaemonStopping).unwrap();
+            shutdown_tx.send(true).unwrap();
+
+            let mut saw_stopping = false;
+            while let Some(item) = stream.next().await {
+                let ev = item.unwrap();
+                if format!("{ev:?}").contains("daemon_stopping") {
+                    saw_stopping = true;
+                }
+            }
+            assert!(
+                saw_stopping,
+                "expected daemon_stopping before EOF when other events were queued before shutdown"
+            );
+        }
+
+        // Case 2: Subscriber lagged past channel capacity before shutdown watch fires.
+        {
+            let (tx, rx) = broadcast::channel::<DaemonEvent>(4);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let stream = build_events_stream(rx, shutdown_rx);
+            tokio::pin!(stream);
+
+            let _ = stream.next().await.unwrap().unwrap();
+
+            for revision in 1..=8 {
+                let _ = tx.send(DaemonEvent::VmDeleted {
+                    id: Uuid::nil(),
+                    revision,
+                });
+            }
+            let _ = tx.send(DaemonEvent::DaemonStopping);
+            shutdown_tx.send(true).unwrap();
+
+            let mut saw_stopping = false;
+            while let Some(item) = stream.next().await {
+                let ev = item.unwrap();
+                if format!("{ev:?}").contains("daemon_stopping") {
+                    saw_stopping = true;
+                }
+            }
+            assert!(
+                saw_stopping,
+                "expected daemon_stopping before EOF even when subscriber lagged"
+            );
+        }
+
+        // Case 3: Shutdown starts before the stream is even polled once.
+        {
+            let (tx, rx) = broadcast::channel::<DaemonEvent>(4);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let _ = tx.send(DaemonEvent::DaemonStopping);
+            shutdown_tx.send(true).unwrap();
+
+            let stream = build_events_stream(rx, shutdown_rx);
+            tokio::pin!(stream);
+            let mut saw_stopping = false;
+            while let Some(item) = stream.next().await {
+                let ev = item.unwrap();
+                if format!("{ev:?}").contains("daemon_stopping") {
+                    saw_stopping = true;
+                }
+            }
+            assert!(
+                saw_stopping,
+                "expected daemon_stopping before EOF when shutdown precedes first poll"
+            );
+        }
     }
 
     #[tokio::test]

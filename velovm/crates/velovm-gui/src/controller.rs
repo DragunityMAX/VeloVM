@@ -884,10 +884,16 @@ fn reload_client_from_runtime_addr_result(
     let current = shared_endpoint.read().unwrap().clone();
     let runtime_err = match ApiClient::from_runtime_addr(data_dir) {
         Ok(Some(c)) => {
-            let token_matches = current
-                .as_ref()
-                .is_none_or(|(_, cur_token)| c.token() == cur_token);
-            if (daemon_url.is_none() || token_matches) && c.health().is_ok() {
+            let allowed = match daemon_url {
+                None => true,
+                Some(url) => {
+                    current
+                        .as_ref()
+                        .is_some_and(|(_, cur_token)| c.token() == cur_token)
+                        || c.base_url() == velovm_core::api_client::normalize_base_url(url)
+                }
+            };
+            if allowed && c.health().is_ok() {
                 set_shared_endpoint(shared_endpoint, &c);
                 return Ok(Some(c));
             }
