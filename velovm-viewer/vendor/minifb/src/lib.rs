@@ -210,6 +210,10 @@ pub trait InputCallback {
     /// Called on Linux (X11/Wayland) with the raw physical Linux evdev keycode
     /// (XKB/X11 keycode minus 8) before layout keysym translation.
     fn set_evdev_key_state(&mut self, _evdev_code: u32, _state: bool) {}
+
+    /// Called on macOS (AppKit) with the raw physical Carbon/HIToolbox virtual
+    /// keycode (`NSEvent.keyCode`) before `KEY_MAPPINGS` translation.
+    fn set_macos_key_state(&mut self, _macos_keycode: u32, _state: bool) {}
 }
 
 /// Window is used to open up a window. It's possible to optionally display a 32-bit buffer when

@@ -21,7 +21,18 @@ const WAYLAND_REPEAT_INTERVAL: Duration = Duration::from_millis(33);
 fn is_repeatable_scancode(sc: u16) -> bool {
     !matches!(
         sc,
-        0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0x46 | 0xe01d | 0xe037 | 0xe038 | 0xe05b | 0xe05c
+        0x1d | 0x2a
+            | 0x36
+            | 0x38
+            | 0x3a
+            | 0x45
+            | 0x46
+            | 0xe01d
+            | 0xe037
+            | 0xe038
+            | 0xe05b
+            | 0xe05c
+            | XT_PAUSE_SCANCODE
     )
 }
 
@@ -129,16 +140,40 @@ pub fn normalize_pointer_pos(
     Some((nx, ny))
 }
 
+const XT_PAUSE_SCANCODE: u16 = 0xe145;
+
+fn push_scancode_event(msgs: &mut Vec<ClientMsg>, sc: u16, make: bool) {
+    if sc == XT_PAUSE_SCANCODE {
+        msgs.push(ClientMsg::KeyEvent {
+            scancode: 0xe11d,
+            make,
+        });
+        msgs.push(ClientMsg::KeyEvent {
+            scancode: 0x0045,
+            make,
+        });
+    } else {
+        msgs.push(ClientMsg::KeyEvent { scancode: sc, make });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCollectorBackend {
+    MinifbKey,
+    Evdev,
+    Macos,
+}
+
 struct KeyEventCollector {
     queue: Arc<Mutex<VecDeque<(u16, bool)>>>,
-    use_evdev: bool,
+    backend: KeyCollectorBackend,
 }
 
 impl InputCallback for KeyEventCollector {
     fn add_char(&mut self, _uni_char: u32) {}
 
     fn set_key_state(&mut self, key: Key, state: bool) {
-        if self.use_evdev {
+        if self.backend != KeyCollectorBackend::MinifbKey {
             return;
         }
         if let Some(sc) = key_to_xt_scancode(key) {
@@ -150,10 +185,22 @@ impl InputCallback for KeyEventCollector {
     }
 
     fn set_evdev_key_state(&mut self, evdev_code: u32, state: bool) {
-        if !self.use_evdev {
+        if self.backend != KeyCollectorBackend::Evdev {
             return;
         }
         if let Some(sc) = evdev_to_xt_scancode(evdev_code) {
+            self.queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((sc, state));
+        }
+    }
+
+    fn set_macos_key_state(&mut self, macos_keycode: u32, state: bool) {
+        if self.backend != KeyCollectorBackend::Macos {
+            return;
+        }
+        if let Some(sc) = macos_to_xt_scancode(macos_keycode) {
             self.queue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -212,13 +259,14 @@ impl InputTracker {
         self.was_active = window.is_active();
         self.unfocused = !self.was_active;
         self.suppressed_buttons = 0;
-        let use_evdev = matches!(
-            ScrollBackend::from_window(window),
-            ScrollBackend::X11 | ScrollBackend::Wayland
-        );
+        let backend = match ScrollBackend::from_window(window) {
+            ScrollBackend::X11 | ScrollBackend::Wayland => KeyCollectorBackend::Evdev,
+            ScrollBackend::AppKit => KeyCollectorBackend::Macos,
+            ScrollBackend::Windows | ScrollBackend::Other => KeyCollectorBackend::MinifbKey,
+        };
         window.set_input_callback(Box::new(KeyEventCollector {
             queue: Arc::clone(&self.key_events),
-            use_evdev,
+            backend,
         }));
     }
 
@@ -245,10 +293,7 @@ impl InputTracker {
         self.wayland_repeat = None;
         let mut msgs = Vec::new();
         for sc in self.held_scancodes.drain(..).rev() {
-            msgs.push(ClientMsg::KeyEvent {
-                scancode: sc,
-                make: false,
-            });
+            push_scancode_event(&mut msgs, sc, false);
         }
         if self.last_buttons != 0 {
             self.last_buttons = 0;
@@ -307,10 +352,7 @@ impl InputTracker {
                     if !self.held_scancodes.contains(&sc) {
                         self.held_scancodes.push(sc);
                     }
-                    msgs.push(ClientMsg::KeyEvent {
-                        scancode: sc,
-                        make: true,
-                    });
+                    push_scancode_event(&mut msgs, sc, true);
                     if snap.scroll_backend == ScrollBackend::Wayland && is_repeatable_scancode(sc) {
                         self.wayland_repeat = Some((sc, now + WAYLAND_REPEAT_DELAY));
                     }
@@ -321,10 +363,7 @@ impl InputTracker {
                 }
                 if let Some(pos) = self.held_scancodes.iter().position(|&k| k == sc) {
                     self.held_scancodes.swap_remove(pos);
-                    msgs.push(ClientMsg::KeyEvent {
-                        scancode: sc,
-                        make: false,
-                    });
+                    push_scancode_event(&mut msgs, sc, false);
                 }
             }
         }
@@ -339,10 +378,7 @@ impl InputTracker {
             self.suppressed_buttons = snap.raw_buttons;
             self.scroll_accum = 0.0;
             for sc in self.held_scancodes.drain(..).rev() {
-                msgs.push(ClientMsg::KeyEvent {
-                    scancode: sc,
-                    make: false,
-                });
+                push_scancode_event(&mut msgs, sc, false);
             }
             if self.last_buttons != 0 {
                 self.last_buttons = 0;
@@ -365,10 +401,7 @@ impl InputTracker {
             if let Some((sc, next_at)) = self.wayland_repeat {
                 if self.held_scancodes.contains(&sc) {
                     if now >= next_at {
-                        msgs.push(ClientMsg::KeyEvent {
-                            scancode: sc,
-                            make: true,
-                        });
+                        push_scancode_event(&mut msgs, sc, true);
                         let next = if now.saturating_duration_since(next_at) >= WAYLAND_REPEAT_INTERVAL
                         {
                             now + WAYLAND_REPEAT_INTERVAL
@@ -547,6 +580,7 @@ pub fn key_to_xt_scancode(key: Key) -> Option<u16> {
         Key::LeftSuper => 0xe05b,
         Key::RightSuper => 0xe05c,
         Key::Menu => 0xe05d,
+        Key::Pause => XT_PAUSE_SCANCODE,
         _ => return None,
     })
 }
@@ -560,9 +594,14 @@ pub fn evdev_to_xt_scancode(evdev_code: u32) -> Option<u16> {
         86 => 0x56, // KEY_102ND (ISO <> key)
         87 => 0x57, // KEY_F11
         88 => 0x58, // KEY_F12
+        89 => 0x73, // KEY_RO (JIS / ABNT2)
+        92 => 0x79, // KEY_HENKAN (JIS)
+        93 => 0x70, // KEY_KATAKANAHIRAGANA (JIS)
+        94 => 0x7b, // KEY_MUHENKAN (JIS)
         96 => 0xe01c, // KEY_KPENTER
         97 => 0xe01d, // KEY_RIGHTCTRL
         98 => 0xe035, // KEY_KPSLASH
+        99 => 0xe037, // KEY_SYSRQ (PrintScreen)
         100 => 0xe038, // KEY_RIGHTALT (AltGr)
         102 => 0xe047, // KEY_HOME
         103 => 0xe048, // KEY_UP
@@ -574,9 +613,131 @@ pub fn evdev_to_xt_scancode(evdev_code: u32) -> Option<u16> {
         109 => 0xe051, // KEY_PAGEDOWN
         110 => 0xe052, // KEY_INSERT
         111 => 0xe053, // KEY_DELETE
+        119 => XT_PAUSE_SCANCODE, // KEY_PAUSE (E1 1D 45)
+        121 => 0x7e, // KEY_KPCOMMA (JIS / ABNT2)
+        124 => 0x7d, // KEY_YEN (JIS)
         125 => 0xe05b, // KEY_LEFTMETA
         126 => 0xe05c, // KEY_RIGHTMETA
         127 | 139 => 0xe05d, // KEY_COMPOSE / KEY_MENU
+        _ => return None,
+    })
+}
+
+/// Maps a physical macOS Carbon/HIToolbox virtual keycode (`NSEvent.keyCode`)
+/// to an XT Set-1 scancode, including ISO 102nd (`0x0a`), ANSI Grave (`0x32`),
+/// JIS keys, PrintScreen (`kVK_F13`, `0x69`), and Pause (`kVK_F15`, `0x71`).
+pub fn macos_to_xt_scancode(macos_keycode: u32) -> Option<u16> {
+    Some(match macos_keycode {
+        0x00 => 0x1e, // kVK_ANSI_A
+        0x01 => 0x1f, // kVK_ANSI_S
+        0x02 => 0x20, // kVK_ANSI_D
+        0x03 => 0x21, // kVK_ANSI_F
+        0x04 => 0x23, // kVK_ANSI_H
+        0x05 => 0x22, // kVK_ANSI_G
+        0x06 => 0x2c, // kVK_ANSI_Z
+        0x07 => 0x2d, // kVK_ANSI_X
+        0x08 => 0x2e, // kVK_ANSI_C
+        0x09 => 0x2f, // kVK_ANSI_V
+        0x0a => 0x56, // kVK_ISO_Section (ISO 102nd key)
+        0x0b => 0x30, // kVK_ANSI_B
+        0x0c => 0x10, // kVK_ANSI_Q
+        0x0d => 0x11, // kVK_ANSI_W
+        0x0e => 0x12, // kVK_ANSI_E
+        0x0f => 0x13, // kVK_ANSI_R
+        0x10 => 0x15, // kVK_ANSI_Y
+        0x11 => 0x14, // kVK_ANSI_T
+        0x12 => 0x02, // kVK_ANSI_1
+        0x13 => 0x03, // kVK_ANSI_2
+        0x14 => 0x04, // kVK_ANSI_3
+        0x15 => 0x05, // kVK_ANSI_4
+        0x16 => 0x07, // kVK_ANSI_6
+        0x17 => 0x06, // kVK_ANSI_5
+        0x18 => 0x0d, // kVK_ANSI_Equal
+        0x19 => 0x0a, // kVK_ANSI_9
+        0x1a => 0x08, // kVK_ANSI_7
+        0x1b => 0x0c, // kVK_ANSI_Minus
+        0x1c => 0x09, // kVK_ANSI_8
+        0x1d => 0x0b, // kVK_ANSI_0
+        0x1e => 0x1b, // kVK_ANSI_RightBracket
+        0x1f => 0x18, // kVK_ANSI_O
+        0x20 => 0x16, // kVK_ANSI_U
+        0x21 => 0x1a, // kVK_ANSI_LeftBracket
+        0x22 => 0x17, // kVK_ANSI_I
+        0x23 => 0x19, // kVK_ANSI_P
+        0x24 => 0x1c, // kVK_Return
+        0x25 => 0x26, // kVK_ANSI_L
+        0x26 => 0x24, // kVK_ANSI_J
+        0x27 => 0x28, // kVK_ANSI_Quote
+        0x28 => 0x25, // kVK_ANSI_K
+        0x29 => 0x27, // kVK_ANSI_Semicolon
+        0x2a => 0x2b, // kVK_ANSI_Backslash
+        0x2b => 0x33, // kVK_ANSI_Comma
+        0x2c => 0x35, // kVK_ANSI_Slash
+        0x2d => 0x31, // kVK_ANSI_N
+        0x2e => 0x32, // kVK_ANSI_M
+        0x2f => 0x34, // kVK_ANSI_Period
+        0x30 => 0x0f, // kVK_Tab
+        0x31 => 0x39, // kVK_Space
+        0x32 => 0x29, // kVK_ANSI_Grave
+        0x33 => 0x0e, // kVK_Delete (Backspace)
+        0x35 => 0x01, // kVK_Escape
+        0x36 => 0xe05c, // Right Command (RightSuper)
+        0x37 => 0xe05b, // kVK_Command (LeftSuper)
+        0x38 => 0x2a, // kVK_Shift (LeftShift)
+        0x39 => 0x3a, // kVK_CapsLock
+        0x3a => 0x38, // kVK_Option (LeftAlt)
+        0x3b => 0x1d, // kVK_Control (LeftCtrl)
+        0x3c => 0x36, // kVK_RightShift
+        0x3d => 0xe038, // kVK_RightOption (RightAlt)
+        0x3e => 0xe01d, // kVK_RightControl
+        0x41 => 0x53, // kVK_ANSI_KeypadDecimal
+        0x43 => 0x37, // kVK_ANSI_KeypadMultiply
+        0x45 => 0x4e, // kVK_ANSI_KeypadPlus
+        0x47 => 0x45, // kVK_ANSI_KeypadClear (NumLock)
+        0x4b => 0xe035, // kVK_ANSI_KeypadDivide
+        0x4c => 0xe01c, // kVK_ANSI_KeypadEnter
+        0x4e => 0x4a, // kVK_ANSI_KeypadMinus
+        0x51 => 0x0d, // kVK_ANSI_KeypadEquals
+        0x52 => 0x52, // kVK_ANSI_Keypad0
+        0x53 => 0x4f, // kVK_ANSI_Keypad1
+        0x54 => 0x50, // kVK_ANSI_Keypad2
+        0x55 => 0x51, // kVK_ANSI_Keypad3
+        0x56 => 0x4b, // kVK_ANSI_Keypad4
+        0x57 => 0x4c, // kVK_ANSI_Keypad5
+        0x58 => 0x4d, // kVK_ANSI_Keypad6
+        0x59 => 0x47, // kVK_ANSI_Keypad7
+        0x5b => 0x48, // kVK_ANSI_Keypad8
+        0x5c => 0x49, // kVK_ANSI_Keypad9
+        0x5d => 0x7d, // kVK_JIS_Yen
+        0x5e => 0x73, // kVK_JIS_Underscore (Ro)
+        0x5f => 0x7e, // kVK_JIS_KeypadComma
+        0x60 => 0x3f, // kVK_F5
+        0x61 => 0x40, // kVK_F6
+        0x62 => 0x41, // kVK_F7
+        0x63 => 0x3d, // kVK_F3
+        0x64 => 0x42, // kVK_F8
+        0x65 => 0x43, // kVK_F9
+        0x66 => 0x7b, // kVK_JIS_Eisu (Muhenkan)
+        0x67 => 0x57, // kVK_F11
+        0x68 => 0x70, // kVK_JIS_Kana (Katakana/Hiragana)
+        0x69 => 0xe037, // kVK_F13 (PrintScreen)
+        0x6b => 0x46, // kVK_F14 (ScrollLock)
+        0x6d => 0x44, // kVK_F10
+        0x6f => 0x58, // kVK_F12
+        0x71 => XT_PAUSE_SCANCODE, // kVK_F15 (Pause)
+        0x72 => 0xe052, // kVK_Help (Insert)
+        0x73 => 0xe047, // kVK_Home
+        0x74 => 0xe049, // kVK_PageUp
+        0x75 => 0xe053, // kVK_ForwardDelete
+        0x76 => 0x3e, // kVK_F4
+        0x77 => 0xe04f, // kVK_End
+        0x78 => 0x3c, // kVK_F2
+        0x79 => 0xe051, // kVK_PageDown
+        0x7a => 0x3b, // kVK_F1
+        0x7b => 0xe04b, // kVK_LeftArrow
+        0x7c => 0xe04d, // kVK_RightArrow
+        0x7d => 0xe050, // kVK_DownArrow
+        0x7e => 0xe048, // kVK_UpArrow
         _ => return None,
     })
 }
@@ -1068,7 +1229,7 @@ mod tests {
         let mut tracker = InputTracker::default();
         let mut collector = KeyEventCollector {
             queue: Arc::clone(&tracker.key_events),
-            use_evdev: true,
+            backend: KeyCollectorBackend::Evdev,
         };
         let active_snap = PollSnapshot {
             is_active: true,
@@ -1146,7 +1307,10 @@ mod tests {
     #[test]
     fn evdev_table_covers_every_key_in_key_to_xt_scancode() {
         let evdev_codes: Vec<u32> = (1..=83)
-            .chain([86, 87, 88, 96, 97, 98, 100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 125, 126, 127])
+            .chain([
+                86, 87, 88, 89, 92, 93, 94, 96, 97, 98, 99, 100, 102, 103, 104, 105, 106, 107,
+                108, 109, 110, 111, 119, 121, 124, 125, 126, 127,
+            ])
             .collect();
         let xt_from_evdev: std::collections::HashSet<u16> = evdev_codes
             .into_iter()
@@ -1167,6 +1331,7 @@ mod tests {
             (Key::F11, 0x57),
             (Key::F12, 0x58),
             (Key::Delete, 0xe053),
+            (Key::Pause, XT_PAUSE_SCANCODE),
         ] {
             let sc = key_to_xt_scancode(key).unwrap();
             assert_eq!(sc, expected_sc);
@@ -1175,5 +1340,116 @@ mod tests {
                 "missing evdev mapping for {key:?} (0x{sc:x})"
             );
         }
+
+        // Verify ISO 102nd, JIS/ABNT2, PrintScreen, and Pause evdev mappings.
+        for (evdev_code, expected_xt) in [
+            (86u32, 0x56u16),          // KEY_102ND
+            (89, 0x73),                // KEY_RO
+            (92, 0x79),                // KEY_HENKAN
+            (93, 0x70),                // KEY_KATAKANAHIRAGANA
+            (94, 0x7b),                // KEY_MUHENKAN
+            (99, 0xe037),              // KEY_SYSRQ (PrintScreen)
+            (119, XT_PAUSE_SCANCODE),  // KEY_PAUSE
+            (121, 0x7e),               // KEY_KPCOMMA
+            (124, 0x7d),               // KEY_YEN
+        ] {
+            assert_eq!(
+                evdev_to_xt_scancode(evdev_code),
+                Some(expected_xt),
+                "unexpected XT mapping for evdev {evdev_code}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_collector_maps_iso_102nd_jis_printscreen_and_pause() {
+        let mut tracker = InputTracker::default();
+        let mut collector = KeyEventCollector {
+            queue: Arc::clone(&tracker.key_events),
+            backend: KeyCollectorBackend::Macos,
+        };
+        let active_snap = PollSnapshot {
+            is_active: true,
+            win_size: (1280, 720),
+            mouse_pos: None,
+            raw_buttons: 0,
+            raw_scroll_dy: None,
+            scroll_backend: ScrollBackend::AppKit,
+        };
+        let _ = tracker.poll_snapshot(active_snap, 1280, 720);
+
+        // macOS sends Key::Unknown via set_key_state for 0x0a/0x32/JIS/PrintScreen;
+        // KeyCollectorBackend::Macos ignores set_key_state and translates raw keycodes.
+        collector.set_macos_key_state(0x0a, true); // kVK_ISO_Section -> 0x56
+        collector.set_key_state(Key::Unknown, true);
+        collector.set_macos_key_state(0x32, true); // kVK_ANSI_Grave -> 0x29
+        collector.set_macos_key_state(0x5d, true); // kVK_JIS_Yen -> 0x7d
+        collector.set_macos_key_state(0x5e, true); // kVK_JIS_Underscore -> 0x73
+        collector.set_macos_key_state(0x5f, true); // kVK_JIS_KeypadComma -> 0x7e
+        collector.set_macos_key_state(0x66, true); // kVK_JIS_Eisu -> 0x7b
+        collector.set_macos_key_state(0x68, true); // kVK_JIS_Kana -> 0x70
+        collector.set_macos_key_state(0x69, true); // PrintScreen (F13) -> 0xe037
+
+        let msgs = tracker.poll_snapshot(active_snap, 1280, 720);
+        assert_eq!(
+            msgs,
+            vec![
+                ClientMsg::KeyEvent { scancode: 0x56, make: true },
+                ClientMsg::KeyEvent { scancode: 0x29, make: true },
+                ClientMsg::KeyEvent { scancode: 0x7d, make: true },
+                ClientMsg::KeyEvent { scancode: 0x73, make: true },
+                ClientMsg::KeyEvent { scancode: 0x7e, make: true },
+                ClientMsg::KeyEvent { scancode: 0x7b, make: true },
+                ClientMsg::KeyEvent { scancode: 0x70, make: true },
+                ClientMsg::KeyEvent { scancode: 0xe037, make: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn pause_key_emits_e1_1d_45_sequence_without_colliding_with_numlock() {
+        let mut tracker = InputTracker::default();
+        let active_snap = snap(true, 0);
+        let _ = tracker.poll_snapshot(active_snap, 800, 600);
+
+        // Hold NumLock (0x45) and Pause (E1 1D 45) simultaneously.
+        tracker.push_key_event(Key::NumLock, true);
+        tracker.push_key_event(Key::Pause, true);
+        let down = tracker.poll_snapshot(active_snap, 800, 600);
+        assert_eq!(
+            down,
+            vec![
+                ClientMsg::KeyEvent { scancode: 0x45, make: true },
+                ClientMsg::KeyEvent { scancode: 0xe11d, make: true },
+                ClientMsg::KeyEvent { scancode: 0x0045, make: true },
+            ]
+        );
+
+        // Releasing Pause emits E1 9D C5 in order and leaves NumLock held.
+        tracker.push_key_event(Key::Pause, false);
+        let up = tracker.poll_snapshot(active_snap, 800, 600);
+        assert_eq!(
+            up,
+            vec![
+                ClientMsg::KeyEvent { scancode: 0xe11d, make: false },
+                ClientMsg::KeyEvent { scancode: 0x0045, make: false },
+            ]
+        );
+
+        // Focus loss still releases NumLock cleanly, and if Pause is held during focus loss
+        // it emits E1 9D C5 in order as well.
+        tracker.push_key_event(Key::Pause, true);
+        let _ = tracker.poll_snapshot(active_snap, 800, 600);
+        let lost = tracker.poll_snapshot(snap(false, 0), 800, 600);
+        assert_eq!(
+            lost,
+            vec![
+                ClientMsg::KeyEvent { scancode: 0xe11d, make: false },
+                ClientMsg::KeyEvent { scancode: 0x0045, make: false },
+                ClientMsg::KeyEvent { scancode: 0x45, make: false },
+            ]
+        );
+
+        assert!(!is_repeatable_scancode(XT_PAUSE_SCANCODE));
     }
 }
