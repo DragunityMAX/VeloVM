@@ -210,6 +210,12 @@ if (-not (Test-Path -LiteralPath $DiskPath) -and [string]::IsNullOrWhiteSpace($C
     throw "Disk image not found: $DiskPath (pass -CreateDiskSize e.g. '64G' to create a new raw disk image)."
 }
 Assert-VmmOptionSafePath -Label "Disk image" -Path $DiskPath
+$resolvedDisk = if (Test-Path -LiteralPath $DiskPath) {
+    (Resolve-Path -LiteralPath $DiskPath).Path
+} else {
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DiskPath)
+}
+Assert-VmmOptionSafePath -Label "Disk image" -Path $resolvedDisk
 if (-not [string]::IsNullOrWhiteSpace($IsoPath)) {
     if (-not (Test-Path -LiteralPath $IsoPath)) {
         throw "ISO image not found: $IsoPath"
@@ -256,10 +262,10 @@ try {
         "--vmbus-scsi", "id=scsi0"
     )
 
-    $baseDiskSpec = if ($CreateDiskSize -and -not (Test-Path -LiteralPath $DiskPath)) {
-        "file:${DiskPath};create=${CreateDiskSize}"
+    $baseDiskSpec = if ($CreateDiskSize -and -not (Test-Path -LiteralPath $resolvedDisk)) {
+        "file:${resolvedDisk};create=${CreateDiskSize}"
     } else {
-        "file:${DiskPath}"
+        "file:${resolvedDisk}"
     }
     $diskSpec = if ($ReadOnlyDiff) {
         "memdiff:${baseDiskSpec},on=scsi0"

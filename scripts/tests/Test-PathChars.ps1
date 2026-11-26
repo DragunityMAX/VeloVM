@@ -101,6 +101,52 @@ try {
         throw "Expected Start-VeloVM.ps1 to reject firmware path with brackets"
     }
 
+    # Relative -DiskPath under a working directory containing '[' must also be rejected after resolution.
+    $bracketDir = Join-Path $tempRoot "VMs[1]"
+    New-Item -ItemType Directory -Path $bracketDir -Force | Out-Null
+    $relDisk = Join-Path $bracketDir "win11.vhdx"
+    Set-Content -LiteralPath $relDisk -Value ""
+    $relDiskRejected = $false
+    Push-Location -LiteralPath $bracketDir
+    try {
+        try {
+            & $launcher -DiskPath "./win11.vhdx" -OpenVmmExe $stubVmm -UefiFirmware $stubFw
+        } catch {
+            if ($_.Exception.Message -like "*Disk image path cannot contain*") {
+                $relDiskRejected = $true
+            } else {
+                throw
+            }
+        }
+    } finally {
+        Pop-Location
+    }
+    if (-not $relDiskRejected) {
+        throw "Expected Start-VeloVM.ps1 to reject relative disk path resolved inside directory with brackets"
+    }
+
+    # Relative -DiskPath with -CreateDiskSize in a directory containing ',' must also be rejected before creating the disk.
+    $commaDir = Join-Path $tempRoot "VMs,1"
+    New-Item -ItemType Directory -Path $commaDir -Force | Out-Null
+    $relCreateRejected = $false
+    Push-Location -LiteralPath $commaDir
+    try {
+        try {
+            & $launcher -DiskPath "./new.img" -CreateDiskSize "1G" -OpenVmmExe $stubVmm -UefiFirmware $stubFw
+        } catch {
+            if ($_.Exception.Message -like "*Disk image path cannot contain*") {
+                $relCreateRejected = $true
+            } else {
+                throw
+            }
+        }
+    } finally {
+        Pop-Location
+    }
+    if (-not $relCreateRejected) {
+        throw "Expected Start-VeloVM.ps1 to reject relative -CreateDiskSize path resolved inside directory with comma"
+    }
+
     Write-Host "PASS: Start-VeloVM.ps1 path character validation checks passed"
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {
