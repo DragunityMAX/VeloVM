@@ -137,6 +137,30 @@ function Sync-HostDriverStorePackages {
     return @($pkgDirs | ForEach-Object { $_.Name })
 }
 
+function Get-ScaledGpuPartitionLimits {
+    param(
+        [Parameter(Mandatory)]
+        [uint64]$Min,
+        [Parameter(Mandatory)]
+        [uint64]$Max,
+        [Parameter(Mandatory)]
+        [uint64]$Optimal,
+        [Parameter(Mandatory)]
+        [ValidateRange(10, 100)]
+        [int]$PartitionPercent
+    )
+
+    # Use [decimal] (96-bit exact integer mantissa) instead of IEEE-754 double
+    # so [uint64]::MaxValue does not round up to 2^64 and overflow on cast.
+    $scaled = [Math]::Floor(([decimal]$Optimal * [decimal]$PartitionPercent) / [decimal]100)
+    $clamped = [uint64]([Math]::Max([decimal]$Min, [Math]::Min([decimal]$Max, $scaled)))
+    return [pscustomobject]@{
+        Min     = $Min
+        Max     = $Max
+        Optimal = $clamped
+    }
+}
+
 if ($MyInvocation.InvocationName -ne '.') {
 Assert-Administrator
 
@@ -181,28 +205,16 @@ if ($existing) {
 }
 Add-VMGpuPartitionAdapter -VMName $VmName -InstancePath $gpu.Name
 
-$scale = $PartitionPercent / 100.0
-$minVram = [uint64]($gpu.MinPartitionVRAM)
-$maxVram = [uint64]($gpu.MaxPartitionVRAM)
-$optVram = [uint64]([Math]::Max($minVram, [Math]::Min($maxVram, $gpu.OptimalPartitionVRAM * $scale)))
-
-$minEnc = [uint64]($gpu.MinPartitionEncode)
-$maxEnc = [uint64]($gpu.MaxPartitionEncode)
-$optEnc = [uint64]([Math]::Max($minEnc, [Math]::Min($maxEnc, $gpu.OptimalPartitionEncode * $scale)))
-
-$minDec = [uint64]($gpu.MinPartitionDecode)
-$maxDec = [uint64]($gpu.MaxPartitionDecode)
-$optDec = [uint64]([Math]::Max($minDec, [Math]::Min($maxDec, $gpu.OptimalPartitionDecode * $scale)))
-
-$minComp = [uint64]($gpu.MinPartitionCompute)
-$maxComp = [uint64]($gpu.MaxPartitionCompute)
-$optComp = [uint64]([Math]::Max($minComp, [Math]::Min($maxComp, $gpu.OptimalPartitionCompute * $scale)))
+$vramLimits = Get-ScaledGpuPartitionLimits -Min ([uint64]$gpu.MinPartitionVRAM) -Max ([uint64]$gpu.MaxPartitionVRAM) -Optimal ([uint64]$gpu.OptimalPartitionVRAM) -PartitionPercent $PartitionPercent
+$encLimits = Get-ScaledGpuPartitionLimits -Min ([uint64]$gpu.MinPartitionEncode) -Max ([uint64]$gpu.MaxPartitionEncode) -Optimal ([uint64]$gpu.OptimalPartitionEncode) -PartitionPercent $PartitionPercent
+$decLimits = Get-ScaledGpuPartitionLimits -Min ([uint64]$gpu.MinPartitionDecode) -Max ([uint64]$gpu.MaxPartitionDecode) -Optimal ([uint64]$gpu.OptimalPartitionDecode) -PartitionPercent $PartitionPercent
+$compLimits = Get-ScaledGpuPartitionLimits -Min ([uint64]$gpu.MinPartitionCompute) -Max ([uint64]$gpu.MaxPartitionCompute) -Optimal ([uint64]$gpu.OptimalPartitionCompute) -PartitionPercent $PartitionPercent
 
 Set-VMGpuPartitionAdapter -VMName $VmName `
-    -MinPartitionVRAM $minVram -MaxPartitionVRAM $maxVram -OptimalPartitionVRAM $optVram `
-    -MinPartitionEncode $minEnc -MaxPartitionEncode $maxEnc -OptimalPartitionEncode $optEnc `
-    -MinPartitionDecode $minDec -MaxPartitionDecode $maxDec -OptimalPartitionDecode $optDec `
-    -MinPartitionCompute $minComp -MaxPartitionCompute $maxComp -OptimalPartitionCompute $optComp
+    -MinPartitionVRAM $vramLimits.Min -MaxPartitionVRAM $vramLimits.Max -OptimalPartitionVRAM $vramLimits.Optimal `
+    -MinPartitionEncode $encLimits.Min -MaxPartitionEncode $encLimits.Max -OptimalPartitionEncode $encLimits.Optimal `
+    -MinPartitionDecode $decLimits.Min -MaxPartitionDecode $decLimits.Max -OptimalPartitionDecode $decLimits.Optimal `
+    -MinPartitionCompute $compLimits.Min -MaxPartitionCompute $compLimits.Max -OptimalPartitionCompute $compLimits.Optimal
 
 Set-VM -VMName $VmName -GuestControlledCacheTypes $true -LowMemoryMappedIoSpace 1GB -HighMemoryMappedIoSpace 32GB
 Write-Host "Configured GPU-PV ($PartitionPercent%) and 32GB High MMIO space for '$VmName'." -ForegroundColor Green
