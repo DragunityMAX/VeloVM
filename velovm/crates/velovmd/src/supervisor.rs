@@ -3863,7 +3863,8 @@ impl Supervisor {
                         .ok_or_else(|| err_not_found("VM not found"))?;
                     ensure_same_live_vm(vm, rpc_gen, "disk detach")?;
                 }
-                TtrpcClient::new(sock.clone())
+                let mut already_absent = false;
+                if let Err(err) = TtrpcClient::new(sock.clone())
                     .modify_resource(vmservice::ModifyResourceRequest {
                         r#type: vmservice::ModifyType::Remove as i32,
                         resource: Some(vmservice::modify_resource_request::Resource::ScsiDisk(
@@ -3875,7 +3876,18 @@ impl Supervisor {
                         )),
                     })
                     .await
-                    .context("hot-removing SCSI disk from running VM")?;
+                {
+                    if is_ttrpc_not_found(&err) {
+                        warn!(
+                            vm_id = %id,
+                            lun,
+                            "SCSI LUN already absent in running VM; committing disk detach to config"
+                        );
+                        already_absent = true;
+                    } else {
+                        return Err(err).context("hot-removing SCSI disk from running VM");
+                    }
+                }
 
                 self.commit_online_vm_mutation(
                     id,
@@ -3914,7 +3926,9 @@ impl Supervisor {
                     },
                     |vm, updated_cfg| vm.config = updated_cfg,
                     || async {
-                        rollback_hot_removed_disk(&sock, id, lun, &existing).await;
+                        if !already_absent {
+                            rollback_hot_removed_disk(&sock, id, lun, &existing).await;
+                        }
                         true
                     },
                 )
@@ -5555,6 +5569,12 @@ fn vm_toml_definitely_absent(path: &Path) -> bool {
     )
 }
 
+fn is_ttrpc_not_found(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|c| c.downcast_ref::<velovm_core::ttrpc::TtrpcRpcError>())
+        .any(|rpc_err| rpc_err.code == 5)
+}
+
 async fn rollback_hot_added_disk(sock: &Path, id: Uuid, lun: u32) -> bool {
     if let Err(rb_err) = TtrpcClient::new(sock.to_path_buf())
         .modify_resource(vmservice::ModifyResourceRequest {
@@ -5569,11 +5589,7 @@ async fn rollback_hot_added_disk(sock: &Path, id: Uuid, lun: u32) -> bool {
         })
         .await
     {
-        if rb_err
-            .chain()
-            .filter_map(|c| c.downcast_ref::<velovm_core::ttrpc::TtrpcRpcError>())
-            .any(|rpc_err| rpc_err.code == 5)
-        {
+        if is_ttrpc_not_found(&rb_err) {
             return true;
         }
         warn!(
@@ -5636,12 +5652,7 @@ async fn rollback_port_forward(
         })
         .await
     {
-        if added
-            && rb_err
-                .chain()
-                .filter_map(|c| c.downcast_ref::<velovm_core::ttrpc::TtrpcRpcError>())
-                .any(|rpc_err| rpc_err.code == 5)
-        {
+        if added && is_ttrpc_not_found(&rb_err) {
             return true;
         }
         warn!(
@@ -9619,6 +9630,119 @@ mod tests {
             .find(|d| d.kind == DiskKind::Dvd)
             .expect("DVD disk should be attached");
         assert_eq!(dvd.lun, 2);
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detach_disk_and_eject_iso_succeed_when_running_vm_returns_not_found() {
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use velovm_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(velovm_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let data_disk = dir.path().join("data.img");
+        let iso_path = dir.path().join("install.iso");
+        fs::write(&data_disk, vec![0u8; 4096]).unwrap();
+        fs::write(&iso_path, vec![0u8; 4096]).unwrap();
+
+        let vm = sup
+            .create_vm(CreateVmPayload {
+                name: "DetachNotFoundVm".into(),
+                preset: velovm_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm_id = vm.config.id;
+        sup.attach_disk(
+            &vm_id.to_string(),
+            AttachDiskPayload {
+                lun: Some(0),
+                path: data_disk,
+                read_only: false,
+                format: Some(DiskFormat::Raw),
+            },
+        )
+        .await
+        .unwrap();
+        sup.mount_iso(
+            &vm_id.to_string(),
+            MountIsoPayload {
+                path: iso_path,
+                lun: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        let sock_path = dir.path().join("detach-not-found.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let server = std::thread::spawn(move || {
+            // Serve 3 requests: NotFound for LUN 0, Internal (13) for LUN 1, NotFound for LUN 1.
+            for (code, message) in [
+                (5, "scsi disk not found"),
+                (13, "transient internal error"),
+                (5, "dvd lun not found"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (stream_id, _, _) = read_frame(&mut stream).unwrap();
+                let resp = TestWireResponse {
+                    result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                        code,
+                        message: message.into(),
+                        details: Vec::new(),
+                    })),
+                };
+                let frame = encode_frame(stream_id, 2, &resp.encode_to_vec()).unwrap();
+                stream.write_all(&frame).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        sup.set_vm_running_socket_for_test(vm_id, sock_path);
+
+        // 1. Detach LUN 0 where OpenVMM returns NotFound (5) -> succeeds and removes from config/vm.toml.
+        let after_detach = sup.detach_disk(&vm_id.to_string(), 0).await.unwrap();
+        assert!(after_detach.config.disks.iter().all(|d| d.lun != 0));
+
+        // 2. Eject ISO on LUN 1 where OpenVMM returns Internal (13) -> still fails and keeps LUN 1.
+        let err = sup.eject_iso(&vm_id.to_string(), Some(1)).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("transient internal error"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            sup.get_vm(&vm_id.to_string())
+                .unwrap()
+                .config
+                .disks
+                .iter()
+                .any(|d| d.lun == 1)
+        );
+
+        // 3. Eject ISO on LUN 1 where OpenVMM returns NotFound (5) -> succeeds and removes DVD.
+        let after_eject = sup.eject_iso(&vm_id.to_string(), Some(1)).await.unwrap();
+        assert!(after_eject.config.disks.is_empty());
+
         server.join().unwrap();
     }
 
