@@ -1451,6 +1451,10 @@ impl PartialEq for DiskMode {
     }
 }
 
+fn render_vm_settings_vram_slider(ui: &mut egui::Ui, vram_mb: &mut u32) {
+    ui.add(egui::Slider::new(vram_mb, 8..=256).clamping(egui::SliderClamping::Edits));
+}
+
 pub fn render_vm_settings_dialog(
     ctx: &egui::Context,
     dlg_opt: &mut Option<VmSettingsDialog>,
@@ -1550,7 +1554,7 @@ pub fn render_vm_settings_dialog(
                             ui.end_row();
 
                             ui.label("VRAM (MiB):");
-                            ui.add(egui::Slider::new(&mut d.vram_mb, 8..=256));
+                            render_vm_settings_vram_slider(ui, &mut d.vram_mb);
                             ui.end_row();
 
                             ui.label("Shared VRAM (SHM):");
@@ -2840,5 +2844,42 @@ mod tests {
         dlg.openvmm_bin = "/cli/openvmm-v2".into();
         dlg.update_conflict_warning();
         assert_eq!(dlg.external_change_warning, None);
+    }
+
+    #[test]
+    fn vm_settings_vram_slider_does_not_clamp_out_of_range_value_on_open() {
+        for (initial_vram, status, enabled_ui) in [
+            (512, VmStatus::Running, false),
+            (512, VmStatus::Off, true),
+            (4, VmStatus::Paused, false),
+        ] {
+            let mut cfg = VmConfig::from_preset("VramClampTest", VmPreset::Custom, Path::new("/tmp/vm"));
+            cfg.fastdesk.enabled = false;
+            cfg.fastdesk.vram_mb = initial_vram;
+
+            let mut dlg = VmSettingsDialog::from_config(&cfg, status);
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_enabled_ui(enabled_ui, |ui| {
+                        render_vm_settings_vram_slider(ui, &mut dlg.vram_mb);
+                    });
+                });
+            });
+
+            assert_eq!(
+                dlg.vram_mb, initial_vram,
+                "rendering settings slider must not clamp untouched vram_mb={initial_vram}"
+            );
+            assert!(!dlg.has_hardware_changes());
+            dlg.description = "edited description".into();
+            assert!(!dlg.has_hardware_changes());
+            let payload = dlg.build_update_payload(&[]);
+            assert_eq!(payload.description.as_deref(), Some("edited description"));
+            assert!(
+                payload.fastdesk.is_none(),
+                "untouched vram_mb must not emit a spurious fastdesk update"
+            );
+        }
     }
 }
