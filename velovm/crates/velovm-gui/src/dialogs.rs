@@ -132,6 +132,214 @@ fn resolve_picker_dir(path: &std::path::Path) -> PathBuf {
     abs
 }
 
+pub(crate) fn resolve_initial_dir_and_filename(initial_path: &str) -> (PathBuf, String) {
+    let trimmed = initial_path.trim();
+    let resolved_initial = resolve_picker_dir(std::path::Path::new(trimmed));
+    if !trimmed.is_empty() && resolved_initial.is_dir() {
+        (resolved_initial, String::new())
+    } else if !trimmed.is_empty()
+        && let Some(parent) = resolved_initial
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        && parent.is_dir()
+    {
+        (
+            resolve_picker_dir(parent),
+            resolved_initial
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+    } else {
+        let home = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        (resolve_picker_dir(&home), String::new())
+    }
+}
+
+pub(crate) fn file_dialog_title(save_mode: bool) -> &'static str {
+    if save_mode {
+        "Choose Output File Path"
+    } else {
+        "Select File"
+    }
+}
+
+#[cfg_attr(not(all(windows, not(test))), allow(dead_code))]
+pub(crate) fn build_file_dialog_filters(
+    target: FilePickerTarget,
+    save_mode: bool,
+    filter_exts: &[String],
+) -> Vec<(&'static str, Vec<String>)> {
+    if filter_exts.is_empty() {
+        return Vec::new();
+    }
+
+    if save_mode {
+        let primary = filter_exts[0].to_ascii_lowercase();
+        let mut filters = if primary == "img" || primary == "raw" {
+            vec![
+                ("Raw Disk Image", vec!["img".to_string(), "raw".to_string()]),
+                ("VHDX Virtual Disk", vec!["vhdx".to_string()]),
+            ]
+        } else if primary == "vhdx" {
+            vec![
+                ("VHDX Virtual Disk", vec!["vhdx".to_string()]),
+                ("Raw Disk Image", vec!["img".to_string(), "raw".to_string()]),
+            ]
+        } else {
+            vec![("Output Files", filter_exts.to_vec())]
+        };
+        filters.push(("All Files", vec!["*".to_string()]));
+        return filters;
+    }
+
+    let label = match target {
+        FilePickerTarget::WizardIso | FilePickerTarget::MountIsoPath => "ISO Images",
+        FilePickerTarget::SettingsFirmwarePath | FilePickerTarget::HostUefiFirmware => {
+            "UEFI Firmware"
+        }
+        FilePickerTarget::WizardExistingDisk
+        | FilePickerTarget::AttachDiskPath
+        | FilePickerTarget::DiskMgrInspectPath => "Disk Images",
+        _ => "Supported Files",
+    };
+    vec![
+        (label, filter_exts.to_vec()),
+        ("All Files", vec!["*".to_string()]),
+    ]
+}
+
+#[derive(Default)]
+pub struct FilePickerState {
+    active: Option<ActiveFilePicker>,
+    pub force_modal: bool,
+}
+
+enum ActiveFilePicker {
+    Modal(FilePickerModal),
+    #[cfg(windows)]
+    Native {
+        target: FilePickerTarget,
+        rx: std::sync::mpsc::Receiver<Option<PathBuf>>,
+    },
+}
+
+impl FilePickerState {
+    #[cfg(test)]
+    pub fn is_open(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub fn set_modal(&mut self, modal: FilePickerModal) {
+        self.active = Some(ActiveFilePicker::Modal(modal));
+    }
+
+    pub fn clear(&mut self) {
+        self.active = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn modal_mut(&mut self) -> Option<&mut FilePickerModal> {
+        match self.active.as_mut() {
+            Some(ActiveFilePicker::Modal(modal)) => Some(modal),
+            _ => None,
+        }
+    }
+
+    pub fn open(
+        &mut self,
+        ctx: &egui::Context,
+        target: FilePickerTarget,
+        initial_path: &str,
+        save_mode: bool,
+        filter_exts: Vec<&str>,
+    ) {
+        if self.active.is_some() {
+            return;
+        }
+        #[cfg(all(windows, not(test)))]
+        if !self.force_modal {
+            self.open_native_windows(ctx, target, initial_path, save_mode, filter_exts);
+            return;
+        }
+        let _ = ctx;
+        self.active = Some(ActiveFilePicker::Modal(FilePickerModal::open(
+            target,
+            initial_path,
+            save_mode,
+            filter_exts,
+        )));
+    }
+
+    #[cfg(all(windows, not(test)))]
+    fn open_native_windows(
+        &mut self,
+        ctx: &egui::Context,
+        target: FilePickerTarget,
+        initial_path: &str,
+        save_mode: bool,
+        filter_exts: Vec<&str>,
+    ) {
+        let (dir, filename) = resolve_initial_dir_and_filename(initial_path);
+        let normalized_exts: Vec<String> = filter_exts
+            .into_iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let filters = build_file_dialog_filters(target, save_mode, &normalized_exts);
+        let title = file_dialog_title(save_mode);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint_ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(title)
+                .set_directory(&dir);
+            if !filename.is_empty() {
+                dialog = dialog.set_file_name(&filename);
+            }
+            for (label, exts) in &filters {
+                let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+                dialog = dialog.add_filter(*label, &ext_refs);
+            }
+            let picked = if save_mode {
+                dialog.save_file()
+            } else {
+                dialog.pick_file()
+            };
+            let _ = tx.send(picked);
+            repaint_ctx.request_repaint();
+        });
+
+        self.active = Some(ActiveFilePicker::Native { target, rx });
+    }
+}
+
+pub fn render_file_picker_state(
+    ctx: &egui::Context,
+    state: &mut FilePickerState,
+) -> Option<(FilePickerTarget, PathBuf)> {
+    match state.active.take() {
+        None => None,
+        Some(ActiveFilePicker::Modal(modal)) => {
+            let mut modal_opt = Some(modal);
+            let chosen = render_file_picker(ctx, &mut modal_opt);
+            if let Some(remaining) = modal_opt {
+                state.active = Some(ActiveFilePicker::Modal(remaining));
+            }
+            chosen
+        }
+        #[cfg(windows)]
+        Some(ActiveFilePicker::Native { target, rx }) => match rx.try_recv() {
+            Ok(Some(path)) => Some((target, path)),
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                state.active = Some(ActiveFilePicker::Native { target, rx });
+                None
+            }
+        },
+    }
+}
+
 impl FilePickerModal {
     pub fn open(
         target: FilePickerTarget,
@@ -164,26 +372,7 @@ impl FilePickerModal {
         };
         let filter_exts_owned = modal.filter_exts.clone();
         modal.start_load(trimmed.clone(), move |seq| {
-            let resolved_initial = resolve_picker_dir(std::path::Path::new(&trimmed));
-            let (start_dir, fname) = if !trimmed.is_empty() && resolved_initial.is_dir() {
-                (resolved_initial, String::new())
-            } else if !trimmed.is_empty()
-                && let Some(parent) = resolved_initial
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                && parent.is_dir()
-            {
-                (
-                    resolve_picker_dir(parent),
-                    resolved_initial
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                )
-            } else {
-                let home = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                (resolve_picker_dir(&home), String::new())
-            };
+            let (start_dir, fname) = resolve_initial_dir_and_filename(&trimmed);
             let dir_str = start_dir.to_string_lossy().into_owned();
             let (entries, error) = read_dir_entries(&start_dir, &filter_exts_owned);
             FilePickerLoadResult {
@@ -1026,11 +1215,7 @@ pub fn render_file_picker(
         if picker.loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        egui::Window::new(if picker.save_mode {
-            "Choose Output File Path"
-        } else {
-            "Select File"
-        })
+        egui::Window::new(file_dialog_title(picker.save_mode))
         .collapsible(false)
         .resizable(true)
         .default_size([620.0, 440.0])
@@ -1136,7 +1321,7 @@ pub fn render_new_vm_wizard(
     wizard_opt: &mut Option<NewVmWizard>,
     switches: &[VirtualSwitchInfo],
     backend: &BackendHandle,
-    file_picker: &mut Option<FilePickerModal>,
+    file_picker: &mut FilePickerState,
 ) {
     let mut close = false;
     if let Some(w) = wizard_opt.as_mut() {
@@ -1335,12 +1520,19 @@ pub fn render_new_vm_wizard(
                                                 } else {
                                                     w.new_disk_path.clone()
                                                 };
-                                                *file_picker = Some(FilePickerModal::open(
+                                                let exts = match w.new_disk_format {
+                                                    DiskFormat::Raw => vec!["img", "raw", "vhdx"],
+                                                    DiskFormat::Vhdx | DiskFormat::Vhd | DiskFormat::Iso => {
+                                                        vec!["vhdx", "img", "raw"]
+                                                    }
+                                                };
+                                                file_picker.open(
+                                                    ui.ctx(),
                                                     FilePickerTarget::WizardNewDiskPath,
                                                     &initial,
                                                     true,
-                                                    vec!["vhdx", "img", "raw"],
-                                                ));
+                                                    exts,
+                                                );
                                             }
                                         });
                                         ui.end_row();
@@ -1368,12 +1560,13 @@ pub fn render_new_vm_wizard(
                                     ui.label("Existing Disk:");
                                     ui.add(egui::TextEdit::singleline(&mut w.existing_disk_path).desired_width(320.0));
                                     if ui.button("Browse…").clicked() {
-                                        *file_picker = Some(FilePickerModal::open(
+                                        file_picker.open(
+                                            ui.ctx(),
                                             FilePickerTarget::WizardExistingDisk,
                                             &w.existing_disk_path,
                                             false,
                                             vec!["vhdx", "vhd", "img", "raw"],
-                                        ));
+                                        );
                                     }
                                 });
                             }
@@ -1387,12 +1580,13 @@ pub fn render_new_vm_wizard(
                             ui.label("Installer ISO (optional):");
                             ui.add(egui::TextEdit::singleline(&mut w.iso_path).desired_width(300.0));
                             if ui.button("Browse…").clicked() {
-                                *file_picker = Some(FilePickerModal::open(
+                                file_picker.open(
+                                    ui.ctx(),
                                     FilePickerTarget::WizardIso,
                                     &w.iso_path,
                                     false,
                                     vec!["iso"],
-                                ));
+                                );
                             }
                         });
                     }
@@ -1568,7 +1762,7 @@ pub fn render_vm_settings_dialog(
     dlg_opt: &mut Option<VmSettingsDialog>,
     switches: &[VirtualSwitchInfo],
     backend: &BackendHandle,
-    file_picker: &mut Option<FilePickerModal>,
+    file_picker: &mut FilePickerState,
 ) {
     let mut close = false;
     if let Some(d) = dlg_opt.as_mut() {
@@ -1652,12 +1846,13 @@ pub fn render_vm_settings_dialog(
                             ui.horizontal(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut d.uefi_firmware).desired_width(240.0));
                                 if ui.button("Browse…").clicked() {
-                                    *file_picker = Some(FilePickerModal::open(
+                                    file_picker.open(
+                                        ui.ctx(),
                                         FilePickerTarget::SettingsFirmwarePath,
                                         &d.uefi_firmware,
                                         false,
                                         vec!["fd", "bin"],
-                                    ));
+                                    );
                                 }
                             });
                             ui.end_row();
@@ -1745,7 +1940,7 @@ pub fn render_disk_manager_dialog(
     ctx: &egui::Context,
     dlg_opt: &mut Option<DiskManagerDialog>,
     backend: &BackendHandle,
-    file_picker: &mut Option<FilePickerModal>,
+    file_picker: &mut FilePickerState,
 ) {
     let mut close = false;
     if let Some(d) = dlg_opt.as_mut() {
@@ -1768,12 +1963,19 @@ pub fn render_disk_manager_dialog(
                             ui.horizontal(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut d.create_path).desired_width(320.0));
                                 if ui.button("Browse…").clicked() {
-                                    *file_picker = Some(FilePickerModal::open(
+                                    let exts = match d.create_format {
+                                        DiskFormat::Raw => vec!["img", "raw", "vhdx"],
+                                        DiskFormat::Vhdx | DiskFormat::Vhd | DiskFormat::Iso => {
+                                            vec!["vhdx", "img", "raw"]
+                                        }
+                                    };
+                                    file_picker.open(
+                                        ui.ctx(),
                                         FilePickerTarget::DiskMgrCreatePath,
                                         &d.create_path,
                                         true,
-                                        vec!["vhdx", "img", "raw"],
-                                    ));
+                                        exts,
+                                    );
                                 }
                             });
                             ui.end_row();
@@ -1810,12 +2012,13 @@ pub fn render_disk_manager_dialog(
                         ui.label("Disk Path:");
                         ui.add(egui::TextEdit::singleline(&mut d.inspect_path).desired_width(320.0));
                         if ui.button("Browse…").clicked() {
-                            *file_picker = Some(FilePickerModal::open(
+                            file_picker.open(
+                                ui.ctx(),
                                 FilePickerTarget::DiskMgrInspectPath,
                                 &d.inspect_path,
                                 false,
                                 vec!["vhdx", "vhd", "img", "raw", "iso"],
-                            ));
+                            );
                         }
                         if ui.button("Inspect").clicked() && !d.inspect_path.trim().is_empty() {
                             backend.send(GuiRequest::InspectDisk(PathBuf::from(
@@ -1867,7 +2070,7 @@ pub fn render_host_settings_dialog(
     dlg_opt: &mut Option<HostSettingsDialog>,
     host_info: Option<&HostInfo>,
     backend: &BackendHandle,
-    file_picker: &mut Option<FilePickerModal>,
+    file_picker: &mut FilePickerState,
 ) {
     let mut close = false;
     if let Some(d) = dlg_opt.as_mut() {
@@ -1985,13 +2188,13 @@ fn path_row(
     label: &str,
     value: &mut String,
     target: FilePickerTarget,
-    file_picker: &mut Option<FilePickerModal>,
+    file_picker: &mut FilePickerState,
 ) {
     ui.label(label);
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(value).desired_width(360.0));
         if ui.button("Browse…").clicked() {
-            *file_picker = Some(FilePickerModal::open(target, value, false, vec![]));
+            file_picker.open(ui.ctx(), target, value, false, vec![]);
         }
     });
     ui.end_row();
@@ -2411,7 +2614,7 @@ mod tests {
         let ctx = egui::Context::default();
         let backend = BackendHandle::spawn(None, None, ctx.clone());
         let mut dlg_opt = Some(VmSettingsDialog::from_config(&cfg, VmStatus::Off));
-        let mut file_picker = None;
+        let mut file_picker = FilePickerState::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             render_vm_settings_dialog(ctx, &mut dlg_opt, &[], &backend, &mut file_picker);
         });
@@ -3321,5 +3524,67 @@ mod tests {
             ctx.data(|d| d.get_temp::<SliderInputState>(state_id)).unwrap().buf,
             "8"
         );
+    }
+
+    #[test]
+    fn file_dialog_metadata_and_state_guard_prevent_concurrent_pickers() {
+        assert_eq!(file_dialog_title(false), "Select File");
+        assert_eq!(file_dialog_title(true), "Choose Output File Path");
+
+        let save_vhdx = build_file_dialog_filters(
+            FilePickerTarget::WizardNewDiskPath,
+            true,
+            &["vhdx".into(), "img".into(), "raw".into()],
+        );
+        assert_eq!(save_vhdx[0].0, "VHDX Virtual Disk");
+        assert_eq!(save_vhdx[0].1, vec!["vhdx"]);
+        assert_eq!(save_vhdx.last().unwrap().0, "All Files");
+
+        let save_raw = build_file_dialog_filters(
+            FilePickerTarget::DiskMgrCreatePath,
+            true,
+            &["img".into(), "raw".into(), "vhdx".into()],
+        );
+        assert_eq!(save_raw[0].0, "Raw Disk Image");
+        assert_eq!(save_raw[0].1, vec!["img", "raw"]);
+
+        let open_iso = build_file_dialog_filters(
+            FilePickerTarget::WizardIso,
+            false,
+            &["iso".into()],
+        );
+        assert_eq!(open_iso[0].0, "ISO Images");
+        assert_eq!(open_iso[0].1, vec!["iso"]);
+        assert_eq!(open_iso[1].0, "All Files");
+
+        assert!(
+            build_file_dialog_filters(FilePickerTarget::HostOpenVmmBin, false, &[]).is_empty()
+        );
+
+        let ctx = egui::Context::default();
+        let mut state = FilePickerState::default();
+        assert!(!state.is_open());
+        state.open(&ctx, FilePickerTarget::WizardIso, ".", false, vec!["iso"]);
+        assert!(state.is_open());
+        assert_eq!(
+            state.modal_mut().unwrap().target,
+            FilePickerTarget::WizardIso
+        );
+
+        // Repeated Browse clicks while a picker is active must not overwrite or stack a second picker.
+        state.open(
+            &ctx,
+            FilePickerTarget::MountIsoPath,
+            ".",
+            false,
+            vec!["iso"],
+        );
+        assert_eq!(
+            state.modal_mut().unwrap().target,
+            FilePickerTarget::WizardIso
+        );
+
+        state.clear();
+        assert!(!state.is_open());
     }
 }
