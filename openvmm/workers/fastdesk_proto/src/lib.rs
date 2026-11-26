@@ -326,4 +326,27 @@ mod tests {
         assert_eq!(read_server_msg(&mut cursor).unwrap(), valid);
         assert_eq!(cursor.position() as usize, valid_len);
     }
+
+    #[test]
+    fn diff_frames_marks_all_dirty_without_panic_on_stride_overflow() {
+        let mut tracker = DirtyTileTracker::new(16, 16);
+        tracker.clear();
+        assert!(tracker.is_empty());
+
+        let buf = [0u8; 64];
+        // On 64-bit targets (16 - 1) * (usize::MAX / 2) overflows usize;
+        // fallback must mark all tiles dirty instead of panicking or wrapping.
+        tracker.diff_frames(&buf, &buf, usize::MAX / 2);
+        let mut merged = Vec::new();
+        tracker.merge_into(&mut merged);
+        assert_eq!(
+            merged,
+            vec![TileRect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+            }]
+        );
+    }
 }
