@@ -1231,12 +1231,12 @@ impl VmConfig {
                         }
                     }
                     NicBackendConfig::Tap { name } => {
-                        #[cfg(windows)]
+                        #[cfg(not(target_os = "linux"))]
                         {
                             let _ = name;
                             bail!("Linux TAP NIC backend is only supported on Linux");
                         }
-                        #[cfg(not(windows))]
+                        #[cfg(target_os = "linux")]
                         {
                             if name != name.trim() {
                                 bail!(
@@ -1253,7 +1253,6 @@ impl VmConfig {
                             {
                                 bail!("invalid TAP interface name '{name}'");
                             }
-                            #[cfg(target_os = "linux")]
                             validate_tap_sysfs_dir(
                                 name,
                                 &Path::new("/sys/class/net").join(name),
@@ -2081,7 +2080,7 @@ mod tests {
         cfg.validate().unwrap();
 
         // Untrimmed TAP name rejected before normalize(), accepted after normalize().
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
         {
             cfg.nics[1].backend = NicBackendConfig::Tap {
                 name: " tap0 ".into(),
@@ -2424,7 +2423,7 @@ mod tests {
         cfg.fastdesk.listen_addr = "127.0.0.1:5900".into();
         cfg.validate().unwrap();
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
         {
             for bad_tap in [".", "..", "tap with space", "this_tap_name_is_too_long"] {
                 cfg.nics[0].backend = NicBackendConfig::Tap {
@@ -2439,6 +2438,19 @@ mod tests {
                 name: "tap0".into(),
             };
             cfg.validate().unwrap();
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            cfg.nics[0].backend = NicBackendConfig::Tap {
+                name: "tap0".into(),
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Linux TAP NIC backend is only supported on Linux"),
+                "unexpected error: {err:#}"
+            );
         }
     }
 
