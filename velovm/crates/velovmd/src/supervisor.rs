@@ -407,7 +407,9 @@ impl Supervisor {
     /// Must only be called after the daemon has validated config and bound its HTTP listener.
     pub fn adopt_running_vms(self: &Arc<Self>) {
         let runtime_dir = self.host_config().runtime_dir;
-        if !runtime_dir.exists() {
+        if let Err(err) = fs::symlink_metadata(&runtime_dir)
+            && err.kind() == std::io::ErrorKind::NotFound
+        {
             return;
         }
         let managed_default_runtime_dir =
@@ -439,6 +441,20 @@ impl Supervisor {
                             vm_id = %id,
                             sock_path = %sock_path.display(),
                             "ignoring symlinked VM RPC socket during adoption"
+                        );
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    Ok(meta)
+                        if {
+                            use std::os::unix::fs::MetadataExt;
+                            meta.uid() != velovm_core::process::current_euid()
+                        } =>
+                    {
+                        warn!(
+                            vm_id = %id,
+                            sock_path = %sock_path.display(),
+                            "ignoring VM RPC socket owned by another uid during adoption"
                         );
                         continue;
                     }
@@ -2397,7 +2413,7 @@ impl Supervisor {
             vm.runtime.started_at = Some(Utc::now());
             vm.runtime.fastdesk_endpoint = fastdesk_endpoint;
             if let Some(shm) = props.fastdesk_shm_path
-                && let Some(valid_shm) = validate_vm_shm_path(Some(&shm), &runtime_dir, id)
+                && let Some(valid_shm) = validate_vm_shm_path(Some(&shm), runtime_dir, id)
             {
                 vm.runtime.shm_path = Some(valid_shm);
             }
@@ -5726,6 +5742,9 @@ fn validate_vm_shm_path(
                 expected_shm = %expected.display(),
                 "ignoring unexpected or symlinked fastdesk_shm_path reported by VM RPC socket"
             );
+            if matches_expected {
+                return None;
+            }
             return validate_vm_shm_path(None, runtime_dir, id);
         }
     }
@@ -9566,6 +9585,7 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn adopt_running_vms_ignores_arbitrary_and_symlinked_fastdesk_shm_path_and_preserves_victim() {
         use prost::Message;
