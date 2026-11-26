@@ -5,11 +5,13 @@ use velovm_core::api_client::launch_velovm_viewer;
 use velovm_core::api_client::resolve_local_viewer_binary;
 use velovm_core::models::AttachDiskPayload;
 use velovm_core::models::CreateDiskPayload;
+use velovm_core::models::CreateSwitchPayload;
 use velovm_core::models::CreateVmPayload;
 use velovm_core::models::DaemonEvent;
 use velovm_core::models::DiskInfo;
 use velovm_core::models::HostConfig;
 use velovm_core::models::HostInfo;
+use velovm_core::models::HostNetAdapterInfo;
 use velovm_core::models::MountIsoPayload;
 use velovm_core::models::PortForward;
 use velovm_core::models::ShutdownVmPayload;
@@ -74,6 +76,15 @@ pub enum GuiRequest {
         dialog_id: Uuid,
         patch: HostConfigPatch,
     },
+    RefreshSwitches,
+    FetchNetAdapters,
+    CreateSwitch {
+        dialog_id: Uuid,
+        payload: CreateSwitchPayload,
+    },
+    DeleteSwitch {
+        id_or_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +99,7 @@ pub enum DialogKind {
     VmSettings(Uuid),
     HostSettings(Uuid),
     DeleteVm(Uuid),
+    CreateSwitch(Uuid),
 }
 
 #[derive(Debug)]
@@ -101,6 +113,11 @@ pub enum GuiUpdate {
         snapshot_seq: u64,
     },
     DaemonDisconnected(String),
+    SwitchesUpdated(Vec<VirtualSwitchInfo>),
+    NetAdaptersLoaded {
+        adapters: Vec<HostNetAdapterInfo>,
+        error: Option<String>,
+    },
     VmUpdated {
         vm: VmSummary,
         select: bool,
@@ -238,6 +255,8 @@ fn is_idempotent_read(req: &GuiRequest) -> bool {
     matches!(
         req,
         GuiRequest::RefreshAll
+            | GuiRequest::RefreshSwitches
+            | GuiRequest::FetchNetAdapters
             | GuiRequest::FetchVmDetails { .. }
             | GuiRequest::FetchVmLogs { .. }
             | GuiRequest::InspectDisk(_)
@@ -296,6 +315,7 @@ fn request_dialog_kind(req: &GuiRequest) -> Option<DialogKind> {
         GuiRequest::UpdateVm { dialog_id, .. } => Some(DialogKind::VmSettings(*dialog_id)),
         GuiRequest::SaveHostConfig { dialog_id, .. } => Some(DialogKind::HostSettings(*dialog_id)),
         GuiRequest::DeleteVm { dialog_id, .. } => Some(DialogKind::DeleteVm(*dialog_id)),
+        GuiRequest::CreateSwitch { dialog_id, .. } => Some(DialogKind::CreateSwitch(*dialog_id)),
         _ => None,
     }
 }
@@ -1313,6 +1333,48 @@ impl BackendState {
                 });
                 Ok(())
             }
+            GuiRequest::RefreshSwitches => {
+                let switches = client.list_switches()?;
+                self.emit(GuiUpdate::SwitchesUpdated(switches));
+                Ok(())
+            }
+            GuiRequest::FetchNetAdapters => {
+                match client.list_net_adapters() {
+                    Ok(adapters) => {
+                        self.emit(GuiUpdate::NetAdaptersLoaded {
+                            adapters,
+                            error: None,
+                        });
+                    }
+                    Err(err) => {
+                        self.emit(GuiUpdate::NetAdaptersLoaded {
+                            adapters: Vec::new(),
+                            error: Some(format!("{err:#}")),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            GuiRequest::CreateSwitch { payload, .. } => {
+                let created = client.create_switch(&payload)?;
+                self.emit(GuiUpdate::StatusMessage(format!(
+                    "Created virtual switch '{}'",
+                    created.name
+                )));
+                let switches = client.list_switches().unwrap_or_else(|_| vec![created]);
+                self.emit(GuiUpdate::SwitchesUpdated(switches));
+                Ok(())
+            }
+            GuiRequest::DeleteSwitch { id_or_name } => {
+                client.delete_switch(&id_or_name)?;
+                self.emit(GuiUpdate::StatusMessage(format!(
+                    "Deleted virtual switch '{id_or_name}'"
+                )));
+                if let Ok(switches) = client.list_switches() {
+                    self.emit(GuiUpdate::SwitchesUpdated(switches));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1709,7 +1771,15 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     }
                                 }
                             }
-                            DaemonEvent::SwitchesUpdated => {}
+                            DaemonEvent::SwitchesUpdated => {
+                                if let Ok(switches) =
+                                    ApiClient::new(&base_url, &token).and_then(|c| c.list_switches())
+                                    && !state.emit_checked(GuiUpdate::SwitchesUpdated(switches))
+                                {
+                                    sse_send_closed = true;
+                                    break;
+                                }
+                            }
                             DaemonEvent::DaemonStopping => {
                                 saw_daemon_stopping = true;
                                 *state.client.write().unwrap() = None;

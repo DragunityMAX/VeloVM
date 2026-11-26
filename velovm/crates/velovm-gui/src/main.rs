@@ -8,6 +8,7 @@ use controller::GuiRequest;
 use controller::GuiUpdate;
 use controller::HostConfigPatch;
 use dialogs::ConfirmActionDialog;
+use dialogs::CreateSwitchDialog;
 use dialogs::DeleteVmDialog;
 use dialogs::DiskManagerDialog;
 use dialogs::FilePickerModal;
@@ -18,6 +19,7 @@ use dialogs::NewVmWizard;
 use dialogs::PendingConfirmAction;
 use dialogs::VmSettingsDialog;
 use dialogs::render_confirm_action_dialog;
+use dialogs::render_create_switch_dialog;
 use dialogs::render_delete_vm_dialog;
 use dialogs::render_disk_manager_dialog;
 use dialogs::render_file_picker_state;
@@ -121,6 +123,7 @@ struct VeloVmApp {
     disk_mgr_dlg: Option<DiskManagerDialog>,
     host_settings_dlg: Option<HostSettingsDialog>,
     delete_vm_dlg: Option<DeleteVmDialog>,
+    create_switch_dlg: Option<CreateSwitchDialog>,
     confirm_action_dlg: Option<ConfirmActionDialog>,
     file_picker: FilePickerState,
 }
@@ -184,6 +187,7 @@ impl VeloVmApp {
             disk_mgr_dlg: None,
             host_settings_dlg: None,
             delete_vm_dlg: None,
+            create_switch_dlg: None,
             confirm_action_dlg: None,
             file_picker: FilePickerState::default(),
         }
@@ -569,7 +573,32 @@ impl VeloVmApp {
                             d.error = Some(err);
                         }
                     }
+                    (DialogKind::CreateSwitch(dialog_id), None) => {
+                        if self
+                            .create_switch_dlg
+                            .as_ref()
+                            .is_some_and(|d| d.dialog_id == dialog_id)
+                        {
+                            self.create_switch_dlg = None;
+                        }
+                    }
+                    (DialogKind::CreateSwitch(dialog_id), Some(err)) => {
+                        if let Some(d) = self.create_switch_dlg.as_mut()
+                            && d.dialog_id == dialog_id
+                        {
+                            d.submitting = false;
+                            d.error = Some(err);
+                        }
+                    }
                 },
+                GuiUpdate::SwitchesUpdated(switches) => {
+                    self.switches = switches;
+                }
+                GuiUpdate::NetAdaptersLoaded { adapters, error } => {
+                    if let Some(d) = self.create_switch_dlg.as_mut() {
+                        d.set_adapters(adapters, error);
+                    }
+                }
                 GuiUpdate::StorageOpFinished { vm_id, op, op_id } => {
                     let map = match op {
                         controller::StorageOpKind::AttachDisk => &mut self.attach_disk_in_flight,
@@ -930,23 +959,85 @@ impl VeloVmApp {
         // Center Workspace
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.nav_filter == NavFilter::Switches {
-                ui.heading("Virtual Switches & Network Backends");
+                ui.horizontal(|ui| {
+                    ui.heading("Virtual Switches & Network Backends");
+                    ui.add_space(12.0);
+                    if ui
+                        .add_enabled(
+                            self.connected && self.create_switch_dlg.is_none(),
+                            egui::Button::new("➕ New Virtual Switch…"),
+                        )
+                        .clicked()
+                    {
+                        self.error_banner = None;
+                        let host_os = self.host_info.as_ref().map(|h| h.os.as_str());
+                        self.create_switch_dlg = Some(CreateSwitchDialog::new(host_os));
+                        self.backend.send(GuiRequest::FetchNetAdapters);
+                    }
+                    if ui
+                        .add_enabled(self.connected, egui::Button::new("↻ Refresh"))
+                        .clicked()
+                    {
+                        self.backend.send(GuiRequest::RefreshSwitches);
+                    }
+                });
+                if let Some(err) = self.error_banner.clone() {
+                    ui.add_space(4.0);
+                    egui::Frame::group(ui.style())
+                        .fill(Color32::from_rgb(70, 24, 24))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(Color32::LIGHT_RED, err);
+                                if ui.small_button("Dismiss").clicked() {
+                                    self.error_banner = None;
+                                }
+                            });
+                        });
+                }
                 ui.separator();
                 egui::Grid::new("switches_table")
                     .striped(true)
-                    .num_columns(4)
+                    .num_columns(6)
                     .spacing([18.0, 8.0])
                     .show(ui, |ui| {
                         ui.label(RichText::new("Name").strong());
                         ui.label(RichText::new("Kind").strong());
+                        ui.label(RichText::new("Type").strong());
                         ui.label(RichText::new("ID").strong());
                         ui.label(RichText::new("Description").strong());
+                        ui.label(RichText::new("Actions").strong());
                         ui.end_row();
                         for sw in &self.switches {
                             ui.label(&sw.name);
                             ui.label(&sw.kind);
+                            ui.label(sw.switch_type.as_deref().unwrap_or("-"));
                             ui.monospace(&sw.id);
                             ui.label(&sw.description);
+                            let del_btn = ui.add_enabled(
+                                self.connected && sw.managed,
+                                egui::Button::new(RichText::new("Delete").color(
+                                    if sw.managed {
+                                        Color32::LIGHT_RED
+                                    } else {
+                                        Color32::GRAY
+                                    },
+                                )),
+                            );
+                            let del_btn = if !sw.managed {
+                                del_btn.on_disabled_hover_text(
+                                    "Built-in or unmanaged switch cannot be deleted",
+                                )
+                            } else {
+                                del_btn
+                            };
+                            if del_btn.clicked() {
+                                self.confirm_action_dlg = Some(ConfirmActionDialog {
+                                    action: PendingConfirmAction::DeleteSwitch {
+                                        id: sw.id.clone(),
+                                        name: sw.name.clone(),
+                                    },
+                                });
+                            }
                             ui.end_row();
                         }
                     });
@@ -1109,6 +1200,12 @@ impl VeloVmApp {
             &mut self.file_picker,
         );
         render_delete_vm_dialog(ctx, &mut self.delete_vm_dlg, &self.backend);
+        render_create_switch_dialog(
+            ctx,
+            &mut self.create_switch_dlg,
+            self.host_info.as_ref(),
+            &self.backend,
+        );
         render_confirm_action_dialog(ctx, &mut self.confirm_action_dlg, &self.backend);
         if let Some((target, path)) = render_file_picker_state(ctx, &mut self.file_picker) {
             self.apply_picked_file(target, path);
