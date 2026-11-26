@@ -13,6 +13,15 @@ pub const DEFAULT_DAEMON_LISTEN: &str = "127.0.0.1:47620";
 pub const MAX_VM_MEMORY_MB: u64 = 16 * 1024 * 1024;
 pub const EVENT_REVISION_HEADER: &str = "x-velovm-event-revision";
 
+fn parse_plain_u16(raw: &str, label: &str, input: &str) -> anyhow::Result<u16> {
+    anyhow::ensure!(
+        !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()),
+        "invalid {label} in '{input}'"
+    );
+    raw.parse()
+        .with_context(|| format!("invalid {label} in '{input}'"))
+}
+
 /// Parses and validates a loopback HTTP listen address (e.g. `127.0.0.1:47620`,
 /// `[::1]:47620`, or `http://localhost:47620`), rejecting arbitrary hostnames and
 /// non-loopback IP addresses.
@@ -43,9 +52,7 @@ pub fn parse_loopback_listen_addr(raw: &str) -> anyhow::Result<std::net::SocketA
         .filter(|p| p.eq_ignore_ascii_case("localhost:"))
         .map(|_| &host_port[10..])
     {
-        let port: u16 = port_str
-            .parse()
-            .with_context(|| format!("invalid listen port in '{raw}'"))?;
+        let port = parse_plain_u16(port_str, "listen port", raw)?;
         return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
     }
     let addr: std::net::SocketAddr = host_port
@@ -792,11 +799,7 @@ pub fn parse_port_forward(spec: &str) -> anyhow::Result<PortForward> {
         .or_else(|| trimmed.split_once("-:"))
         .context("port forward must contain '->' (quote it in shells, e.g. \"tcp:127.0.0.1:3389->3389\")")?;
 
-    let guest_port: u16 = right
-        .trim()
-        .trim_start_matches(':')
-        .parse()
-        .with_context(|| format!("invalid guest port in '{spec}'"))?;
+    let guest_port = parse_plain_u16(right.trim().trim_start_matches(':'), "guest port", spec)?;
 
     let (protocol, addr_part) = if left.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("tcp:")) {
         (IpProto::Tcp, &left[4..])
@@ -822,10 +825,7 @@ pub fn parse_port_forward(spec: &str) -> anyhow::Result<PortForward> {
         ("127.0.0.1".to_string(), addr_part)
     };
 
-    let host_port: u16 = host_port_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid host port in '{spec}'"))?;
+    let host_port = parse_plain_u16(host_port_str.trim(), "host port", spec)?;
 
     let pf = PortForward {
         protocol,
@@ -1768,7 +1768,17 @@ mod tests {
         assert_eq!(pf4.host_port, 8080);
         assert_eq!(pf4.guest_port, 80);
 
-        for bad in ["SCTP:53->53", "badhost:80->80", "0->80", "80->0"] {
+        for bad in [
+            "SCTP:53->53",
+            "badhost:80->80",
+            "0->80",
+            "80->0",
+            "tcp:+80->80",
+            "tcp:127.0.0.1:80->+80",
+            "tcp:1.2.3.4:80->+80",
+            "+8080->80",
+            "8080->+80",
+        ] {
             assert!(
                 parse_port_forward(bad).is_err(),
                 "expected '{bad}' to be rejected"
@@ -1820,6 +1830,9 @@ mod tests {
         assert!(https_err.to_string().contains("HTTPS"), "{https_err:#}");
         assert!(parse_loopback_listen_addr("HTTPS://localhost:47620").is_err());
         assert!(parse_loopback_listen_addr("ftp://127.0.0.1:47620").is_err());
+        assert!(parse_loopback_listen_addr("localhost:+5").is_err());
+        assert!(parse_loopback_listen_addr("http://localhost:+47620/").is_err());
+        assert!(parse_loopback_listen_addr("localhost:").is_err());
     }
 
     #[test]
