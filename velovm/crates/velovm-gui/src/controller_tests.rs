@@ -4035,3 +4035,66 @@ fn reload_client_from_runtime_addr_respects_daemon_url_when_unconnected() {
     .unwrap();
     assert!(res_token.is_some());
 }
+
+#[test]
+fn reload_and_sync_client_accept_localhost_and_canonical_ipv6_daemon_urls_after_token_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let daemon = rt
+        .block_on(velovmd::TestDaemonHandle::spawn(dir.path().to_path_buf()))
+        .unwrap();
+    let port = daemon
+        .base_url
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .expect("daemon base_url port");
+    let localhost_url = format!("http://localhost:{port}");
+
+    // When shared_endpoint holds a rotated/stale token (or None), --daemon-url http://localhost:<port>
+    // must still match the canonical http://127.0.0.1:<port> runtime client.
+    let shared_none: SharedEndpoint = Arc::new(RwLock::new(None));
+    let adopted = reload_client_from_runtime_addr_result(
+        Some(dir.path()),
+        Some(&localhost_url),
+        &shared_none,
+    )
+    .unwrap()
+    .expect("http://localhost:<port> should match http://127.0.0.1:<port>");
+    assert_eq!(adopted.base_url(), daemon.base_url);
+
+    let shared_stale_token: SharedEndpoint =
+        Arc::new(RwLock::new(Some((daemon.base_url.clone(), "stale-old-token".to_string()))));
+    let reloaded = reload_client_from_runtime_addr_result(
+        Some(dir.path()),
+        Some(&format!("localhost:{port}/")),
+        &shared_stale_token,
+    )
+    .unwrap()
+    .expect("localhost:<port>/ should match after token rotation");
+    assert_eq!(reloaded.base_url(), daemon.base_url);
+    assert_eq!(reloaded.token(), adopted.token());
+
+    // sync_client_before_request must also pick up the rotated token for http://localhost:<port>.
+    let mut stale_client = ApiClient::new(&localhost_url, "stale-old-token").unwrap();
+    let shared_sync: SharedEndpoint = Arc::new(RwLock::new(None));
+    assert!(sync_client_before_request(
+        &mut stale_client,
+        Some(dir.path()),
+        Some(&localhost_url),
+        &shared_sync,
+    ));
+    assert_eq!(stale_client.token(), adopted.token());
+    assert_eq!(stale_client.base_url(), daemon.base_url);
+
+    // Non-canonical IPv6 loopback URLs also match canonical http://[::1]:<port> clients, while
+    // mismatched ports still do not.
+    let v6_client = ApiClient::new(format!("http://[::1]:{port}"), "tok").unwrap();
+    assert!(daemon_url_matches_client(
+        &format!("http://[0:0:0:0:0:0:0:1]:{port}/"),
+        &v6_client
+    ));
+    assert!(!daemon_url_matches_client(
+        &format!("http://localhost:{}", port.wrapping_add(1).max(1)),
+        &adopted
+    ));
+}
