@@ -9460,6 +9460,7 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn detach_disk_and_eject_iso_succeed_when_running_vm_returns_not_found() {
         use prost::Message;
