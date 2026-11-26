@@ -222,7 +222,7 @@ enum VmCmd {
     /// Request cooperative guest OS shutdown
     Shutdown {
         vm: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "force")]
         acpi: bool,
         #[arg(long)]
         force: bool,
@@ -288,7 +288,7 @@ struct CreateVmArgs {
     /// Create and attach a new OS disk of this size (e.g. 64G)
     #[arg(long)]
     create_disk: Option<String>,
-    /// Optional explicit path for --create-disk (defaults to <vm_dir>/disk0.<ext>)
+    /// Optional explicit path for --create-disk (defaults to <data_dir>/disks/<name>-<id8>-disk0.<ext>)
     #[arg(long, requires = "create_disk")]
     create_disk_path: Option<PathBuf>,
     #[arg(long, value_enum, requires = "create_disk")]
@@ -1576,5 +1576,31 @@ mod tests {
             paths.as_slice(),
             &[format!("/api/v1/vms/{expected_uuid}?delete_disks=true")]
         );
+    }
+
+    #[test]
+    fn cli_create_disk_path_help_describes_data_dir_disks_default() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let vm_cmd = cmd.find_subcommand_mut("vm").expect("vm subcommand");
+        let create_cmd = vm_cmd
+            .find_subcommand_mut("create")
+            .expect("vm create subcommand");
+        let help = create_cmd.render_long_help().to_string();
+        assert!(
+            help.contains("<data_dir>/disks/<name>-<id8>-disk0.<ext>"),
+            "unexpected help text:\n{help}"
+        );
+        assert!(!help.contains("<vm_dir>/disk0.<ext>"));
+    }
+
+    #[test]
+    fn shutdown_rejects_acpi_with_force() {
+        assert!(
+            Cli::try_parse_from(["velovm", "vm", "shutdown", "MyVm", "--acpi", "--force"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["velovm", "vm", "shutdown", "MyVm", "--acpi"]).is_ok());
+        assert!(Cli::try_parse_from(["velovm", "vm", "shutdown", "MyVm", "--force"]).is_ok());
     }
 }

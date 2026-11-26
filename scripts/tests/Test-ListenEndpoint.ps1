@@ -53,4 +53,44 @@ $ep5 = Resolve-ListenEndpoint -Addr " 127.0.0.1 "
 Assert-Equal $ep5.ListenAddr "127.0.0.1:5901" "trimmed-ipv4-vmm"
 Assert-Equal $ep5.ViewerAddr "127.0.0.1:5901" "trimmed-ipv4-viewer"
 
+$ep6 = Resolve-ListenEndpoint -Addr "::1"
+Assert-Equal $ep6.ListenAddr "[::1]:5901" "bare-ipv6-vmm"
+Assert-Equal $ep6.ViewerAddr "[::1]:5901" "bare-ipv6-viewer"
+
+$ep7 = Resolve-ListenEndpoint -Addr "127.0.0.1:6000"
+Assert-Equal $ep7.ListenAddr "127.0.0.1:6000" "ipv4-port-vmm"
+Assert-Equal $ep7.ViewerAddr "127.0.0.1:6000" "ipv4-port-viewer"
+Assert-Equal $ep7.Port 6000 "ipv4-port-num"
+
+function Assert-Throws {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Addr,
+        [Parameter(Mandatory)] [string]$Label
+    )
+    $threw = $false
+    try {
+        $null = Resolve-ListenEndpoint -Addr $Addr
+    } catch {
+        $threw = $true
+    }
+    if (-not $threw) {
+        throw "FAIL ($Label): expected '$Addr' to be rejected"
+    }
+}
+
+Assert-Throws "localhost:6000" "hostname-localhost-port"
+Assert-Throws "LOCALHOST:6000" "hostname-upper-localhost-port"
+Assert-Throws "localhost" "hostname-localhost-bare"
+Assert-Throws "example.com:6000" "hostname-domain-port"
+Assert-Throws "[localhost]:6000" "bracketed-hostname"
+Assert-Throws "[127.0.0.1]:6000" "bracketed-ipv4-port"
+Assert-Throws ":6000" "empty-host-port"
+Assert-Throws "" "empty-addr"
+Assert-Throws "1234" "integer-ipv4-form"
+Assert-Throws "0177.0.0.1" "leading-zero-ipv4"
+Assert-Throws "999.0.0.1:6000" "invalid-ipv4-octet"
+Assert-Throws "127.0.0.1:0" "port-zero"
+Assert-Throws "127.0.0.1:70000" "port-overflow"
+Assert-Throws "127.0.0.1:abc" "port-non-numeric"
+
 Write-Host "PASS: Start-VeloVM.ps1 Resolve-ListenEndpoint tests passed"

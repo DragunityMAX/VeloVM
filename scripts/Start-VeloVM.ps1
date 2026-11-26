@@ -85,49 +85,77 @@ function Resolve-ListenEndpoint {
         [int]$DefaultPort = 5901
     )
     $trimmed = $Addr.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        throw "Invalid listen address '$Addr': expected IP address or socket address like 127.0.0.1:$DefaultPort or [::1]:$DefaultPort."
+    }
+
     $viewerAddr = $trimmed
     $vmmListenAddr = $trimmed
     $listenPort = $DefaultPort
     $listenIp = $null
+    $hostPart = $null
+    $isBracketed = $false
+    $hasExplicitPort = $false
 
     if ($trimmed -match '^\[([^\]]+)\]:(\d+)$') {
         $hostPart = $Matches[1]
-        $listenPort = [int]$Matches[2]
-        [System.Net.IPAddress]$parsed = $null
-        if ([System.Net.IPAddress]::TryParse($hostPart, [ref]$parsed)) {
-            $listenIp = $parsed
+        $portText = $Matches[2]
+        $isBracketed = $true
+        $hasExplicitPort = $true
+        $parsedPort = 0
+        if (-not [int]::TryParse($portText, [ref]$parsedPort) -or $parsedPort -lt 1 -or $parsedPort -gt 65535) {
+            throw "Invalid TCP listen port in '$Addr': expected 1..65535."
         }
+        $listenPort = $parsedPort
+    } elseif ($trimmed -match '^\[([^\]]+)\]$') {
+        $hostPart = $Matches[1]
+        $isBracketed = $true
+        $viewerAddr = "[$hostPart]:$DefaultPort"
+        $vmmListenAddr = "[$hostPart]:$DefaultPort"
     } elseif ($trimmed -match '^([^:]+):(\d+)$') {
         $hostPart = $Matches[1]
-        $listenPort = [int]$Matches[2]
-        [System.Net.IPAddress]$parsed = $null
-        if ([System.Net.IPAddress]::TryParse($hostPart, [ref]$parsed)) {
-            $listenIp = $parsed
+        $portText = $Matches[2]
+        $hasExplicitPort = $true
+        $parsedPort = 0
+        if (-not [int]::TryParse($portText, [ref]$parsedPort) -or $parsedPort -lt 1 -or $parsedPort -gt 65535) {
+            throw "Invalid TCP listen port in '$Addr': expected 1..65535."
         }
+        $listenPort = $parsedPort
     } else {
-        $bare = $trimmed.Trim('[', ']')
-        [System.Net.IPAddress]$parsed = $null
-        if ([System.Net.IPAddress]::TryParse($bare, [ref]$parsed)) {
-            $listenIp = $parsed
-            if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
-                $viewerAddr = "[$bare]:$DefaultPort"
-                $vmmListenAddr = "[$bare]:$DefaultPort"
-            } else {
-                $viewerAddr = "${bare}:$DefaultPort"
-                $vmmListenAddr = "${bare}:$DefaultPort"
+        $hostPart = $trimmed
+    }
+
+    [System.Net.IPAddress]$parsed = $null
+    if (-not $hostPart.Contains('[') -and -not $hostPart.Contains(']') -and -not $hostPart.Contains('%') -and
+        [System.Net.IPAddress]::TryParse($hostPart, [ref]$parsed)) {
+        if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            if (-not $isBracketed -and $hostPart -match '^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$') {
+                $listenIp = $parsed
             }
-        } else {
-            $viewerAddr = "${trimmed}:$DefaultPort"
+        } elseif ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            $listenIp = $parsed
         }
     }
 
-    if ($null -ne $listenIp) {
-        if ($listenIp.Equals([System.Net.IPAddress]::Any) -or
-            ($listenIp.IsIPv4MappedToIPv6 -and $listenIp.MapToIPv4().Equals([System.Net.IPAddress]::Any))) {
-            $viewerAddr = "127.0.0.1:$listenPort"
-        } elseif ($listenIp.Equals([System.Net.IPAddress]::IPv6Any)) {
-            $viewerAddr = "[::1]:$listenPort"
+    if ($null -eq $listenIp) {
+        throw "Invalid listen address '$Addr': expected IP address or socket address like 127.0.0.1:$DefaultPort or [::1]:$DefaultPort."
+    }
+
+    if (-not $hasExplicitPort) {
+        if ($listenIp.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            $viewerAddr = "[$hostPart]:$DefaultPort"
+            $vmmListenAddr = "[$hostPart]:$DefaultPort"
+        } else {
+            $viewerAddr = "${hostPart}:$DefaultPort"
+            $vmmListenAddr = "${hostPart}:$DefaultPort"
         }
+    }
+
+    if ($listenIp.Equals([System.Net.IPAddress]::Any) -or
+        ($listenIp.IsIPv4MappedToIPv6 -and $listenIp.MapToIPv4().Equals([System.Net.IPAddress]::Any))) {
+        $viewerAddr = "127.0.0.1:$listenPort"
+    } elseif ($listenIp.Equals([System.Net.IPAddress]::IPv6Any)) {
+        $viewerAddr = "[::1]:$listenPort"
     }
 
     return [PSCustomObject]@{

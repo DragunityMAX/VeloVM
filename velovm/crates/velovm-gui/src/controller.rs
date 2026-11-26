@@ -876,6 +876,15 @@ fn set_shared_endpoint(shared_endpoint: &SharedEndpoint, client: &ApiClient) {
         Some((client.base_url().to_string(), client.token().to_string()));
 }
 
+fn daemon_url_matches_client(daemon_url: &str, client: &ApiClient) -> bool {
+    velovm_core::models::parse_loopback_listen_addr(daemon_url)
+        .ok()
+        .filter(|addr| addr.port() != 0)
+        .map(|addr| format!("http://{addr}"))
+        .as_deref()
+        == Some(client.base_url())
+}
+
 fn reload_client_from_runtime_addr_result(
     data_dir: Option<&Path>,
     daemon_url: Option<&str>,
@@ -890,7 +899,7 @@ fn reload_client_from_runtime_addr_result(
                     current
                         .as_ref()
                         .is_some_and(|(_, cur_token)| c.token() == cur_token)
-                        || c.base_url() == velovm_core::api_client::normalize_base_url(url)
+                        || daemon_url_matches_client(url, &c)
                 }
             };
             if allowed && c.health().is_ok() {
@@ -950,7 +959,11 @@ fn sync_client_before_request(
             let token_matches = runtime_client.token() == client.token();
             let changed = runtime_client.base_url() != client.base_url()
                 || runtime_client.token() != client.token();
-            if changed && (daemon_url.is_none() || token_matches) && runtime_client.health().is_ok()
+            if changed
+                && daemon_url.is_none_or(|url| {
+                    token_matches || daemon_url_matches_client(url, &runtime_client)
+                })
+                && runtime_client.health().is_ok()
             {
                 set_shared_endpoint(shared_endpoint, &runtime_client);
                 *client = runtime_client;
@@ -1082,6 +1095,7 @@ impl BackendState {
                 Ok(())
             }
             GuiRequest::ShutdownVm { id, acpi, force } => {
+                anyhow::ensure!(!(acpi && force), "ACPI shutdown does not support force");
                 let vm =
                     client.shutdown_vm(&id.to_string(), &ShutdownVmPayload { force, acpi })?;
                 self.emit(GuiUpdate::StatusMessage(format!(

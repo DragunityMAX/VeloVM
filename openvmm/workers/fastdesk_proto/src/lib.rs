@@ -349,4 +349,100 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn shm_path_empty_normalizes_to_none_and_oversized_utf8_fails_cleanly() {
+        // Some("") normalizes to None on the wire for both ServerHello and Resolution.
+        let hello_empty = ServerMsg::ServerHello {
+            capabilities: CAP_ALL,
+            width: 800,
+            height: 600,
+            stride: 800 * 4,
+            offset: 0,
+            vram_size: 4 * 1024 * 1024,
+            shm_path: Some(String::new()),
+        };
+        assert_eq!(
+            roundtrip_server(&hello_empty),
+            ServerMsg::ServerHello {
+                capabilities: CAP_ALL,
+                width: 800,
+                height: 600,
+                stride: 800 * 4,
+                offset: 0,
+                vram_size: 4 * 1024 * 1024,
+                shm_path: None,
+            }
+        );
+
+        let res_empty = ServerMsg::Resolution {
+            width: 1024,
+            height: 768,
+            stride: 1024 * 4,
+            offset: 0,
+            shm_path: Some(String::new()),
+        };
+        assert_eq!(
+            roundtrip_server(&res_empty),
+            ServerMsg::Resolution {
+                width: 1024,
+                height: 768,
+                stride: 1024 * 4,
+                offset: 0,
+                shm_path: None,
+            }
+        );
+
+        // Exact u16::MAX UTF-8 byte length round-trips intact.
+        let exact_max = format!("{}é", "a".repeat(u16::MAX as usize - 2));
+        assert_eq!(exact_max.len(), u16::MAX as usize);
+        let res_max = ServerMsg::Resolution {
+            width: 1024,
+            height: 768,
+            stride: 1024 * 4,
+            offset: 0,
+            shm_path: Some(exact_max),
+        };
+        assert_eq!(roundtrip_server(&res_max), res_max);
+
+        // Exceeding u16::MAX bytes must return StringTooLarge (not truncate mid-UTF-8)
+        // and roll back partial frame bytes from the output buffer.
+        let too_long = format!("{}é", "a".repeat(u16::MAX as usize - 1));
+        assert_eq!(too_long.len(), u16::MAX as usize + 1);
+
+        let mut out = Vec::new();
+        let valid = ServerMsg::Pong {
+            client_time_us: 1,
+            host_time_us: 2,
+        };
+        encode_server_msg(&valid, &mut out).unwrap();
+        let valid_len = out.len();
+
+        let hello_too_long = ServerMsg::ServerHello {
+            capabilities: CAP_ALL,
+            width: 800,
+            height: 600,
+            stride: 800 * 4,
+            offset: 0,
+            vram_size: 4 * 1024 * 1024,
+            shm_path: Some(too_long.clone()),
+        };
+        let err = encode_server_msg(&hello_too_long, &mut out).unwrap_err();
+        assert!(matches!(err, ProtoError::StringTooLarge(n) if n == too_long.len()));
+        assert_eq!(out.len(), valid_len);
+
+        let res_too_long = ServerMsg::Resolution {
+            width: 800,
+            height: 600,
+            stride: 800 * 4,
+            offset: 0,
+            shm_path: Some(too_long.clone()),
+        };
+        let err = encode_server_msg(&res_too_long, &mut out).unwrap_err();
+        assert!(matches!(err, ProtoError::StringTooLarge(n) if n == too_long.len()));
+        assert_eq!(out.len(), valid_len);
+
+        let mut cursor = std::io::Cursor::new(&out);
+        assert_eq!(read_server_msg(&mut cursor).unwrap(), valid);
+    }
 }

@@ -44,6 +44,9 @@ pub enum ProtoError {
     /// Frame payload exceeds [`MAX_FRAME_PAYLOAD_BYTES`].
     #[error("frame payload {0} exceeds maximum")]
     FrameTooLarge(usize),
+    /// Optional wire string exceeds `u16::MAX` bytes.
+    #[error("string length {0} exceeds maximum")]
+    StringTooLarge(usize),
     /// Unknown [`RectEncoding`] tag.
     #[error("invalid rectangle encoding {0}")]
     InvalidEncoding(u8),
@@ -107,6 +110,8 @@ pub enum ServerMsg {
         /// Total framebuffer VRAM size in bytes.
         vram_size: u32,
         /// Optional backing shared-memory file path for local zero-copy mode.
+        ///
+        /// Empty strings (`Some("")`) are normalized to `None` on the wire.
         shm_path: Option<String>,
     },
     /// Desktop resolution or format changed.
@@ -120,6 +125,8 @@ pub enum ServerMsg {
         /// Byte offset of the primary surface within VRAM.
         offset: u32,
         /// Optional backing shared-memory file path.
+        ///
+        /// Empty strings (`Some("")`) are normalized to `None` on the wire.
         shm_path: Option<String>,
     },
     /// A batch of dirty rectangles for a single display update.
@@ -223,16 +230,23 @@ pub fn decode_client_frame_header(header: &[u8; 5]) -> Result<(u8, usize), Proto
     Ok((msg_type, payload_len))
 }
 
-fn write_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+/// Encodes an optional UTF-8 string as `[len: u16 LE][bytes]`.
+///
+/// `None` and `Some("")` both encode with length `0` (so `Some("")` is normalized
+/// to `None` when decoded). Returns [`ProtoError::StringTooLarge`] if `s` exceeds
+/// `u16::MAX` bytes rather than truncating mid-UTF-8.
+fn write_opt_str(out: &mut Vec<u8>, s: Option<&str>) -> Result<(), ProtoError> {
     match s {
-        Some(val) => {
+        Some(val) if !val.is_empty() => {
             let bytes = val.as_bytes();
-            let len = (bytes.len().min(u16::MAX as usize)) as u16;
+            let len = u16::try_from(bytes.len())
+                .map_err(|_| ProtoError::StringTooLarge(bytes.len()))?;
             out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&bytes[..len as usize]);
+            out.extend_from_slice(bytes);
         }
-        None => out.extend_from_slice(&0u16.to_le_bytes()),
+        Some(_) | None => out.extend_from_slice(&0u16.to_le_bytes()),
     }
+    Ok(())
 }
 
 struct Cursor<'a> {
@@ -284,6 +298,8 @@ impl<'a> Cursor<'a> {
         ]))
     }
 
+    /// Decodes an optional UTF-8 string encoded as `[len: u16 LE][bytes]`.
+    /// Length `0` maps to `None` (normalizing any encoded `Some("")`).
     fn opt_str(&mut self) -> Result<Option<String>, ProtoError> {
         let len = self.u16()? as usize;
         if len == 0 {
@@ -332,7 +348,10 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) -> Result<(), Proto
             out.extend_from_slice(&stride.to_le_bytes());
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&vram_size.to_le_bytes());
-            write_opt_str(out, shm_path.as_deref());
+            if let Err(err) = write_opt_str(out, shm_path.as_deref()) {
+                out.truncate(len_pos - 1);
+                return Err(err);
+            }
             finish_frame(out, len_pos)
         }
         ServerMsg::Resolution {
@@ -347,7 +366,10 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) -> Result<(), Proto
             out.extend_from_slice(&height.to_le_bytes());
             out.extend_from_slice(&stride.to_le_bytes());
             out.extend_from_slice(&offset.to_le_bytes());
-            write_opt_str(out, shm_path.as_deref());
+            if let Err(err) = write_opt_str(out, shm_path.as_deref()) {
+                out.truncate(len_pos - 1);
+                return Err(err);
+            }
             finish_frame(out, len_pos)
         }
         ServerMsg::FrameBatch {
