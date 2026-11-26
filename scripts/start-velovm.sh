@@ -245,15 +245,21 @@ resolve_listen_endpoint() {
     LISTEN_PORT="5901"
     VIEWER_ADDR="$LISTEN_ADDR"
     VMM_LISTEN_ADDR="$LISTEN_ADDR"
+    local bracketed=0
     if [[ "$LISTEN_ADDR" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
         LISTEN_HOST="${BASH_REMATCH[1]}"
         LISTEN_PORT="${BASH_REMATCH[2]}"
+        bracketed=1
+    elif [[ "$LISTEN_ADDR" =~ ^\[([^\]]+)\]$ ]]; then
+        LISTEN_HOST="${BASH_REMATCH[1]}"
+        bracketed=1
+        VIEWER_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
+        VMM_LISTEN_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
     elif [[ "$LISTEN_ADDR" =~ ^([^:]+):([0-9]+)$ ]]; then
         LISTEN_HOST="${BASH_REMATCH[1]}"
         LISTEN_PORT="${BASH_REMATCH[2]}"
     elif [[ "$LISTEN_ADDR" == *:* ]]; then
-        LISTEN_HOST="${LISTEN_ADDR#[}"
-        LISTEN_HOST="${LISTEN_HOST%]}"
+        LISTEN_HOST="$LISTEN_ADDR"
         VIEWER_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
         VMM_LISTEN_ADDR="[${LISTEN_HOST}]:${LISTEN_PORT}"
     else
@@ -261,8 +267,88 @@ resolve_listen_endpoint() {
         VIEWER_ADDR="${LISTEN_ADDR}:${LISTEN_PORT}"
     fi
 
-    if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 65535 )); then
+    if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || (( ${#LISTEN_PORT} > 5 )) || (( 10#$LISTEN_PORT < 1 || 10#$LISTEN_PORT > 65535 )); then
         echo "Error: invalid TCP listen port in --listen: $LISTEN_ADDR" >&2
+        exit 1
+    fi
+
+    _is_valid_ipv4() {
+        local candidate="$1"
+        [[ "$candidate" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+        local octet
+        for octet in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+            if [[ "$octet" != "0" && ( "$octet" =~ ^0 || $((10#$octet)) -gt 255 ) ]]; then
+                return 1
+            fi
+        done
+        return 0
+    }
+
+    _count_ipv6_side_hextets() {
+        local side="$1"
+        local allow_ipv4_tail="$2"
+        local -n out_count="$3"
+        out_count=0
+        [[ -z "$side" ]] && return 0
+        [[ "$side" =~ ^:|:$ ]] && return 1
+        local -a segs=()
+        IFS=':' read -r -a segs <<< "$side"
+        local i seg
+        for ((i = 0; i < ${#segs[@]}; i++)); do
+            seg="${segs[$i]}"
+            [[ -z "$seg" ]] && return 1
+            if [[ "$seg" == *.* ]]; then
+                if (( allow_ipv4_tail && i == ${#segs[@]} - 1 )) && _is_valid_ipv4 "$seg"; then
+                    out_count=$((out_count + 2))
+                else
+                    return 1
+                fi
+            elif [[ "$seg" =~ ^[0-9a-fA-F]{1,4}$ ]]; then
+                out_count=$((out_count + 1))
+            else
+                return 1
+            fi
+        done
+        return 0
+    }
+
+    local valid_host=0
+    if (( bracketed == 0 )) && _is_valid_ipv4 "$LISTEN_HOST"; then
+        valid_host=1
+    elif [[ "$LISTEN_HOST" == *:* && "$LISTEN_HOST" != *:::* ]]; then
+        local ip6="$LISTEN_HOST"
+        local has_compress=0
+        local left="$ip6"
+        local right=""
+        local parse_ok=1
+        if [[ "$ip6" == *::* ]]; then
+            has_compress=1
+            left="${ip6%%::*}"
+            right="${ip6#*::}"
+            if [[ "$right" == *::* ]]; then
+                parse_ok=0
+            fi
+        fi
+        if (( parse_ok )); then
+            local left_count=0 right_count=0
+            local left_ipv4_tail=0
+            if (( has_compress == 0 )); then
+                left_ipv4_tail=1
+            fi
+            if _count_ipv6_side_hextets "$left" "$left_ipv4_tail" left_count && \
+               _count_ipv6_side_hextets "$right" 1 right_count; then
+                local total_hextets=$((left_count + right_count))
+                if (( has_compress )); then
+                    (( total_hextets <= 7 )) && valid_host=1
+                else
+                    (( total_hextets == 8 )) && valid_host=1
+                fi
+            fi
+        fi
+    fi
+
+    if (( valid_host == 0 )); then
+        echo "Error: invalid TCP listen address in --listen: $LISTEN_ADDR (expected IP address or socket address like 127.0.0.1:5901 or [::1]:5901)" >&2
         exit 1
     fi
 
