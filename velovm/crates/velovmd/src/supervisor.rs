@@ -4504,6 +4504,7 @@ impl Supervisor {
                 } else {
                     vmservice::ModifyType::Remove as i32
                 };
+                let mut already_absent = false;
                 let proto_port = to_proto_port_config(&port);
                 if let Err(err) = TtrpcClient::new(sock.clone())
                     .modify_resource(vmservice::ModifyResourceRequest {
@@ -4524,23 +4525,34 @@ impl Supervisor {
                     .await
                     .context("updating Consomme port forward on running VM")
                 {
-                    if add
-                        && !velovm_core::ttrpc::is_ttrpc_definite_not_applied(&err)
-                        && self.is_same_live_vm(id, rpc_gen)
-                        && !rollback_port_forward(&sock, id, nic_id, add, proto_port).await
-                        && let Some(pg) = pending_guard.as_mut()
-                        && self.retain_orphaned_port_forward(id, rpc_gen, nic_id, port.clone())
-                    {
+                    if !add && is_ttrpc_not_found(&err) {
                         warn!(
                             vm_id = %id,
                             nic_id = %nic_id,
                             host_port = port.host_port,
-                            error = %err,
-                            "hot-add Consomme port forward RPC failed ambiguously and rollback did not succeed; retaining pending port reservation until VM stops"
+                            guest_port = port.guest_port,
+                            "Consomme port forward already absent in running VM; committing removal to config"
                         );
-                        pg.disarm();
+                        already_absent = true;
+                    } else {
+                        if add
+                            && !velovm_core::ttrpc::is_ttrpc_definite_not_applied(&err)
+                            && self.is_same_live_vm(id, rpc_gen)
+                            && !rollback_port_forward(&sock, id, nic_id, add, proto_port).await
+                            && let Some(pg) = pending_guard.as_mut()
+                            && self.retain_orphaned_port_forward(id, rpc_gen, nic_id, port.clone())
+                        {
+                            warn!(
+                                vm_id = %id,
+                                nic_id = %nic_id,
+                                host_port = port.host_port,
+                                error = %err,
+                                "hot-add Consomme port forward RPC failed ambiguously and rollback did not succeed; retaining pending port reservation until VM stops"
+                            );
+                            pg.disarm();
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
                 }
 
                 let res = self
@@ -4582,7 +4594,13 @@ impl Supervisor {
                                 vm.pending_port_forwards.remove(pos);
                             }
                         },
-                        || rollback_port_forward(&sock, id, nic_id, add, proto_port),
+                        || async {
+                            if already_absent {
+                                true
+                            } else {
+                                rollback_port_forward(&sock, id, nic_id, add, proto_port).await
+                            }
+                        },
                     )
                     .await;
 
@@ -10472,6 +10490,241 @@ mod tests {
             assert!(vm.summary().runtime.orphaned_port_forwards.is_empty());
         }
         assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_port_forward_succeeds_when_running_vm_returns_not_found() {
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use velovm_core::models::{IpProto, PortForward};
+        use velovm_core::ttrpc::{TtrpcStatus, encode_frame, read_frame};
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireRequest {
+            #[prost(string, tag = "1")]
+            service: String,
+            #[prost(string, tag = "2")]
+            method: String,
+            #[prost(bytes = "vec", tag = "3")]
+            payload: Vec<u8>,
+        }
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(velovm_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        struct RestorePerm(PathBuf);
+        impl Drop for RestorePerm {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+
+        let vm1 = sup
+            .create_vm(CreateVmPayload {
+                name: "PortRemoveNotFoundVm1".into(),
+                preset: velovm_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm1_id = vm1.config.id;
+        let vm1_nic_id = vm1.config.nics[0].id;
+
+        let vm2 = sup
+            .create_vm(CreateVmPayload {
+                name: "PortRemoveNotFoundVm2".into(),
+                preset: velovm_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let vm2_id = vm2.config.id;
+        let vm2_nic_id = vm2.config.nics[0].id;
+
+        let pf1 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 18123,
+            guest_port: 8123,
+        };
+        let pf2 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 18124,
+            guest_port: 8124,
+        };
+
+        sup.add_port_forward(&vm1_id.to_string(), vm1_nic_id, pf1.clone())
+            .await
+            .unwrap();
+        sup.add_port_forward(&vm1_id.to_string(), vm1_nic_id, pf2.clone())
+            .await
+            .unwrap();
+
+        let sock1_path = dir.path().join("port-remove-not-found-1.sock");
+        let listener1 = UnixListener::bind(&sock1_path).unwrap();
+        let (tx_req, rx_req) = std::sync::mpsc::channel::<i32>();
+
+        let server1 = std::thread::spawn(move || {
+            // Serve 3 requests on VM1:
+            // 1) Internal (13) on remove pf1 -> must fail
+            // 2) NotFound (5) on remove pf1 -> must succeed
+            // 3) NotFound (5) on add pf1 -> must still fail
+            // 4) Optional NotFound (5) on remove pf2 when vm_dir is read-only (must NOT send a rollback Update!)
+            for (idx, (code, message)) in [
+                (13, "transient internal error"),
+                (5, "port is not bound"),
+                (5, "nic not found"),
+                (5, "port is not bound"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let Ok((mut stream, _)) = listener1.accept() else {
+                    break;
+                };
+                let (stream_id, _, req_bytes) = read_frame(&mut stream).unwrap();
+                let wire_req = TestWireRequest::decode(req_bytes.as_slice()).unwrap();
+                let req = vmservice::ModifyResourceRequest::decode(wire_req.payload.as_slice()).unwrap();
+                tx_req.send(req.r#type).unwrap();
+                let resp = TestWireResponse {
+                    result: Some(test_wire_response::Result::Status(TtrpcStatus {
+                        code,
+                        message: message.into(),
+                        details: Vec::new(),
+                    })),
+                };
+                let frame = encode_frame(stream_id, 2, &resp.encode_to_vec()).unwrap();
+                stream.write_all(&frame).unwrap();
+                stream.flush().unwrap();
+                if idx == 2 {
+                    // Only wait for a 4th request if the caller tests read-only commit failure.
+                    listener1.set_nonblocking(false).unwrap();
+                }
+            }
+        });
+
+        let sock2_path = dir.path().join("port-remove-not-found-2.sock");
+        let listener2 = UnixListener::bind(&sock2_path).unwrap();
+        let server2 = std::thread::spawn(move || {
+            let (mut stream, _) = listener2.accept().unwrap();
+            let (stream_id, _, _) = read_frame(&mut stream).unwrap();
+            let resp = TestWireResponse {
+                result: Some(test_wire_response::Result::Payload(Vec::new())),
+            };
+            let frame = encode_frame(stream_id, 2, &resp.encode_to_vec()).unwrap();
+            stream.write_all(&frame).unwrap();
+            stream.flush().unwrap();
+        });
+
+        sup.set_vm_running_socket_for_test(vm1_id, sock1_path);
+        sup.set_vm_running_socket_for_test(vm2_id, sock2_path);
+
+        // 1. Non-NotFound error still fails and keeps the forward.
+        let err = sup
+            .remove_port_forward(&vm1_id.to_string(), vm1_nic_id, pf1.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("transient internal error"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(rx_req.recv().unwrap(), vmservice::ModifyType::Remove as i32);
+
+        // 2. NotFound on remove succeeds and removes pf1 from config/vm.toml.
+        let updated = sup
+            .remove_port_forward(&vm1_id.to_string(), vm1_nic_id, pf1.clone())
+            .await
+            .unwrap();
+        assert_eq!(rx_req.recv().unwrap(), vmservice::ModifyType::Remove as i32);
+        match &updated.config.nics[0].backend {
+            NicBackendConfig::Consomme { port_forwards, .. } => {
+                assert!(!port_forwards.contains(&pf1));
+                assert!(port_forwards.contains(&pf2));
+            }
+            other => panic!("expected Consomme backend, got {other:?}"),
+        }
+
+        // Now VM2 can bind host_port 18123 because pf1 was removed from VM1.
+        sup.add_port_forward(&vm2_id.to_string(), vm2_nic_id, pf1.clone())
+            .await
+            .unwrap();
+
+        // 3. NotFound on add still fails (only remove treats NotFound as already absent).
+        let pf3 = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 18125,
+            guest_port: 8125,
+        };
+        let add_not_found_err = sup
+            .add_port_forward(&vm1_id.to_string(), vm1_nic_id, pf3)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{add_not_found_err:#}").contains("nic not found"),
+            "unexpected add error: {add_not_found_err:#}"
+        );
+        assert_eq!(rx_req.recv().unwrap(), vmservice::ModifyType::Update as i32);
+
+        // 4. If NotFound on remove is followed by a config save failure, do NOT roll back with Update.
+        let vm1_dir = sup.store.vm_dir(vm1_id);
+        let _restore = RestorePerm(vm1_dir.clone());
+        fs::set_permissions(&vm1_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let can_write_vm_dir = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(vm1_dir.join(".probe"))
+            .is_ok();
+        if !can_write_vm_dir {
+            let save_err = sup
+                .remove_port_forward(&vm1_id.to_string(), vm1_nic_id, pf2.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{save_err:#}").contains("Permission denied")
+                    || format!("{save_err:#}").contains("saving"),
+                "unexpected error: {save_err:#}"
+            );
+            assert_eq!(rx_req.recv().unwrap(), vmservice::ModifyType::Remove as i32);
+            // No rollback Update RPC should be sent.
+            assert!(
+                rx_req
+                    .recv_timeout(Duration::from_millis(150))
+                    .is_err(),
+                "must not send rollback Update RPC when port forward was already absent"
+            );
+        } else {
+            // Running as root: still consume the 4th server slot cleanly.
+            let _ = sup
+                .remove_port_forward(&vm1_id.to_string(), vm1_nic_id, pf2)
+                .await
+                .unwrap();
+            let _ = rx_req.recv().unwrap();
+        }
+
+        server1.join().unwrap();
+        server2.join().unwrap();
     }
 
     #[test]
