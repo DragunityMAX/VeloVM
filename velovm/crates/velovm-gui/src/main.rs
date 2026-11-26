@@ -11,6 +11,7 @@ use dialogs::ConfirmActionDialog;
 use dialogs::DeleteVmDialog;
 use dialogs::DiskManagerDialog;
 use dialogs::FilePickerModal;
+use dialogs::FilePickerState;
 use dialogs::FilePickerTarget;
 use dialogs::HostSettingsDialog;
 use dialogs::NewVmWizard;
@@ -19,7 +20,7 @@ use dialogs::VmSettingsDialog;
 use dialogs::render_confirm_action_dialog;
 use dialogs::render_delete_vm_dialog;
 use dialogs::render_disk_manager_dialog;
-use dialogs::render_file_picker;
+use dialogs::render_file_picker_state;
 use dialogs::render_host_settings_dialog;
 use dialogs::render_new_vm_wizard;
 use dialogs::render_vm_settings_dialog;
@@ -121,19 +122,23 @@ struct VeloVmApp {
     host_settings_dlg: Option<HostSettingsDialog>,
     delete_vm_dlg: Option<DeleteVmDialog>,
     confirm_action_dlg: Option<ConfirmActionDialog>,
-    file_picker: Option<FilePickerModal>,
+    file_picker: FilePickerState,
 }
 
 impl VeloVmApp {
     fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf, daemon_url: Option<String>) -> Self {
-        Self::new_headless(&cc.egui_ctx, data_dir, daemon_url)
+        let mut app = Self::new_headless(&cc.egui_ctx, data_dir, daemon_url);
+        app.file_picker.force_modal = false;
+        app
     }
 
     fn new_headless(ctx: &egui::Context, data_dir: PathBuf, daemon_url: Option<String>) -> Self {
         ctx.set_visuals(egui::Visuals::dark());
         let backend = BackendHandle::spawn(Some(data_dir.clone()), daemon_url, ctx.clone());
         backend.send(GuiRequest::ConnectOrStartDaemon);
-        Self::new_with_backend(data_dir, backend)
+        let mut app = Self::new_with_backend(data_dir, backend);
+        app.file_picker.force_modal = true;
+        app
     }
 
     #[cfg(test)]
@@ -180,7 +185,7 @@ impl VeloVmApp {
             host_settings_dlg: None,
             delete_vm_dlg: None,
             confirm_action_dlg: None,
-            file_picker: None,
+            file_picker: FilePickerState::default(),
         }
     }
 
@@ -1105,7 +1110,7 @@ impl VeloVmApp {
         );
         render_delete_vm_dialog(ctx, &mut self.delete_vm_dlg, &self.backend);
         render_confirm_action_dialog(ctx, &mut self.confirm_action_dlg, &self.backend);
-        if let Some((target, path)) = render_file_picker(ctx, &mut self.file_picker) {
+        if let Some((target, path)) = render_file_picker_state(ctx, &mut self.file_picker) {
             self.apply_picked_file(target, path);
         }
     }
@@ -1243,12 +1248,13 @@ impl VeloVmApp {
             ui.label("Attach Disk:");
             ui.add(egui::TextEdit::singleline(&mut self.attach_disk_input).desired_width(300.0));
             if ui.button("Browse…").clicked() {
-                self.file_picker = Some(FilePickerModal::open(
+                self.file_picker.open(
+                    ui.ctx(),
                     FilePickerTarget::AttachDiskPath,
                     &self.attach_disk_input,
                     false,
                     vec!["vhdx", "vhd", "img", "raw"],
-                ));
+                );
             }
             let attach_busy = self.attach_disk_in_flight.contains_key(&id);
             let attach_label = if attach_busy { "Attaching…" } else { "Attach" };
@@ -1277,12 +1283,13 @@ impl VeloVmApp {
             ui.label("Mount ISO:  ");
             ui.add(egui::TextEdit::singleline(&mut self.mount_iso_input).desired_width(300.0));
             if ui.button("Browse…").clicked() {
-                self.file_picker = Some(FilePickerModal::open(
+                self.file_picker.open(
+                    ui.ctx(),
                     FilePickerTarget::MountIsoPath,
                     &self.mount_iso_input,
                     false,
                     vec!["iso"],
-                ));
+                );
             }
             let mount_busy = self.mount_iso_in_flight.contains_key(&id);
             let mount_label = if mount_busy {
@@ -1640,9 +1647,9 @@ fn run_self_test() -> anyhow::Result<()> {
         }
     }
     anyhow::ensure!(picker.current_dir == sub_dir);
-    app.file_picker = Some(picker);
+    app.file_picker.set_modal(picker);
     let _ = step_headless_ui(&ctx, &mut app, 2);
-    app.file_picker = None;
+    app.file_picker.clear();
 
     // Exercise VmSettingsDialog and UpdateVm.
     let mut settings_dlg = VmSettingsDialog::from_config(&vm.config, vm.runtime.status);
