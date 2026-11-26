@@ -94,14 +94,29 @@ if [[ -z "$DISK_PATH" ]]; then
     exit 1
 fi
 
+validate_vmm_arg_path() {
+    local label="$1"
+    local path="$2"
+    case "$path" in
+        *","*|*";"*|*"["*|*"]"*)
+            echo "Error: $label path cannot contain ',', ';', '[', or ']' (unsupported by openvmm option parsing): $path" >&2
+            exit 1
+            ;;
+    esac
+}
+
 if [[ ! -f "$DISK_PATH" ]]; then
     echo "Error: disk image not found: $DISK_PATH" >&2
     exit 1
 fi
+validate_vmm_arg_path "disk image" "$DISK_PATH"
 
-if [[ -n "$ISO_PATH" && ! -f "$ISO_PATH" ]]; then
-    echo "Error: ISO image not found: $ISO_PATH" >&2
-    exit 1
+if [[ -n "$ISO_PATH" ]]; then
+    if [[ ! -f "$ISO_PATH" ]]; then
+        echo "Error: ISO image not found: $ISO_PATH" >&2
+        exit 1
+    fi
+    validate_vmm_arg_path "ISO image" "$ISO_PATH"
 fi
 
 resolve_first() {
@@ -145,6 +160,7 @@ UEFI_FD="$(resolve_first \
     echo "Error: UEFI firmware MSVM.fd not found at $SCRIPT_DIR/firmware/MSVM.fd." >&2
     exit 1
 }
+validate_vmm_arg_path "UEFI firmware" "$UEFI_FD"
 
 VMM_PID=""
 VMM_READ_FD_OPEN=0

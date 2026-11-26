@@ -61,6 +61,16 @@ function Resolve-FirstExisting {
     return ""
 }
 
+function Assert-VmmOptionSafePath {
+    param(
+        [string]$Label,
+        [string]$Path
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Path) -and $Path -match '[,;\[\]]') {
+        throw "$Label path cannot contain ',', ';', '[', or ']' (unsupported by openvmm option parsing): $Path"
+    }
+}
+
 function Format-ProcessArgument {
     param([string]$Arg)
     if ($Arg -match '[\s"]') {
@@ -188,6 +198,7 @@ $resolvedUefi = Resolve-FirstExisting -ExplicitPath $UefiFirmware -Candidates @(
 
 $uefiArgs = @()
 if (-not [string]::IsNullOrWhiteSpace($resolvedUefi)) {
+    Assert-VmmOptionSafePath -Label "UEFI firmware" -Path $resolvedUefi
     $uefiArgs = @("--uefi", "firmware=$resolvedUefi")
 } elseif (-not [string]::IsNullOrWhiteSpace($env:X86_64_OPENVMM_UEFI_FIRMWARE) -and (Test-Path -LiteralPath $env:X86_64_OPENVMM_UEFI_FIRMWARE)) {
     $uefiArgs = @("--uefi")
@@ -198,8 +209,12 @@ if (-not [string]::IsNullOrWhiteSpace($resolvedUefi)) {
 if (-not (Test-Path -LiteralPath $DiskPath) -and [string]::IsNullOrWhiteSpace($CreateDiskSize)) {
     throw "Disk image not found: $DiskPath (pass -CreateDiskSize e.g. '64G' to create a new raw disk image)."
 }
-if (-not [string]::IsNullOrWhiteSpace($IsoPath) -and -not (Test-Path -LiteralPath $IsoPath)) {
-    throw "ISO image not found: $IsoPath"
+Assert-VmmOptionSafePath -Label "Disk image" -Path $DiskPath
+if (-not [string]::IsNullOrWhiteSpace($IsoPath)) {
+    if (-not (Test-Path -LiteralPath $IsoPath)) {
+        throw "ISO image not found: $IsoPath"
+    }
+    Assert-VmmOptionSafePath -Label "ISO image" -Path $IsoPath
 }
 
 $diskParent = Split-Path -Parent $DiskPath
@@ -255,6 +270,7 @@ try {
 
     if (-not [string]::IsNullOrWhiteSpace($IsoPath)) {
         $resolvedIso = (Resolve-Path -LiteralPath $IsoPath).Path
+        Assert-VmmOptionSafePath -Label "ISO image" -Path $resolvedIso
         $vmmArgs += @("--disk", "file:${resolvedIso},dvd,on=scsi0")
     }
 
