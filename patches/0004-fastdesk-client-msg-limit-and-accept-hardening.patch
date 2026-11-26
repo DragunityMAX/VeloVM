@@ -1,0 +1,144 @@
+diff --git a/openvmm/workers/fastdesk_proto/src/lib.rs b/openvmm/workers/fastdesk_proto/src/lib.rs
+index d8ded07..c65c3ca 100644
+--- a/openvmm/workers/fastdesk_proto/src/lib.rs
++++ b/openvmm/workers/fastdesk_proto/src/lib.rs
+@@ -21,6 +21,7 @@
+ pub use wire::EncodedRect;
+ pub use wire::ProtoError;
+ pub use wire::ServerMsg;
++pub use wire::decode_client_frame_header;
+ pub use wire::decode_client_msg;
+ pub use wire::decode_frame_header;
+ pub use wire::decode_server_msg;
+@@ -73,6 +74,9 @@
+ /// Maximum wire frame payload size (64 MiB).
+ pub const MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+ 
++/// Maximum wire payload size for client-to-server control/input messages (1 KiB).
++pub const MAX_CLIENT_MSG_PAYLOAD_BYTES: usize = 1024;
++
+ /// Maximum cursor width or height in pixels (SynthVid limit).
+ pub const MAX_CURSOR_DIM: u16 = 96;
+ 
+@@ -270,4 +274,56 @@ fn dirty_tile_tracker_merge_and_diff() {
+             }]
+         );
+     }
++
++    #[test]
++    fn decode_client_frame_header_rejects_oversized_payload() {
++        let mut hdr = [101u8, 0, 0, 0, 0];
++        hdr[1..5].copy_from_slice(&(MAX_CLIENT_MSG_PAYLOAD_BYTES as u32).to_le_bytes());
++        assert_eq!(
++            decode_client_frame_header(&hdr).unwrap(),
++            (101, MAX_CLIENT_MSG_PAYLOAD_BYTES)
++        );
++
++        hdr[1..5].copy_from_slice(&((MAX_CLIENT_MSG_PAYLOAD_BYTES as u32) + 1).to_le_bytes());
++        assert!(matches!(
++            decode_client_frame_header(&hdr),
++            Err(ProtoError::FrameTooLarge(n)) if n == MAX_CLIENT_MSG_PAYLOAD_BYTES + 1
++        ));
++
++        hdr[1..5].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
++        assert!(matches!(
++            decode_client_frame_header(&hdr),
++            Err(ProtoError::FrameTooLarge(n)) if n == 64 * 1024 * 1024
++        ));
++    }
++
++    #[test]
++    fn encode_server_msg_rolls_back_partial_frame_on_frame_too_large() {
++        let mut out = Vec::new();
++        let valid = ServerMsg::Pong {
++            client_time_us: 42,
++            host_time_us: 99,
++        };
++        encode_server_msg(&valid, &mut out).unwrap();
++        let valid_len = out.len();
++
++        let oversized = ServerMsg::CursorShape {
++            width: 1,
++            height: 1,
++            hotspot_x: 0,
++            hotspot_y: 0,
++            lz4_bgra: vec![0u8; MAX_FRAME_PAYLOAD_BYTES],
++        };
++        let err = encode_server_msg(&oversized, &mut out).unwrap_err();
++        assert!(matches!(err, ProtoError::FrameTooLarge(n) if n > MAX_FRAME_PAYLOAD_BYTES));
++        assert_eq!(
++            out.len(),
++            valid_len,
++            "failed encode must roll back partial frame bytes"
++        );
++
++        let mut cursor = std::io::Cursor::new(&out);
++        assert_eq!(read_server_msg(&mut cursor).unwrap(), valid);
++        assert_eq!(cursor.position() as usize, valid_len);
++    }
+ }
+diff --git a/openvmm/workers/fastdesk_proto/src/wire.rs b/openvmm/workers/fastdesk_proto/src/wire.rs
+index c8dd235..19bea9b 100644
+--- a/openvmm/workers/fastdesk_proto/src/wire.rs
++++ b/openvmm/workers/fastdesk_proto/src/wire.rs
+@@ -4,6 +4,7 @@
+ //! Binary length-prefixed wire messages between `fastdesk_worker` and `fastdesk-viewer`.
+ 
+ use crate::MAGIC;
++use crate::MAX_CLIENT_MSG_PAYLOAD_BYTES;
+ use crate::MAX_CURSOR_DIM;
+ use crate::MAX_FRAME_PAYLOAD_BYTES;
+ use crate::MAX_RECTS_PER_BATCH;
+@@ -211,6 +212,17 @@ pub enum ClientMsg {
+     Ok((msg_type, payload_len))
+ }
+ 
++/// Decodes a 5-byte client-to-server frame header `[msg_type: u8][payload_len: u32 LE]`,
++/// enforcing [`MAX_CLIENT_MSG_PAYLOAD_BYTES`].
++pub fn decode_client_frame_header(header: &[u8; 5]) -> Result<(u8, usize), ProtoError> {
++    let msg_type = header[0];
++    let payload_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
++    if payload_len > MAX_CLIENT_MSG_PAYLOAD_BYTES {
++        return Err(ProtoError::FrameTooLarge(payload_len));
++    }
++    Ok((msg_type, payload_len))
++}
++
+ fn write_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+     match s {
+         Some(val) => {
+@@ -290,9 +302,10 @@ fn begin_frame(out: &mut Vec<u8>, msg_type: u8) -> usize {
+     len_pos
+ }
+ 
+-fn finish_frame(out: &mut [u8], len_pos: usize) -> Result<(), ProtoError> {
++fn finish_frame(out: &mut Vec<u8>, len_pos: usize) -> Result<(), ProtoError> {
+     let payload_len = out.len() - (len_pos + 4);
+     if payload_len > MAX_FRAME_PAYLOAD_BYTES {
++        out.truncate(len_pos - 1);
+         return Err(ProtoError::FrameTooLarge(payload_len));
+     }
+     out[len_pos..len_pos + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+@@ -592,7 +605,7 @@ pub fn write_client_msg(writer: &mut impl Write, msg: &ClientMsg) -> Result<(),
+ pub fn read_client_msg(reader: &mut impl Read) -> Result<ClientMsg, ProtoError> {
+     let mut hdr = [0u8; 5];
+     reader.read_exact(&mut hdr)?;
+-    let (msg_type, payload_len) = decode_frame_header(&hdr)?;
++    let (msg_type, payload_len) = decode_client_frame_header(&hdr)?;
+     let mut payload = vec![0u8; payload_len];
+     reader.read_exact(&mut payload)?;
+     decode_client_msg(msg_type, &payload)
+diff --git a/openvmm/workers/fastdesk_worker/Cargo.toml b/openvmm/workers/fastdesk_worker/Cargo.toml
+index 11c59ce..083b389 100644
+--- a/openvmm/workers/fastdesk_worker/Cargo.toml
++++ b/openvmm/workers/fastdesk_worker/Cargo.toml
+@@ -29,6 +29,9 @@ socket2 = { workspace = true, features = ["all"] }
+ tracing.workspace = true
+ unicycle.workspace = true
+ 
++[target.'cfg(unix)'.dependencies]
++libc.workspace = true
++
+ [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+ vmsocket.workspace = true
+ 
