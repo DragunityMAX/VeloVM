@@ -915,11 +915,12 @@ fn open_and_read_token_windows_with_sid(
     }))
 }
 
-pub fn save_pending_disks_journal(
+fn save_json_journal<T: serde::Serialize>(
     path: &Path,
-    disks: &[crate::models::DiskAttachment],
+    items: &[T],
+    label: &str,
 ) -> anyhow::Result<()> {
-    if disks.is_empty() {
+    if items.is_empty() {
         match fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -932,21 +933,47 @@ pub fn save_pending_disks_journal(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating runtime directory {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec(disks).context("serializing pending disk journal")?;
+    let bytes = serde_json::to_vec(items).with_context(|| format!("serializing {label}"))?;
     atomic_write(path, &bytes, false)
 }
 
-pub fn load_pending_disks_journal(path: &Path) -> anyhow::Result<Vec<crate::models::DiskAttachment>> {
+fn load_json_journal<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<Vec<T>> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("reading pending disk journal {}", path.display()));
+            return Err(err).with_context(|| format!("reading {label} {}", path.display()));
         }
     };
     serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing pending disk journal {}", path.display()))
+        .with_context(|| format!("parsing {label} {}", path.display()))
+}
+
+pub fn save_pending_disks_journal(
+    path: &Path,
+    disks: &[crate::models::DiskAttachment],
+) -> anyhow::Result<()> {
+    save_json_journal(path, disks, "pending disk journal")
+}
+
+pub fn load_pending_disks_journal(path: &Path) -> anyhow::Result<Vec<crate::models::DiskAttachment>> {
+    load_json_journal(path, "pending disk journal")
+}
+
+pub fn save_pending_port_forwards_journal(
+    path: &Path,
+    ports: &[crate::models::OrphanedPortForward],
+) -> anyhow::Result<()> {
+    save_json_journal(path, ports, "pending port-forward journal")
+}
+
+pub fn load_pending_port_forwards_journal(
+    path: &Path,
+) -> anyhow::Result<Vec<crate::models::OrphanedPortForward>> {
+    load_json_journal(path, "pending port-forward journal")
 }
 
 pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
