@@ -6971,22 +6971,33 @@ fn delete_windows_switch(switch_id: &str) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn discover_windows_net_adapters() -> anyhow::Result<Vec<HostNetAdapterInfo>> {
-    const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
     let Some(ps_path) = windows_powershell_path() else {
         return Ok(Vec::new());
     };
-    let stdout_bytes = run_powershell_with_timeout(
+    let stdout_bytes = match run_powershell_with_timeout(
         &ps_path,
         "Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Select-Object Name,InterfaceDescription,MacAddress,Status,LinkSpeed | ConvertTo-Json -Compress",
         &[],
         QUERY_TIMEOUT,
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(error = %err, "failed to query Windows physical network adapters; returning empty list");
+            return Ok(Vec::new());
+        }
+    };
     let trimmed = String::from_utf8_lossy(&stdout_bytes);
     if trimmed.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let val: serde_json::Value = serde_json::from_slice(&stdout_bytes)
-        .context("parsing Get-NetAdapter JSON output")?;
+    let val: serde_json::Value = match serde_json::from_slice(&stdout_bytes) {
+        Ok(val) => val,
+        Err(err) => {
+            warn!(error = %err, "failed to parse Get-NetAdapter JSON output; returning empty list");
+            return Ok(Vec::new());
+        }
+    };
     let arr = match val {
         serde_json::Value::Array(items) => items,
         obj @ serde_json::Value::Object(_) => vec![obj],

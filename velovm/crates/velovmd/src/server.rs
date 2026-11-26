@@ -4001,53 +4001,56 @@ mod tests {
         assert_eq!(del_missing.status(), reqwest::StatusCode::NOT_FOUND);
 
         // 4. DELETE switch attached to a VM -> 409 Conflict
-        #[cfg(target_os = "linux")]
-        let (target_switch, nic_backend) = (
-            "br-conflict",
-            velovm_core::models::NicBackendConfig::Bridge {
-                name: "br-conflict".to_string(),
-            },
-        );
-        #[cfg(not(target_os = "linux"))]
-        let (target_switch, nic_backend) = (
-            "11111111-2222-3333-4444-555555555555",
-            velovm_core::models::NicBackendConfig::VmSwitch {
-                switch_id: "11111111-2222-3333-4444-555555555555".to_string(),
-                switch_name: Some("LabSwitch".to_string()),
-            },
-        );
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            #[cfg(target_os = "linux")]
+            let (target_switch, nic_backend) = (
+                "br-conflict",
+                velovm_core::models::NicBackendConfig::Bridge {
+                    name: "br-conflict".to_string(),
+                },
+            );
+            #[cfg(windows)]
+            let (target_switch, nic_backend) = (
+                "11111111-2222-3333-4444-555555555555",
+                velovm_core::models::NicBackendConfig::VmSwitch {
+                    switch_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                    switch_name: Some("LabSwitch".to_string()),
+                },
+            );
 
-        let create_vm_resp = client
-            .post(format!("{}/api/v1/vms", daemon.base_url))
-            .bearer_auth(&daemon.token)
-            .json(&CreateVmPayload {
-                name: "SwitchConflictVm".to_string(),
-                preset: VmPreset::Custom,
-                vcpus: Some(2),
-                memory_mb: Some(512),
-                nics: Some(vec![velovm_core::models::NicAttachment {
-                    id: Uuid::new_v4(),
-                    name: "Test NIC".to_string(),
-                    mac_address: "00-15-5D-11-22-33".to_string(),
-                    backend: nic_backend,
-                }]),
-                ..Default::default()
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(create_vm_resp.status(), reqwest::StatusCode::CREATED);
+            let create_vm_resp = client
+                .post(format!("{}/api/v1/vms", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .json(&CreateVmPayload {
+                    name: "SwitchConflictVm".to_string(),
+                    preset: VmPreset::Custom,
+                    vcpus: Some(2),
+                    memory_mb: Some(512),
+                    nics: Some(vec![velovm_core::models::NicAttachment {
+                        id: Uuid::new_v4(),
+                        name: "Test NIC".to_string(),
+                        mac_address: "00-15-5D-11-22-33".to_string(),
+                        backend: nic_backend,
+                    }]),
+                    ..Default::default()
+                })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(create_vm_resp.status(), reqwest::StatusCode::CREATED);
 
-        let conflict_resp = client
-            .delete(format!(
-                "{}/api/v1/host/switches/{target_switch}",
-                daemon.base_url
-            ))
-            .bearer_auth(&daemon.token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(conflict_resp.status(), reqwest::StatusCode::CONFLICT);
+            let conflict_resp = client
+                .delete(format!(
+                    "{}/api/v1/host/switches/{target_switch}",
+                    daemon.base_url
+                ))
+                .bearer_auth(&daemon.token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(conflict_resp.status(), reqwest::StatusCode::CONFLICT);
+        }
 
         daemon.shutdown().await;
     }
