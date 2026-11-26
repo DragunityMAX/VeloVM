@@ -25,6 +25,9 @@ virt_whp = ["openvmm_core/virt_whp", "dep:virt_whp"]
 # Enable building with macOS hypervisor framework support.
 virt_hvf = ["dep:virt_hvf"]
 
+# Enable userspace L2 virtual switch socket/pipe network backend.
+net_l2 = ["dep:net_l2"]
+
 [dependencies]
 hypervisor_resources.workspace = true
 mesh_worker.workspace = true
@@ -72,6 +75,7 @@ scsidisk.workspace = true
 # Network backends
 net_backend.workspace = true
 net_consomme = { workspace = true, optional = true }
+net_l2 = { workspace = true, optional = true }
 
 # Virtio devices
 virtio.workspace = true

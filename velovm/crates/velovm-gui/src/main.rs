@@ -1404,6 +1404,9 @@ impl VeloVmApp {
                     NicBackendConfig::Bridge { name } => {
                         ui.label(format!("Backend: Linux Bridge ({name})"));
                     }
+                    NicBackendConfig::L2Switch { switch_id } => {
+                        ui.label(format!("Backend: Userspace L2 Switch ({switch_id})"));
+                    }
                 }
             });
         }

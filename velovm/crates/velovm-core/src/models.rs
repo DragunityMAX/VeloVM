@@ -861,6 +861,9 @@ pub enum NicBackendConfig {
     Bridge {
         name: String,
     },
+    L2Switch {
+        switch_id: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -925,6 +928,9 @@ impl NicAttachment {
             }
             NicBackendConfig::Tap { name } | NicBackendConfig::Bridge { name } => {
                 *name = name.trim().to_string();
+            }
+            NicBackendConfig::L2Switch { switch_id } => {
+                *switch_id = switch_id.trim().to_string();
             }
         }
     }
@@ -1294,6 +1300,9 @@ impl VmConfig {
                             validate_linux_iface_name(name, "bridge")?;
                         }
                     }
+                    NicBackendConfig::L2Switch { switch_id } => {
+                        validate_l2_switch_id(switch_id)?;
+                    }
                 }
             }
         }
@@ -1321,6 +1330,26 @@ pub fn validate_linux_iface_name(name: &str, kind: &str) -> anyhow::Result<()> {
         || name.chars().any(char::is_whitespace)
     {
         bail!("invalid {kind} interface name '{name}'");
+    }
+    Ok(())
+}
+
+/// Validates a userspace L2 virtual switch identifier (safe for socket/pipe paths on all platforms).
+pub fn validate_l2_switch_id(switch_id: &str) -> anyhow::Result<()> {
+    if switch_id != switch_id.trim() {
+        bail!("L2 switch id '{switch_id}' cannot have leading or trailing whitespace");
+    }
+    if switch_id.is_empty()
+        || switch_id == "."
+        || switch_id == ".."
+        || switch_id.len() > 64
+        || !switch_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!(
+            "invalid L2 switch id '{switch_id}' (allowed: 1-64 ASCII alphanumeric, '-', or '_' characters)"
+        );
     }
     Ok(())
 }
@@ -2816,6 +2845,35 @@ mod tests {
                 err.to_string()
                     .contains("Linux bridge NIC backend is only supported on Linux"),
                 "unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn nic_backend_l2_switch_serde_and_validation() {
+        let mut cfg = VmConfig::from_preset(
+            "L2Test",
+            VmPreset::Custom,
+            &std::env::temp_dir().join("vm-l2"),
+        );
+        cfg.nics[0].backend = NicBackendConfig::L2Switch {
+            switch_id: " lab-net_1 ".into(),
+        };
+        let encoded = serde_json::to_string(&cfg.nics[0].backend).unwrap();
+        let decoded: NicBackendConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, cfg.nics[0].backend);
+
+        assert!(cfg.validate().is_err());
+        cfg.normalize();
+        cfg.validate().unwrap();
+
+        for bad_id in ["", " ", ".", "..", "bad/id", "bad\\id", "has space"] {
+            cfg.nics[0].backend = NicBackendConfig::L2Switch {
+                switch_id: bad_id.into(),
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "expected L2 switch id '{bad_id}' to fail validation"
             );
         }
     }

@@ -213,6 +213,7 @@ pub struct Supervisor {
     initial_listen_addr: String,
     host_config: RwLock<HostConfig>,
     host_config_lock: tokio::sync::Mutex<()>,
+    l2_switches: crate::l2_switch::L2SwitchManager,
     active_listener: std::sync::Mutex<Option<ActiveListener>>,
     draining_listeners: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     vms: RwLock<HashMap<Uuid, ManagedVm>>,
@@ -266,6 +267,8 @@ impl Supervisor {
             );
         }
 
+        let l2_switches = crate::l2_switch::L2SwitchManager::new(data_dir)?;
+
         let (events_tx, _) = broadcast::channel(256);
         let (shutdown_watch, _) = watch::channel(false);
         let supervisor = Arc::new(Self {
@@ -276,6 +279,7 @@ impl Supervisor {
             initial_listen_addr,
             host_config: RwLock::new(host_config),
             host_config_lock: tokio::sync::Mutex::new(()),
+            l2_switches,
             active_listener: std::sync::Mutex::new(None),
             draining_listeners: std::sync::Mutex::new(Vec::new()),
             vms: RwLock::new(vm_map),
@@ -966,6 +970,10 @@ impl Supervisor {
         Ok(new_cfg)
     }
 
+    pub fn l2_switches(&self) -> &crate::l2_switch::L2SwitchManager {
+        &self.l2_switches
+    }
+
     pub fn list_switches(&self) -> Vec<VirtualSwitchInfo> {
         let mut out = vec![VirtualSwitchInfo {
             id: "consomme".to_string(),
@@ -985,7 +993,41 @@ impl Supervisor {
         {
             out.extend(discover_linux_tap_interfaces());
         }
+        out.extend(self.l2_switches.list_switches());
         out
+    }
+
+    pub fn create_l2_switch(
+        &self,
+        name: &str,
+        cidr: Option<String>,
+    ) -> anyhow::Result<VirtualSwitchInfo> {
+        let runtime_dir = self.host_config().runtime_dir;
+        self.l2_switches
+            .create_switch(name, cidr, &runtime_dir)
+            .map_err(|e| err_bad_request(format!("{e:#}")))
+    }
+
+    pub fn delete_l2_switch(&self, id_or_name: &str) -> anyhow::Result<bool> {
+        let target = id_or_name.trim();
+        {
+            let guard = self.vms.read().unwrap();
+            for (vm_id, vm) in &*guard {
+                if vm.config.nics.iter().any(|n| {
+                    matches!(
+                        &n.backend,
+                        NicBackendConfig::L2Switch { switch_id }
+                            if switch_id == target || switch_id.eq_ignore_ascii_case(target)
+                    )
+                }) {
+                    return Err(err_conflict(format!(
+                        "cannot delete L2 switch '{target}': attached to VM '{}' ({vm_id})",
+                        vm.config.name
+                    )));
+                }
+            }
+        }
+        self.l2_switches.delete_switch(target)
     }
 
     fn resolve_vm_id(&self, id_or_name: &str) -> anyhow::Result<Uuid> {
@@ -2305,6 +2347,13 @@ impl Supervisor {
 
         let log_path = self.store.vm_log_path(id);
         let stderr_log_path = log_path.with_extension("stderr.log");
+        for nic in &cfg.nics {
+            if let NicBackendConfig::L2Switch { switch_id } = &nic.backend {
+                self.l2_switches
+                    .ensure_switch_running(runtime_dir, switch_id)
+                    .map_err(|e| err_bad_request(format!("{e:#}")))?;
+            }
+        }
         let (shm_path, stderr_file) = {
             let mut guard = self.vms.write().unwrap();
             let vm = guard.get_mut(&id).context("VM vanished")?;
@@ -2428,7 +2477,12 @@ impl Supervisor {
             }
         }
 
-        let create_req = build_create_vm_request(&cfg, &uefi_path, shm_path.as_deref())?;
+        let create_req = build_create_vm_request_with_runtime(
+            &cfg,
+            &uefi_path,
+            shm_path.as_deref(),
+            Some(runtime_dir),
+        )?;
         if let Err(err) = run_cancellable_rpc(cancel_rx, client.create_vm(create_req)).await {
             let msg = format!("{err:#}");
             if cfg.tpm_enabled
@@ -6092,10 +6146,20 @@ fn fastdesk_low_mmio_gap_mb(fastdesk: &velovm_core::models::FastDeskSettings) ->
     (u64::from(fastdesk.vram_mb) + FASTDESK_LOW_MMIO_HEADROOM_MB).max(128)
 }
 
+#[cfg(test)]
 pub(crate) fn build_create_vm_request(
     cfg: &VmConfig,
     uefi_path: &Path,
     shm_path: Option<&Path>,
+) -> anyhow::Result<vmservice::CreateVmRequest> {
+    build_create_vm_request_with_runtime(cfg, uefi_path, shm_path, None)
+}
+
+pub(crate) fn build_create_vm_request_with_runtime(
+    cfg: &VmConfig,
+    uefi_path: &Path,
+    shm_path: Option<&Path>,
+    runtime_dir: Option<&Path>,
 ) -> anyhow::Result<vmservice::CreateVmRequest> {
     let sb_template = match cfg.secure_boot_template {
         SecureBootTemplateConfig::None => {
@@ -6125,7 +6189,11 @@ pub(crate) fn build_create_vm_request(
     });
 
     let scsi_disks = cfg.disks.iter().map(to_proto_scsi_disk).collect();
-    let nic_config = cfg.nics.iter().map(to_proto_nic_config).collect();
+    let nic_config = cfg
+        .nics
+        .iter()
+        .map(|nic| to_proto_nic_config(nic, runtime_dir))
+        .collect();
 
     let fastdesk_config = if cfg.fastdesk.enabled {
         Some(vmservice::FastDeskConfig {
@@ -6209,7 +6277,7 @@ fn to_proto_port_config(pf: &PortForward) -> vmservice::PortConfig {
     }
 }
 
-fn to_proto_nic_config(nic: &NicAttachment) -> vmservice::NicConfig {
+fn to_proto_nic_config(nic: &NicAttachment, runtime_dir: Option<&Path>) -> vmservice::NicConfig {
     let backend = match &nic.backend {
         NicBackendConfig::Consomme {
             cidr,
@@ -6242,6 +6310,12 @@ fn to_proto_nic_config(nic: &NicAttachment) -> vmservice::NicConfig {
                 source: Some(vmservice::tap_backend::Source::Name(
                     name.trim().to_string(),
                 )),
+            })
+        }
+        NicBackendConfig::L2Switch { switch_id } => {
+            let rt = runtime_dir.unwrap_or_else(|| Path::new(""));
+            vmservice::nic_config::Backend::L2Socket(vmservice::L2SocketBackend {
+                path: crate::l2_switch::l2_switch_endpoint(rt, switch_id.trim()),
             })
         }
     };
@@ -11061,5 +11135,88 @@ mod tests {
         );
         srv.join().unwrap();
         assert_eq!(recorded.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn l2_switch_lifecycle_conflict_check_and_proto_nic_translation() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), None).unwrap();
+
+        let sw = sup
+            .create_l2_switch("l2-lab", Some("10.50.0.0/24".to_string()))
+            .unwrap();
+        assert_eq!(sw.id, "l2-lab");
+        assert_eq!(sw.kind, "l2");
+        assert!(sw.managed);
+        assert!(sup.list_switches().iter().any(|s| s.id == "l2-lab"));
+
+        let mut cfg = VmConfig::from_preset(
+            "L2Vm",
+            velovm_core::models::VmPreset::Custom,
+            &dir.path().join("vms/l2vm"),
+        );
+        cfg.nics = vec![NicAttachment {
+            id: Uuid::new_v4(),
+            name: "L2 NIC".to_string(),
+            mac_address: "00-15-5D-22-33-44".to_string(),
+            backend: NicBackendConfig::L2Switch {
+                switch_id: "l2-lab".to_string(),
+            },
+        }];
+
+        let rt_dir = sup.host_config().runtime_dir;
+        let req = build_create_vm_request_with_runtime(
+            &cfg,
+            &dir.path().join("MSVM.fd"),
+            None,
+            Some(&rt_dir),
+        )
+        .unwrap();
+        let nics = req.config.unwrap().devices_config.unwrap().nic_config;
+        assert_eq!(nics.len(), 1);
+        match nics[0].backend.as_ref().unwrap() {
+            vmservice::nic_config::Backend::L2Socket(l2) => {
+                assert_eq!(
+                    l2.path,
+                    crate::l2_switch::l2_switch_endpoint(&rt_dir, "l2-lab")
+                );
+            }
+            other => panic!("expected L2Socket backend, got {other:?}"),
+        }
+
+        // Attaching VM blocks L2 switch deletion with 409 Conflict.
+        sup.vms.write().unwrap().insert(
+            cfg.id,
+            ManagedVm {
+                config: cfg.clone(),
+                runtime: VmRuntimeState::default(),
+                child: None,
+                adopted_proc: None,
+                monitor_cancel: None,
+                monitor_handle: None,
+                generation: 0,
+                start_cancel: None,
+                stop_wait: None,
+                prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
+                power_op_lock: Arc::new(tokio::sync::Mutex::new(())),
+                hotplug_lock: Arc::new(tokio::sync::Mutex::new(())),
+                pending_disks: Vec::new(),
+                pending_port_forwards: Vec::new(),
+                orphaned_disks: Vec::new(),
+                orphaned_port_forwards: Vec::new(),
+                detach_on_drop: false,
+                deleting: false,
+            },
+        );
+        let conflict = sup.delete_l2_switch("l2-lab").unwrap_err();
+        assert!(matches!(
+            conflict.downcast_ref::<ApiErrorKind>(),
+            Some(ApiErrorKind::Conflict(_))
+        ));
+
+        sup.vms.write().unwrap().remove(&cfg.id);
+        assert!(sup.delete_l2_switch("l2-lab").unwrap());
+        assert!(!sup.list_switches().iter().any(|s| s.id == "l2-lab"));
+        sup.l2_switches().shutdown_all();
     }
 }

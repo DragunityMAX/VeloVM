@@ -462,6 +462,8 @@ message NicBackend {
         TapBackend      tap      = 2;
         // Built-in user-mode (consomme) network backend.
         ConsommeBackend consomme = 3;
+        // Userspace L2 virtual switch socket/pipe backend.
+        L2SocketBackend l2_socket = 4;
     }
 }
 
@@ -1093,11 +1095,17 @@ message NICConfig {
         DioBackend dio = 6;
         TapBackend tap = 7;
         ConsommeBackend consomme = 8;
+        L2SocketBackend l2_socket = 10;
     }
     // Guest-visible NIC frontend. Defaults to the VMBus synthetic NIC.
     // Virtio uses VPCI on Windows/macOS with VMBus enabled, MMIO otherwise.
     // Virtio NICs must be configured at VM creation, not added via ModifyResource.
     NicFrontend frontend = 9;
+}
+
+message L2SocketBackend {
+    // Unix domain socket path (Linux/macOS) or Windows named pipe path (\\.\pipe\velovm-switch-<id>).
+    string path = 1;
 }
 
 message DioBackend {

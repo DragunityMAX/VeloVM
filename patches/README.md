@@ -42,6 +42,18 @@
 - **Behavioral impact:** `video_core::CursorShape` delivered by SynthVid is now consistently top-down for `fastdesk_worker` and `velovm-viewer` instead of vertically inverted.
 - **Why carried:** Fixes inverted hardware cursors when connecting to Windows guests whose SynthVid driver emits bottom-up DIB cursor bitmaps.
 
+### `0006-net-l2-userspace-switch-backend.patch`
+- **Targets:**
+  - `openvmm/Cargo.toml`
+  - `openvmm/openvmm/openvmm/Cargo.toml`
+  - `openvmm/openvmm/openvmm_resources/Cargo.toml`
+  - `openvmm/openvmm/openvmm_resources/src/lib.rs`
+  - `openvmm/vm/devices/net/net_backend_resources/src/lib.rs`
+  - `openvmm/vm/devices/net/net_l2/`
+- **Summary:** Adds the cross-platform `net_l2` network backend crate (`L2SocketEndpoint`, `L2SocketQueue`, `L2SocketResolver`), `L2SocketHandle` resource definition in `net_backend_resources`, and `net_l2` feature/resolver registration in `openvmm_resources` and `openvmm` (paired with `L2SocketBackend` ttrpc support in `0003`).
+- **Behavioral impact:** Enables unprivileged VM-to-VM Ethernet switching over Unix domain sockets (Linux/macOS) and named pipes (Windows) using 2-byte length-prefixed Ethernet frames.
+- **Why carried:** Provides cross-platform virtual switching on macOS and unprivileged Linux/Windows hosts without `CAP_NET_ADMIN` or Hyper-V Administrator privileges.
+
 ## Verifying and Regenerating
 
 From the repository root (against pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610`):
@@ -53,6 +65,7 @@ git apply -R --check patches/0002-disk-writable-image-locking-and-vhdx-open.patc
 git apply -R --check patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
 git apply -R --check patches/0004-fastdesk-client-msg-limit-and-accept-hardening.patch
 git apply -R --check patches/0005-uidevices-flip-synthvid-cursor-bitmap-to-top-down.patch
+git apply -R --check patches/0006-net-l2-userspace-switch-backend.patch
 
 # Regenerate patches from baseline commit 795181d2a88ddbd3243f494f8706eb27c3cb4610:
 git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/support/mesh/mesh_rpc/src/server.rs \
@@ -65,6 +78,8 @@ git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/workers/fastdesk_pr
   > patches/0004-fastdesk-client-msg-limit-and-accept-hardening.patch
 git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/vm/devices/uidevices/src/video/mod.rs \
   > patches/0005-uidevices-flip-synthvid-cursor-bitmap-to-top-down.patch
+git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/Cargo.toml openvmm/openvmm/openvmm/Cargo.toml openvmm/openvmm/openvmm_resources/Cargo.toml openvmm/openvmm/openvmm_resources/src/lib.rs openvmm/vm/devices/net/net_backend_resources/src/lib.rs openvmm/vm/devices/net/net_l2 \
+  > patches/0006-net-l2-userspace-switch-backend.patch
 
 # Apply to a clean checkout of the pre-OpenVMMS baseline (then refresh `openvmm/Cargo.lock`
 # because `0002` adds `libc` and `tracing` dependencies to `disklayer_vhdx` before `cargo build --locked`):

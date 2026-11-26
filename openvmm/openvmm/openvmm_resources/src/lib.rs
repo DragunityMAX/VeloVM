@@ -62,6 +62,8 @@ vm_resource::register_static_resolvers! {
     net_backend::null::NullResolver,
     #[cfg(feature = "net_consomme")]
     net_consomme::resolver::ConsommeResolver,
+    #[cfg(feature = "net_l2")]
+    net_l2::resolver::L2SocketResolver,
     #[cfg(all(feature = "net_tap", target_os = "linux"))]
     net_tap::resolver::TapResolver,
     #[cfg(windows)]

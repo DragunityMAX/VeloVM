@@ -1,3 +1,4 @@
+pub mod l2_switch;
 pub mod server;
 pub mod supervisor;
 
@@ -37,6 +38,9 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
     // Adopt running VMs only after listen validation and TCP bind have succeeded so a failed
     // startup never alters or cleans up running VM runtime files.
     supervisor.adopt_running_vms();
+    supervisor
+        .l2_switches()
+        .start_all_persisted(&supervisor.host_config().runtime_dir);
     let bound_addr = supervisor.serve_on_listener(listener).await?;
     info!(address = %bound_addr, data_dir = %opts.data_dir.display(), "velovmd listening");
 
@@ -58,6 +62,7 @@ pub async fn run_daemon(opts: DaemonOptions) -> anyhow::Result<()> {
         supervisor.detach_all_vms().await;
     }
     supervisor.join_all_listeners().await;
+    supervisor.l2_switches().shutdown_all();
     supervisor.clear_runtime_listen_addr();
 
     Ok(())

@@ -337,7 +337,7 @@ index 4c6546f..5810756 100644
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
-index b63d6b6..f03b482 100644
+index b63d6b6..bd4bc80 100644
 --- a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 +++ b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 @@ -35,6 +35,7 @@ struct FdRegistry {}
@@ -1073,7 +1073,7 @@ index b63d6b6..f03b482 100644
      let endpoint = match nic.backend.context("missing backend")? {
          #[cfg(windows)]
          Backend::LegacyPortId(port_id) => net_backend_resources::dio::WindowsDirectIoHandle {
-@@ -2466,24 +2824,31 @@ fn parse_nic_config(
+@@ -2466,24 +2824,32 @@ fn parse_nic_config(
          }
          .into_resource(),
          #[cfg(windows)]
@@ -1105,6 +1105,7 @@ index b63d6b6..f03b482 100644
          #[cfg(target_os = "linux")]
          Backend::Tap(tap) => build_tap_backend(tap, registry)?,
          Backend::Consomme(consomme) => build_consomme_handle(consomme, recv)?.into_resource(),
++        Backend::L2Socket(l2) => build_l2_socket_handle(l2)?.into_resource(),
          _ => anyhow::bail!("unsupported backend"),
      };
 -    let instance_id = nic.nic_id.parse().context("invalid instance ID")?;
@@ -1117,7 +1118,7 @@ index b63d6b6..f03b482 100644
          vmservice::NicFrontend::Vmbus => NicDevice::Vmbus(
              NetvspHandle {
                  instance_id,
-@@ -2503,39 +2868,92 @@ fn parse_nic_config(
+@@ -2503,39 +2869,92 @@ fn parse_nic_config(
              }
              .into_resource(),
          },
@@ -1226,7 +1227,7 @@ index b63d6b6..f03b482 100644
  ) -> anyhow::Result<vmm_core_defs::LayoutConfig> {
      const MB: u64 = 0x100000;
  
-@@ -2555,6 +2973,12 @@ fn apply_mmio_overrides(
+@@ -2555,6 +2974,12 @@ fn apply_mmio_overrides(
          }
      }
  
@@ -1239,7 +1240,34 @@ index b63d6b6..f03b482 100644
      Ok(layout)
  }
  
-@@ -3439,11 +3863,16 @@ fn service(
+@@ -3246,6 +3671,7 @@ fn build_nic_backend(
+     let vmservice::NicBackend { kind } = backend;
+     Ok(match kind.context("missing network backend")? {
+         Kind::Consomme(consomme) => build_consomme_handle(consomme, None)?.into_resource(),
++        Kind::L2Socket(l2) => build_l2_socket_handle(l2)?.into_resource(),
+         #[cfg(target_os = "linux")]
+         Kind::Tap(tap) => build_tap_backend(tap, registry)?,
+         #[cfg(windows)]
+@@ -3262,6 +3688,18 @@ fn build_nic_backend(
+     })
+ }
+ 
++fn build_l2_socket_handle(
++    l2: vmservice::L2SocketBackend,
++) -> anyhow::Result<net_backend_resources::l2::L2SocketHandle> {
++    let trimmed = l2.path.trim();
++    if trimmed.is_empty() {
++        anyhow::bail!("L2SocketBackend path cannot be empty");
++    }
++    Ok(net_backend_resources::l2::L2SocketHandle {
++        path: trimmed.to_string(),
++    })
++}
++
+ /// Resolves a proto `TapBackend` into a tap NIC endpoint resource, either by
+ /// opening `/dev/net/tun` by device name or by resolving a descriptor
+ /// registered via the fd-passing protocol.
+@@ -3439,11 +3877,16 @@ fn service(
              controller_task: None,
              wait_vm_response: None,
              lifecycle: VmLifecycle::Running,
@@ -1256,7 +1284,7 @@ index b63d6b6..f03b482 100644
          }
      }
  
-@@ -4363,11 +4792,16 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4363,11 +4806,16 @@ fn guest_power_exit_stops_rpc_server() {
                      controller_task: None,
                      wait_vm_response: None,
                      lifecycle: VmLifecycle::Running,
@@ -1273,7 +1301,7 @@ index b63d6b6..f03b482 100644
                  };
                  event_send.send(VmControllerEvent::ExitRequested { code });
                  assert_eq!(service.run(listener, worker_recv).await.unwrap(), code);
-@@ -4375,6 +4809,118 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4375,6 +4823,118 @@ fn guest_power_exit_stops_rpc_server() {
          });
      }
  
@@ -1392,7 +1420,7 @@ index b63d6b6..f03b482 100644
      #[test]
      fn uefi_initial_variables_defaults() {
          for arch in [
-@@ -4568,6 +5114,17 @@ fn platform_config_rejects_vmbus_devices() {
+@@ -4568,6 +5128,17 @@ fn platform_config_rejects_vmbus_devices() {
                  }),
                  ..Default::default()
              },
@@ -1410,7 +1438,7 @@ index b63d6b6..f03b482 100644
          ] {
              assert!(validate_platform_config(&config).is_ok());
              assert!(
-@@ -4877,4 +5434,610 @@ fn reject_invalid_vfio_bar_address_config() {
+@@ -4877,4 +5448,610 @@ fn reject_invalid_vfio_bar_address_config() {
              .is_err()
          );
      }
@@ -2022,7 +2050,7 @@ index b63d6b6..f03b482 100644
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto b/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
-index 2b4d184..241fac9 100644
+index 2b4d184..6e497df 100644
 --- a/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
 +++ b/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
 @@ -27,6 +27,9 @@ service VM {
@@ -2045,7 +2073,16 @@ index 2b4d184..241fac9 100644
  }
  
  // An endpoint PCIe device function. Attached behind a port in the topology
-@@ -760,6 +766,21 @@ message PcieAttachment {
+@@ -456,6 +462,8 @@ message NicBackend {
+         TapBackend      tap      = 2;
+         // Built-in user-mode (consomme) network backend.
+         ConsommeBackend consomme = 3;
++        // Userspace L2 virtual switch socket/pipe backend.
++        L2SocketBackend l2_socket = 4;
+     }
+ }
+ 
+@@ -760,6 +768,21 @@ message PcieAttachment {
      }
  }
  
@@ -2067,7 +2104,7 @@ index 2b4d184..241fac9 100644
  message VMConfig {
      // Action for the VMM to take when the guest triggers a power event.
      enum GuestPowerAction {
-@@ -842,6 +863,11 @@ message VMConfig {
+@@ -842,6 +865,11 @@ message VMConfig {
      // Enable the guest watchdog device. Timeout behavior is configured
      // separately by guest_power_actions.watchdog.
      bool guest_watchdog = 22;
@@ -2079,7 +2116,7 @@ index 2b4d184..241fac9 100644
  }
  
  // WindowsOptions contains virtual machine configurations that are only present on a Windows host.
-@@ -978,6 +1004,10 @@ message PropertiesVMResponse {
+@@ -978,6 +1006,10 @@ message PropertiesVMResponse {
      VmState state = 3;
      // Set when state is Halted.
      optional string halt_reason = 4;
@@ -2090,7 +2127,7 @@ index 2b4d184..241fac9 100644
  }
  
  message CapabilitiesVMResponse {
-@@ -1016,8 +1046,16 @@ enum ModifyType {
+@@ -1016,8 +1048,16 @@ enum ModifyType {
  }
  
  enum DiskType {
@@ -2107,7 +2144,7 @@ index 2b4d184..241fac9 100644
      SCSI_DISK_TYPE_PHYSICAL = 2;
  }
  
-@@ -1025,8 +1063,12 @@ message SCSIDisk {
+@@ -1025,8 +1065,12 @@ message SCSIDisk {
      uint32 controller = 1;
      uint32 lun = 2;
      string host_path = 3;
@@ -2120,6 +2157,26 @@ index 2b4d184..241fac9 100644
  }
  
  message VPMEMDisk {
+@@ -1051,6 +1095,7 @@ message NICConfig {
+         DioBackend dio = 6;
+         TapBackend tap = 7;
+         ConsommeBackend consomme = 8;
++        L2SocketBackend l2_socket = 10;
+     }
+     // Guest-visible NIC frontend. Defaults to the VMBus synthetic NIC.
+     // Virtio uses VPCI on Windows/macOS with VMBus enabled, MMIO otherwise.
+@@ -1058,6 +1103,11 @@ message NICConfig {
+     NicFrontend frontend = 9;
+ }
+ 
++message L2SocketBackend {
++    // Unix domain socket path (Linux/macOS) or Windows named pipe path (\\.\pipe\velovm-switch-<id>).
++    string path = 1;
++}
++
+ message DioBackend {
+     string switch_id = 1;   // GUID
+     string port_id = 2;     // GUID
 diff --git a/openvmm/workers/fastdesk_worker/src/lib.rs b/openvmm/workers/fastdesk_worker/src/lib.rs
 index 5762845..e7811a9 100644
 --- a/openvmm/workers/fastdesk_worker/src/lib.rs

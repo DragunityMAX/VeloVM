@@ -760,6 +760,7 @@ impl VmSettingsDialog {
             Some(NicBackendConfig::Tap { name }) | Some(NicBackendConfig::Bridge { name }) => {
                 name.clone()
             }
+            Some(NicBackendConfig::L2Switch { switch_id }) => switch_id.clone(),
         };
         let uefi_firmware = cfg
             .uefi_firmware
@@ -1184,6 +1185,9 @@ pub fn build_nics_from_switch_id(
     let backend = match sw.map(|s| s.kind.as_str()) {
         Some("tap") => NicBackendConfig::Tap {
             name: switch_id.to_string(),
+        },
+        Some("l2") | Some("l2_hub") => NicBackendConfig::L2Switch {
+            switch_id: switch_id.to_string(),
         },
         _ => NicBackendConfig::VmSwitch {
             switch_id: switch_id.to_string(),

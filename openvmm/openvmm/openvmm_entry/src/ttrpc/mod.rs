@@ -2846,6 +2846,7 @@ fn parse_nic_config(
         #[cfg(target_os = "linux")]
         Backend::Tap(tap) => build_tap_backend(tap, registry)?,
         Backend::Consomme(consomme) => build_consomme_handle(consomme, recv)?.into_resource(),
+        Backend::L2Socket(l2) => build_l2_socket_handle(l2)?.into_resource(),
         _ => anyhow::bail!("unsupported backend"),
     };
     let device = match frontend {
@@ -3670,6 +3671,7 @@ fn build_nic_backend(
     let vmservice::NicBackend { kind } = backend;
     Ok(match kind.context("missing network backend")? {
         Kind::Consomme(consomme) => build_consomme_handle(consomme, None)?.into_resource(),
+        Kind::L2Socket(l2) => build_l2_socket_handle(l2)?.into_resource(),
         #[cfg(target_os = "linux")]
         Kind::Tap(tap) => build_tap_backend(tap, registry)?,
         #[cfg(windows)]
@@ -3683,6 +3685,18 @@ fn build_nic_backend(
             .into_resource()
         }
         _ => anyhow::bail!("unsupported network backend"),
+    })
+}
+
+fn build_l2_socket_handle(
+    l2: vmservice::L2SocketBackend,
+) -> anyhow::Result<net_backend_resources::l2::L2SocketHandle> {
+    let trimmed = l2.path.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("L2SocketBackend path cannot be empty");
+    }
+    Ok(net_backend_resources::l2::L2SocketHandle {
+        path: trimmed.to_string(),
     })
 }
 
