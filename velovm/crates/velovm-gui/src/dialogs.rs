@@ -548,6 +548,7 @@ pub struct VmSettingsDialog {
     pub secure_boot_enabled: bool,
     pub secure_boot_template: SecureBootTemplateConfig,
     pub tpm_enabled: bool,
+    pub initial_uefi_firmware: String,
     pub uefi_firmware: String,
     pub fastdesk_enabled: bool,
     pub vram_mb: u32,
@@ -569,6 +570,11 @@ impl VmSettingsDialog {
             Some(NicBackendConfig::VmSwitch { switch_id, .. }) => switch_id.clone(),
             Some(NicBackendConfig::Tap { name }) => name.clone(),
         };
+        let uefi_firmware = cfg
+            .uefi_firmware
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Self {
             dialog_id: Uuid::new_v4(),
             vm_id: cfg.id,
@@ -582,11 +588,8 @@ impl VmSettingsDialog {
             secure_boot_enabled: cfg.secure_boot_enabled,
             secure_boot_template: cfg.secure_boot_template,
             tpm_enabled: cfg.tpm_enabled,
-            uefi_firmware: cfg
-                .uefi_firmware
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            initial_uefi_firmware: uefi_firmware.clone(),
+            uefi_firmware,
             fastdesk_enabled: cfg.fastdesk.enabled,
             vram_mb: cfg.fastdesk.vram_mb,
             use_shm: cfg.fastdesk.use_shm,
@@ -604,7 +607,7 @@ impl VmSettingsDialog {
         self.vcpus != self.initial_config.vcpus
             || self.memory_mb != self.initial_config.memory_mb
             || self.nested_virt != self.initial_config.nested_virt
-            || string_to_opt(&self.uefi_firmware) != self.initial_config.uefi_firmware
+            || self.uefi_firmware.trim() != self.initial_uefi_firmware.trim()
             || self.secure_boot_enabled != self.initial_config.secure_boot_enabled
             || self.secure_boot_template != self.initial_config.secure_boot_template
             || self.tpm_enabled != self.initial_config.tpm_enabled
@@ -646,8 +649,8 @@ impl VmSettingsDialog {
             }
             fastdesk
         });
-        let cur_fw = string_to_opt(&self.uefi_firmware);
-        let uefi_firmware = (cur_fw != self.initial_config.uefi_firmware).then_some(cur_fw);
+        let uefi_firmware = (self.uefi_firmware.trim() != self.initial_uefi_firmware.trim())
+            .then(|| string_to_opt(&self.uefi_firmware));
 
         UpdateVmPayload {
             name,
@@ -2730,6 +2733,41 @@ mod tests {
         let patch = dlg.build_patch();
         assert_eq!(patch.listen_addr.as_deref(), Some("127.0.0.1:47621"));
         assert!(patch.openvmm_bin.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vm_settings_dialog_does_not_emit_spurious_diff_for_non_utf8_unix_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8_fw = PathBuf::from(OsStr::from_bytes(b"/tmp/fw-\xff\xfe/MSVM.fd"));
+        let mut cfg = VmConfig::from_preset("NonUtf8Fw", VmPreset::Custom, Path::new("/tmp/vm"));
+        cfg.uefi_firmware = Some(non_utf8_fw);
+
+        let mut dlg = VmSettingsDialog::from_config(&cfg, VmStatus::Running);
+        assert!(
+            !dlg.has_hardware_changes(),
+            "untouched non-UTF-8 uefi_firmware must not trigger has_hardware_changes"
+        );
+        assert!(
+            dlg.build_update_payload(&[]).is_empty(),
+            "untouched non-UTF-8 uefi_firmware must not emit a spurious diff"
+        );
+
+        dlg.description = "updated while running".into();
+        assert!(!dlg.has_hardware_changes());
+        let payload = dlg.build_update_payload(&[]);
+        assert_eq!(payload.description.as_deref(), Some("updated while running"));
+        assert!(payload.uefi_firmware.is_none());
+
+        dlg.uefi_firmware = "/tmp/new-MSVM.fd".into();
+        assert!(dlg.has_hardware_changes());
+        let fw_payload = dlg.build_update_payload(&[]);
+        assert_eq!(
+            fw_payload.uefi_firmware,
+            Some(Some(PathBuf::from("/tmp/new-MSVM.fd")))
+        );
     }
 
     #[test]
