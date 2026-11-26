@@ -705,15 +705,13 @@ jobs:
             cat "$RUNNER_TEMP/bench-linux-x64.txt"
           } > "$BUNDLE/BUILD_INFO.txt"
 
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            tar -C dist -czf dist/velovm-linux-x64.tar.gz velovm-linux-x64
-          fi
+          tar -C dist -czf dist/velovm-linux-x64.tar.gz velovm-linux-x64
 
       - name: Upload Linux x64 artifact bundle
         uses: actions/upload-artifact@v7
         with:
-          name: velovm-linux-x64
-          path: dist/velovm-linux-x64/*
+          path: dist/velovm-linux-x64.tar.gz
+          archive: false
           if-no-files-found: error
 
       - name: Upload Linux x64 release archive
@@ -1119,15 +1117,13 @@ jobs:
             cat "$RUNNER_TEMP/bench-macos-arm64.txt"
           } > "$BUNDLE/BUILD_INFO.txt"
 
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            tar -C dist -czf dist/velovm-macos-arm64.tar.gz velovm-macos-arm64
-          fi
+          tar -C dist -czf dist/velovm-macos-arm64.tar.gz velovm-macos-arm64
 
       - name: Upload macOS arm64 artifact bundle
         uses: actions/upload-artifact@v7
         with:
-          name: velovm-macos-arm64
-          path: dist/velovm-macos-arm64/*
+          path: dist/velovm-macos-arm64.tar.gz
+          archive: false
           if-no-files-found: error
 
       - name: Upload macOS arm64 release archive

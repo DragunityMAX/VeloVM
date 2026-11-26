@@ -32,3 +32,6 @@ windows-sys = { version = "0.61", features = [
 libc = "0.2"
 
 [workspace]
+
+[patch.crates-io]
+minifb = { path = "vendor/minifb" }

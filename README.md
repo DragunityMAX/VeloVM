@@ -58,12 +58,31 @@ Or create a new raw disk and install Windows 11 from an ISO:
 .\Start-VeloVM.ps1 -DiskPath C:\VMs\win11.img -CreateDiskSize 64G -IsoPath C:\ISOs\Win11.iso -Memory 8G -Processors 4
 ```
 
+### Quickstart on Linux (After Extracting `velovm-linux-x64.tar.gz`)
+
+```bash
+tar -xzf velovm-linux-x64.tar.gz
+cd velovm-linux-x64
+# If you downloaded loose files instead of the tarball, ensure binaries and script are executable:
+chmod +x openvmm openvmm-img velovm-viewer velovmd velovm velovm-gui start-velovm.sh
+
+./velovm-gui
+# Or via CLI:
+./velovm vm create Linux-Dev --preset linux --cpus 4 --memory 8G --create-disk 32G --iso /path/to/ubuntu.iso
+./velovm vm start Linux-Dev
+./velovm vm connect Linux-Dev
+# Or standalone launcher:
+./start-velovm.sh --disk /path/to/win11.vhdx --memory 8G --cpus 4
+```
+
 ### Quickstart on macOS (Apple Silicon / macOS 13+ Ventura or Newer)
 
 - **Requirements:** Apple Silicon (`arm64` / `aarch64-apple-darwin`) running macOS 13 or newer, and **ARM64** guest images/ISOs (Windows 11 ARM64 or Linux ARM64; Intel `x86_64` macOS hosts and x86_64 guests are not supported by Hypervisor.framework).
-- **Gatekeeper & Hypervisor Entitlements:** The release bundle ad-hoc signs `openvmm` with `com.apple.security.hypervisor`. If you downloaded the archive with a web browser, clear the quarantine attribute before running:
+- **Extract & Gatekeeper / Hypervisor Entitlements:** Extract the `.tar.gz` bundle so executable permissions are preserved (or run `chmod +x openvmm openvmm-img velovm-viewer velovmd velovm velovm-gui start-velovm.sh` if using loose files). The release bundle ad-hoc signs `openvmm` with `com.apple.security.hypervisor`. If you downloaded the archive with a web browser, clear the quarantine attribute before running:
   ```bash
-  xattr -dr com.apple.quarantine /path/to/velovm-macos-arm64
+  tar -xzf velovm-macos-arm64.tar.gz
+  cd velovm-macos-arm64
+  xattr -dr com.apple.quarantine .
   ```
   If you rebuild `openvmm` from source, sign the binary with `openvmm/build_support/macos/entitlements.xml` (otherwise `hv_vm_create` fails with `HV_DENIED`):
   ```bash
@@ -81,7 +100,7 @@ Or create a new raw disk and install Windows 11 from an ISO:
   ```
 
 ### Triggering CI Builds & Releases
-- **Any push or PR** to `main` / `master` (or **Run workflow** in the GitHub Actions tab) builds and uploads `velovm-windows-x64`, `velovm-linux-x64`, and `velovm-macos-arm64` workflow artifacts.
+- **Any push or PR** to `main` / `master` (or **Run workflow** in the GitHub Actions tab) builds and uploads `velovm-windows-x64` (`.zip`) plus `velovm-linux-x64.tar.gz` and `velovm-macos-arm64.tar.gz` workflow artifacts (preserving POSIX executable permissions).
 - **Tagging a release** automatically attaches `velovm-windows-x64.zip`, `velovm-linux-x64.tar.gz`, `velovm-macos-arm64.tar.gz`, and `SHA256SUMS.txt` to a GitHub Release:
   ```bash
   git tag v0.1.0

@@ -155,10 +155,25 @@ fn should_hide_win32_cursor_for_setcursor(
         && hit_test == WIN32_HTCLIENT
 }
 
+#[cfg(any(windows, test))]
+fn win32_scancode_to_missing_minifb_key(lparam: isize) -> Option<minifb::Key> {
+    let scancode = ((lparam as usize) >> 16) & 0x1ff;
+    match scancode {
+        0x038 => Some(minifb::Key::LeftAlt),
+        0x138 => Some(minifb::Key::RightAlt),
+        0x15b => Some(minifb::Key::LeftSuper),
+        0x15c => Some(minifb::Key::RightSuper),
+        _ => None,
+    }
+}
+
 #[cfg(windows)]
 mod win32_cursor {
     use super::should_hide_win32_cursor_for_setcursor;
+    use super::win32_scancode_to_missing_minifb_key;
     use std::collections::HashMap;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::HWND;
@@ -174,16 +189,21 @@ mod win32_cursor {
     use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SetCursor;
     use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYUP;
     use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
     use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCHITTEST;
     use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSKEYUP;
     use windows_sys::Win32::UI::WindowsAndMessaging::WNDPROC;
     use windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct SubclassEntry {
         prev_proc: isize,
         hide_client_cursor: bool,
+        key_events: Option<Arc<Mutex<VecDeque<(u16, bool)>>>>,
     }
 
     fn registry() -> &'static Mutex<HashMap<usize, SubclassEntry>> {
@@ -222,12 +242,25 @@ mod win32_cursor {
             if msg == WM_NCDESTROY {
                 map.remove(&key)
             } else {
-                map.get(&key).copied()
+                map.get(&key).cloned()
             }
         };
 
+        if matches!(msg, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP)
+            && let Some(mapped_key) = win32_scancode_to_missing_minifb_key(lparam)
+            && let Some(scancode) = super::input::key_to_xt_scancode(mapped_key)
+        {
+            let is_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if let Some(q) = entry.as_ref().and_then(|e| e.key_events.as_ref()) {
+                q.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back((scancode, is_down));
+            }
+            return 0;
+        }
+
         if msg == WM_SETCURSOR {
-            if let Some(e) = entry {
+            if let Some(e) = &entry {
                 if should_hide_win32_cursor_for_setcursor(e.hide_client_cursor, key, wparam, lparam)
                 {
                     unsafe {
@@ -264,6 +297,53 @@ mod win32_cursor {
         }
     }
 
+    fn ensure_subclassed(hwnd: HWND, update: impl FnOnce(&mut SubclassEntry)) {
+        if hwnd.is_null() {
+            return;
+        }
+        let key = hwnd as usize;
+        let our_addr = proc_addr();
+        {
+            let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = map.get_mut(&key) {
+                update(entry);
+                return;
+            }
+        }
+
+        let prev = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
+        if prev == 0 || prev == our_addr {
+            return;
+        }
+        let mut entry = SubclassEntry {
+            prev_proc: prev,
+            hide_client_cursor: false,
+            key_events: None,
+        };
+        update(&mut entry);
+        {
+            let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(key, entry);
+        }
+        let actual_prev = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, our_addr) };
+        let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if actual_prev == 0 {
+            map.remove(&key);
+            return;
+        }
+        if actual_prev != our_addr
+            && let Some(entry) = map.get_mut(&key)
+        {
+            entry.prev_proc = actual_prev;
+        }
+    }
+
+    pub fn attach_key_hook(hwnd: HWND, key_events: Arc<Mutex<VecDeque<(u16, bool)>>>) {
+        ensure_subclassed(hwnd, |entry| {
+            entry.key_events = Some(key_events);
+        });
+    }
+
     pub fn set_client_cursor_visibility(hwnd: HWND, visible: bool) {
         if hwnd.is_null() {
             return;
@@ -273,62 +353,34 @@ mod win32_cursor {
         let hide = !visible;
 
         if hide {
-            {
-                let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(entry) = map.get_mut(&key) {
-                    entry.hide_client_cursor = true;
-                    drop(map);
-                    refresh_cursor_now(hwnd);
-                    return;
-                }
-            }
-
-            let prev = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
-            if prev == 0 || prev == our_addr {
-                return;
-            }
-            {
-                let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
-                map.insert(
-                    key,
-                    SubclassEntry {
-                        prev_proc: prev,
-                        hide_client_cursor: true,
-                    },
-                );
-            }
-            let actual_prev = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, our_addr) };
-            {
-                let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
-                if actual_prev == 0 {
-                    map.remove(&key);
-                    return;
-                }
-                if actual_prev != our_addr {
-                    if let Some(entry) = map.get_mut(&key) {
-                        entry.prev_proc = actual_prev;
-                    }
-                }
-            }
+            ensure_subclassed(hwnd, |entry| {
+                entry.hide_client_cursor = true;
+            });
             refresh_cursor_now(hwnd);
         } else {
             let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
             let prev_to_restore = {
                 let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
-                if current == our_addr {
-                    map.remove(&key).map(|e| e.prev_proc)
-                } else {
-                    if let Some(entry) = map.get_mut(&key) {
+                if let Some(entry) = map.get_mut(&key) {
+                    if entry.key_events.is_some() {
                         entry.hide_client_cursor = false;
+                        None
+                    } else if current == our_addr {
+                        map.remove(&key).map(|e| e.prev_proc)
+                    } else {
+                        entry.hide_client_cursor = false;
+                        None
                     }
+                } else {
                     None
                 }
             };
-            if let Some(prev) = prev_to_restore {
-                if prev != 0 && prev != our_addr {
-                    unsafe {
-                        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev);
-                    }
+            if let Some(prev) = prev_to_restore
+                && prev != 0
+                && prev != our_addr
+            {
+                unsafe {
+                    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev);
                 }
             }
             refresh_cursor_now(hwnd);
@@ -409,6 +461,11 @@ fn create_viewer_window(
     }
     native_cursor.on_window_created(&mut window);
     input.attach_window(&mut window);
+    #[cfg(windows)]
+    {
+        let hwnd = window.get_window_handle() as windows_sys::Win32::Foundation::HWND;
+        win32_cursor::attach_key_hook(hwnd, input.key_events_queue());
+    }
     Ok(window)
 }
 
@@ -1042,5 +1099,40 @@ mod tests {
         assert!(parse_resolution("1920x0").is_err());
         assert!(parse_resolution("0x0").is_err());
         assert_eq!(parse_resolution("1920x1080").unwrap(), (1920, 1080));
+    }
+
+    #[test]
+    fn win32_scancode_hook_maps_alt_altgr_and_super_keys() {
+        // Make events (transition bit 31 = 0).
+        assert_eq!(
+            win32_scancode_to_missing_minifb_key((0x038usize << 16) as isize),
+            Some(minifb::Key::LeftAlt)
+        );
+        assert_eq!(
+            win32_scancode_to_missing_minifb_key((0x138usize << 16) as isize),
+            Some(minifb::Key::RightAlt)
+        );
+        assert_eq!(
+            win32_scancode_to_missing_minifb_key((0x15busize << 16) as isize),
+            Some(minifb::Key::LeftSuper)
+        );
+        assert_eq!(
+            win32_scancode_to_missing_minifb_key((0x15cusize << 16) as isize),
+            Some(minifb::Key::RightSuper)
+        );
+
+        // Break events (bits 30..31 set, sign-extended if negative isize).
+        assert_eq!(
+            win32_scancode_to_missing_minifb_key(((0xc000_0000usize | (0x138 << 16)) as u32 as i32) as isize),
+            Some(minifb::Key::RightAlt)
+        );
+
+        // Keys already translated by minifb are left untouched.
+        for already_handled in [0x001usize, 0x01e, 0x11d, 0x15d] {
+            assert_eq!(
+                win32_scancode_to_missing_minifb_key((already_handled << 16) as isize),
+                None
+            );
+        }
     }
 }

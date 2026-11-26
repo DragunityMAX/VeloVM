@@ -107,7 +107,11 @@ impl RegistryStore {
     /// managing the same registry simultaneously.
     pub fn try_acquire_daemon_lock(&self) -> anyhow::Result<fs::File> {
         let path = self.lock_path();
-        let file = open_private_file_nofollow(&path, false, "daemon lock")?;
+        let file = open_private_file_nofollow(
+            &path,
+            PrivateFileMode::ReadWrite { truncate: false },
+            "daemon lock",
+        )?;
 
         #[cfg(target_os = "linux")]
         {
@@ -915,11 +919,12 @@ fn open_and_read_token_windows_with_sid(
     }))
 }
 
-pub fn save_pending_disks_journal(
+fn save_json_journal<T: serde::Serialize>(
     path: &Path,
-    disks: &[crate::models::DiskAttachment],
+    items: &[T],
+    label: &str,
 ) -> anyhow::Result<()> {
-    if disks.is_empty() {
+    if items.is_empty() {
         match fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -932,30 +937,73 @@ pub fn save_pending_disks_journal(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating runtime directory {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec(disks).context("serializing pending disk journal")?;
+    let bytes = serde_json::to_vec(items).with_context(|| format!("serializing {label}"))?;
     atomic_write(path, &bytes, false)
 }
 
-pub fn load_pending_disks_journal(path: &Path) -> anyhow::Result<Vec<crate::models::DiskAttachment>> {
+fn load_json_journal<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<Vec<T>> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("reading pending disk journal {}", path.display()));
+            return Err(err).with_context(|| format!("reading {label} {}", path.display()));
         }
     };
     serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing pending disk journal {}", path.display()))
+        .with_context(|| format!("parsing {label} {}", path.display()))
+}
+
+pub fn save_pending_disks_journal(
+    path: &Path,
+    disks: &[crate::models::DiskAttachment],
+) -> anyhow::Result<()> {
+    save_json_journal(path, disks, "pending disk journal")
+}
+
+pub fn load_pending_disks_journal(path: &Path) -> anyhow::Result<Vec<crate::models::DiskAttachment>> {
+    load_json_journal(path, "pending disk journal")
+}
+
+pub fn save_pending_port_forwards_journal(
+    path: &Path,
+    ports: &[crate::models::OrphanedPortForward],
+) -> anyhow::Result<()> {
+    save_json_journal(path, ports, "pending port-forward journal")
+}
+
+pub fn load_pending_port_forwards_journal(
+    path: &Path,
+) -> anyhow::Result<Vec<crate::models::OrphanedPortForward>> {
+    load_json_journal(path, "pending port-forward journal")
+}
+
+#[derive(Clone, Copy)]
+enum PrivateFileMode {
+    ReadWrite { truncate: bool },
+    Append,
 }
 
 pub fn open_shm_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
-    open_private_file_nofollow(path, true, "FastDesk SHM")
+    open_private_file_nofollow(
+        path,
+        PrivateFileMode::ReadWrite { truncate: true },
+        "FastDesk SHM",
+    )
+}
+
+/// Opens `path` for owner-only append without following symlinks, junctions,
+/// FIFOs, or hard-linked targets, and applies `0600` / owner-only ACL via the
+/// opened handle.
+pub(crate) fn open_log_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
+    open_private_file_nofollow(path, PrivateFileMode::Append, "log")
 }
 
 fn open_private_file_nofollow(
     path: &Path,
-    truncate: bool,
+    mode: PrivateFileMode,
     label: &str,
 ) -> anyhow::Result<fs::File> {
     if let Ok(meta) = fs::symlink_metadata(path)
@@ -972,11 +1020,15 @@ fn open_private_file_nofollow(
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let mut opts = fs::OpenOptions::new();
-        opts.read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
+        match mode {
+            PrivateFileMode::ReadWrite { .. } => {
+                opts.read(true).write(true).create(true).truncate(false);
+            }
+            PrivateFileMode::Append => {
+                opts.create(true).append(true);
+            }
+        }
+        opts.mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = opts
             .open(path)
@@ -1005,7 +1057,7 @@ fn open_private_file_nofollow(
                 path.display()
             );
         }
-        if truncate {
+        if matches!(mode, PrivateFileMode::ReadWrite { truncate: true }) {
             file.set_len(0)
                 .with_context(|| format!("truncating {label} file {}", path.display()))?;
         }
@@ -1016,13 +1068,20 @@ fn open_private_file_nofollow(
 
     #[cfg(windows)]
     {
-        open_private_file_nofollow_windows(path, truncate, label)
+        open_private_file_nofollow_windows(path, mode, label)
     }
 
     #[cfg(not(any(unix, windows)))]
     {
         let mut opts = fs::OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(truncate);
+        match mode {
+            PrivateFileMode::ReadWrite { truncate } => {
+                opts.read(true).write(true).create(true).truncate(truncate);
+            }
+            PrivateFileMode::Append => {
+                opts.create(true).append(true);
+            }
+        }
         opts.open(path)
             .with_context(|| format!("opening {label} file {}", path.display()))
     }
@@ -1152,7 +1211,7 @@ impl OwnerOnlySecurityDescriptor {
 #[cfg(windows)]
 fn open_private_file_nofollow_windows(
     path: &Path,
-    truncate: bool,
+    mode: PrivateFileMode,
     label: &str,
 ) -> anyhow::Result<fs::File> {
     use std::os::windows::ffi::OsStrExt;
@@ -1169,7 +1228,7 @@ fn open_private_file_nofollow_windows(
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_ALWAYS, WRITE_DAC,
     };
@@ -1181,10 +1240,14 @@ fn open_private_file_nofollow_windows(
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let desired_access = match mode {
+        PrivateFileMode::ReadWrite { .. } => GENERIC_READ | GENERIC_WRITE | WRITE_DAC,
+        PrivateFileMode::Append => GENERIC_READ | FILE_APPEND_DATA | WRITE_DAC,
+    };
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE | WRITE_DAC,
+            desired_access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             &sa,
             OPEN_ALWAYS,
@@ -1267,7 +1330,7 @@ fn open_private_file_nofollow_windows(
             .with_context(|| format!("SetSecurityInfo failed for {}", path.display()));
     }
 
-    if truncate {
+    if matches!(mode, PrivateFileMode::ReadWrite { truncate: true }) {
         file.set_len(0)
             .with_context(|| format!("truncating {label} file {}", path.display()))?;
     }
@@ -1543,42 +1606,6 @@ fn check_handle_owner_only_windows_for_sid(
     } else {
         Ok(WindowsTokenAclStatus::PermissiveDacl)
     }
-}
-
-#[cfg(windows)]
-pub(crate) fn set_path_owner_only_windows(path: &Path) -> anyhow::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    };
-
-    let token_buf = current_user_token_buf()?;
-    let token_user = unsafe { token_buf[0].assume_init_ref() };
-    let dacl_guard = build_owner_only_dacl_windows(token_user.User.Sid)?;
-
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let err = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl_guard.0.cast_const(),
-            std::ptr::null(),
-        )
-    };
-    if err != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(err as i32))
-            .with_context(|| format!("SetNamedSecurityInfoW failed for {}", path.display()));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2353,5 +2380,97 @@ mod tests {
             cfg.runtime_dir,
             crate::models::default_runtime_dir(dir.path())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_log_file_nofollow_rejects_symlinks_fifos_and_hard_links_and_appends_0600() {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Symlink target's permissions and contents remain untouched.
+        let target = dir.path().join("victim.log");
+        fs::write(&target, b"keep-me").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let sym = dir.path().join("sym.log");
+        std::os::unix::fs::symlink(&target, &sym).unwrap();
+        assert!(open_log_file_nofollow(&sym).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep-me");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        // 2. FIFO rejected without blocking.
+        let fifo = dir.path().join("pipe.log");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(open_log_file_nofollow(&fifo).is_err());
+
+        // 3. Hard-linked regular file rejected without changing target permissions.
+        let linked = dir.path().join("linked.log");
+        fs::write(&linked, b"shared-log").unwrap();
+        fs::set_permissions(&linked, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&linked, dir.path().join("linked-alias.log")).unwrap();
+        assert!(open_log_file_nofollow(&linked).is_err());
+        assert_eq!(fs::read(&linked).unwrap(), b"shared-log");
+        assert_eq!(
+            fs::metadata(&linked).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        // 4. Fresh and existing regular log files open with 0600 and append cleanly.
+        let log_path = dir.path().join("velovmd.log");
+        {
+            let mut f = open_log_file_nofollow(&log_path).unwrap();
+            let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            f.write_all(b"line1\n").unwrap();
+        }
+        {
+            let mut f = open_log_file_nofollow(&log_path).unwrap();
+            f.write_all(b"line2\n").unwrap();
+        }
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "line1\nline2\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_log_file_nofollow_windows_rejects_symlinks_hard_links_and_appends_owner_only() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let log_path = dir.path().join("velovmd.log");
+        {
+            let mut f = open_log_file_nofollow(&log_path).unwrap();
+            assert_eq!(
+                check_handle_owner_only_windows(&f, &log_path).unwrap(),
+                WindowsTokenAclStatus::OwnerOnly
+            );
+            f.write_all(b"line1\n").unwrap();
+        }
+        {
+            let mut f = open_log_file_nofollow(&log_path).unwrap();
+            f.write_all(b"line2\n").unwrap();
+        }
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "line1\nline2\n");
+
+        let linked = dir.path().join("linked.log");
+        fs::write(&linked, b"shared-log").unwrap();
+        fs::hard_link(&linked, dir.path().join("linked-alias.log")).unwrap();
+        assert!(open_log_file_nofollow(&linked).is_err());
+
+        let target = dir.path().join("victim.log");
+        fs::write(&target, b"keep-me").unwrap();
+        let sym = dir.path().join("sym.log");
+        if std::os::windows::fs::symlink_file(&target, &sym).is_ok() {
+            assert!(open_log_file_nofollow(&sym).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"keep-me");
+        }
     }
 }
