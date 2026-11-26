@@ -1204,7 +1204,7 @@ pub fn render_new_vm_wizard(
                             ui,
                             |ui| {
                                 ui.label("Virtual CPUs:");
-                                ui.add(egui::Slider::new(&mut w.vcpus, 1..=256));
+                                render_u32_slider_with_input(ui, "wiz_vcpus", &mut w.vcpus, 1..=256);
                                 ui.end_row();
 
                                 ui.label("Startup Memory (MiB):");
@@ -1262,7 +1262,12 @@ pub fn render_new_vm_wizard(
                                 |ui| {
                                     ui.label("Video Memory (VRAM MiB):");
                                     ui.horizontal(|ui| {
-                                        ui.add(egui::Slider::new(&mut w.vram_mb, 8..=256));
+                                        render_u32_slider_with_input(
+                                            ui,
+                                            "wiz_vram_mb",
+                                            &mut w.vram_mb,
+                                            8..=256,
+                                        );
                                         ui.label("(32 MiB supports 4K)");
                                     });
                                     ui.end_row();
@@ -1451,8 +1456,111 @@ impl PartialEq for DiskMode {
     }
 }
 
-fn render_vm_settings_vram_slider(ui: &mut egui::Ui, vram_mb: &mut u32) {
-    ui.add(egui::Slider::new(vram_mb, 8..=256).clamping(egui::SliderClamping::Edits));
+#[derive(Clone, Default)]
+struct SliderInputState {
+    buf: String,
+    editing: bool,
+    dirty: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct SliderInputResponses {
+    slider: egui::Response,
+    input: egui::Response,
+    state_id: egui::Id,
+}
+
+/// Renders a horizontal `u32` slider alongside a plain numeric `TextEdit` box.
+///
+/// `egui::Slider`'s built-in `DragValue` displays a horizontal drag cursor on
+/// the number box instead of the slider. Separating them lets the slider use
+/// grab/grabbing cursors while the number box uses a standard text cursor.
+fn render_u32_slider_with_input(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+) -> SliderInputResponses {
+    let base_id = ui.make_persistent_id(id_source);
+    let state_id = base_id.with("state");
+    let text_id = base_id.with("text");
+
+    ui.horizontal(|ui| {
+        let mut slider_response = ui.add(
+            egui::Slider::new(value, range.clone())
+                .show_value(false)
+                .clamping(egui::SliderClamping::Edits),
+        );
+        if ui.is_enabled() {
+            if slider_response.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if slider_response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+
+        let mut state = ui
+            .data_mut(|d| d.get_temp::<SliderInputState>(state_id))
+            .unwrap_or_else(|| SliderInputState {
+                buf: value.to_string(),
+                editing: false,
+                dirty: false,
+            });
+
+        if !state.editing || slider_response.changed() {
+            state.buf = value.to_string();
+            state.dirty = false;
+        }
+
+        let input_width = ui.spacing().interact_size.x.max(44.0);
+        let text_response = ui.add(
+            egui::TextEdit::singleline(&mut state.buf)
+                .id(text_id)
+                .desired_width(input_width),
+        );
+
+        if text_response.changed() {
+            state.buf.retain(|c| c.is_ascii_digit());
+            state.dirty = true;
+        }
+
+        let commit = text_response.lost_focus()
+            || (text_response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+
+        if commit {
+            if state.dirty {
+                let parsed = match state.buf.trim().parse::<u32>() {
+                    Ok(n) => Some(n.clamp(*range.start(), *range.end())),
+                    Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => Some(*range.end()),
+                    Err(_) => None,
+                };
+                if let Some(clamped) = parsed
+                    && *value != clamped
+                {
+                    *value = clamped;
+                    slider_response.mark_changed();
+                }
+            }
+            state.buf = value.to_string();
+            state.editing = false;
+            state.dirty = false;
+        } else {
+            state.editing = text_response.has_focus();
+        }
+
+        ui.data_mut(|d| d.insert_temp(state_id, state));
+
+        SliderInputResponses {
+            slider: slider_response,
+            input: text_response,
+            state_id,
+        }
+    })
+    .inner
+}
+
+fn render_vm_settings_vram_slider(ui: &mut egui::Ui, vram_mb: &mut u32) -> SliderInputResponses {
+    render_u32_slider_with_input(ui, "vm_settings_vram_mb", vram_mb, 8..=256)
 }
 
 pub fn render_vm_settings_dialog(
@@ -1497,7 +1605,12 @@ pub fn render_vm_settings_dialog(
                         ui,
                         |ui| {
                             ui.label("Virtual CPUs:");
-                            ui.add(egui::Slider::new(&mut d.vcpus, 1..=256));
+                            render_u32_slider_with_input(
+                                ui,
+                                "vm_settings_vcpus",
+                                &mut d.vcpus,
+                                1..=256,
+                            );
                             ui.end_row();
 
                             ui.label("Memory (MiB):");
@@ -2881,5 +2994,332 @@ mod tests {
                 "untouched vram_mb must not emit a spurious fastdesk update"
             );
         }
+    }
+
+    #[test]
+    fn u32_slider_with_input_uses_grab_cursor_on_slider_and_text_cursor_on_input() {
+        let ctx = egui::Context::default();
+        let mut value = 4u32;
+        let mut slider_rect = egui::Rect::NOTHING;
+        let mut input_rect = egui::Rect::NOTHING;
+        let mut state_id = egui::Id::NULL;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let resps = render_u32_slider_with_input(ui, "cursor_test", &mut value, 1..=256);
+                slider_rect = resps.slider.rect;
+                input_rect = resps.input.rect;
+                state_id = resps.state_id;
+            });
+        });
+
+        // Hover the number input box -> CursorIcon::Text, never ResizeHorizontal.
+        let out_input_hover = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(input_rect.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "cursor_test", &mut value, 1..=256);
+                });
+            },
+        );
+        assert_eq!(out_input_hover.platform_output.cursor_icon, egui::CursorIcon::Text);
+        assert_ne!(
+            out_input_hover.platform_output.cursor_icon,
+            egui::CursorIcon::ResizeHorizontal
+        );
+
+        // Hover the slider track -> CursorIcon::Grab.
+        let out_slider_hover = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(slider_rect.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "cursor_test", &mut value, 1..=256);
+                });
+            },
+        );
+        assert_eq!(out_slider_hover.platform_output.cursor_icon, egui::CursorIcon::Grab);
+
+        // Press and drag the slider -> CursorIcon::Grabbing and value updates.
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(slider_rect.center()),
+                    egui::Event::PointerButton {
+                        pos: slider_rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "cursor_test", &mut value, 1..=256);
+                });
+            },
+        );
+        let drag_target = egui::pos2(slider_rect.right() - 2.0, slider_rect.center().y);
+        let out_slider_drag = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(drag_target)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "cursor_test", &mut value, 1..=256);
+                });
+            },
+        );
+        assert_eq!(
+            out_slider_drag.platform_output.cursor_icon,
+            egui::CursorIcon::Grabbing
+        );
+        assert!(value > 4, "dragging slider right should increase value (got {value})");
+
+        // Release pointer and verify unfocused buffer synced from slider value.
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: drag_target,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "cursor_test", &mut value, 1..=256);
+                });
+            },
+        );
+        let synced_buf = ctx.data(|d| d.get_temp::<SliderInputState>(state_id)).unwrap().buf;
+        assert_eq!(synced_buf, value.to_string());
+    }
+
+    #[test]
+    fn u32_slider_with_input_text_entry_commits_clamps_and_reverts() {
+        let ctx = egui::Context::default();
+        let mut value = 4u32;
+        let mut input_rect = egui::Rect::NOTHING;
+        let mut state_id = egui::Id::NULL;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let resps = render_u32_slider_with_input(ui, "entry_test", &mut value, 8..=256);
+                input_rect = resps.input.rect;
+                state_id = resps.state_id;
+            });
+        });
+
+        let focus_input = |ctx: &egui::Context, value: &mut u32| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(input_rect.center()),
+                        egui::Event::PointerButton {
+                            pos: input_rect.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos: input_rect.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render_u32_slider_with_input(ui, "entry_test", value, 8..=256);
+                    });
+                },
+            );
+        };
+
+        // 1. Select all, type "64", press Enter -> updates value to 64.
+        focus_input(&ctx, &mut value);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                    egui::Event::Text("64".into()),
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "entry_test", &mut value, 8..=256);
+                });
+            },
+        );
+        assert_eq!(value, 64);
+
+        // 2. Type out-of-range high ("999") and blur -> clamps to 256.
+        focus_input(&ctx, &mut value);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                    egui::Event::Text("999".into()),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "entry_test", &mut value, 8..=256);
+                });
+            },
+        );
+        let outside = egui::pos2(input_rect.right() + 50.0, input_rect.bottom() + 50.0);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(outside),
+                    egui::Event::PointerButton {
+                        pos: outside,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: outside,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "entry_test", &mut value, 8..=256);
+                });
+            },
+        );
+        assert_eq!(value, 256);
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<SliderInputState>(state_id)).unwrap().buf,
+            "256"
+        );
+
+        // 3. Type out-of-range low ("2") and press Enter -> clamps to 8.
+        focus_input(&ctx, &mut value);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                    egui::Event::Text("2".into()),
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "entry_test", &mut value, 8..=256);
+                });
+            },
+        );
+        assert_eq!(value, 8);
+
+        // 4. Clear input to empty and blur -> reverts buffer and preserves previous value (8).
+        focus_input(&ctx, &mut value);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "entry_test", &mut value, 8..=256);
+                });
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(outside),
+                    egui::Event::PointerButton {
+                        pos: outside,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: outside,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_u32_slider_with_input(ui, "entry_test", &mut value, 8..=256);
+                });
+            },
+        );
+        assert_eq!(value, 8);
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<SliderInputState>(state_id)).unwrap().buf,
+            "8"
+        );
     }
 }
