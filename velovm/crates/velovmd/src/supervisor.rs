@@ -555,7 +555,7 @@ impl Supervisor {
                                 .exists()
                                 .then(|| shm_candidate.to_string_lossy().into_owned());
                             Self::restore_pending_disks_from_journal(vm, &sock_path);
-                        Self::restore_pending_port_forwards_from_journal(vm, &sock_path);
+                            Self::restore_pending_port_forwards_from_journal(vm, &sock_path);
                             vm.runtime.revision = self.next_revision();
                             vm.generation = 1;
                             adopted_vms.push((id, sock_path));
@@ -2334,31 +2334,20 @@ impl Supervisor {
             cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .with_context(|| format!("spawning {}", openvmm_bin.display()))?;
         let pid = child.id();
 
-        {
-            let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM vanished")?;
-            if *cancel_rx.borrow()
-                || self.is_shutting_down()
-                || vm.generation != start_gen
-                || vm.runtime.status != VmStatus::Starting
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("VM startup cancelled by stop request");
-            }
-            vm.child = Some(child);
-            vm.adopted_proc = None;
-            vm.runtime.pid = Some(pid);
-            vm.runtime.rpc_socket_path = Some(sock_path.clone());
-            vm.runtime.shm_path = shm_path.as_ref().map(|p| p.to_string_lossy().into_owned());
-            velovm_core::process::write_pid_file(&pid_path, pid)
-                .with_context(|| format!("writing VM pid file {}", pid_path.display()))?;
-        }
+        self.commit_spawned_child(
+            id,
+            start_gen,
+            cancel_rx,
+            child,
+            &sock_path,
+            &pid_path,
+            shm_path.as_deref(),
+        )?;
         drop(prepare_guard);
 
         let client = TtrpcClient::new(&sock_path);
@@ -2468,6 +2457,71 @@ impl Supervisor {
         });
         info!(vm_id = %id, name = %summary.config.name, pid, "VM started");
         Ok(summary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_spawned_child(
+        &self,
+        id: Uuid,
+        start_gen: u64,
+        cancel_rx: &watch::Receiver<bool>,
+        child: std::process::Child,
+        sock_path: &Path,
+        pid_path: &Path,
+        shm_path: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        enum CommitAction {
+            Committed,
+            Abort {
+                child: std::process::Child,
+                reason: &'static str,
+            },
+        }
+
+        let pid = child.id();
+        let action = {
+            let mut guard = self.vms.write().unwrap();
+            match guard.get_mut(&id) {
+                None => CommitAction::Abort {
+                    child,
+                    reason: "VM vanished",
+                },
+                Some(vm)
+                    if *cancel_rx.borrow()
+                        || self.is_shutting_down()
+                        || vm.generation != start_gen
+                        || vm.runtime.status != VmStatus::Starting =>
+                {
+                    CommitAction::Abort {
+                        child,
+                        reason: "VM startup cancelled by stop request",
+                    }
+                }
+                Some(vm) => {
+                    vm.child = Some(child);
+                    vm.adopted_proc = None;
+                    vm.runtime.pid = Some(pid);
+                    vm.runtime.rpc_socket_path = Some(sock_path.to_path_buf());
+                    vm.runtime.shm_path = shm_path.map(|p| p.to_string_lossy().into_owned());
+                    velovm_core::process::write_pid_file(pid_path, pid)
+                        .with_context(|| format!("writing VM pid file {}", pid_path.display()))?;
+                    CommitAction::Committed
+                }
+            }
+        };
+
+        match action {
+            CommitAction::Committed => Ok(()),
+            CommitAction::Abort { mut child, reason } => {
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup_runtime_files(
+                    Some(sock_path.to_path_buf()),
+                    shm_path.map(|p| p.to_string_lossy().into_owned()),
+                );
+                bail!("{reason}");
+            }
+        }
     }
 
     fn cleanup_failed_start(&self, id: Uuid, start_gen: u64, err_msg: &str) {
@@ -9631,6 +9685,103 @@ mod tests {
             .expect("DVD disk should be attached");
         assert_eq!(dvd.lun, 2);
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_spawned_child_kills_process_and_cleans_runtime_files_when_vm_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let missing_id = Uuid::new_v4();
+        let runtime_dir = sup.host_config().runtime_dir;
+        fs::create_dir_all(&runtime_dir).unwrap();
+        let sock_path = runtime_dir.join(format!("{missing_id}.sock"));
+        let pid_path = sock_path.with_extension("pid");
+        let shm_path = runtime_dir.join(format!("vram-{missing_id}.shm"));
+        fs::write(&sock_path, b"sock").unwrap();
+        fs::write(&shm_path, b"shm").unwrap();
+
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let err = sup
+            .commit_spawned_child(
+                missing_id,
+                1,
+                &cancel_rx,
+                child,
+                &sock_path,
+                &pid_path,
+                Some(&shm_path),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("VM vanished"), "{err:#}");
+
+        // Child must have been killed and reaped.
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "expected spawned child pid {pid} to be terminated and reaped");
+        assert!(!sock_path.exists());
+        assert!(!shm_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_spawned_child_kills_process_when_cancelled_mid_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "VM-CancelMidSpawn".into(),
+                preset: velovm_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let runtime_dir = sup.host_config().runtime_dir;
+        fs::create_dir_all(&runtime_dir).unwrap();
+        let sock_path = runtime_dir.join(format!("{id}.sock"));
+        let pid_path = sock_path.with_extension("pid");
+        let shm_path = runtime_dir.join(format!("vram-{id}.shm"));
+        fs::write(&sock_path, b"sock").unwrap();
+        fs::write(&pid_path, b"12345").unwrap();
+        fs::write(&shm_path, b"shm").unwrap();
+
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let _ = cancel_tx.send(true);
+
+        let err = sup
+            .commit_spawned_child(
+                id,
+                1,
+                &cancel_rx,
+                child,
+                &sock_path,
+                &pid_path,
+                Some(&shm_path),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "expected cancelled child pid {pid} to be terminated and reaped");
+        assert!(!sock_path.exists());
+        assert!(!pid_path.exists());
+        assert!(!shm_path.exists());
     }
 
     #[cfg(unix)]
