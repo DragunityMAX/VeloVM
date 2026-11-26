@@ -858,6 +858,9 @@ pub enum NicBackendConfig {
     Tap {
         name: String,
     },
+    Bridge {
+        name: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -920,7 +923,7 @@ impl NicAttachment {
                     .map(|n| n.trim().to_string())
                     .filter(|n| !n.is_empty());
             }
-            NicBackendConfig::Tap { name } => {
+            NicBackendConfig::Tap { name } | NicBackendConfig::Bridge { name } => {
                 *name = name.trim().to_string();
             }
         }
@@ -1273,25 +1276,22 @@ impl VmConfig {
                         }
                         #[cfg(target_os = "linux")]
                         {
-                            if name != name.trim() {
-                                bail!(
-                                    "TAP interface name '{name}' cannot have leading or trailing whitespace"
-                                );
-                            }
-                            if name.is_empty()
-                                || name == "."
-                                || name == ".."
-                                || name.len() > 15
-                                || name.contains('/')
-                                || name.contains('\0')
-                                || name.chars().any(char::is_whitespace)
-                            {
-                                bail!("invalid TAP interface name '{name}'");
-                            }
+                            validate_linux_iface_name(name, "TAP")?;
                             validate_tap_sysfs_dir(
                                 name,
                                 &Path::new("/sys/class/net").join(name),
                             )?;
+                        }
+                    }
+                    NicBackendConfig::Bridge { name } => {
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            let _ = name;
+                            bail!("Linux bridge NIC backend is only supported on Linux");
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            validate_linux_iface_name(name, "bridge")?;
                         }
                     }
                 }
@@ -1305,6 +1305,24 @@ impl VmConfig {
             .find(|lun| !self.disks.iter().any(|d| d.lun == *lun))
             .unwrap_or(0)
     }
+}
+
+/// Validates Linux network interface name constraints (IFNAMSIZ = 15 chars, no path separators or whitespace).
+pub fn validate_linux_iface_name(name: &str, kind: &str) -> anyhow::Result<()> {
+    if name != name.trim() {
+        bail!("{kind} interface name '{name}' cannot have leading or trailing whitespace");
+    }
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > 15
+        || name.contains('/')
+        || name.contains('\0')
+        || name.chars().any(char::is_whitespace)
+    {
+        bail!("invalid {kind} interface name '{name}'");
+    }
+    Ok(())
 }
 
 /// Rejects Linux bridge interfaces passed where a persistent TAP device name is required.
@@ -1516,12 +1534,118 @@ pub struct DiskInfo {
     pub warning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualSwitchInfo {
     pub id: String,
     pub name: String,
     pub kind: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_type: Option<String>,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uplink_adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSwitchPayload {
+    pub name: String,
+    #[serde(alias = "switch_type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_adapter_name: Option<String>,
+    #[serde(default)]
+    pub allow_management_os: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
+}
+
+impl CreateSwitchPayload {
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        self.kind = self.kind.trim().to_ascii_lowercase();
+        self.net_adapter_name = self
+            .net_adapter_name
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.cidr = self
+            .cidr
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let name = self.name.trim();
+        if name.is_empty() || name != self.name {
+            bail!("virtual switch name cannot be empty or have leading/trailing whitespace");
+        }
+        if name == "."
+            || name == ".."
+            || name.len() > 64
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+            || name.chars().any(char::is_control)
+        {
+            bail!("invalid virtual switch name '{name}'");
+        }
+
+        let kind = self.kind.trim().to_ascii_lowercase();
+        match kind.as_str() {
+            "external" => {
+                let adapter = self
+                    .net_adapter_name
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                if adapter.is_empty() {
+                    bail!("external virtual switches require a non-empty net_adapter_name");
+                }
+            }
+            "bridge" => {
+                validate_linux_iface_name(name, "bridge")?;
+            }
+            "internal" | "private" | "l2" | "l2_hub" => {}
+            other => bail!("unsupported virtual switch kind '{other}'"),
+        }
+
+        if let Some(cidr) = &self.cidr {
+            let trimmed = cidr.trim();
+            let Some((ip_str, prefix_str)) = trimmed.split_once('/') else {
+                bail!("invalid CIDR '{trimmed}' (expected address/prefix)");
+            };
+            let ip: std::net::IpAddr = ip_str
+                .parse()
+                .with_context(|| format!("invalid CIDR IP address '{ip_str}'"))?;
+            let prefix: u8 = prefix_str
+                .parse()
+                .with_context(|| format!("invalid CIDR prefix '{prefix_str}'"))?;
+            let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+            if prefix > max_prefix {
+                bail!("CIDR prefix /{prefix} exceeds maximum /{max_prefix}");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostNetAdapterInfo {
+    pub name: String,
+    #[serde(default)]
+    pub interface_description: String,
+    #[serde(default)]
+    pub mac_address: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub link_speed: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1553,6 +1677,7 @@ pub enum DaemonEvent {
         revision: u64,
     },
     HostConfigUpdated,
+    SwitchesUpdated,
     Resync,
     DaemonStopping,
 }
@@ -2568,5 +2693,130 @@ mod tests {
         cfg.validate().unwrap();
         #[cfg(not(any(windows, target_os = "linux")))]
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn virtual_switch_crud_models_serde_and_validation() {
+        // Backwards compatibility: legacy JSON without new switch fields must deserialize cleanly.
+        let legacy: VirtualSwitchInfo = serde_json::from_str(
+            r#"{"id":"consomme","name":"Default NAT","kind":"nat","description":"NAT"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.switch_type, None);
+        assert!(!legacy.managed);
+        assert_eq!(legacy.uplink_adapter, None);
+        assert_eq!(legacy.cidr, None);
+
+        let full = VirtualSwitchInfo {
+            id: "br0".into(),
+            name: "br0".into(),
+            kind: "bridge".into(),
+            description: "Linux bridge".into(),
+            switch_type: Some("bridge".into()),
+            managed: true,
+            uplink_adapter: Some("eth0".into()),
+            cidr: Some("10.10.0.0/24".into()),
+        };
+        let encoded = serde_json::to_string(&full).unwrap();
+        let decoded: VirtualSwitchInfo = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, full);
+
+        // CreateSwitchPayload accepts `switch_type` alias and validates rules.
+        let mut payload: CreateSwitchPayload = serde_json::from_str(
+            r#"{"name":"  LabExt  ","switch_type":"External","net_adapter_name":" Ethernet ","allow_management_os":true}"#,
+        )
+        .unwrap();
+        payload.normalize();
+        assert_eq!(payload.name, "LabExt");
+        assert_eq!(payload.kind, "external");
+        assert_eq!(payload.net_adapter_name.as_deref(), Some("Ethernet"));
+        payload.validate().unwrap();
+
+        let missing_adapter = CreateSwitchPayload {
+            name: "BadExt".into(),
+            kind: "external".into(),
+            net_adapter_name: Some("   ".into()),
+            allow_management_os: true,
+            cidr: None,
+        };
+        assert!(missing_adapter.validate().is_err());
+
+        for bad_name in ["", "   ", ".", "..", "bad/name", "bad\\name"] {
+            let p = CreateSwitchPayload {
+                name: bad_name.into(),
+                kind: "internal".into(),
+                ..Default::default()
+            };
+            assert!(p.validate().is_err(), "expected '{bad_name}' to fail");
+        }
+
+        let too_long_bridge = CreateSwitchPayload {
+            name: "bridge_name_exceeds_15".into(),
+            kind: "bridge".into(),
+            ..Default::default()
+        };
+        assert!(too_long_bridge.validate().is_err());
+
+        let valid_bridge = CreateSwitchPayload {
+            name: "br-vm0".into(),
+            kind: "bridge".into(),
+            cidr: Some("192.168.50.0/24".into()),
+            ..Default::default()
+        };
+        valid_bridge.validate().unwrap();
+
+        let bad_cidr = CreateSwitchPayload {
+            name: "priv0".into(),
+            kind: "private".into(),
+            cidr: Some("192.168.50.0/33".into()),
+            ..Default::default()
+        };
+        assert!(bad_cidr.validate().is_err());
+
+        let event_json = serde_json::to_string(&DaemonEvent::SwitchesUpdated).unwrap();
+        let event: DaemonEvent = serde_json::from_str(&event_json).unwrap();
+        assert!(matches!(event, DaemonEvent::SwitchesUpdated));
+    }
+
+    #[test]
+    fn nic_backend_bridge_serde_and_validation() {
+        let mut cfg = VmConfig::from_preset(
+            "BridgeTest",
+            VmPreset::Custom,
+            &std::env::temp_dir().join("vm-bridge"),
+        );
+        cfg.nics[0].backend = NicBackendConfig::Bridge {
+            name: " br0 ".into(),
+        };
+        let encoded = serde_json::to_string(&cfg.nics[0].backend).unwrap();
+        let decoded: NicBackendConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, cfg.nics[0].backend);
+
+        // Leading/trailing whitespace is rejected until normalized.
+        assert!(cfg.validate().is_err());
+        cfg.normalize();
+
+        #[cfg(target_os = "linux")]
+        {
+            cfg.validate().unwrap();
+            for bad_bridge in [".", "..", "br with space", "bridge_name_too_long", "br/0"] {
+                cfg.nics[0].backend = NicBackendConfig::Bridge {
+                    name: bad_bridge.into(),
+                };
+                assert!(
+                    cfg.validate().is_err(),
+                    "expected bridge name '{bad_bridge}' to be rejected"
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Linux bridge NIC backend is only supported on Linux"),
+                "unexpected error: {err:#}"
+            );
+        }
     }
 }

@@ -1401,6 +1401,9 @@ impl VeloVmApp {
                     NicBackendConfig::Tap { name } => {
                         ui.label(format!("Backend: Linux TAP ({name})"));
                     }
+                    NicBackendConfig::Bridge { name } => {
+                        ui.label(format!("Backend: Linux Bridge ({name})"));
+                    }
                 }
             });
         }
