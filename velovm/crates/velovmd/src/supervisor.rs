@@ -403,6 +403,67 @@ impl Supervisor {
         }
     }
 
+    fn restore_pending_port_forwards_from_journal(vm: &mut ManagedVm, sock_path: &Path) {
+        let journal_path = sock_path.with_extension("pending-ports.json");
+        let entries = match velovm_core::store::load_pending_port_forwards_journal(&journal_path) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!(
+                    vm_id = %vm.config.id,
+                    path = %journal_path.display(),
+                    error = %err,
+                    "failed to load pending port-forward journal for re-adopted VM"
+                );
+                return;
+            }
+        };
+        let original_len = entries.len();
+        let surviving: Vec<OrphanedPortForward> = entries
+            .into_iter()
+            .filter(|pf| {
+                !vm.config.nics.iter().any(|nic| {
+                    nic.id == pf.nic_id
+                        && matches!(
+                            &nic.backend,
+                            NicBackendConfig::Consomme { port_forwards, .. }
+                                if port_forwards.contains(&pf.forward)
+                        )
+                })
+            })
+            .collect();
+        if surviving.len() != original_len
+            && let Err(err) =
+                velovm_core::store::save_pending_port_forwards_journal(&journal_path, &surviving)
+        {
+            warn!(
+                vm_id = %vm.config.id,
+                path = %journal_path.display(),
+                error = %err,
+                "failed to prune committed entries from pending port-forward journal for re-adopted VM"
+            );
+        }
+        if !surviving.is_empty() {
+            warn!(
+                vm_id = %vm.config.id,
+                count = surviving.len(),
+                "restoring surviving pending port-forward reservations from runtime journal for re-adopted VM"
+            );
+            for entry in surviving {
+                if !vm
+                    .pending_port_forwards
+                    .iter()
+                    .any(|(nic_id, f)| *nic_id == entry.nic_id && *f == entry.forward)
+                {
+                    vm.pending_port_forwards
+                        .push((entry.nic_id, entry.forward.clone()));
+                }
+                if !vm.orphaned_port_forwards.contains(&entry) {
+                    vm.orphaned_port_forwards.push(entry);
+                }
+            }
+        }
+    }
+
     /// Probes existing VM RPC sockets under `runtime_dir` and re-adopts running VMs.
     /// Must only be called after the daemon has validated config and bound its HTTP listener.
     pub fn adopt_running_vms(self: &Arc<Self>) {
@@ -451,6 +512,7 @@ impl Supervisor {
                                 .then(|| shm_candidate.to_string_lossy().into_owned())
                         });
                         Self::restore_pending_disks_from_journal(vm, &sock_path);
+                        Self::restore_pending_port_forwards_from_journal(vm, &sock_path);
                         vm.runtime.revision = self.next_revision();
                         vm.generation = 1;
                         adopted_vms.push((id, sock_path));
@@ -493,6 +555,7 @@ impl Supervisor {
                                 .exists()
                                 .then(|| shm_candidate.to_string_lossy().into_owned());
                             Self::restore_pending_disks_from_journal(vm, &sock_path);
+                        Self::restore_pending_port_forwards_from_journal(vm, &sock_path);
                             vm.runtime.revision = self.next_revision();
                             vm.generation = 1;
                             adopted_vms.push((id, sock_path));
@@ -2223,6 +2286,7 @@ impl Supervisor {
             let _ = fs::remove_file(&sock_path);
             let _ = fs::remove_file(&pid_path);
             let _ = fs::remove_file(sock_path.with_extension("pending-disks.json"));
+            let _ = fs::remove_file(sock_path.with_extension("pending-ports.json"));
 
             let shm_path = if cfg.fastdesk.enabled && cfg.fastdesk.use_shm {
                 let path = runtime_dir.join(format!("vram-{id}.shm"));
@@ -4192,6 +4256,48 @@ impl Supervisor {
         let hp_lock = self.hotplug_lock(id)?;
         let _hp_guard = hp_lock.lock().await;
 
+        struct PendingPortForwardGuard<'a> {
+            vms: &'a RwLock<HashMap<Uuid, ManagedVm>>,
+            vm_id: Uuid,
+            rpc_gen: u64,
+            nic_id: Uuid,
+            port: PortForward,
+            journal_path: PathBuf,
+            armed: bool,
+        }
+        impl PendingPortForwardGuard<'_> {
+            fn disarm(&mut self) {
+                self.armed = false;
+            }
+        }
+        impl Drop for PendingPortForwardGuard<'_> {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                if let Ok(mut guard) = self.vms.write()
+                    && let Some(vm) = guard.get_mut(&self.vm_id)
+                    && vm.generation == self.rpc_gen
+                    && let Some(pos) = vm
+                        .pending_port_forwards
+                        .iter()
+                        .position(|(n, p)| *n == self.nic_id && *p == self.port)
+                {
+                    vm.pending_port_forwards.remove(pos);
+                    let remaining = snapshot_port_forwards_for_journal(vm);
+                    let live = !vm.deleting
+                        && matches!(vm.runtime.status, VmStatus::Running | VmStatus::Paused);
+                    drop(guard);
+                    if remaining.is_empty() || live {
+                        let _ = velovm_core::store::save_pending_port_forwards_journal(
+                            &self.journal_path,
+                            &remaining,
+                        );
+                    }
+                }
+            }
+        }
+
         let plan = {
             let mut guard = self.vms.write().unwrap();
             let vm = guard
@@ -4206,28 +4312,27 @@ impl Supervisor {
             let vm_gen = vm.generation;
             match sock_opt {
                 Some(sock) => {
-                    let pending_guard = if add {
-                        guard
-                            .get_mut(&id)
-                            .unwrap()
-                            .pending_port_forwards
-                            .push((nic_id, port.clone()));
-                        Some(PendingReservationGuard::new(&self.vms, id, {
-                            let port = port.clone();
-                            move |vm| {
-                                if let Some(pos) = vm
-                                    .pending_port_forwards
-                                    .iter()
-                                    .position(|(n, p)| *n == nic_id && *p == port)
-                                {
-                                    vm.pending_port_forwards.remove(pos);
-                                }
-                            }
-                        }))
+                    let journal_path = sock.with_extension("pending-ports.json");
+                    let (pending_guard, pending_snapshot) = if add {
+                        let pending_snapshot = {
+                            let vm_mut = guard.get_mut(&id).unwrap();
+                            vm_mut.pending_port_forwards.push((nic_id, port.clone()));
+                            snapshot_port_forwards_for_journal(vm_mut)
+                        };
+                        let pg = PendingPortForwardGuard {
+                            vms: &self.vms,
+                            vm_id: id,
+                            rpc_gen: vm_gen,
+                            nic_id,
+                            port: port.clone(),
+                            journal_path: journal_path.clone(),
+                            armed: true,
+                        };
+                        (Some(pg), Some(pending_snapshot))
                     } else {
-                        None
+                        (None, None)
                     };
-                    Ok((sock, vm_gen, pending_guard))
+                    Ok((sock, vm_gen, pending_guard, journal_path, pending_snapshot))
                 }
                 None => {
                     let prev_cfg = vm.config.clone();
@@ -4262,7 +4367,20 @@ impl Supervisor {
                 )
                 .await?
             }
-            Ok((sock, rpc_gen, mut pending_guard)) => {
+            Ok((sock, rpc_gen, mut pending_guard, journal_path, pending_snapshot)) => {
+                if let Some(snapshot) = pending_snapshot {
+                    let journal_for_save = journal_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        velovm_core::store::save_pending_port_forwards_journal(
+                            &journal_for_save,
+                            &snapshot,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("modify_port_forward journal save task failed: {e}")
+                    })??;
+                }
                 let modify_type = if add {
                     vmservice::ModifyType::Update as i32
                 } else {
@@ -4355,6 +4473,50 @@ impl Supervisor {
                         if let Some(pg) = pending_guard.as_mut() {
                             pg.disarm();
                         }
+                        if add {
+                            let (should_write, remaining_pending) = {
+                                let guard = self.vms.read().unwrap();
+                                match guard.get(&id) {
+                                    Some(vm) if vm.generation == rpc_gen => {
+                                        let live = !vm.deleting
+                                            && matches!(
+                                                vm.runtime.status,
+                                                VmStatus::Running | VmStatus::Paused
+                                            );
+                                        let remaining = snapshot_port_forwards_for_journal(vm);
+                                        (remaining.is_empty() || live, remaining)
+                                    }
+                                    _ => (false, Vec::new()),
+                                }
+                            };
+                            if should_write {
+                                let journal_for_clear = journal_path;
+                                let clear_res = tokio::task::spawn_blocking(move || {
+                                    velovm_core::store::save_pending_port_forwards_journal(
+                                        &journal_for_clear,
+                                        &remaining_pending,
+                                    )
+                                })
+                                .await;
+                                match clear_res {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(journal_err)) => {
+                                        warn!(
+                                            vm_id = %id,
+                                            error = %journal_err,
+                                            "failed to clear pending port-forward journal after commit"
+                                        );
+                                    }
+                                    Err(join_err) => {
+                                        warn!(
+                                            vm_id = %id,
+                                            error = %join_err,
+                                            "pending port-forward journal clear task failed after commit"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         summary
                     }
                     Err((err, retain_reservation)) => {
@@ -4407,7 +4569,7 @@ impl Supervisor {
         nic_id: Uuid,
         forward: PortForward,
     ) -> bool {
-        let summary = {
+        let (summary, journal_update) = {
             let mut guard = self.vms.write().unwrap();
             let Some(vm) = guard.get_mut(&id) else {
                 return false;
@@ -4415,13 +4577,37 @@ impl Supervisor {
             if ensure_same_live_vm(vm, rpc_gen, "port forward update").is_err() {
                 return false;
             }
+            if !vm
+                .pending_port_forwards
+                .iter()
+                .any(|(n, f)| *n == nic_id && *f == forward)
+            {
+                vm.pending_port_forwards.push((nic_id, forward.clone()));
+            }
             let entry = OrphanedPortForward { nic_id, forward };
             if !vm.orphaned_port_forwards.contains(&entry) {
                 vm.orphaned_port_forwards.push(entry);
             }
             vm.runtime.revision = self.next_revision();
-            vm.summary()
+            let journal_update = vm.runtime.rpc_socket_path.as_ref().map(|sock| {
+                (
+                    sock.with_extension("pending-ports.json"),
+                    snapshot_port_forwards_for_journal(vm),
+                )
+            });
+            (vm.summary(), journal_update)
         };
+        if let Some((journal_path, snapshot)) = journal_update
+            && let Err(err) =
+                velovm_core::store::save_pending_port_forwards_journal(&journal_path, &snapshot)
+        {
+            warn!(
+                vm_id = %id,
+                path = %journal_path.display(),
+                error = %err,
+                "failed to persist orphaned port-forward reservation to journal"
+            );
+        }
         self.emit(DaemonEvent::VmUpdated { vm: summary });
         true
     }
@@ -5012,37 +5198,6 @@ enum OnlinePlanStep {
     NeedDiskKeys(Vec<PathBuf>),
 }
 
-struct PendingReservationGuard<'a, F: FnOnce(&mut ManagedVm)> {
-    vms: &'a RwLock<HashMap<Uuid, ManagedVm>>,
-    vm_id: Uuid,
-    cleanup: Option<F>,
-}
-
-impl<'a, F: FnOnce(&mut ManagedVm)> PendingReservationGuard<'a, F> {
-    fn new(vms: &'a RwLock<HashMap<Uuid, ManagedVm>>, vm_id: Uuid, cleanup: F) -> Self {
-        Self {
-            vms,
-            vm_id,
-            cleanup: Some(cleanup),
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.cleanup = None;
-    }
-}
-
-impl<F: FnOnce(&mut ManagedVm)> Drop for PendingReservationGuard<'_, F> {
-    fn drop(&mut self) {
-        if let Some(cleanup) = self.cleanup.take()
-            && let Ok(mut guard) = self.vms.write()
-            && let Some(vm) = guard.get_mut(&self.vm_id)
-        {
-            cleanup(vm);
-        }
-    }
-}
-
 /// Drain window during daemon shutdown, sized above `TtrpcClient`'s default
 /// 30s RPC timeout so an in-flight `modify_resource` + `vm.toml` save can finish
 /// cleanly before `detach_all_vms()`.
@@ -5179,6 +5334,23 @@ fn ensure_disks_not_conflicting_with_keys(
         }
     }
     Ok(())
+}
+
+fn snapshot_port_forwards_for_journal(vm: &ManagedVm) -> Vec<OrphanedPortForward> {
+    let mut entries: Vec<OrphanedPortForward> = vm
+        .pending_port_forwards
+        .iter()
+        .map(|(nic_id, forward)| OrphanedPortForward {
+            nic_id: *nic_id,
+            forward: forward.clone(),
+        })
+        .collect();
+    for orphaned in &vm.orphaned_port_forwards {
+        if !entries.contains(orphaned) {
+            entries.push(orphaned.clone());
+        }
+    }
+    entries
 }
 
 fn ensure_port_forwards_not_conflicting_with_active_vms(
@@ -5635,6 +5807,7 @@ fn cleanup_runtime_files(sock_path: Option<PathBuf>, shm_path: Option<String>) {
     if let Some(sock) = sock_path {
         let _ = fs::remove_file(sock.with_extension("pid"));
         let _ = fs::remove_file(sock.with_extension("pending-disks.json"));
+        let _ = fs::remove_file(sock.with_extension("pending-ports.json"));
         let _ = fs::remove_file(sock);
     }
     if let Some(shm) = shm_path {
@@ -9447,5 +9620,255 @@ mod tests {
             .expect("DVD disk should be attached");
         assert_eq!(dvd.lun, 2);
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopt_running_vms_restores_pending_port_forwards_journal_and_blocks_conflicts() {
+        use prost::Message;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use velovm_core::models::{IpProto, PortForward};
+        use velovm_core::ttrpc::{encode_frame, read_frame};
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestWireResponse {
+            #[prost(oneof = "test_wire_response::Result", tags = "1, 2")]
+            result: Option<test_wire_response::Result>,
+        }
+        mod test_wire_response {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Result {
+                #[prost(message, tag = "1")]
+                Status(velovm_core::ttrpc::TtrpcStatus),
+                #[prost(bytes, tag = "2")]
+                Payload(Vec<u8>),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 18080,
+            guest_port: 8080,
+        };
+
+        let (vm1_id, vm1_nic_id, vm2_id, vm2_nic_id, sock1_path, sock2_path) = {
+            let sup1 = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+            let vm1 = sup1
+                .create_vm(CreateVmPayload {
+                    name: "VM1-AdoptPortJournal".into(),
+                    preset: velovm_core::models::VmPreset::Custom,
+                    vcpus: Some(2),
+                    memory_mb: Some(1024),
+                    ..Default::default()
+                })
+                .unwrap();
+            let vm2 = sup1
+                .create_vm(CreateVmPayload {
+                    name: "VM2-AdoptPortJournal".into(),
+                    preset: velovm_core::models::VmPreset::Custom,
+                    vcpus: Some(2),
+                    memory_mb: Some(1024),
+                    ..Default::default()
+                })
+                .unwrap();
+            let rt = sup1.host_config().runtime_dir;
+            fs::create_dir_all(&rt).unwrap();
+            let s1 = rt.join(format!("{}.sock", vm1.config.id));
+            let s2 = rt.join(format!("{}.sock", vm2.config.id));
+
+            // Simulate retained orphaned port forward on running VM1 before restart.
+            sup1.set_vm_running_socket_for_test(vm1.config.id, s1.clone());
+            assert!(sup1.retain_orphaned_port_forward(
+                vm1.config.id,
+                1,
+                vm1.config.nics[0].id,
+                pf.clone(),
+            ));
+            assert!(
+                s1.with_extension("pending-ports.json").exists(),
+                "retain_orphaned_port_forward must persist pending-ports.json"
+            );
+
+            (
+                vm1.config.id,
+                vm1.config.nics[0].id,
+                vm2.config.id,
+                vm2.config.nics[0].id,
+                s1,
+                s2,
+            )
+        };
+
+        let listener1 = UnixListener::bind(&sock1_path).unwrap();
+        let listener2 = UnixListener::bind(&sock2_path).unwrap();
+        listener1.set_nonblocking(true).unwrap();
+        listener2.set_nonblocking(true).unwrap();
+        let stop_srv = Arc::new(AtomicBool::new(false));
+
+        let spawn_props_srv = |listener: UnixListener, flag: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                while !flag.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            if let Ok((stream_id, _, _)) = read_frame(&mut stream) {
+                                let payload = vmservice::PropertiesVmResponse {
+                                    state: vmservice::VmState::Running as i32,
+                                    ..Default::default()
+                                }
+                                .encode_to_vec();
+                                let resp = TestWireResponse {
+                                    result: Some(test_wire_response::Result::Payload(payload)),
+                                };
+                                if let Ok(frame) = encode_frame(stream_id, 2, &resp.encode_to_vec())
+                                {
+                                    let _ = stream.write_all(&frame);
+                                    let _ = stream.flush();
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        let srv1 = spawn_props_srv(listener1, Arc::clone(&stop_srv));
+        let srv2 = spawn_props_srv(listener2, Arc::clone(&stop_srv));
+
+        let sup2 = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        sup2.adopt_running_vms();
+
+        let m1_summary = sup2.get_vm(&vm1_id.to_string()).unwrap();
+        assert_eq!(m1_summary.runtime.status, VmStatus::Running);
+        assert_eq!(
+            m1_summary.runtime.orphaned_port_forwards,
+            vec![OrphanedPortForward {
+                nic_id: vm1_nic_id,
+                forward: pf.clone(),
+            }]
+        );
+
+        // Hot-adding the conflicting host port to running VM2 must fail with 409 Conflict.
+        let err = sup2
+            .add_port_forward(&vm2_id.to_string(), vm2_nic_id, pf.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::Conflict(_))),
+            "expected 409 Conflict against adopted pending-ports journal, got: {err:#}"
+        );
+
+        // cleanup_runtime_files removes pending-ports.json alongside pending-disks.json.
+        cleanup_runtime_files(Some(sock1_path.clone()), None);
+        assert!(!sock1_path.with_extension("pending-ports.json").exists());
+
+        stop_srv.store(true, Ordering::Release);
+        sup2.detach_all_vms().await;
+        srv1.join().unwrap();
+        srv2.join().unwrap();
+    }
+
+    #[test]
+    fn restore_pending_port_forwards_from_journal_prunes_committed_entries() {
+        use velovm_core::models::{IpProto, PortForward};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), Some("127.0.0.1:0")).unwrap();
+        let created = sup
+            .create_vm(CreateVmPayload {
+                name: "VM-PrunePortsJournal".into(),
+                preset: velovm_core::models::VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = created.config.id;
+        let nic_id = created.config.nics[0].id;
+        let sock_path = sup.host_config().runtime_dir.join(format!("{id}.sock"));
+        let journal_path = sock_path.with_extension("pending-ports.json");
+
+        let committed_pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 19001,
+            guest_port: 9001,
+        };
+        let uncommitted_pf = PortForward {
+            protocol: IpProto::Tcp,
+            host_addr: "127.0.0.1".into(),
+            host_port: 19002,
+            guest_port: 9002,
+        };
+
+        let committed_entry = OrphanedPortForward {
+            nic_id,
+            forward: committed_pf.clone(),
+        };
+        let uncommitted_entry = OrphanedPortForward {
+            nic_id,
+            forward: uncommitted_pf.clone(),
+        };
+
+        velovm_core::store::save_pending_port_forwards_journal(
+            &journal_path,
+            &[committed_entry, uncommitted_entry.clone()],
+        )
+        .unwrap();
+
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            if let NicBackendConfig::Consomme { port_forwards, .. } = &mut vm.config.nics[0].backend
+            {
+                port_forwards.push(committed_pf);
+            }
+            Supervisor::restore_pending_port_forwards_from_journal(vm, &sock_path);
+            assert_eq!(vm.pending_port_forwards, vec![(nic_id, uncommitted_pf)]);
+            assert_eq!(
+                vm.summary().runtime.orphaned_port_forwards,
+                vec![uncommitted_entry.clone()]
+            );
+            // Calling restore again must not duplicate entries.
+            Supervisor::restore_pending_port_forwards_from_journal(vm, &sock_path);
+            assert_eq!(
+                vm.summary().runtime.orphaned_port_forwards,
+                vec![uncommitted_entry.clone()]
+            );
+            vm.pending_port_forwards.clear();
+            vm.orphaned_port_forwards.clear();
+        }
+        let persisted =
+            velovm_core::store::load_pending_port_forwards_journal(&journal_path).unwrap();
+        assert_eq!(persisted, vec![uncommitted_entry]);
+
+        // When all entries are committed, pruning removes the journal file.
+        velovm_core::store::save_pending_port_forwards_journal(
+            &journal_path,
+            &[OrphanedPortForward {
+                nic_id,
+                forward: PortForward {
+                    protocol: IpProto::Tcp,
+                    host_addr: "127.0.0.1".into(),
+                    host_port: 19001,
+                    guest_port: 9001,
+                },
+            }],
+        )
+        .unwrap();
+        {
+            let mut guard = sup.vms.write().unwrap();
+            let vm = guard.get_mut(&id).unwrap();
+            Supervisor::restore_pending_port_forwards_from_journal(vm, &sock_path);
+            assert!(vm.pending_port_forwards.is_empty());
+            assert!(vm.summary().runtime.orphaned_port_forwards.is_empty());
+        }
+        assert!(!journal_path.exists());
     }
 }
