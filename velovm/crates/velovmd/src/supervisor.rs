@@ -707,7 +707,7 @@ impl Supervisor {
         }
     }
 
-    fn emit(&self, event: DaemonEvent) {
+    pub(crate) fn emit(&self, event: DaemonEvent) {
         let _ = self.events_tx.send(event);
     }
 

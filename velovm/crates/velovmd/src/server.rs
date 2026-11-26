@@ -23,12 +23,14 @@ use futures_util::Stream;
 use velovm_core::models::ApiErrorBody;
 use velovm_core::models::AttachDiskPayload;
 use velovm_core::models::CreateDiskPayload;
+use velovm_core::models::CreateSwitchPayload;
 use velovm_core::models::CreateVmPayload;
 use velovm_core::models::DaemonEvent;
 use velovm_core::models::DiskInfo;
 use velovm_core::models::HostConfig;
 use velovm_core::models::HostConfigPatch;
 use velovm_core::models::HostInfo;
+use velovm_core::models::HostNetAdapterInfo;
 use velovm_core::models::InspectDiskPayload;
 use velovm_core::models::MountIsoPayload;
 use velovm_core::models::PortForwardPayload;
@@ -140,7 +142,12 @@ pub fn build_router(supervisor: Arc<Supervisor>, token: String, bound_addr: Sock
                 .put(put_host_config)
                 .patch(patch_host_config),
         )
-        .route("/api/v1/host/switches", get(list_switches))
+        .route(
+            "/api/v1/host/switches",
+            get(list_switches).post(create_switch),
+        )
+        .route("/api/v1/host/switches/{id}", delete(delete_switch))
+        .route("/api/v1/host/net-adapters", get(list_net_adapters))
         .route("/api/v1/daemon/shutdown", post(daemon_shutdown))
         .route("/api/v1/disks/create", post(create_disk))
         .route("/api/v1/disks/inspect", post(inspect_disk))
@@ -392,6 +399,42 @@ async fn list_switches(
         .await
         .map(Json)
         .map_err(ApiError::internal)
+}
+
+async fn create_switch(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateSwitchPayload>,
+) -> Result<(StatusCode, Json<VirtualSwitchInfo>), ApiError> {
+    let sup = state.supervisor.clone();
+    let created = tokio::task::spawn_blocking(move || sup.create_switch(payload))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::map_anyhow)?;
+    state.supervisor.emit(DaemonEvent::SwitchesUpdated);
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn delete_switch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let sup = state.supervisor.clone();
+    tokio::task::spawn_blocking(move || sup.delete_switch(&id))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::map_anyhow)?;
+    state.supervisor.emit(DaemonEvent::SwitchesUpdated);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_net_adapters(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<HostNetAdapterInfo>>, ApiError> {
+    tokio::task::spawn_blocking(move || state.supervisor.list_net_adapters())
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::map_anyhow)
+        .map(Json)
 }
 
 #[derive(Deserialize, Default)]
@@ -716,9 +759,12 @@ mod tests {
         }
     }
     use velovm_core::models::CreateDiskPayload;
+    use velovm_core::models::CreateSwitchPayload;
     use velovm_core::models::CreateVmPayload;
+    use velovm_core::models::DaemonEvent;
     use velovm_core::models::DiskFormat;
     use velovm_core::models::DiskKind;
+    use velovm_core::models::HostNetAdapterInfo;
     use velovm_core::models::IpProto;
     use velovm_core::models::MountIsoPayload;
     use velovm_core::models::NicBackendConfig;
@@ -729,6 +775,8 @@ mod tests {
     use velovm_core::models::VmStatus;
     use velovm_core::models::VmSummary;
     use std::fs;
+    use std::time::Duration;
+    use uuid::Uuid;
 
     fn test_http_client() -> reqwest::Client {
         reqwest::Client::builder().no_proxy().build().unwrap()
@@ -2314,6 +2362,9 @@ mod tests {
             (reqwest::Method::GET, "/api/v1/host/config"),
             (reqwest::Method::PUT, "/api/v1/host/config"),
             (reqwest::Method::GET, "/api/v1/host/switches"),
+            (reqwest::Method::POST, "/api/v1/host/switches"),
+            (reqwest::Method::DELETE, "/api/v1/host/switches/some-switch"),
+            (reqwest::Method::GET, "/api/v1/host/net-adapters"),
             (reqwest::Method::POST, "/api/v1/daemon/shutdown"),
             (reqwest::Method::POST, "/api/v1/disks/create"),
             (reqwest::Method::POST, "/api/v1/disks/inspect"),
@@ -3874,6 +3925,176 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn virtual_switch_crud_endpoints_validate_reject_builtin_and_detect_vm_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        // 1. GET /api/v1/host/net-adapters returns 200 OK JSON array
+        let adapters_resp = client
+            .get(format!("{}/api/v1/host/net-adapters", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(adapters_resp.status(), reqwest::StatusCode::OK);
+        let _adapters: Vec<HostNetAdapterInfo> = adapters_resp.json().await.unwrap();
+
+        // 2. POST /api/v1/host/switches validation errors -> 400 Bad Request
+        let empty_name_resp = client
+            .post(format!("{}/api/v1/host/switches", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateSwitchPayload {
+                name: "   ".to_string(),
+                kind: "internal".to_string(),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_name_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let missing_adapter_resp = client
+            .post(format!("{}/api/v1/host/switches", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateSwitchPayload {
+                name: "BadExt".to_string(),
+                kind: "external".to_string(),
+                net_adapter_name: None,
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_adapter_resp.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+
+        // 3. DELETE built-in switches -> 400 Bad Request; missing switch -> 404 Not Found
+        for builtin in ["consomme", "c08cb7b8-9b3c-408e-8e30-5e16a3aeb444"] {
+            let del_builtin = client
+                .delete(format!("{}/api/v1/host/switches/{builtin}", daemon.base_url))
+                .bearer_auth(&daemon.token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(del_builtin.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+
+        let del_missing = client
+            .delete(format!(
+                "{}/api/v1/host/switches/nonexistent-switch",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(del_missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // 4. DELETE switch attached to a VM -> 409 Conflict
+        #[cfg(target_os = "linux")]
+        let (target_switch, nic_backend) = (
+            "br-conflict",
+            velovm_core::models::NicBackendConfig::Bridge {
+                name: "br-conflict".to_string(),
+            },
+        );
+        #[cfg(not(target_os = "linux"))]
+        let (target_switch, nic_backend) = (
+            "11111111-2222-3333-4444-555555555555",
+            velovm_core::models::NicBackendConfig::VmSwitch {
+                switch_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                switch_name: Some("LabSwitch".to_string()),
+            },
+        );
+
+        let create_vm_resp = client
+            .post(format!("{}/api/v1/vms", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&CreateVmPayload {
+                name: "SwitchConflictVm".to_string(),
+                preset: VmPreset::Custom,
+                vcpus: Some(2),
+                memory_mb: Some(512),
+                nics: Some(vec![velovm_core::models::NicAttachment {
+                    id: Uuid::new_v4(),
+                    name: "Test NIC".to_string(),
+                    mac_address: "00-15-5D-11-22-33".to_string(),
+                    backend: nic_backend,
+                }]),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_vm_resp.status(), reqwest::StatusCode::CREATED);
+
+        let conflict_resp = client
+            .delete(format!(
+                "{}/api/v1/host/switches/{target_switch}",
+                daemon.base_url
+            ))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict_resp.status(), reqwest::StatusCode::CONFLICT);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sse_events_stream_delivers_switches_updated_event() {
+        use futures_util::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let resp = client
+            .get(format!("{}/api/v1/events", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let mut stream = resp.bytes_stream();
+        // Read initial Resync event
+        let first_chunk = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("initial SSE resync")
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&first_chunk).contains("resync"),
+            "unexpected initial SSE chunk: {}",
+            String::from_utf8_lossy(&first_chunk)
+        );
+
+        daemon.supervisor.emit(DaemonEvent::SwitchesUpdated);
+
+        let update_chunk = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("SwitchesUpdated SSE event")
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&update_chunk).contains("switches_updated"),
+            "expected switches_updated SSE event, got: {}",
+            String::from_utf8_lossy(&update_chunk)
+        );
 
         daemon.shutdown().await;
     }
