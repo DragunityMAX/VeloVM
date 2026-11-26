@@ -995,6 +995,16 @@ pub struct VmConfig {
     pub updated_at: DateTime<Utc>,
 }
 
+fn validate_fastdesk_transport_support(
+    transport: FastDeskTransport,
+    hvsock_supported: bool,
+) -> anyhow::Result<()> {
+    if transport == FastDeskTransport::HvSock && !hvsock_supported {
+        bail!("fastdesk.transport 'hv_sock' is only supported on Windows and Linux");
+    }
+    Ok(())
+}
+
 impl VmConfig {
     pub fn from_preset(name: impl Into<String>, preset: VmPreset, vm_dir: &Path) -> Self {
         let id = Uuid::new_v4();
@@ -1087,6 +1097,29 @@ impl VmValidationOptions {
     }
 }
 
+fn validate_fastdesk_loopback_listen_addr(raw: &str) -> anyhow::Result<std::net::SocketAddr> {
+    if raw.contains("://") || raw.ends_with('/') {
+        bail!(
+            "invalid fastdesk.listen_addr '{raw}': expected loopback IP or socket address without URL scheme"
+        );
+    }
+    let addr = if let Ok(sa) = raw.parse::<std::net::SocketAddr>() {
+        sa
+    } else {
+        let ip: std::net::IpAddr = raw.parse().with_context(|| {
+            format!(
+                "invalid fastdesk.listen_addr '{raw}': expected loopback IP or socket address like 127.0.0.1:5900 or [::1]:5900"
+            )
+        })?;
+        std::net::SocketAddr::new(ip, 0)
+    };
+    anyhow::ensure!(
+        addr.ip().is_loopback(),
+        "fastdesk.listen_addr '{raw}' must be a loopback address (e.g. 127.0.0.1:5900 or [::1]:5900)"
+    );
+    Ok(addr)
+}
+
 impl VmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_with_options(true, true)
@@ -1118,18 +1151,18 @@ impl VmConfig {
             bail!("memory_mb must be between 128 and {MAX_VM_MEMORY_MB} MiB");
         }
         if opts.validate_fastdesk {
-            if self.fastdesk.enabled && (self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256) {
-                bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
+            if self.fastdesk.enabled {
+                validate_fastdesk_transport_support(
+                    self.fastdesk.transport,
+                    cfg!(any(windows, target_os = "linux")),
+                )?;
+                if self.fastdesk.vram_mb < 8 || self.fastdesk.vram_mb > 256 {
+                    bail!("fastdesk.vram_mb must be between 8 and 256 MiB");
+                }
             }
             if !self.fastdesk.listen_addr.trim().is_empty() {
                 let raw = self.fastdesk.listen_addr.trim();
-                if raw.contains("://") || raw.ends_with('/') {
-                    bail!(
-                        "invalid fastdesk.listen_addr '{raw}': expected host:port socket address without URL scheme"
-                    );
-                }
-                parse_loopback_listen_addr(raw)
-                    .context("invalid fastdesk.listen_addr")?;
+                validate_fastdesk_loopback_listen_addr(raw)?;
             }
         }
         if opts.validate_disks {
@@ -2413,6 +2446,8 @@ mod tests {
             "http://127.0.0.1:5900",
             "http://localhost:5900/",
             "127.0.0.1:5900/",
+            "localhost:5900",
+            "192.168.1.10:5900",
         ] {
             cfg.fastdesk.listen_addr = bad_addr.into();
             assert!(
@@ -2420,8 +2455,10 @@ mod tests {
                 "expected fastdesk.listen_addr '{bad_addr}' to be rejected"
             );
         }
-        cfg.fastdesk.listen_addr = "127.0.0.1:5900".into();
-        cfg.validate().unwrap();
+        for good_addr in ["127.0.0.1:5900", "[::1]:5900", "127.0.0.1", "::1"] {
+            cfg.fastdesk.listen_addr = good_addr.into();
+            cfg.validate().unwrap();
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -2497,5 +2534,24 @@ mod tests {
             &["firmware/MSVM.fd", rel],
         );
         assert_eq!(found, Some(fw));
+    }
+
+    #[test]
+    fn fastdesk_hvsock_transport_is_rejected_on_unsupported_platforms() {
+        validate_fastdesk_transport_support(FastDeskTransport::Tcp, false).unwrap();
+        validate_fastdesk_transport_support(FastDeskTransport::HvSock, true).unwrap();
+        assert!(validate_fastdesk_transport_support(FastDeskTransport::HvSock, false).is_err());
+
+        let mut cfg = VmConfig::from_preset(
+            "HvSockPlatformTest",
+            VmPreset::Custom,
+            &std::env::temp_dir().join("vm"),
+        );
+        cfg.fastdesk.enabled = true;
+        cfg.fastdesk.transport = FastDeskTransport::HvSock;
+        #[cfg(any(windows, target_os = "linux"))]
+        cfg.validate().unwrap();
+        #[cfg(not(any(windows, target_os = "linux")))]
+        assert!(cfg.validate().is_err());
     }
 }

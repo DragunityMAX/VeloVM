@@ -1,6 +1,6 @@
 # Vendored OpenVMM Patches
 
-`openvmm/` vendors a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) starting from upstream commit `c4419be15ab702194f0a25c294bd2f6187804824` (with FastDesk integration landed on this repository's `main` branch). Changes made inside vendored crates relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` are tracked here as named patches so they can be audited, preserved, or dropped cleanly during upstream syncs; the only change under `openvmm/` outside these three patches relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` is `openvmm/Cargo.lock`.
+`openvmm/` vendors a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) starting from upstream commit `c4419be15ab702194f0a25c294bd2f6187804824` (with FastDesk integration landed on this repository's `main` branch). Changes made inside vendored crates relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` are tracked here as named patches so they can be audited, preserved, or dropped cleanly during upstream syncs; the only change under `openvmm/` outside these four patches relative to the pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610` is `openvmm/Cargo.lock`.
 
 ## Patch Inventory
 
@@ -27,6 +27,15 @@
 - **Behavioral impact:** **Breaking change for `SCSIDisk.type` (`DiskType`):** Upstream OpenVMM ignored `SCSIDisk.type` and always dispatched by file extension via `open_disk_type`. With this patch, `SCSI_DISK_TYPE_VHDX`, `SCSI_DISK_TYPE_VHD1`, and `SCSI_DISK_TYPE_PHYSICAL` are all explicitly honoured regardless of extension, so ttrpc clients must pass the variant matching the image format (rather than relying on `SCSIDisk.type` being ignored in favor of filename extension).
 - **Why carried:** Exposes FastDesk, DVD/ISO hot-plug, reset, vTPM 2.0, and Hyper-V switch auto-port control over `vmservice.VM` ttrpc for VeloVM (`velovmd`).
 
+### `0004-fastdesk-client-msg-limit-and-accept-hardening.patch`
+- **Targets:**
+  - `openvmm/workers/fastdesk_proto/src/lib.rs`
+  - `openvmm/workers/fastdesk_proto/src/wire.rs`
+  - `openvmm/workers/fastdesk_worker/Cargo.toml`
+- **Summary:** Adds `MAX_CLIENT_MSG_PAYLOAD_BYTES` (1 KiB) and `decode_client_frame_header`, updates `read_client_msg` to enforce the client message payload size limit, rolls back partial frame bytes in `finish_frame` on `FrameTooLarge`, and adds the Unix `libc` dependency to `fastdesk_worker/Cargo.toml` (used for accept/peer-credential hardening in `fastdesk_worker`).
+- **Behavioral impact:** Prevents unbounded allocations / OOM DoS from oversized client-to-server FastDesk frames, leaves output buffers clean after oversized server frame encoding failures, and ensures `fastdesk_worker` builds on Unix targets.
+- **Why carried:** Tracks FastDesk protocol and `fastdesk_worker` build/hardening changes outside the `0003` ttrpc extension patch so re-applying patches onto a clean baseline preserves both security fixes and Unix compilation.
+
 ## Verifying and Regenerating
 
 From the repository root (against pre-OpenVMMS baseline commit `795181d2a88ddbd3243f494f8706eb27c3cb4610`):
@@ -36,6 +45,7 @@ From the repository root (against pre-OpenVMMS baseline commit `795181d2a88ddbd3
 git apply -R --check patches/0001-mesh-rpc-cancel-pending-rpcs-on-client-disconnect.patch
 git apply -R --check patches/0002-disk-writable-image-locking-and-vhdx-open.patch
 git apply -R --check patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
+git apply -R --check patches/0004-fastdesk-client-msg-limit-and-accept-hardening.patch
 
 # Regenerate patches from baseline commit 795181d2a88ddbd3243f494f8706eb27c3cb4610:
 git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/support/mesh/mesh_rpc/src/server.rs \
@@ -44,6 +54,8 @@ git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/openvmm/openvmm_hel
   > patches/0002-disk-writable-image-locking-and-vhdx-open.patch
 git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto openvmm/openvmm/openvmm_entry/src/lib.rs openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs openvmm/workers/fastdesk_worker/src/lib.rs openvmm/workers/fastdesk_worker_defs/src/lib.rs \
   > patches/0003-vmservice-ttrpc-fastdesk-dvd-reset-tpm-extensions.patch
+git diff 795181d2a88ddbd3243f494f8706eb27c3cb4610 -- openvmm/workers/fastdesk_proto/src/lib.rs openvmm/workers/fastdesk_proto/src/wire.rs openvmm/workers/fastdesk_worker/Cargo.toml \
+  > patches/0004-fastdesk-client-msg-limit-and-accept-hardening.patch
 
 # Apply to a clean checkout of the pre-OpenVMMS baseline (then refresh `openvmm/Cargo.lock`
 # because `0002` adds `libc` and `tracing` dependencies to `disklayer_vhdx` before `cargo build --locked`):
