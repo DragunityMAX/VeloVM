@@ -61,7 +61,9 @@ pub fn parse_loopback_listen_addr(raw: &str) -> anyhow::Result<std::net::SocketA
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostConfig {
+    #[serde(default)]
     pub data_dir: PathBuf,
+    #[serde(default)]
     pub runtime_dir: PathBuf,
     pub listen_addr: String,
     pub openvmm_bin: Option<PathBuf>,
