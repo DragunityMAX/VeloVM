@@ -3854,4 +3854,27 @@ mod tests {
 
         daemon.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn shutdown_vm_returns_bad_request_when_acpi_and_force_are_both_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonHandle::spawn(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let client = test_http_client();
+
+        let resp = client
+            .post(format!("{}/api/v1/vms/nonexistent/shutdown", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&velovm_core::models::ShutdownVmPayload {
+                acpi: true,
+                force: true,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        daemon.shutdown().await;
+    }
 }
