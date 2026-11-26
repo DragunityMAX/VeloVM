@@ -1612,7 +1612,12 @@ async fn vm_config_from_command_line(
         resources.acpi_power_button = Some(send);
     }
 
-    let layout_config = chipset.layout_config();
+    let mut layout_config = chipset.layout_config();
+    if framebuffer.is_some() {
+        layout_config.chipset_low_mmio_size = layout_config
+            .chipset_low_mmio_size
+            .max(min_low_mmio_for_framebuffer(arch, vram_size));
+    }
     let VmChipsetResult {
         chipset,
         mut chipset_devices,
@@ -2975,6 +2980,24 @@ fn validate_shm_path(shm_path: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn min_low_mmio_for_framebuffer(
+    arch: vm_manifest_builder::MachineArch,
+    vram_size: usize,
+) -> u32 {
+    const MB: u64 = 1024 * 1024;
+    // Reserve space above the framebuffer for the architectural reserved
+    // window (32 MiB on x86_64, 272 MiB on aarch64) plus PCI/chipset
+    // low-MMIO devices so the entire VRAM range stays below 4 GiB.
+    let headroom = match arch {
+        vm_manifest_builder::MachineArch::X86_64 => 64 * MB,
+        vm_manifest_builder::MachineArch::Aarch64 => (272 + 32) * MB,
+    };
+    let required = u64::try_from(vram_size)
+        .unwrap_or(u32::MAX as u64)
+        .saturating_add(headroom);
+    u32::try_from(required).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn alloc_framebuffer_vram(
@@ -4364,5 +4387,30 @@ mod tests {
         assert!(alloc_framebuffer_vram(Some(&valid), 16 * 1024 * 1024).is_err());
         assert!(valid.is_file());
         assert_eq!(std::fs::metadata(&valid).unwrap().len(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn min_low_mmio_for_framebuffer_covers_256mib_vram_and_arch_reserved() {
+        const MB: usize = 1024 * 1024;
+        let x64_layout = VmManifestBuilder::new(
+            vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
+            vm_manifest_builder::MachineArch::X86_64,
+        )
+        .layout_config();
+        let x64_low = x64_layout
+            .chipset_low_mmio_size
+            .max(min_low_mmio_for_framebuffer(
+                vm_manifest_builder::MachineArch::X86_64,
+                256 * MB,
+            ));
+        assert_eq!(x64_low, 320 * MB as u32);
+        // 320 MiB below 4 GiB leaves 288 MiB below the 32 MiB x86_64 arch-reserved window.
+        assert!(u64::from(x64_low) >= 256 * MB as u64 + 32 * MB as u64);
+
+        let aarch64_low = min_low_mmio_for_framebuffer(
+            vm_manifest_builder::MachineArch::Aarch64,
+            256 * MB,
+        );
+        assert_eq!(aarch64_low, (256 + 272 + 32) * MB as u32);
     }
 }

@@ -1,5 +1,5 @@
 diff --git a/openvmm/openvmm/openvmm_entry/src/lib.rs b/openvmm/openvmm/openvmm_entry/src/lib.rs
-index 4c6546f..57c7860 100644
+index 4c6546f..5810756 100644
 --- a/openvmm/openvmm/openvmm_entry/src/lib.rs
 +++ b/openvmm/openvmm/openvmm_entry/src/lib.rs
 @@ -1305,33 +1305,9 @@ async fn vm_config_from_command_line(
@@ -39,7 +39,21 @@ index 4c6546f..57c7860 100644
          resources.framebuffer_access = Some(fba);
          Some(fb)
      } else {
-@@ -2430,7 +2406,7 @@ fn cleanup_socket(path: &Path) {
+@@ -1636,7 +1612,12 @@ async fn vm_config_from_command_line(
+         resources.acpi_power_button = Some(send);
+     }
+ 
+-    let layout_config = chipset.layout_config();
++    let mut layout_config = chipset.layout_config();
++    if framebuffer.is_some() {
++        layout_config.chipset_low_mmio_size = layout_config
++            .chipset_low_mmio_size
++            .max(min_low_mmio_for_framebuffer(arch, vram_size));
++    }
+     let VmChipsetResult {
+         chipset,
+         mut chipset_devices,
+@@ -2430,7 +2411,7 @@ fn cleanup_socket(path: &Path) {
  }
  
  #[cfg(windows)]
@@ -48,7 +62,7 @@ index 4c6546f..57c7860 100644
      switch_id: Option<&str>,
  ) -> anyhow::Result<(
      openvmm_defs::config::SwitchPortId,
-@@ -2976,7 +2952,100 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
+@@ -2976,7 +2957,118 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
      result
  }
  
@@ -76,6 +90,24 @@ index 4c6546f..57c7860 100644
 +        );
 +    }
 +    Ok(())
++}
++
++pub(crate) fn min_low_mmio_for_framebuffer(
++    arch: vm_manifest_builder::MachineArch,
++    vram_size: usize,
++) -> u32 {
++    const MB: u64 = 1024 * 1024;
++    // Reserve space above the framebuffer for the architectural reserved
++    // window (32 MiB on x86_64, 272 MiB on aarch64) plus PCI/chipset
++    // low-MMIO devices so the entire VRAM range stays below 4 GiB.
++    let headroom = match arch {
++        vm_manifest_builder::MachineArch::X86_64 => 64 * MB,
++        vm_manifest_builder::MachineArch::Aarch64 => (272 + 32) * MB,
++    };
++    let required = u64::try_from(vram_size)
++        .unwrap_or(u32::MAX as u64)
++        .saturating_add(headroom);
++    u32::try_from(required).unwrap_or(u32::MAX)
 +}
 +
 +pub(crate) fn alloc_framebuffer_vram(
@@ -150,7 +182,7 @@ index 4c6546f..57c7860 100644
      label: &str,
      listen_str: &str,
      default_port: u16,
-@@ -3011,6 +3080,7 @@ fn bind_display_tcp_listener(
+@@ -3011,6 +3103,7 @@ fn bind_display_tcp_listener(
              );
          }
      }
@@ -158,7 +190,7 @@ index 4c6546f..57c7860 100644
      socket.set_reuse_address(true)?;
      socket
          .bind(&addr.into())
-@@ -3029,6 +3099,65 @@ fn bind_display_tcp_listener(
+@@ -3029,6 +3122,65 @@ fn bind_display_tcp_listener(
      Ok(socket.into())
  }
  
@@ -224,7 +256,7 @@ index 4c6546f..57c7860 100644
  async fn run_control_inner(
      driver: &DefaultDriver,
      mesh_slot: &mut Option<VmmMesh>,
-@@ -4186,4 +4315,54 @@ fn rejects_duplicate_pcie_port_assignment_from_storage() {
+@@ -4186,4 +4338,79 @@ fn rejects_duplicate_pcie_port_assignment_from_storage() {
              mesh.shutdown().await;
          });
      }
@@ -278,9 +310,34 @@ index 4c6546f..57c7860 100644
 +        assert!(valid.is_file());
 +        assert_eq!(std::fs::metadata(&valid).unwrap().len(), 8 * 1024 * 1024);
 +    }
++
++    #[test]
++    fn min_low_mmio_for_framebuffer_covers_256mib_vram_and_arch_reserved() {
++        const MB: usize = 1024 * 1024;
++        let x64_layout = VmManifestBuilder::new(
++            vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
++            vm_manifest_builder::MachineArch::X86_64,
++        )
++        .layout_config();
++        let x64_low = x64_layout
++            .chipset_low_mmio_size
++            .max(min_low_mmio_for_framebuffer(
++                vm_manifest_builder::MachineArch::X86_64,
++                256 * MB,
++            ));
++        assert_eq!(x64_low, 320 * MB as u32);
++        // 320 MiB below 4 GiB leaves 288 MiB below the 32 MiB x86_64 arch-reserved window.
++        assert!(u64::from(x64_low) >= 256 * MB as u64 + 32 * MB as u64);
++
++        let aarch64_low = min_low_mmio_for_framebuffer(
++            vm_manifest_builder::MachineArch::Aarch64,
++            256 * MB,
++        );
++        assert_eq!(aarch64_low, (256 + 272 + 32) * MB as u32);
++    }
  }
 diff --git a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
-index b63d6b6..72caa04 100644
+index b63d6b6..f03b482 100644
 --- a/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 +++ b/openvmm/openvmm/openvmm_entry/src/ttrpc/mod.rs
 @@ -35,6 +35,7 @@ struct FdRegistry {}
@@ -533,7 +590,21 @@ index b63d6b6..72caa04 100644
          let acpi_power_button_rpc = if supports_acpi_power_button(&load_mode) {
              let (send, recv) = mesh::channel();
              let irq = match arch {
-@@ -1405,7 +1490,7 @@ async fn create_vm_inner(
+@@ -1319,7 +1404,12 @@ async fn create_vm_inner(
+             chipset_builder = chipset_builder.with_uefi(uefi_manifest);
+         }
+         let layout_config = chipset_builder.layout_config();
+-        let layout_config = apply_mmio_overrides(layout_config, req_config.memory_config.as_ref())?;
++        let layout_config = apply_mmio_overrides(
++            layout_config,
++            req_config.memory_config.as_ref(),
++            arch,
++            framebuffer.is_some().then_some(fastdesk_vram_size),
++        )?;
+         let chipset = chipset_builder
+             .build()
+             .context("failed to build vm configuration")?;
+@@ -1405,7 +1495,7 @@ async fn create_vm_inner(
              #[cfg(windows)]
              kernel_vmnics: vec![],
              input: mesh::Receiver::new(),
@@ -542,7 +613,7 @@ index b63d6b6..72caa04 100644
              vga_firmware: None,
              vtl2_gfx: false,
              virtio_devices: vec![],
-@@ -1439,8 +1524,44 @@ async fn create_vm_inner(
+@@ -1439,8 +1529,44 @@ async fn create_vm_inner(
  
          let mut scsi_rpc = None;
          let mut consomme_rpc = std::collections::HashMap::new();
@@ -588,7 +659,7 @@ index b63d6b6..72caa04 100644
                  let mut devices = Vec::new();
                  for disk in devices_config.scsi_disks {
                      devices.push(make_disk_config(disk).await?);
-@@ -1476,7 +1597,12 @@ async fn create_vm_inner(
+@@ -1476,7 +1602,12 @@ async fn create_vm_inner(
                  } else {
                      None
                  };
@@ -602,7 +673,7 @@ index b63d6b6..72caa04 100644
                      NicDevice::Vmbus(resource) => {
                          config.vmbus_devices.push((DeviceVtl::Vtl0, resource));
                      }
-@@ -1569,6 +1695,45 @@ async fn create_vm_inner(
+@@ -1569,6 +1700,45 @@ async fn create_vm_inner(
              .await
              .context("spawning vm process failed")?;
  
@@ -648,7 +719,7 @@ index b63d6b6..72caa04 100644
          let (shared_memory, saved_state, active_memory_backing_file, snapshot_id) =
              if let Some(restore) = &restore {
                  let prepared =
-@@ -1592,6 +1757,75 @@ async fn create_vm_inner(
+@@ -1592,6 +1762,75 @@ async fn create_vm_inner(
                  (shared_memory, None, memory_backing_file, None)
              };
  
@@ -724,7 +795,7 @@ index b63d6b6..72caa04 100644
          let worker = vm_host
              .launch_worker(
                  VM_WORKER,
-@@ -1618,7 +1852,7 @@ async fn create_vm_inner(
+@@ -1618,7 +1857,7 @@ async fn create_vm_inner(
              mesh,
              vm_worker: worker,
              vnc_worker: None,
@@ -733,7 +804,7 @@ index b63d6b6..72caa04 100644
              gdb_worker: None,
              diag_inspector: None,
              vtl2_settings: None,
-@@ -1643,6 +1877,10 @@ async fn create_vm_inner(
+@@ -1643,6 +1882,10 @@ async fn create_vm_inner(
          self.vm_controller = Some(vm_controller_send);
          self.vm_controller_events = Some(event_recv);
          self.controller_task = Some(controller_task);
@@ -744,7 +815,7 @@ index b63d6b6..72caa04 100644
          self.vm = Some(Arc::new(Vm {
              shutdown_rpc,
              acpi_power_button_rpc,
-@@ -1653,6 +1891,10 @@ async fn create_vm_inner(
+@@ -1653,6 +1896,10 @@ async fn create_vm_inner(
          }));
          self.snapshot_saved = false;
          self.memory_backing_file = active_memory_backing_file;
@@ -755,7 +826,7 @@ index b63d6b6..72caa04 100644
          self.lifecycle = VmLifecycle::Paused;
          Ok(snapshot_id)
      }
-@@ -1670,10 +1912,15 @@ async fn teardown_vm(&mut self) -> anyhow::Result<()> {
+@@ -1670,10 +1917,15 @@ async fn teardown_vm(&mut self) -> anyhow::Result<()> {
          if let Some(task) = self.controller_task.take() {
              task.await;
          }
@@ -771,7 +842,7 @@ index b63d6b6..72caa04 100644
          if let Some((_, response)) = self.wait_vm_response.take() {
              response.send(Err(grpc_error(anyhow!("VM torn down"))));
          }
-@@ -1690,6 +1937,8 @@ fn build_properties(&self) -> vmservice::PropertiesVmResponse {
+@@ -1690,6 +1942,8 @@ fn build_properties(&self) -> vmservice::PropertiesVmResponse {
              processor_stats: None,
              state: vmservice::VmState::from(&self.lifecycle) as i32,
              halt_reason,
@@ -780,7 +851,7 @@ index b63d6b6..72caa04 100644
          }
      }
  
-@@ -1826,7 +2075,9 @@ async fn pause_vm(&mut self) -> anyhow::Result<()> {
+@@ -1826,7 +2080,9 @@ async fn pause_vm(&mut self) -> anyhow::Result<()> {
              .await
              .map(drop)
              .context("pause failed")?;
@@ -791,7 +862,7 @@ index b63d6b6..72caa04 100644
              self.lifecycle = VmLifecycle::Paused;
          }
          Ok(())
-@@ -1842,12 +2093,34 @@ async fn resume_vm(&mut self) -> anyhow::Result<()> {
+@@ -1842,12 +2098,34 @@ async fn resume_vm(&mut self) -> anyhow::Result<()> {
              .await
              .map(drop)
              .context("resume failed")?;
@@ -827,7 +898,7 @@ index b63d6b6..72caa04 100644
      async fn save_vm(
          &mut self,
          request: vmservice::SaveVmRequest,
-@@ -1913,6 +2186,7 @@ fn handle_controller_event(&mut self, event: VmControllerEvent) -> Option<i32> {
+@@ -1913,6 +2191,7 @@ fn handle_controller_event(&mut self, event: VmControllerEvent) -> Option<i32> {
          match event {
              VmControllerEvent::GuestHalt(reason) => {
                  tracing::info!(%reason, "guest halted (via controller)");
@@ -835,7 +906,7 @@ index b63d6b6..72caa04 100644
                  self.lifecycle = VmLifecycle::Halted(reason);
                  if let Some((_, response)) = self.wait_vm_response.take() {
                      response.send(Ok(()));
-@@ -1940,6 +2214,11 @@ fn handle_controller_event(&mut self, event: VmControllerEvent) -> Option<i32> {
+@@ -1940,6 +2219,11 @@ fn handle_controller_event(&mut self, event: VmControllerEvent) -> Option<i32> {
                  // task will be awaited during final cleanup.
                  self.vm.take();
                  self.vm_controller.take();
@@ -847,7 +918,7 @@ index b63d6b6..72caa04 100644
                  self.lifecycle = VmLifecycle::Uninitialized;
              }
              VmControllerEvent::VncWorkerStopped { error } => {
-@@ -2022,13 +2301,20 @@ fn remove_vpci_device(
+@@ -2022,13 +2306,20 @@ fn remove_vpci_device(
              .instance_id
              .parse()
              .context("invalid VPCI instance ID")?;
@@ -869,7 +940,7 @@ index b63d6b6..72caa04 100644
      }
  
      fn modify_resource(
-@@ -2068,7 +2354,13 @@ impl Future<Output = anyhow::Result<vmservice::ModifyResourceResponse>> + use<>,
+@@ -2068,7 +2359,13 @@ impl Future<Output = anyhow::Result<vmservice::ModifyResourceResponse>> + use<>,
                          .context("no scsi controller")?
                          .call_failable(ScsiControllerRequest::RemoveDevice, scsi_path);
                      Ok(async move {
@@ -884,7 +955,7 @@ index b63d6b6..72caa04 100644
                          Ok(vmservice::ModifyResourceResponse::default())
                      }
                      .boxed())
-@@ -2087,18 +2379,27 @@ impl Future<Output = anyhow::Result<vmservice::ModifyResourceResponse>> + use<>,
+@@ -2087,18 +2384,27 @@ impl Future<Output = anyhow::Result<vmservice::ModifyResourceResponse>> + use<>,
                               configure it at VM creation time"
                          );
                      }
@@ -913,7 +984,7 @@ index b63d6b6..72caa04 100644
                          Ok(vmservice::ModifyResourceResponse::default())
                      }
                      .boxed())
-@@ -2274,9 +2575,16 @@ fn modify_consomme_nic(
+@@ -2274,9 +2580,16 @@ fn modify_consomme_nic(
              }
              ConsommeNicAction::UnbindPorts(ports) => {
                  for cfg in ports {
@@ -932,7 +1003,7 @@ index b63d6b6..72caa04 100644
                  }
                  None
              }
-@@ -2438,6 +2746,38 @@ fn parse_port_config(port: vmservice::PortConfig) -> anyhow::Result<HostPortConf
+@@ -2438,6 +2751,38 @@ fn parse_port_config(port: vmservice::PortConfig) -> anyhow::Result<HostPortConf
      })
  }
  
@@ -971,7 +1042,7 @@ index b63d6b6..72caa04 100644
  enum NicDevice {
      Vmbus(Resource<VmbusDeviceHandleKind>),
      Virtio {
-@@ -2446,16 +2786,29 @@ enum NicDevice {
+@@ -2446,16 +2791,29 @@ enum NicDevice {
      },
  }
  
@@ -1002,7 +1073,7 @@ index b63d6b6..72caa04 100644
      let endpoint = match nic.backend.context("missing backend")? {
          #[cfg(windows)]
          Backend::LegacyPortId(port_id) => net_backend_resources::dio::WindowsDirectIoHandle {
-@@ -2466,24 +2819,31 @@ fn parse_nic_config(
+@@ -2466,24 +2824,31 @@ fn parse_nic_config(
          }
          .into_resource(),
          #[cfg(windows)]
@@ -1046,7 +1117,7 @@ index b63d6b6..72caa04 100644
          vmservice::NicFrontend::Vmbus => NicDevice::Vmbus(
              NetvspHandle {
                  instance_id,
-@@ -2503,33 +2863,84 @@ fn parse_nic_config(
+@@ -2503,39 +2868,92 @@ fn parse_nic_config(
              }
              .into_resource(),
          },
@@ -1143,9 +1214,32 @@ index b63d6b6..72caa04 100644
 +}
 +
  /// Applies the MMIO gap sizes from the request's `MemoryConfig` to the
- /// chipset's default layout. A zero-sized request field leaves the chipset
- /// default in place.
-@@ -3439,11 +3850,16 @@ fn service(
+-/// chipset's default layout. A zero-sized request field leaves the chipset
+-/// default in place.
++/// chipset's default layout and enforces a low-MMIO floor when a framebuffer
++/// is attached so large VRAM apertures do not overflow past 4 GiB.
+ fn apply_mmio_overrides(
+     mut layout: vmm_core_defs::LayoutConfig,
+     memory_config: Option<&vmservice::MemoryConfig>,
++    arch: vm_manifest_builder::MachineArch,
++    framebuffer_vram_size: Option<usize>,
+ ) -> anyhow::Result<vmm_core_defs::LayoutConfig> {
+     const MB: u64 = 0x100000;
+ 
+@@ -2555,6 +2973,12 @@ fn apply_mmio_overrides(
+         }
+     }
+ 
++    if let Some(vram_size) = framebuffer_vram_size {
++        layout.chipset_low_mmio_size = layout
++            .chipset_low_mmio_size
++            .max(crate::min_low_mmio_for_framebuffer(arch, vram_size));
++    }
++
+     Ok(layout)
+ }
+ 
+@@ -3439,11 +3863,16 @@ fn service(
              controller_task: None,
              wait_vm_response: None,
              lifecycle: VmLifecycle::Running,
@@ -1162,7 +1256,7 @@ index b63d6b6..72caa04 100644
          }
      }
  
-@@ -4363,11 +4779,16 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4363,11 +4792,16 @@ fn guest_power_exit_stops_rpc_server() {
                      controller_task: None,
                      wait_vm_response: None,
                      lifecycle: VmLifecycle::Running,
@@ -1179,7 +1273,7 @@ index b63d6b6..72caa04 100644
                  };
                  event_send.send(VmControllerEvent::ExitRequested { code });
                  assert_eq!(service.run(listener, worker_recv).await.unwrap(), code);
-@@ -4375,6 +4796,118 @@ fn guest_power_exit_stops_rpc_server() {
+@@ -4375,6 +4809,118 @@ fn guest_power_exit_stops_rpc_server() {
          });
      }
  
@@ -1298,7 +1392,7 @@ index b63d6b6..72caa04 100644
      #[test]
      fn uefi_initial_variables_defaults() {
          for arch in [
-@@ -4568,6 +5101,17 @@ fn platform_config_rejects_vmbus_devices() {
+@@ -4568,6 +5114,17 @@ fn platform_config_rejects_vmbus_devices() {
                  }),
                  ..Default::default()
              },
@@ -1316,7 +1410,7 @@ index b63d6b6..72caa04 100644
          ] {
              assert!(validate_platform_config(&config).is_ok());
              assert!(
-@@ -4877,4 +5421,556 @@ fn reject_invalid_vfio_bar_address_config() {
+@@ -4877,4 +5434,610 @@ fn reject_invalid_vfio_bar_address_config() {
              .is_err()
          );
      }
@@ -1871,6 +1965,60 @@ index b63d6b6..72caa04 100644
 +                task.await;
 +            }
 +        });
++    }
++
++    #[test]
++    fn apply_mmio_overrides_enforces_low_mmio_floor_for_large_vram() {
++        const MB: u32 = 1024 * 1024;
++        let base = VmManifestBuilder::new(
++            vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
++            vm_manifest_builder::MachineArch::X86_64,
++        )
++        .layout_config();
++        assert_eq!(base.chipset_low_mmio_size, 128 * MB);
++
++        // Even if memory_config omits or under-sizes low_mmio_gap_in_mb, 256 MiB VRAM raises it
++        // above 256 MiB + 32 MiB ARCH_RESERVED_X86_64 so VRAM stays below 4 GiB high RAM.
++        let raised = apply_mmio_overrides(
++            base.clone(),
++            Some(&vmservice::MemoryConfig {
++                memory_mb: 8192,
++                low_mmio_gap_in_mb: 0,
++                ..Default::default()
++            }),
++            vm_manifest_builder::MachineArch::X86_64,
++            Some(256 * MB as usize),
++        )
++        .unwrap();
++        assert_eq!(raised.chipset_low_mmio_size, 320 * MB);
++
++        // A larger explicit low_mmio_gap_in_mb (like velovmd's 384 MiB for 256 MiB VRAM) is kept.
++        let explicit = apply_mmio_overrides(
++            base.clone(),
++            Some(&vmservice::MemoryConfig {
++                memory_mb: 8192,
++                low_mmio_gap_in_mb: 384,
++                ..Default::default()
++            }),
++            vm_manifest_builder::MachineArch::X86_64,
++            Some(256 * MB as usize),
++        )
++        .unwrap();
++        assert_eq!(explicit.chipset_low_mmio_size, 384 * MB);
++
++        // Without a framebuffer, the default 128 MiB gap is preserved.
++        let no_fb = apply_mmio_overrides(
++            base,
++            Some(&vmservice::MemoryConfig {
++                memory_mb: 8192,
++                low_mmio_gap_in_mb: 0,
++                ..Default::default()
++            }),
++            vm_manifest_builder::MachineArch::X86_64,
++            None,
++        )
++        .unwrap();
++        assert_eq!(no_fb.chipset_low_mmio_size, 128 * MB);
 +    }
  }
 diff --git a/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto b/openvmm/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
