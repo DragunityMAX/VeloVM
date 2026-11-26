@@ -390,6 +390,15 @@ impl Supervisor {
                 count = surviving.len(),
                 "restoring surviving pending disk reservations from runtime journal for re-adopted VM"
             );
+            for entry in &surviving {
+                if !vm
+                    .orphaned_disks
+                    .iter()
+                    .any(|d| d.lun == entry.lun && d.path == entry.path)
+                {
+                    vm.orphaned_disks.push(entry.clone());
+                }
+            }
             vm.pending_disks.extend(surviving);
         }
     }
@@ -8884,6 +8893,10 @@ mod tests {
             assert_eq!(m1.runtime.status, VmStatus::Running);
             assert_eq!(m1.pending_disks.len(), 1);
             assert_eq!(m1.pending_disks[0].path, shared_disk);
+            let summary = m1.summary();
+            assert_eq!(summary.runtime.orphaned_disks.len(), 1);
+            assert_eq!(summary.runtime.orphaned_disks[0].lun, 3);
+            assert_eq!(summary.runtime.orphaned_disks[0].path, shared_disk);
         }
 
         let err = sup2
@@ -9017,7 +9030,18 @@ mod tests {
             vm.config.disks.push(committed_entry.clone());
             Supervisor::restore_pending_disks_from_journal(vm, &sock_path);
             assert_eq!(vm.pending_disks, vec![uncommitted_entry.clone()]);
+            assert_eq!(
+                vm.summary().runtime.orphaned_disks,
+                vec![uncommitted_entry.clone()]
+            );
+            // Calling restore again does not duplicate orphaned_disks entries.
+            Supervisor::restore_pending_disks_from_journal(vm, &sock_path);
+            assert_eq!(
+                vm.summary().runtime.orphaned_disks,
+                vec![uncommitted_entry.clone()]
+            );
             vm.pending_disks.clear();
+            vm.orphaned_disks.clear();
         }
         let persisted = velovm_core::store::load_pending_disks_journal(&journal_path).unwrap();
         assert_eq!(persisted, vec![uncommitted_entry]);
@@ -9030,6 +9054,7 @@ mod tests {
             let vm = guard.get_mut(&id).unwrap();
             Supervisor::restore_pending_disks_from_journal(vm, &sock_path);
             assert!(vm.pending_disks.is_empty());
+            assert!(vm.summary().runtime.orphaned_disks.is_empty());
         }
         assert!(
             !journal_path.exists(),
