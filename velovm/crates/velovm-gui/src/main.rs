@@ -200,6 +200,18 @@ impl VeloVmApp {
         }
     }
 
+    fn open_new_vm_wizard(&mut self) {
+        if self.new_vm_wizard.is_none() {
+            self.new_vm_wizard = Some(NewVmWizard::new(&self.data_dir));
+        }
+    }
+
+    fn open_disk_manager_dialog(&mut self) {
+        if self.disk_mgr_dlg.is_none() {
+            self.disk_mgr_dlg = Some(DiskManagerDialog::new(&self.data_dir));
+        }
+    }
+
     fn process_updates(&mut self) {
         while let Some(upd) = self.backend.try_recv() {
             self.apply_update(upd);
@@ -693,10 +705,10 @@ impl VeloVmApp {
 
                 ui.separator();
                 if ui.button("➕ New VM…").clicked() {
-                    self.new_vm_wizard = Some(NewVmWizard::new(&self.data_dir));
+                    self.open_new_vm_wizard();
                 }
                 if ui.button("💾 Virtual Disk Manager…").clicked() {
-                    self.disk_mgr_dlg = Some(DiskManagerDialog::new(&self.data_dir));
+                    self.open_disk_manager_dialog();
                 }
                 let can_edit_host = self.connected && self.host_config_loaded;
                 if ui
@@ -798,10 +810,10 @@ impl VeloVmApp {
 
                 ui.label(RichText::new("Host").strong());
                 if ui.button("New Virtual Machine…").clicked() {
-                    self.new_vm_wizard = Some(NewVmWizard::new(&self.data_dir));
+                    self.open_new_vm_wizard();
                 }
                 if ui.button("Virtual Hard Disk Manager…").clicked() {
-                    self.disk_mgr_dlg = Some(DiskManagerDialog::new(&self.data_dir));
+                    self.open_disk_manager_dialog();
                 }
                 let can_edit_host = self.connected && self.host_config_loaded;
                 if ui
@@ -2755,5 +2767,35 @@ mod tests {
             error: None,
         });
         assert!(app.delete_vm_dlg.is_none());
+    }
+
+    #[test]
+    fn open_new_vm_wizard_and_disk_manager_do_not_overwrite_open_dialogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = VeloVmApp::new_for_test(&egui::Context::default(), dir.path().to_path_buf());
+
+        app.open_new_vm_wizard();
+        let wiz = app.new_vm_wizard.as_mut().unwrap();
+        let wiz_id = wiz.wizard_id;
+        wiz.name = "My-In-Progress-VM".into();
+        wiz.submitting = true;
+
+        app.open_new_vm_wizard();
+        let wiz_after = app.new_vm_wizard.as_ref().unwrap();
+        assert_eq!(wiz_after.wizard_id, wiz_id);
+        assert_eq!(wiz_after.name, "My-In-Progress-VM");
+        assert!(wiz_after.submitting);
+
+        app.open_disk_manager_dialog();
+        let mgr = app.disk_mgr_dlg.as_mut().unwrap();
+        mgr.tab = 1;
+        mgr.create_size_gb = 256;
+        mgr.inspect_path = "/tmp/existing.vhdx".into();
+
+        app.open_disk_manager_dialog();
+        let mgr_after = app.disk_mgr_dlg.as_ref().unwrap();
+        assert_eq!(mgr_after.tab, 1);
+        assert_eq!(mgr_after.create_size_gb, 256);
+        assert_eq!(mgr_after.inspect_path, "/tmp/existing.vhdx");
     }
 }
