@@ -138,7 +138,61 @@ function Resolve-ListenEndpoint {
     }
 }
 
-function Test-FastDeskTcpListening {
+function Test-EndpointAddressMatch {
+    param(
+        [System.Net.IPAddress]$ListenerAddress,
+        [System.Net.IPAddress]$TargetAddress
+    )
+    if ($null -eq $TargetAddress -or
+        $TargetAddress.Equals([System.Net.IPAddress]::Any) -or
+        $TargetAddress.Equals([System.Net.IPAddress]::IPv6Any) -or
+        ($TargetAddress.IsIPv4MappedToIPv6 -and $TargetAddress.MapToIPv4().Equals([System.Net.IPAddress]::Any))) {
+        return $true
+    }
+    if ($ListenerAddress.Equals($TargetAddress) -or
+        $ListenerAddress.Equals([System.Net.IPAddress]::Any) -or
+        $ListenerAddress.Equals([System.Net.IPAddress]::IPv6Any)) {
+        return $true
+    }
+    if ($TargetAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
+        $ListenerAddress.IsIPv4MappedToIPv6 -and
+        $ListenerAddress.MapToIPv4().Equals($TargetAddress)) {
+        return $true
+    }
+    return $false
+}
+
+function Get-ProcessTreeIds {
+    param(
+        [int]$RootPid,
+        [object[]]$Processes
+    )
+    $ids = [System.Collections.Generic.HashSet[int]]::new()
+    $null = $ids.Add($RootPid)
+    if ($null -eq $Processes -and (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        try {
+            $Processes = Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop
+        } catch {
+            $Processes = @()
+        }
+    }
+    if ($null -ne $Processes) {
+        $changed = $true
+        while ($changed) {
+            $changed = $false
+            foreach ($proc in $Processes) {
+                $pidVal = [int]$proc.ProcessId
+                $ppidVal = [int]$proc.ParentProcessId
+                if ($ids.Contains($ppidVal) -and $ids.Add($pidVal)) {
+                    $changed = $true
+                }
+            }
+        }
+    }
+    return @($ids)
+}
+
+function Test-AnyTcpListening {
     param(
         [int]$Port,
         [System.Net.IPAddress]$IpAddress
@@ -148,20 +202,40 @@ function Test-FastDeskTcpListening {
         if ($ep.Port -ne $Port) {
             continue
         }
-        if ($null -eq $IpAddress -or
-            $IpAddress.Equals([System.Net.IPAddress]::Any) -or
-            $IpAddress.Equals([System.Net.IPAddress]::IPv6Any) -or
-            ($IpAddress.IsIPv4MappedToIPv6 -and $IpAddress.MapToIPv4().Equals([System.Net.IPAddress]::Any))) {
+        if (Test-EndpointAddressMatch -ListenerAddress $ep.Address -TargetAddress $IpAddress) {
             return $true
         }
-        if ($ep.Address.Equals($IpAddress) -or
-            $ep.Address.Equals([System.Net.IPAddress]::Any) -or
-            $ep.Address.Equals([System.Net.IPAddress]::IPv6Any)) {
-            return $true
+    }
+    return $false
+}
+
+function Test-FastDeskTcpListening {
+    param(
+        [int]$Port,
+        [System.Net.IPAddress]$IpAddress,
+        [int[]]$ProcessIds,
+        [object[]]$Connections
+    )
+    if ($null -eq $Connections) {
+        if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+            $Connections = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
+        } else {
+            return $false
         }
-        if ($IpAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
-            $ep.Address.IsIPv4MappedToIPv6 -and
-            $ep.Address.MapToIPv4().Equals($IpAddress)) {
+    }
+
+    foreach ($conn in $Connections) {
+        if ([int]$conn.LocalPort -ne $Port) {
+            continue
+        }
+        if ($null -ne $ProcessIds -and $ProcessIds.Count -gt 0 -and ($ProcessIds -notcontains [int]$conn.OwningProcess)) {
+            continue
+        }
+        [System.Net.IPAddress]$localIp = $null
+        if (-not [System.Net.IPAddress]::TryParse([string]$conn.LocalAddress, [ref]$localIp)) {
+            continue
+        }
+        if (Test-EndpointAddressMatch -ListenerAddress $localIp -TargetAddress $IpAddress) {
             return $true
         }
     }
@@ -303,6 +377,9 @@ try {
         $viewerTarget = "hvsock://loopback/$VsockPort"
     } else {
         $tcpEndpoint = Resolve-ListenEndpoint -Addr $ListenAddr
+        if ($tcpEndpoint.Port -ne 0 -and (Test-AnyTcpListening -Port $tcpEndpoint.Port -IpAddress $tcpEndpoint.IpAddress)) {
+            throw "FastDesk listen address $($tcpEndpoint.ListenAddr) is already in use by another process."
+        }
         $vmmArgs += @("--fastdesk-listen", $tcpEndpoint.ListenAddr)
         $viewerTarget = "tcp://$($tcpEndpoint.ViewerAddr)"
     }
@@ -319,7 +396,8 @@ try {
             if ($vmmProc.HasExited) {
                 throw "openvmm.exe exited prematurely with code $($vmmProc.ExitCode)."
             }
-            if (Test-FastDeskTcpListening -Port $tcpEndpoint.Port -IpAddress $tcpEndpoint.IpAddress) {
+            $vmmPids = Get-ProcessTreeIds -RootPid $vmmProc.Id
+            if (Test-FastDeskTcpListening -Port $tcpEndpoint.Port -IpAddress $tcpEndpoint.IpAddress -ProcessIds $vmmPids) {
                 break
             }
             if ((Get-Date) -ge $deadline) {
@@ -345,6 +423,10 @@ try {
             & $resolvedViewer --connect $viewerTarget
             $viewerExitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
             if ($viewerExitCode -eq 0) {
+                $vmmProc.Refresh()
+                if ($vmmProc.HasExited -and $vmmProc.ExitCode -ne 0) {
+                    throw "openvmm.exe exited with code $($vmmProc.ExitCode)."
+                }
                 break
             }
             $vmmProc.Refresh()
