@@ -3979,3 +3979,59 @@ fn token_rotation_on_same_url_switches_sse_without_backoff_and_does_not_clobber_
     drop(backend);
     drop(server);
 }
+
+#[test]
+fn reload_client_from_runtime_addr_respects_daemon_url_when_unconnected() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let daemon = rt
+        .block_on(velovmd::TestDaemonHandle::spawn(dir.path().to_path_buf()))
+        .unwrap();
+    let store = velovm_core::store::RegistryStore::open(dir.path());
+    let token = store.read_token().unwrap();
+
+    // Reserve a different unused loopback port for --daemon-url.
+    let unused_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_addr = unused_listener.local_addr().unwrap();
+    let override_url = format!("http://{other_addr}");
+    assert_ne!(override_url, daemon.base_url);
+
+    // 1. When shared_endpoint is None and daemon.addr points to a different port,
+    //    reload must NOT bypass --daemon-url.
+    let shared: SharedEndpoint = Arc::new(RwLock::new(None));
+    let res = reload_client_from_runtime_addr_result(
+        Some(dir.path()),
+        Some(&override_url),
+        &shared,
+    )
+    .unwrap();
+    assert!(
+        res.is_none(),
+        "must not adopt runtime daemon.addr when --daemon-url targets a different endpoint"
+    );
+    assert!(shared.read().unwrap().is_none());
+
+    // 2. When --daemon-url matches the runtime daemon.addr endpoint (even without scheme),
+    //    reload is permitted when unconnected.
+    let bare_runtime_addr = daemon.base_url.trim_start_matches("http://");
+    let res_same = reload_client_from_runtime_addr_result(
+        Some(dir.path()),
+        Some(bare_runtime_addr),
+        &shared,
+    )
+    .unwrap();
+    let adopted = res_same.expect("matching --daemon-url should be adopted");
+    assert_eq!(adopted.base_url(), daemon.base_url);
+
+    // 3. When shared_endpoint already holds the matching token, reload still allows
+    //    following a runtime address update under --daemon-url.
+    let shared_with_token: SharedEndpoint =
+        Arc::new(RwLock::new(Some((override_url.clone(), token))));
+    let res_token = reload_client_from_runtime_addr_result(
+        Some(dir.path()),
+        Some(&override_url),
+        &shared_with_token,
+    )
+    .unwrap();
+    assert!(res_token.is_some());
+}
