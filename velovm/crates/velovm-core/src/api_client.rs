@@ -924,28 +924,7 @@ pub fn ensure_daemon_running(
         cmd.current_dir(&dir);
     }
     let log_file_path = dir.join("velovmd.log");
-    let log_is_safe = match std::fs::symlink_metadata(&log_file_path) {
-        Ok(m) => !m.file_type().is_symlink() && m.file_type().is_file(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    };
-    let mut log_opts = std::fs::OpenOptions::new();
-    log_opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        log_opts.mode(0o600);
-    }
-    if log_is_safe && let Ok(log_file) = log_opts.open(&log_file_path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = log_file.set_permissions(std::fs::Permissions::from_mode(0o600));
-        }
-        #[cfg(windows)]
-        {
-            let _ = crate::store::set_path_owner_only_windows(&log_file_path);
-        }
+    if let Ok(log_file) = crate::store::open_log_file_nofollow(&log_file_path) {
         let err_file = log_file.try_clone().ok();
         cmd.stdout(Stdio::from(log_file));
         if let Some(ef) = err_file {

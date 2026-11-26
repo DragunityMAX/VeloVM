@@ -94,14 +94,29 @@ if [[ -z "$DISK_PATH" ]]; then
     exit 1
 fi
 
+validate_vmm_arg_path() {
+    local label="$1"
+    local path="$2"
+    case "$path" in
+        *","*|*";"*|*"["*|*"]"*)
+            echo "Error: $label path cannot contain ',', ';', '[', or ']' (unsupported by openvmm option parsing): $path" >&2
+            exit 1
+            ;;
+    esac
+}
+
 if [[ ! -f "$DISK_PATH" ]]; then
     echo "Error: disk image not found: $DISK_PATH" >&2
     exit 1
 fi
+validate_vmm_arg_path "disk image" "$DISK_PATH"
 
-if [[ -n "$ISO_PATH" && ! -f "$ISO_PATH" ]]; then
-    echo "Error: ISO image not found: $ISO_PATH" >&2
-    exit 1
+if [[ -n "$ISO_PATH" ]]; then
+    if [[ ! -f "$ISO_PATH" ]]; then
+        echo "Error: ISO image not found: $ISO_PATH" >&2
+        exit 1
+    fi
+    validate_vmm_arg_path "ISO image" "$ISO_PATH"
 fi
 
 resolve_first() {
@@ -145,6 +160,7 @@ UEFI_FD="$(resolve_first \
     echo "Error: UEFI firmware MSVM.fd not found at $SCRIPT_DIR/firmware/MSVM.fd." >&2
     exit 1
 }
+validate_vmm_arg_path "UEFI firmware" "$UEFI_FD"
 
 VMM_PID=""
 VMM_READ_FD_OPEN=0
@@ -317,9 +333,11 @@ collect_process_tree_pids() {
 }
 
 is_tcp_listening_lsof() {
-    if [[ -n "${VMM_PID:-}" ]] && command -v pgrep >/dev/null 2>&1; then
-        local pid_list
-        pid_list="$(collect_process_tree_pids "$VMM_PID")"
+    if [[ -n "${VMM_PID:-}" ]]; then
+        local pid_list="$VMM_PID"
+        if command -v pgrep >/dev/null 2>&1; then
+            pid_list="$(collect_process_tree_pids "$VMM_PID")"
+        fi
         lsof -nP -a -p "$pid_list" -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
         return $?
     fi
@@ -327,7 +345,7 @@ is_tcp_listening_lsof() {
     return $?
 }
 
-is_tcp_listening() {
+matching_tcp_inodes() {
     local port_hex ip4_hex=""
     port_hex="$(printf '%04X' "$LISTEN_PORT")"
     if [[ "$LISTEN_HOST" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
@@ -342,29 +360,98 @@ is_tcp_listening() {
             FNR > 1 && $4 == "0A" {
                 addr = toupper($2)
                 if (length(addr) > length(port) && substr(addr, length(addr) - length(port) + 1) == port) {
+                    matched = 0
                     if (ip4 == "" || ip4 == "00000000") {
-                        found = 1
-                        exit 0
+                        matched = 1
+                    } else {
+                        host = substr(addr, 1, length(addr) - length(port))
+                        if (host == ip4 || host == "00000000" || host == "00000000000000000000000000000000" || host == ("0000000000000000FFFF0000" ip4)) {
+                            matched = 1
+                        }
                     }
-                    host = substr(addr, 1, length(addr) - length(port))
-                    if (host == ip4 || host == "00000000" || host == "00000000000000000000000000000000" || host == ("0000000000000000FFFF0000" ip4)) {
-                        found = 1
-                        exit 0
+                    if (matched && $10 != "" && $10 != "0") {
+                        print $10
                     }
                 }
             }
-            END { exit(found ? 0 : 1) }
         ' "${proc_files[@]}"
+        return 0
+    fi
+    return 1
+}
+
+is_any_tcp_listening() {
+    if [[ -r /proc/net/tcp || -r /proc/net/tcp6 ]]; then
+        local inodes
+        inodes="$(matching_tcp_inodes)"
+        [[ -n "$inodes" ]]
         return $?
     elif command -v ss >/dev/null 2>&1; then
         ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep "LISTEN" >/dev/null
         return $?
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+is_tcp_listening() {
+    [[ -n "${VMM_PID:-}" ]] || return 1
+
+    if [[ -r /proc/net/tcp || -r /proc/net/tcp6 ]]; then
+        local inodes
+        inodes="$(matching_tcp_inodes)"
+        [[ -n "$inodes" ]] || return 1
+
+        local -A want_inodes=()
+        local inode pid_list pid fd target sock_inode
+        while IFS= read -r inode; do
+            [[ -n "$inode" ]] && want_inodes["$inode"]=1
+        done <<< "$inodes"
+
+        pid_list="$(collect_process_tree_pids "$VMM_PID")"
+        local -a pids=()
+        IFS=',' read -r -a pids <<< "$pid_list"
+        for pid in "${pids[@]}"; do
+            [[ -n "$pid" && -d "/proc/$pid/fd" ]] || continue
+            for fd in /proc/"$pid"/fd/*; do
+                [[ -e "$fd" || -L "$fd" ]] || continue
+                target="$(readlink "$fd" 2>/dev/null || true)"
+                if [[ "$target" =~ ^socket:\[([0-9]+)\]$ ]]; then
+                    sock_inode="${BASH_REMATCH[1]}"
+                    if [[ -n "${want_inodes[$sock_inode]:-}" ]]; then
+                        return 0
+                    fi
+                fi
+            done
+        done
+        return 1
+    elif command -v ss >/dev/null 2>&1; then
+        local ss_out pid_list pid
+        ss_out="$(ss -Htanp "( sport = :$LISTEN_PORT )" 2>/dev/null | grep "LISTEN" || true)"
+        [[ -n "$ss_out" ]] || return 1
+        pid_list="$(collect_process_tree_pids "$VMM_PID")"
+        local -a pids=()
+        IFS=',' read -r -a pids <<< "$pid_list"
+        for pid in "${pids[@]}"; do
+            [[ -n "$pid" ]] || continue
+            if [[ "$ss_out" == *"pid=${pid},"* || "$ss_out" == *"pid=${pid})"* ]]; then
+                return 0
+            fi
+        done
+        return 1
     elif command -v lsof >/dev/null 2>&1; then
         is_tcp_listening_lsof
         return $?
     fi
     return 1
 }
+
+if [[ "$LISTEN_PORT" -ne 0 ]] && is_any_tcp_listening; then
+    echo "Error: FastDesk listen address ${LISTEN_ADDR} is already in use." >&2
+    exit 1
+fi
 
 FIFO_TMP="${TMPDIR:-/tmp}"
 FIFO_TMP="${FIFO_TMP%/}"
@@ -417,12 +504,26 @@ while true; do
     VIEWER_RC=0
     "$VIEWER_BIN" --connect "tcp://${VIEWER_ADDR}" || VIEWER_RC=$?
     if [[ "$VIEWER_RC" -eq 0 ]]; then
+        if ! kill -0 "$VMM_PID" 2>/dev/null; then
+            VMM_RC=0
+            wait "$VMM_PID" || VMM_RC=$?
+            VMM_PID=""
+            if [[ "$VMM_RC" -ne 0 ]]; then
+                echo "Error: openvmm exited with code ${VMM_RC}." >&2
+                exit "$VMM_RC"
+            fi
+        fi
         break
     fi
     ATTEMPT_ELAPSED_MS=$(( $(now_ms) - ATTEMPT_START_MS ))
     if ! kill -0 "$VMM_PID" 2>/dev/null; then
-        wait "$VMM_PID" || true
-        echo "Error: openvmm exited prematurely." >&2
+        VMM_RC=0
+        wait "$VMM_PID" || VMM_RC=$?
+        VMM_PID=""
+        echo "Error: openvmm exited prematurely (code ${VMM_RC})." >&2
+        if [[ "$VMM_RC" -ne 0 ]]; then
+            exit "$VMM_RC"
+        fi
         exit 1
     fi
     if [[ "$ATTEMPT_ELAPSED_MS" -ge 2000 || "$(now_ms)" -ge "$DEADLINE_MS" ]]; then

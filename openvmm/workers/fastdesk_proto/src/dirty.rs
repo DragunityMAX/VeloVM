@@ -162,10 +162,20 @@ impl DirtyTileTracker {
     pub fn diff_frames(&mut self, prev_bgra: &[u8], cur_bgra: &[u8], stride_bytes: usize) {
         let w = self.width as usize;
         let h = self.height as usize;
-        if w == 0 || h == 0 || stride_bytes < w * 4 {
+        let Some(row_bytes) = w.checked_mul(4) else {
+            self.mark_all();
+            return;
+        };
+        if w == 0 || h == 0 || stride_bytes < row_bytes {
             return;
         }
-        let needed = (h - 1) * stride_bytes + w * 4;
+        let Some(needed) = (h - 1)
+            .checked_mul(stride_bytes)
+            .and_then(|rows| rows.checked_add(row_bytes))
+        else {
+            self.mark_all();
+            return;
+        };
         if prev_bgra.len() < needed || cur_bgra.len() < needed {
             self.mark_all();
             return;

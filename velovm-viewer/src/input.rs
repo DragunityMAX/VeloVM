@@ -117,16 +117,36 @@ pub fn normalize_pointer_pos(
     Some((nx, ny))
 }
 
-struct KeyEventCollector(Arc<Mutex<VecDeque<(Key, bool)>>>);
+struct KeyEventCollector {
+    queue: Arc<Mutex<VecDeque<(u16, bool)>>>,
+    use_evdev: bool,
+}
 
 impl InputCallback for KeyEventCollector {
     fn add_char(&mut self, _uni_char: u32) {}
 
     fn set_key_state(&mut self, key: Key, state: bool) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back((key, state));
+        if self.use_evdev {
+            return;
+        }
+        if let Some(sc) = key_to_xt_scancode(key) {
+            self.queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((sc, state));
+        }
+    }
+
+    fn set_evdev_key_state(&mut self, evdev_code: u32, state: bool) {
+        if !self.use_evdev {
+            return;
+        }
+        if let Some(sc) = evdev_to_xt_scancode(evdev_code) {
+            self.queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((sc, state));
+        }
     }
 }
 
@@ -142,8 +162,8 @@ pub struct PollSnapshot {
 
 #[derive(Debug)]
 pub struct InputTracker {
-    key_events: Arc<Mutex<VecDeque<(Key, bool)>>>,
-    held_keys: Vec<Key>,
+    key_events: Arc<Mutex<VecDeque<(u16, bool)>>>,
+    held_scancodes: Vec<u16>,
     was_active: bool,
     unfocused: bool,
     suppressed_buttons: u8,
@@ -157,7 +177,7 @@ impl Default for InputTracker {
     fn default() -> Self {
         Self {
             key_events: Arc::new(Mutex::new(VecDeque::new())),
-            held_keys: Vec::new(),
+            held_scancodes: Vec::new(),
             was_active: false,
             unfocused: true,
             suppressed_buttons: 0,
@@ -178,20 +198,29 @@ impl InputTracker {
         self.was_active = window.is_active();
         self.unfocused = !self.was_active;
         self.suppressed_buttons = 0;
-        window.set_input_callback(Box::new(KeyEventCollector(Arc::clone(&self.key_events))));
+        let use_evdev = matches!(
+            ScrollBackend::from_window(window),
+            ScrollBackend::X11 | ScrollBackend::Wayland
+        );
+        window.set_input_callback(Box::new(KeyEventCollector {
+            queue: Arc::clone(&self.key_events),
+            use_evdev,
+        }));
     }
 
     #[cfg(windows)]
-    pub(crate) fn key_events_queue(&self) -> Arc<Mutex<VecDeque<(Key, bool)>>> {
+    pub(crate) fn key_events_queue(&self) -> Arc<Mutex<VecDeque<(u16, bool)>>> {
         Arc::clone(&self.key_events)
     }
 
     #[cfg(test)]
     pub fn push_key_event(&self, key: Key, is_down: bool) {
-        self.key_events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back((key, is_down));
+        if let Some(sc) = key_to_xt_scancode(key) {
+            self.key_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((sc, is_down));
+        }
     }
 
     pub fn release_all(&mut self) -> Vec<ClientMsg> {
@@ -200,13 +229,11 @@ impl InputTracker {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         let mut msgs = Vec::new();
-        for key in self.held_keys.drain(..).rev() {
-            if let Some(sc) = key_to_xt_scancode(key) {
-                msgs.push(ClientMsg::KeyEvent {
-                    scancode: sc,
-                    make: false,
-                });
-            }
+        for sc in self.held_scancodes.drain(..).rev() {
+            msgs.push(ClientMsg::KeyEvent {
+                scancode: sc,
+                make: false,
+            });
         }
         if self.last_buttons != 0 {
             self.last_buttons = 0;
@@ -244,30 +271,26 @@ impl InputTracker {
 
     pub fn poll_snapshot(&mut self, snap: PollSnapshot, width: u16, height: u16) -> Vec<ClientMsg> {
         let mut msgs = Vec::new();
-        let events: Vec<(Key, bool)> = {
+        let events: Vec<(u16, bool)> = {
             let mut q = self.key_events.lock().unwrap_or_else(|e| e.into_inner());
             q.drain(..).collect()
         };
 
-        for (key, is_down) in events {
+        for (sc, is_down) in events {
             if is_down {
-                if (!self.unfocused || snap.is_active) && !self.held_keys.contains(&key) {
-                    if let Some(sc) = key_to_xt_scancode(key) {
-                        self.held_keys.push(key);
-                        msgs.push(ClientMsg::KeyEvent {
-                            scancode: sc,
-                            make: true,
-                        });
-                    }
-                }
-            } else if let Some(pos) = self.held_keys.iter().position(|&k| k == key) {
-                self.held_keys.swap_remove(pos);
-                if let Some(sc) = key_to_xt_scancode(key) {
+                if (!self.unfocused || snap.is_active) && !self.held_scancodes.contains(&sc) {
+                    self.held_scancodes.push(sc);
                     msgs.push(ClientMsg::KeyEvent {
                         scancode: sc,
-                        make: false,
+                        make: true,
                     });
                 }
+            } else if let Some(pos) = self.held_scancodes.iter().position(|&k| k == sc) {
+                self.held_scancodes.swap_remove(pos);
+                msgs.push(ClientMsg::KeyEvent {
+                    scancode: sc,
+                    make: false,
+                });
             }
         }
 
@@ -279,13 +302,11 @@ impl InputTracker {
             self.unfocused = true;
             self.suppressed_buttons = snap.raw_buttons;
             self.scroll_accum = 0.0;
-            for key in self.held_keys.drain(..).rev() {
-                if let Some(sc) = key_to_xt_scancode(key) {
-                    msgs.push(ClientMsg::KeyEvent {
-                        scancode: sc,
-                        make: false,
-                    });
-                }
+            for sc in self.held_scancodes.drain(..).rev() {
+                msgs.push(ClientMsg::KeyEvent {
+                    scancode: sc,
+                    make: false,
+                });
             }
             if self.last_buttons != 0 {
                 self.last_buttons = 0;
@@ -465,6 +486,36 @@ pub fn key_to_xt_scancode(key: Key) -> Option<u16> {
         Key::LeftSuper => 0xe05b,
         Key::RightSuper => 0xe05c,
         Key::Menu => 0xe05d,
+        _ => return None,
+    })
+}
+
+/// Maps a physical Linux evdev keycode (`<linux/input-event-codes.h>`) to an
+/// XT Set-1 scancode, independent of the host's XKB/X11 keyboard layout.
+pub fn evdev_to_xt_scancode(evdev_code: u32) -> Option<u16> {
+    Some(match evdev_code {
+        // KEY_ESC (1) ..= KEY_KPDOT (83) match XT Set-1 scancodes 0x01..=0x53 1:1.
+        1..=83 => evdev_code as u16,
+        86 => 0x56, // KEY_102ND (ISO <> key)
+        87 => 0x57, // KEY_F11
+        88 => 0x58, // KEY_F12
+        96 => 0xe01c, // KEY_KPENTER
+        97 => 0xe01d, // KEY_RIGHTCTRL
+        98 => 0xe035, // KEY_KPSLASH
+        100 => 0xe038, // KEY_RIGHTALT (AltGr)
+        102 => 0xe047, // KEY_HOME
+        103 => 0xe048, // KEY_UP
+        104 => 0xe049, // KEY_PAGEUP
+        105 => 0xe04b, // KEY_LEFT
+        106 => 0xe04d, // KEY_RIGHT
+        107 => 0xe04f, // KEY_END
+        108 => 0xe050, // KEY_DOWN
+        109 => 0xe051, // KEY_PAGEDOWN
+        110 => 0xe052, // KEY_INSERT
+        111 => 0xe053, // KEY_DELETE
+        125 => 0xe05b, // KEY_LEFTMETA
+        126 => 0xe05c, // KEY_RIGHTMETA
+        127 | 139 => 0xe05d, // KEY_COMPOSE / KEY_MENU
         _ => return None,
     })
 }
@@ -799,6 +850,120 @@ mod tests {
                     scancode: expected_sc,
                     make: false
                 }]
+            );
+        }
+    }
+
+    #[test]
+    fn linux_evdev_collector_uses_physical_keycodes_and_ignores_layout_keysyms() {
+        let mut tracker = InputTracker::default();
+        let mut collector = KeyEventCollector {
+            queue: Arc::clone(&tracker.key_events),
+            use_evdev: true,
+        };
+        let active_snap = PollSnapshot {
+            is_active: true,
+            win_size: (1280, 720),
+            mouse_pos: None,
+            raw_buttons: 0,
+            raw_scroll_dy: None,
+            scroll_backend: ScrollBackend::X11,
+        };
+        let _ = tracker.poll_snapshot(active_snap, 1280, 720);
+
+        // German QWERTZ: physical Y position (evdev 21) produces keysym 'z' (Key::Z).
+        // With use_evdev=true, set_evdev_key_state(21) emits 0x15 and set_key_state(Key::Z) is ignored.
+        collector.set_evdev_key_state(21, true);
+        collector.set_key_state(Key::Z, true);
+        // French AZERTY: physical '2' key (evdev 3, 'é') has no minifb US Key, and AltGr (evdev 100)
+        // produces ISO_Level3_Shift which minifb drops; physical evdev codes still reach the guest.
+        collector.set_evdev_key_state(3, true);
+        collector.set_evdev_key_state(100, true);
+        // ISO 102nd key (evdev 86) -> 0x56.
+        collector.set_evdev_key_state(86, true);
+
+        let msgs = tracker.poll_snapshot(active_snap, 1280, 720);
+        assert_eq!(
+            msgs,
+            vec![
+                ClientMsg::KeyEvent {
+                    scancode: 0x15,
+                    make: true
+                },
+                ClientMsg::KeyEvent {
+                    scancode: 0x03,
+                    make: true
+                },
+                ClientMsg::KeyEvent {
+                    scancode: 0xe038,
+                    make: true
+                },
+                ClientMsg::KeyEvent {
+                    scancode: 0x56,
+                    make: true
+                },
+            ]
+        );
+
+        // Focus loss releases held evdev scancodes cleanly.
+        let unfocused_snap = PollSnapshot {
+            is_active: false,
+            ..active_snap
+        };
+        let release_msgs = tracker.poll_snapshot(unfocused_snap, 1280, 720);
+        assert_eq!(
+            release_msgs,
+            vec![
+                ClientMsg::KeyEvent {
+                    scancode: 0x56,
+                    make: false
+                },
+                ClientMsg::KeyEvent {
+                    scancode: 0xe038,
+                    make: false
+                },
+                ClientMsg::KeyEvent {
+                    scancode: 0x03,
+                    make: false
+                },
+                ClientMsg::KeyEvent {
+                    scancode: 0x15,
+                    make: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn evdev_table_covers_every_key_in_key_to_xt_scancode() {
+        let evdev_codes: Vec<u32> = (1..=83)
+            .chain([86, 87, 88, 96, 97, 98, 100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 125, 126, 127])
+            .collect();
+        let xt_from_evdev: std::collections::HashSet<u16> = evdev_codes
+            .into_iter()
+            .filter_map(evdev_to_xt_scancode)
+            .collect();
+
+        for (key, expected_sc) in [
+            (Key::Escape, 0x01),
+            (Key::Q, 0x10),
+            (Key::A, 0x1e),
+            (Key::Z, 0x2c),
+            (Key::Y, 0x15),
+            (Key::LeftAlt, 0x38),
+            (Key::RightAlt, 0xe038),
+            (Key::LeftSuper, 0xe05b),
+            (Key::RightSuper, 0xe05c),
+            (Key::Menu, 0xe05d),
+            (Key::F11, 0x57),
+            (Key::F12, 0x58),
+            (Key::Delete, 0xe053),
+        ] {
+            let sc = key_to_xt_scancode(key).unwrap();
+            assert_eq!(sc, expected_sc);
+            assert!(
+                xt_from_evdev.contains(&sc),
+                "missing evdev mapping for {key:?} (0x{sc:x})"
             );
         }
     }
