@@ -284,11 +284,11 @@ resolve_listen_endpoint() {
         return 0
     }
 
+    local _ipv6_side_count=0
     _count_ipv6_side_hextets() {
         local side="$1"
         local allow_ipv4_tail="$2"
-        local -n out_count="$3"
-        out_count=0
+        _ipv6_side_count=0
         [[ -z "$side" ]] && return 0
         [[ "$side" =~ ^:|:$ ]] && return 1
         local -a segs=()
@@ -299,12 +299,12 @@ resolve_listen_endpoint() {
             [[ -z "$seg" ]] && return 1
             if [[ "$seg" == *.* ]]; then
                 if (( allow_ipv4_tail && i == ${#segs[@]} - 1 )) && _is_valid_ipv4 "$seg"; then
-                    out_count=$((out_count + 2))
+                    _ipv6_side_count=$((_ipv6_side_count + 2))
                 else
                     return 1
                 fi
             elif [[ "$seg" =~ ^[0-9a-fA-F]{1,4}$ ]]; then
-                out_count=$((out_count + 1))
+                _ipv6_side_count=$((_ipv6_side_count + 1))
             else
                 return 1
             fi
@@ -335,8 +335,10 @@ resolve_listen_endpoint() {
             if (( has_compress == 0 )); then
                 left_ipv4_tail=1
             fi
-            if _count_ipv6_side_hextets "$left" "$left_ipv4_tail" left_count && \
-               _count_ipv6_side_hextets "$right" 1 right_count; then
+            if _count_ipv6_side_hextets "$left" "$left_ipv4_tail" && \
+               left_count=$_ipv6_side_count && \
+               _count_ipv6_side_hextets "$right" 1 && \
+               right_count=$_ipv6_side_count; then
                 local total_hextets=$((left_count + right_count))
                 if (( has_compress )); then
                     (( total_hextets <= 7 )) && valid_host=1
