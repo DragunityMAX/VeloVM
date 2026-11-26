@@ -140,7 +140,7 @@ wait "$UNRELATED_VMM" 2>/dev/null || true
 
 # Test 4: End-to-end pre-start rejection when port is already in use, and non-zero openvmm exit propagation.
 TMP_ROOT="$(mktemp -d)"
-trap 'rm -f "$PORT_FILE" "$PORT_FILE2"; rm -rf "$TMP_ROOT"; kill "$PARENT_PID" "${SOCK_PARENT:-}" "$OTHER_PID" 2>/dev/null || true; wait "$PARENT_PID" "${SOCK_PARENT:-}" "$OTHER_PID" 2>/dev/null || true' EXIT
+trap 'rm -f "${PORT_FILE:-}" "$PORT_FILE2"; rm -rf "$TMP_ROOT"; kill "$PARENT_PID" "${SOCK_PARENT:-}" "$OTHER_PID" 2>/dev/null || true; wait "$PARENT_PID" "${SOCK_PARENT:-}" "$OTHER_PID" 2>/dev/null || true' EXIT
 
 cp "$LAUNCHER" "$TMP_ROOT/start-velovm.sh"
 chmod +x "$TMP_ROOT/start-velovm.sh"
