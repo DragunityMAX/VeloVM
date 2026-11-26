@@ -6077,6 +6077,18 @@ fn normalize_fastdesk_endpoint(raw: &str) -> String {
     normalized
 }
 
+fn fastdesk_low_mmio_gap_mb(fastdesk: &velovm_core::models::FastDeskSettings) -> u64 {
+    // Keep at least 128 MiB above the FastDesk VRAM aperture for the x86_64
+    // 32 MiB architectural reserved window (0xFE00_0000..4 GiB) and other
+    // low-MMIO chipset/PCI devices so VRAM > 96 MiB does not collide with
+    // high RAM at 4 GiB.
+    const FASTDESK_LOW_MMIO_HEADROOM_MB: u64 = 128;
+    if !fastdesk.enabled {
+        return 0;
+    }
+    (u64::from(fastdesk.vram_mb) + FASTDESK_LOW_MMIO_HEADROOM_MB).max(128)
+}
+
 pub(crate) fn build_create_vm_request(
     cfg: &VmConfig,
     uefi_path: &Path,
@@ -6131,6 +6143,7 @@ pub(crate) fn build_create_vm_request(
         config: Some(vmservice::VmConfig {
             memory_config: Some(vmservice::MemoryConfig {
                 memory_mb: cfg.memory_mb,
+                low_mmio_gap_in_mb: fastdesk_low_mmio_gap_mb(&cfg.fastdesk),
                 ..Default::default()
             }),
             processor_config: Some(vmservice::ProcessorConfig {
@@ -6646,7 +6659,9 @@ mod tests {
         let req = build_create_vm_request(&cfg, &uefi_path, Some(&shm_path)).unwrap();
         assert_eq!(req.log_id, cfg.id.to_string());
         let vm_cfg = req.config.unwrap();
-        assert_eq!(vm_cfg.memory_config.unwrap().memory_mb, 6144);
+        let mem_cfg = vm_cfg.memory_config.unwrap();
+        assert_eq!(mem_cfg.memory_mb, 6144);
+        assert_eq!(mem_cfg.low_mmio_gap_in_mb, 192);
         assert_eq!(vm_cfg.processor_config.unwrap().processor_count, 6);
         assert!(vm_cfg.nested_virt);
         assert!(vm_cfg.tpm_enabled);
@@ -6709,6 +6724,51 @@ mod tests {
         assert_eq!(fd.listen_addr, "127.0.0.1:5905");
         assert_eq!(fd.vsock_port, Some(6005));
         assert_eq!(fd.shm_path.as_deref(), Some(shm_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn build_create_vm_request_scales_low_mmio_gap_for_fastdesk_vram() {
+        let vm_dir = tempfile::tempdir().unwrap();
+        let uefi_path = vm_dir.path().join("MSVM.fd");
+        let mut cfg = VmConfig::from_preset(
+            "LowMmioTest",
+            velovm_core::models::VmPreset::Windows11,
+            vm_dir.path(),
+        );
+        cfg.memory_mb = 8192;
+        cfg.fastdesk.enabled = false;
+        cfg.fastdesk.vram_mb = 256;
+
+        let disabled_req = build_create_vm_request(&cfg, &uefi_path, None).unwrap();
+        assert_eq!(
+            disabled_req
+                .config
+                .unwrap()
+                .memory_config
+                .unwrap()
+                .low_mmio_gap_in_mb,
+            0
+        );
+
+        cfg.fastdesk.enabled = true;
+        for (vram_mb, expected_gap_mb) in [(32, 160), (64, 192), (128, 256), (256, 384)] {
+            cfg.fastdesk.vram_mb = vram_mb;
+            let req = build_create_vm_request(&cfg, &uefi_path, None).unwrap();
+            let low_mmio_gap_in_mb = req
+                .config
+                .unwrap()
+                .memory_config
+                .unwrap()
+                .low_mmio_gap_in_mb;
+            assert_eq!(
+                low_mmio_gap_in_mb, expected_gap_mb,
+                "unexpected low_mmio_gap_in_mb for vram_mb={vram_mb}"
+            );
+            assert!(
+                low_mmio_gap_in_mb >= u64::from(vram_mb) + 64,
+                "low MMIO gap {low_mmio_gap_in_mb} MiB must exceed VRAM {vram_mb} MiB + x86_64 reserved headroom"
+            );
+        }
     }
 
     #[cfg(unix)]

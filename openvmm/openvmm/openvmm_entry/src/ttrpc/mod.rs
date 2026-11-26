@@ -1404,7 +1404,12 @@ impl VmService {
             chipset_builder = chipset_builder.with_uefi(uefi_manifest);
         }
         let layout_config = chipset_builder.layout_config();
-        let layout_config = apply_mmio_overrides(layout_config, req_config.memory_config.as_ref())?;
+        let layout_config = apply_mmio_overrides(
+            layout_config,
+            req_config.memory_config.as_ref(),
+            arch,
+            framebuffer.is_some().then_some(fastdesk_vram_size),
+        )?;
         let chipset = chipset_builder
             .build()
             .context("failed to build vm configuration")?;
@@ -2942,11 +2947,13 @@ fn resolve_fastdesk_max_clients(max_clients: u32) -> usize {
 }
 
 /// Applies the MMIO gap sizes from the request's `MemoryConfig` to the
-/// chipset's default layout. A zero-sized request field leaves the chipset
-/// default in place.
+/// chipset's default layout and enforces a low-MMIO floor when a framebuffer
+/// is attached so large VRAM apertures do not overflow past 4 GiB.
 fn apply_mmio_overrides(
     mut layout: vmm_core_defs::LayoutConfig,
     memory_config: Option<&vmservice::MemoryConfig>,
+    arch: vm_manifest_builder::MachineArch,
+    framebuffer_vram_size: Option<usize>,
 ) -> anyhow::Result<vmm_core_defs::LayoutConfig> {
     const MB: u64 = 0x100000;
 
@@ -2964,6 +2971,12 @@ fn apply_mmio_overrides(
                 .checked_mul(MB)
                 .context("invalid high MMIO gap size")?;
         }
+    }
+
+    if let Some(vram_size) = framebuffer_vram_size {
+        layout.chipset_low_mmio_size = layout
+            .chipset_low_mmio_size
+            .max(crate::min_low_mmio_for_framebuffer(arch, vram_size));
     }
 
     Ok(layout)
@@ -5972,5 +5985,59 @@ mod tests {
                 task.await;
             }
         });
+    }
+
+    #[test]
+    fn apply_mmio_overrides_enforces_low_mmio_floor_for_large_vram() {
+        const MB: u32 = 1024 * 1024;
+        let base = VmManifestBuilder::new(
+            vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
+            vm_manifest_builder::MachineArch::X86_64,
+        )
+        .layout_config();
+        assert_eq!(base.chipset_low_mmio_size, 128 * MB);
+
+        // Even if memory_config omits or under-sizes low_mmio_gap_in_mb, 256 MiB VRAM raises it
+        // above 256 MiB + 32 MiB ARCH_RESERVED_X86_64 so VRAM stays below 4 GiB high RAM.
+        let raised = apply_mmio_overrides(
+            base.clone(),
+            Some(&vmservice::MemoryConfig {
+                memory_mb: 8192,
+                low_mmio_gap_in_mb: 0,
+                ..Default::default()
+            }),
+            vm_manifest_builder::MachineArch::X86_64,
+            Some(256 * MB as usize),
+        )
+        .unwrap();
+        assert_eq!(raised.chipset_low_mmio_size, 320 * MB);
+
+        // A larger explicit low_mmio_gap_in_mb (like velovmd's 384 MiB for 256 MiB VRAM) is kept.
+        let explicit = apply_mmio_overrides(
+            base.clone(),
+            Some(&vmservice::MemoryConfig {
+                memory_mb: 8192,
+                low_mmio_gap_in_mb: 384,
+                ..Default::default()
+            }),
+            vm_manifest_builder::MachineArch::X86_64,
+            Some(256 * MB as usize),
+        )
+        .unwrap();
+        assert_eq!(explicit.chipset_low_mmio_size, 384 * MB);
+
+        // Without a framebuffer, the default 128 MiB gap is preserved.
+        let no_fb = apply_mmio_overrides(
+            base,
+            Some(&vmservice::MemoryConfig {
+                memory_mb: 8192,
+                low_mmio_gap_in_mb: 0,
+                ..Default::default()
+            }),
+            vm_manifest_builder::MachineArch::X86_64,
+            None,
+        )
+        .unwrap();
+        assert_eq!(no_fb.chipset_low_mmio_size, 128 * MB);
     }
 }
