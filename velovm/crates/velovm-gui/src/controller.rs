@@ -1082,6 +1082,7 @@ impl BackendState {
                 Ok(())
             }
             GuiRequest::ShutdownVm { id, acpi, force } => {
+                anyhow::ensure!(!(acpi && force), "ACPI shutdown does not support force");
                 let vm =
                     client.shutdown_vm(&id.to_string(), &ShutdownVmPayload { force, acpi })?;
                 self.emit(GuiUpdate::StatusMessage(format!(

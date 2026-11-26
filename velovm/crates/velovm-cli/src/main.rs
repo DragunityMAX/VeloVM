@@ -222,7 +222,7 @@ enum VmCmd {
     /// Request cooperative guest OS shutdown
     Shutdown {
         vm: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "force")]
         acpi: bool,
         #[arg(long)]
         force: bool,
@@ -1592,5 +1592,15 @@ mod tests {
             "unexpected help text:\n{help}"
         );
         assert!(!help.contains("<vm_dir>/disk0.<ext>"));
+    }
+
+    #[test]
+    fn shutdown_rejects_acpi_with_force() {
+        assert!(
+            Cli::try_parse_from(["velovm", "vm", "shutdown", "MyVm", "--acpi", "--force"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["velovm", "vm", "shutdown", "MyVm", "--acpi"]).is_ok());
+        assert!(Cli::try_parse_from(["velovm", "vm", "shutdown", "MyVm", "--force"]).is_ok());
     }
 }
