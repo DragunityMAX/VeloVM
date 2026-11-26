@@ -2399,22 +2399,30 @@ impl Supervisor {
     ) -> anyhow::Result<()> {
         enum CommitAction {
             Committed,
-            Cancelled(std::process::Child),
-            Missing(std::process::Child),
+            Abort {
+                child: std::process::Child,
+                reason: &'static str,
+            },
         }
 
         let pid = child.id();
         let action = {
             let mut guard = self.vms.write().unwrap();
             match guard.get_mut(&id) {
-                None => CommitAction::Missing(child),
+                None => CommitAction::Abort {
+                    child,
+                    reason: "VM vanished",
+                },
                 Some(vm)
                     if *cancel_rx.borrow()
                         || self.is_shutting_down()
                         || vm.generation != start_gen
                         || vm.runtime.status != VmStatus::Starting =>
                 {
-                    CommitAction::Cancelled(child)
+                    CommitAction::Abort {
+                        child,
+                        reason: "VM startup cancelled by stop request",
+                    }
                 }
                 Some(vm) => {
                     vm.child = Some(child);
@@ -2422,30 +2430,23 @@ impl Supervisor {
                     vm.runtime.pid = Some(pid);
                     vm.runtime.rpc_socket_path = Some(sock_path.to_path_buf());
                     vm.runtime.shm_path = shm_path.map(|p| p.to_string_lossy().into_owned());
+                    velovm_core::process::write_pid_file(pid_path, pid)
+                        .with_context(|| format!("writing VM pid file {}", pid_path.display()))?;
                     CommitAction::Committed
                 }
             }
         };
 
         match action {
-            CommitAction::Committed => {
-                velovm_core::process::write_pid_file(pid_path, pid)
-                    .with_context(|| format!("writing VM pid file {}", pid_path.display()))?;
-                Ok(())
-            }
-            CommitAction::Cancelled(mut child) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("VM startup cancelled by stop request");
-            }
-            CommitAction::Missing(mut child) => {
+            CommitAction::Committed => Ok(()),
+            CommitAction::Abort { mut child, reason } => {
                 let _ = child.kill();
                 let _ = child.wait();
                 cleanup_runtime_files(
                     Some(sock_path.to_path_buf()),
                     shm_path.map(|p| p.to_string_lossy().into_owned()),
                 );
-                bail!("VM vanished");
+                bail!("{reason}");
             }
         }
     }
@@ -9539,6 +9540,10 @@ mod tests {
         fs::create_dir_all(&runtime_dir).unwrap();
         let sock_path = runtime_dir.join(format!("{id}.sock"));
         let pid_path = sock_path.with_extension("pid");
+        let shm_path = runtime_dir.join(format!("vram-{id}.shm"));
+        fs::write(&sock_path, b"sock").unwrap();
+        fs::write(&pid_path, b"12345").unwrap();
+        fs::write(&shm_path, b"shm").unwrap();
 
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
@@ -9546,7 +9551,15 @@ mod tests {
         let _ = cancel_tx.send(true);
 
         let err = sup
-            .commit_spawned_child(id, 1, &cancel_rx, child, &sock_path, &pid_path, None)
+            .commit_spawned_child(
+                id,
+                1,
+                &cancel_rx,
+                child,
+                &sock_path,
+                &pid_path,
+                Some(&shm_path),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err:#}");
 
@@ -9557,6 +9570,8 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "expected cancelled child pid {pid} to be terminated and reaped");
+        assert!(!sock_path.exists());
         assert!(!pid_path.exists());
+        assert!(!shm_path.exists());
     }
 }
