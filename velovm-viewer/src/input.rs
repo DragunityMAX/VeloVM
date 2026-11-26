@@ -12,6 +12,18 @@ use raw_window_handle::RawDisplayHandle;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
+
+const WAYLAND_REPEAT_DELAY: Duration = Duration::from_millis(400);
+const WAYLAND_REPEAT_INTERVAL: Duration = Duration::from_millis(33);
+
+fn is_repeatable_scancode(sc: u16) -> bool {
+    !matches!(
+        sc,
+        0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0x46 | 0xe01d | 0xe037 | 0xe038 | 0xe05b | 0xe05c
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImageBounds {
@@ -164,6 +176,7 @@ pub struct PollSnapshot {
 pub struct InputTracker {
     key_events: Arc<Mutex<VecDeque<(u16, bool)>>>,
     held_scancodes: Vec<u16>,
+    wayland_repeat: Option<(u16, Instant)>,
     was_active: bool,
     unfocused: bool,
     suppressed_buttons: u8,
@@ -178,6 +191,7 @@ impl Default for InputTracker {
         Self {
             key_events: Arc::new(Mutex::new(VecDeque::new())),
             held_scancodes: Vec::new(),
+            wayland_repeat: None,
             was_active: false,
             unfocused: true,
             suppressed_buttons: 0,
@@ -228,6 +242,7 @@ impl InputTracker {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.wayland_repeat = None;
         let mut msgs = Vec::new();
         for sc in self.held_scancodes.drain(..).rev() {
             msgs.push(ClientMsg::KeyEvent {
@@ -270,6 +285,16 @@ impl InputTracker {
     }
 
     pub fn poll_snapshot(&mut self, snap: PollSnapshot, width: u16, height: u16) -> Vec<ClientMsg> {
+        self.poll_snapshot_at(snap, width, height, Instant::now())
+    }
+
+    pub fn poll_snapshot_at(
+        &mut self,
+        snap: PollSnapshot,
+        width: u16,
+        height: u16,
+        now: Instant,
+    ) -> Vec<ClientMsg> {
         let mut msgs = Vec::new();
         let events: Vec<(u16, bool)> = {
             let mut q = self.key_events.lock().unwrap_or_else(|e| e.into_inner());
@@ -278,19 +303,29 @@ impl InputTracker {
 
         for (sc, is_down) in events {
             if is_down {
-                if (!self.unfocused || snap.is_active) && !self.held_scancodes.contains(&sc) {
-                    self.held_scancodes.push(sc);
+                if !self.unfocused || snap.is_active {
+                    if !self.held_scancodes.contains(&sc) {
+                        self.held_scancodes.push(sc);
+                    }
                     msgs.push(ClientMsg::KeyEvent {
                         scancode: sc,
                         make: true,
                     });
+                    if snap.scroll_backend == ScrollBackend::Wayland && is_repeatable_scancode(sc) {
+                        self.wayland_repeat = Some((sc, now + WAYLAND_REPEAT_DELAY));
+                    }
                 }
-            } else if let Some(pos) = self.held_scancodes.iter().position(|&k| k == sc) {
-                self.held_scancodes.swap_remove(pos);
-                msgs.push(ClientMsg::KeyEvent {
-                    scancode: sc,
-                    make: false,
-                });
+            } else {
+                if self.wayland_repeat.is_some_and(|(r_sc, _)| r_sc == sc) {
+                    self.wayland_repeat = None;
+                }
+                if let Some(pos) = self.held_scancodes.iter().position(|&k| k == sc) {
+                    self.held_scancodes.swap_remove(pos);
+                    msgs.push(ClientMsg::KeyEvent {
+                        scancode: sc,
+                        make: false,
+                    });
+                }
             }
         }
 
@@ -300,6 +335,7 @@ impl InputTracker {
         } else if self.was_active {
             self.was_active = false;
             self.unfocused = true;
+            self.wayland_repeat = None;
             self.suppressed_buttons = snap.raw_buttons;
             self.scroll_accum = 0.0;
             for sc in self.held_scancodes.drain(..).rev() {
@@ -320,8 +356,33 @@ impl InputTracker {
             return msgs;
         } else {
             self.unfocused = true;
+            self.wayland_repeat = None;
             self.suppressed_buttons = snap.raw_buttons;
             return msgs;
+        }
+
+        if snap.scroll_backend == ScrollBackend::Wayland {
+            if let Some((sc, next_at)) = self.wayland_repeat {
+                if self.held_scancodes.contains(&sc) {
+                    if now >= next_at {
+                        msgs.push(ClientMsg::KeyEvent {
+                            scancode: sc,
+                            make: true,
+                        });
+                        let next = if now.saturating_duration_since(next_at) >= WAYLAND_REPEAT_INTERVAL
+                        {
+                            now + WAYLAND_REPEAT_INTERVAL
+                        } else {
+                            next_at + WAYLAND_REPEAT_INTERVAL
+                        };
+                        self.wayland_repeat = Some((sc, next));
+                    }
+                } else {
+                    self.wayland_repeat = None;
+                }
+            }
+        } else {
+            self.wayland_repeat = None;
         }
 
         self.suppressed_buttons &= snap.raw_buttons;
@@ -683,7 +744,9 @@ mod tests {
             ]
         );
 
-        // Host auto-repeat (repeated down for already-held key) does not duplicate make.
+        // Host auto-repeat (repeated down for already-held key) forwards each make without
+        // duplicating held_scancodes entries.
+        tracker.push_key_event(Key::B, true);
         tracker.push_key_event(Key::B, true);
         tracker.push_key_event(Key::B, true);
         let msgs = tracker.poll_snapshot(snap(true, 0), 800, 600);
@@ -694,7 +757,153 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(keys, vec![(0x30, true)]);
+        assert_eq!(keys, vec![(0x30, true), (0x30, true), (0x30, true)]);
+
+        // Releasing once clears the held scancode cleanly.
+        tracker.push_key_event(Key::B, false);
+        let msgs = tracker.poll_snapshot(snap(true, 0), 800, 600);
+        let keys: Vec<(u16, bool)> = msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                ClientMsg::KeyEvent { scancode, make } => Some((scancode, make)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![(0x30, false)]);
+
+        // Repeated downs followed by focus loss emit only a single break.
+        tracker.push_key_event(Key::Backspace, true);
+        tracker.push_key_event(Key::Backspace, true);
+        let _ = tracker.poll_snapshot(snap(true, 0), 800, 600);
+        let lost = tracker.poll_snapshot(snap(false, 0), 800, 600);
+        assert_eq!(
+            lost,
+            vec![ClientMsg::KeyEvent {
+                scancode: 0x0e,
+                make: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn wayland_held_key_repeats_on_timer_and_stops_on_release_or_focus_loss() {
+        let wayland_snap = |is_active: bool| PollSnapshot {
+            is_active,
+            win_size: (800, 600),
+            mouse_pos: Some((100.0, 100.0)),
+            raw_buttons: 0,
+            raw_scroll_dy: None,
+            scroll_backend: ScrollBackend::Wayland,
+        };
+        let key_events = |msgs: Vec<ClientMsg>| -> Vec<(u16, bool)> {
+            msgs.into_iter()
+                .filter_map(|m| match m {
+                    ClientMsg::KeyEvent { scancode, make } => Some((scancode, make)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut tracker = InputTracker::default();
+        let t0 = Instant::now();
+
+        // Initial press emits one make, nothing before delay expires.
+        tracker.push_key_event(Key::Backspace, true);
+        assert_eq!(
+            key_events(tracker.poll_snapshot_at(wayland_snap(true), 800, 600, t0)),
+            vec![(0x0e, true)]
+        );
+        assert!(
+            key_events(tracker.poll_snapshot_at(
+                wayland_snap(true),
+                800,
+                600,
+                t0 + WAYLAND_REPEAT_DELAY - Duration::from_millis(1),
+            ))
+            .is_empty()
+        );
+
+        // At delay, emits repeat make; then emits again at interval.
+        assert_eq!(
+            key_events(tracker.poll_snapshot_at(
+                wayland_snap(true),
+                800,
+                600,
+                t0 + WAYLAND_REPEAT_DELAY,
+            )),
+            vec![(0x0e, true)]
+        );
+        assert!(
+            key_events(tracker.poll_snapshot_at(
+                wayland_snap(true),
+                800,
+                600,
+                t0 + WAYLAND_REPEAT_DELAY + WAYLAND_REPEAT_INTERVAL - Duration::from_millis(1),
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            key_events(tracker.poll_snapshot_at(
+                wayland_snap(true),
+                800,
+                600,
+                t0 + WAYLAND_REPEAT_DELAY + WAYLAND_REPEAT_INTERVAL,
+            )),
+            vec![(0x0e, true)]
+        );
+
+        // Release stops repeats immediately.
+        tracker.push_key_event(Key::Backspace, false);
+        assert_eq!(
+            key_events(tracker.poll_snapshot_at(
+                wayland_snap(true),
+                800,
+                600,
+                t0 + WAYLAND_REPEAT_DELAY + WAYLAND_REPEAT_INTERVAL * 2,
+            )),
+            vec![(0x0e, false)]
+        );
+        assert!(
+            key_events(tracker.poll_snapshot_at(
+                wayland_snap(true),
+                800,
+                600,
+                t0 + WAYLAND_REPEAT_DELAY + WAYLAND_REPEAT_INTERVAL * 4,
+            ))
+            .is_empty()
+        );
+
+        // Modifiers do not repeat on the Wayland timer; focus loss clears active repeat.
+        let t1 = t0 + Duration::from_secs(2);
+        tracker.push_key_event(Key::LeftShift, true);
+        assert_eq!(
+            key_events(tracker.poll_snapshot_at(wayland_snap(true), 800, 600, t1)),
+            vec![(0x2a, true)]
+        );
+        assert!(
+            key_events(tracker.poll_snapshot_at(
+                wayland_snap(true),
+                800,
+                600,
+                t1 + Duration::from_secs(1),
+            ))
+            .is_empty()
+        );
+
+        // Pressing a printable key starts repeating it; focus loss releases both and stops repeat.
+        let t2 = t1 + Duration::from_secs(2);
+        tracker.push_key_event(Key::A, true);
+        assert_eq!(
+            key_events(tracker.poll_snapshot_at(wayland_snap(true), 800, 600, t2)),
+            vec![(0x1e, true)]
+        );
+        let lost = key_events(tracker.poll_snapshot_at(
+            wayland_snap(false),
+            800,
+            600,
+            t2 + WAYLAND_REPEAT_DELAY,
+        ));
+        assert_eq!(lost, vec![(0x1e, false), (0x2a, false)]);
     }
 
     #[test]
