@@ -1274,6 +1274,7 @@ pub fn render_new_vm_wizard(
                                     ui.label("Transport:");
                                     ui.horizontal(|ui| {
                                         ui.radio_value(&mut w.transport, FastDeskTransport::Tcp, "TCP Loopback");
+                                        #[cfg(any(windows, target_os = "linux"))]
                                         ui.radio_value(&mut w.transport, FastDeskTransport::HvSock, "AF_HYPERV / AF_VSOCK");
                                     });
                                     ui.end_row();
