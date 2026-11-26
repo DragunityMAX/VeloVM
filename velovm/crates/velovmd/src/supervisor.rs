@@ -3262,6 +3262,11 @@ impl Supervisor {
         id_or_name: &str,
         req: ShutdownVmPayload,
     ) -> anyhow::Result<VmSummary> {
+        if req.acpi && req.force {
+            return Err(err_bad_request(
+                "ACPI shutdown does not support --force",
+            ));
+        }
         let id = self.resolve_vm_id(id_or_name)?;
         let sock = self.require_running_socket(id)?;
         let client = TtrpcClient::new(sock);

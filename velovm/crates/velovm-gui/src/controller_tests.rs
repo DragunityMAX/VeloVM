@@ -4035,3 +4035,49 @@ fn reload_client_from_runtime_addr_respects_daemon_url_when_unconnected() {
     .unwrap();
     assert!(res_token.is_some());
 }
+
+#[test]
+fn shutdown_vm_request_rejects_acpi_with_force_before_rpc() {
+    let (upd_tx, _upd_rx) = mpsc::channel();
+    let mut client = ApiClient::new("http://127.0.0.1:1", "tok").unwrap();
+    let state = BackendState {
+        data_dir: None,
+        daemon_url: None,
+        client: RwLock::new(None),
+        shared_endpoint: Arc::new(RwLock::new(None)),
+        sse_active: AtomicBool::new(false),
+        notified_connected: AtomicBool::new(false),
+        shutdown: AtomicBool::new(false),
+        sse_wake: (Mutex::new(0), Condvar::new()),
+        connect_in_flight: AtomicBool::new(false),
+        snapshot_seq: std::sync::atomic::AtomicU64::new(0),
+        snapshot_sync_lock: Mutex::new(()),
+        snapshot_sync: Mutex::new(SnapshotSyncState::default()),
+        daemon_instance_id: Mutex::new((0, None)),
+        host_cfg_lock: Mutex::new(()),
+        logs_in_flight: Mutex::new(HashSet::new()),
+        details_in_flight: Mutex::new(HashSet::new()),
+        attach_disk_in_flight: Mutex::new(HashSet::new()),
+        mount_iso_in_flight: Mutex::new(HashSet::new()),
+        sse_read_timeout: Duration::from_secs(2),
+        sse_backoff_initial: Duration::from_millis(50),
+        sse_backoff_max: Duration::from_secs(1),
+        sse_backoff_stable_after: Duration::from_secs(5),
+        upd_tx,
+        repaint_ctx: egui::Context::default(),
+    };
+    let err = state
+        .execute_client_request(
+            &mut client,
+            GuiRequest::ShutdownVm {
+                id: Uuid::nil(),
+                acpi: true,
+                force: true,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("ACPI shutdown does not support force"),
+        "unexpected error: {err:#}"
+    );
+}
