@@ -1,6 +1,7 @@
 use crate::models::ApiErrorBody;
 use crate::models::AttachDiskPayload;
 use crate::models::CreateDiskPayload;
+use crate::models::CreateSwitchPayload;
 use crate::models::CreateVmPayload;
 use crate::models::DEFAULT_DAEMON_LISTEN;
 use crate::models::DiskInfo;
@@ -8,6 +9,7 @@ use crate::models::EVENT_REVISION_HEADER;
 use crate::models::HostConfig;
 use crate::models::HostConfigPatch;
 use crate::models::HostInfo;
+use crate::models::HostNetAdapterInfo;
 use crate::models::InspectDiskPayload;
 use crate::models::MountIsoPayload;
 use crate::models::PortForward;
@@ -267,6 +269,27 @@ impl ApiClient {
 
     pub fn list_switches(&self) -> anyhow::Result<Vec<VirtualSwitchInfo>> {
         self.get("/api/v1/host/switches")
+    }
+
+    pub fn create_switch(&self, payload: &CreateSwitchPayload) -> anyhow::Result<VirtualSwitchInfo> {
+        self.post("/api/v1/host/switches", payload)
+    }
+
+    pub fn delete_switch(&self, id: &str) -> anyhow::Result<()> {
+        self.ensure_verified()?;
+        let url = format!("{}/api/v1/host/switches/{}", self.base_url, url_segment(id));
+        let resp = self
+            .client
+            .delete(url)
+            .bearer_auth(&self.token)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .send()
+            .context("DELETE /api/v1/host/switches/{id}")?;
+        decode_empty_response(resp)
+    }
+
+    pub fn list_net_adapters(&self) -> anyhow::Result<Vec<HostNetAdapterInfo>> {
+        self.get("/api/v1/host/net-adapters")
     }
 
     pub fn list_vms(&self) -> anyhow::Result<Vec<VmSummary>> {
@@ -2080,5 +2103,112 @@ mod tests {
             "{err_ensure:#}"
         );
         assert!(!store.is_daemon_locked());
+    }
+
+    #[test]
+    fn switch_crud_and_net_adapter_client_methods_use_expected_endpoints() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "switch-test-token";
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = [0u8; 4096];
+                let n = stream.read(&mut req_buf).unwrap();
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let (status_line, resp_body) = if first_line.starts_with("GET /api/v1/health") {
+                    let query = first_line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.split_once('?'))
+                        .map(|(_, q)| q)
+                        .unwrap_or("");
+                    let challenge = query
+                        .split('&')
+                        .filter_map(|kv| kv.split_once('='))
+                        .find(|(k, _)| *k == "challenge")
+                        .map(|(_, v)| v)
+                        .unwrap_or("");
+                    let proof = crate::models::compute_health_auth_proof(token, addr, challenge);
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"{{"status":"ok","service":"velovmd","auth_proof":"{proof}"}}"#
+                        ),
+                    )
+                } else if first_line.starts_with("POST /api/v1/host/switches ") {
+                    let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let payload: CreateSwitchPayload = serde_json::from_str(body).unwrap();
+                    assert_eq!(payload.name, "LabSwitch");
+                    assert_eq!(payload.kind, "internal");
+                    (
+                        "HTTP/1.1 201 Created",
+                        serde_json::to_string(&VirtualSwitchInfo {
+                            id: "sw-1".into(),
+                            name: payload.name,
+                            kind: "vmswitch".into(),
+                            description: "Hyper-V Internal Switch".into(),
+                            switch_type: Some("internal".into()),
+                            managed: true,
+                            uplink_adapter: None,
+                            cidr: None,
+                        })
+                        .unwrap(),
+                    )
+                } else if first_line.starts_with("GET /api/v1/host/net-adapters ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        serde_json::to_string(&vec![HostNetAdapterInfo {
+                            name: "Ethernet".into(),
+                            interface_description: "Intel Gigabit".into(),
+                            mac_address: "00-11-22-33-44-55".into(),
+                            status: "Up".into(),
+                            link_speed: "1 Gbps".into(),
+                        }])
+                        .unwrap(),
+                    )
+                } else if first_line.starts_with("DELETE /api/v1/host/switches/sw%201 ") {
+                    ("HTTP/1.1 204 No Content", String::new())
+                } else {
+                    (
+                        "HTTP/1.1 500 Internal Server Error",
+                        format!(r#"{{"error":"unexpected request: {first_line}"}}"#),
+                    )
+                };
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = ApiClient::new(format!("http://{addr}"), token).unwrap();
+        let created = client
+            .create_switch(&CreateSwitchPayload {
+                name: "LabSwitch".into(),
+                kind: "internal".into(),
+                net_adapter_name: None,
+                allow_management_os: false,
+                cidr: None,
+            })
+            .unwrap();
+        assert_eq!(created.id, "sw-1");
+        assert!(created.managed);
+        assert_eq!(created.switch_type.as_deref(), Some("internal"));
+
+        let adapters = client.list_net_adapters().unwrap();
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].name, "Ethernet");
+
+        client.delete_switch("sw 1").unwrap();
+        srv.join().unwrap();
     }
 }

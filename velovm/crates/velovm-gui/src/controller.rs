@@ -1709,6 +1709,7 @@ fn spawn_sse_listener(state: Arc<BackendState>) {
                                     }
                                 }
                             }
+                            DaemonEvent::SwitchesUpdated => {}
                             DaemonEvent::DaemonStopping => {
                                 saw_daemon_stopping = true;
                                 *state.client.write().unwrap() = None;

@@ -972,6 +972,9 @@ impl Supervisor {
             name: "Default NAT (Consomme)".to_string(),
             kind: "nat".to_string(),
             description: "User-mode NAT with live TCP/UDP host port forwarding".to_string(),
+            switch_type: Some("nat".to_string()),
+            managed: false,
+            ..Default::default()
         }];
 
         #[cfg(windows)]
@@ -6220,6 +6223,14 @@ fn to_proto_nic_config(nic: &NicAttachment) -> vmservice::NicConfig {
                 )),
             })
         }
+        NicBackendConfig::Bridge { name } => {
+            // Ephemeral TAP provisioning for Bridge backends is implemented in #189.
+            vmservice::nic_config::Backend::Tap(vmservice::TapBackend {
+                source: Some(vmservice::tap_backend::Source::Name(
+                    name.trim().to_string(),
+                )),
+            })
+        }
     };
     vmservice::NicConfig {
         nic_id: nic.id.to_string(),
@@ -6335,6 +6346,9 @@ fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
         name: "Default Switch".to_string(),
         kind: "vmswitch".to_string(),
         description: "Windows Hyper-V Default Switch (HCN)".to_string(),
+        switch_type: Some("internal".to_string()),
+        managed: false,
+        ..Default::default()
     }];
 
     if windows_hyperv_module_available()
@@ -6390,14 +6404,15 @@ fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
                 if let (Some(id), Some(name)) = (item["Id"].as_str(), item["Name"].as_str()) {
                     let id_lower = id.to_ascii_lowercase();
                     if !out.iter().any(|s| s.id.eq_ignore_ascii_case(&id_lower)) {
+                        let switch_type = item["SwitchType"].as_str().unwrap_or("Unknown");
                         out.push(VirtualSwitchInfo {
                             id: id_lower,
                             name: name.to_string(),
                             kind: "vmswitch".to_string(),
-                            description: format!(
-                                "Hyper-V Virtual Switch ({})",
-                                item["SwitchType"].as_str().unwrap_or("Unknown")
-                            ),
+                            description: format!("Hyper-V Virtual Switch ({switch_type})"),
+                            switch_type: Some(switch_type.to_ascii_lowercase()),
+                            managed: true,
+                            ..Default::default()
                         });
                     }
                 }
@@ -6452,6 +6467,9 @@ fn parse_linux_tap_in_dir(iface_path: &Path, name: &str) -> Option<VirtualSwitch
         name: name.to_string(),
         kind: "tap".to_string(),
         description,
+        switch_type: Some("tap".to_string()),
+        managed: false,
+        ..Default::default()
     })
 }
 

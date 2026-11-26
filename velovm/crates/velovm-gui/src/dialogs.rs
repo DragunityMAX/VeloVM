@@ -568,7 +568,9 @@ impl VmSettingsDialog {
             None => "none".to_string(),
             Some(NicBackendConfig::Consomme { .. }) => "consomme".to_string(),
             Some(NicBackendConfig::VmSwitch { switch_id, .. }) => switch_id.clone(),
-            Some(NicBackendConfig::Tap { name }) => name.clone(),
+            Some(NicBackendConfig::Tap { name }) | Some(NicBackendConfig::Bridge { name }) => {
+                name.clone()
+            }
         };
         let uefi_firmware = cfg
             .uefi_firmware
@@ -2254,6 +2256,7 @@ mod tests {
             name: "tap1".to_string(),
             kind: "tap".to_string(),
             description: "Secondary test TAP".to_string(),
+            ..Default::default()
         }];
         dlg.selected_switch_id = "tap1".to_string();
         let switched_payload = dlg.build_update_payload(&switches);
@@ -2394,6 +2397,7 @@ mod tests {
             name: "br0".to_string(),
             kind: "bridge".to_string(),
             description: "Linux bridge".to_string(),
+            ..Default::default()
         }];
         let nics = build_nics_from_switch_id("br0", &switches, &[]);
         assert_eq!(nics.len(), 1);
