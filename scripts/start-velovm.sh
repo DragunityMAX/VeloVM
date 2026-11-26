@@ -290,6 +290,36 @@ now_ms() {
     fi
 }
 
+collect_process_tree_pids() {
+    local root_pid="$1"
+    local queue=("$root_pid")
+    local all_pids=("$root_pid")
+    local idx=0
+    while [[ $idx -lt ${#queue[@]} ]]; do
+        local pid="${queue[$idx]}"
+        idx=$((idx + 1))
+        local child
+        while IFS= read -r child; do
+            [[ "$child" =~ ^[0-9]+$ ]] || continue
+            queue+=("$child")
+            all_pids+=("$child")
+        done < <(pgrep -P "$pid" 2>/dev/null || true)
+    done
+    local IFS=,
+    echo "${all_pids[*]}"
+}
+
+is_tcp_listening_lsof() {
+    if [[ -n "${VMM_PID:-}" ]] && command -v pgrep >/dev/null 2>&1; then
+        local pid_list
+        pid_list="$(collect_process_tree_pids "$VMM_PID")"
+        lsof -nP -a -p "$pid_list" -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+    lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+}
+
 is_tcp_listening() {
     local port_hex ip4_hex=""
     port_hex="$(printf '%04X' "$LISTEN_PORT")"
@@ -323,7 +353,7 @@ is_tcp_listening() {
         ss -Htan "( sport = :$LISTEN_PORT )" 2>/dev/null | grep "LISTEN" >/dev/null
         return $?
     elif command -v lsof >/dev/null 2>&1; then
-        [[ -n "${VMM_PID:-}" ]] && lsof -nP -a -p "$VMM_PID" -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >/dev/null 2>&1
+        is_tcp_listening_lsof
         return $?
     fi
     return 1
