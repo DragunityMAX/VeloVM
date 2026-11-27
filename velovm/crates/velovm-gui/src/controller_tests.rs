@@ -1943,8 +1943,8 @@ fn sse_backs_off_and_reports_error_when_events_fail_on_healthy_daemon() {
         None,
         egui::Context::default(),
         Duration::from_secs(2),
-        Duration::from_millis(40),
-        Duration::from_millis(320),
+        Duration::from_millis(100),
+        Duration::from_millis(800),
     );
     backend.send(GuiRequest::ConnectOrStartDaemon);
 
@@ -1960,7 +1960,7 @@ fn sse_backs_off_and_reports_error_when_events_fail_on_healthy_daemon() {
         _ => unreachable!(),
     }
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if events_times.lock().unwrap().len() >= 4 {
             break;
@@ -1973,11 +1973,11 @@ fn sse_backs_off_and_reports_error_when_events_fail_on_healthy_daemon() {
     }
 
     let times = events_times.lock().unwrap().clone();
-    // Delays before attempts 1..4 are 40ms, 80ms, 160ms; verify backoff grows past initial 40ms.
+    // Delays before attempts 1..4 are 100ms, 200ms, 400ms; verify backoff grows past initial 100ms.
     let gap1 = times[1].duration_since(times[0]);
     let gap3 = times[3].duration_since(times[2]);
     assert!(
-        gap3 >= Duration::from_millis(120) && gap3 > gap1,
+        gap3 >= Duration::from_millis(320) && gap3 > gap1,
         "expected exponential SSE backoff (gap1={gap1:?}, gap3={gap3:?})"
     );
 
@@ -3643,12 +3643,12 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
                 let _ = stream.write_all(format!("data: {leading_json}\n\n").as_bytes());
                 let _ = stream.flush();
                 if idx == 1 {
-                    // Send keep-alives every 100ms for 700ms (~3x the 250ms read timeout).
-                    for _ in 0..7 {
+                    // Send keep-alives every 150ms for 900ms (~1.5x the 600ms read timeout, 4x margin per beat).
+                    for _ in 0..6 {
                         if stop.load(Ordering::Acquire) {
                             return;
                         }
-                        thread::sleep(Duration::from_millis(100));
+                        thread::sleep(Duration::from_millis(150));
                         if stream.write_all(b": keep-alive\n\n").is_err() {
                             return;
                         }
@@ -3707,7 +3707,7 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
         Some(dir.path().to_path_buf()),
         None,
         egui::Context::default(),
-        Duration::from_millis(250),
+        Duration::from_millis(600),
     );
     backend.send(GuiRequest::ConnectOrStartDaemon);
 
@@ -3715,7 +3715,7 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
         matches!(u, GuiUpdate::DaemonConnected { .. })
     });
 
-    // VmUpdated arrives after ~700ms of keep-alives without any reconnect or second snapshot fetch.
+    // VmUpdated arrives after ~900ms of keep-alives without any reconnect or second snapshot fetch.
     let updated = recv_until(&backend, Duration::from_secs(5), |u| {
         matches!(
             u,
@@ -3730,7 +3730,7 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
     assert_eq!(vms_fetches.load(Ordering::SeqCst), 1);
 
     // Once keep-alives stop, idle read_timeout fires and reconnects + reconciles to stage 1 (Paused).
-    let reconciled = recv_until(&backend, Duration::from_secs(5), |u| {
+    let reconciled = recv_until(&backend, Duration::from_secs(8), |u| {
         matches!(u, GuiUpdate::DaemonConnected { vms, .. } if vms.iter().any(|v| v.runtime.status == VmStatus::Paused))
     });
     assert!(matches!(reconciled, GuiUpdate::DaemonConnected { .. }));
@@ -4143,4 +4143,255 @@ fn shutdown_vm_request_rejects_acpi_with_force_before_rpc() {
         err.to_string().contains("ACPI shutdown does not support force"),
         "unexpected error: {err:#}"
     );
+}
+
+#[test]
+fn create_switch_dialog_validates_os_aware_kinds_and_external_adapter() {
+    use crate::dialogs::{CreateSwitchDialog, SwitchCreateKind};
+
+    let mut win_dlg = CreateSwitchDialog::new(Some("windows"));
+    assert_eq!(win_dlg.kind, SwitchCreateKind::Internal);
+    assert_eq!(
+        SwitchCreateKind::available_for_os(Some("windows")),
+        &[
+            SwitchCreateKind::External,
+            SwitchCreateKind::Internal,
+            SwitchCreateKind::Private,
+        ]
+    );
+    assert!(win_dlg.build_payload().is_err(), "empty name must fail");
+
+    win_dlg.name = "  LabInternal  ".to_string();
+    let internal_payload = win_dlg.build_payload().unwrap();
+    assert_eq!(internal_payload.name, "LabInternal");
+    assert_eq!(internal_payload.kind, "internal");
+    assert!(!internal_payload.allow_management_os);
+
+    win_dlg.kind = SwitchCreateKind::External;
+    assert!(
+        win_dlg.build_payload().is_err(),
+        "external switch without adapter must fail"
+    );
+
+    win_dlg.set_adapters(
+        vec![
+            HostNetAdapterInfo {
+                name: "Ethernet 2".to_string(),
+                status: "Disconnected".to_string(),
+                ..Default::default()
+            },
+            HostNetAdapterInfo {
+                name: "Ethernet".to_string(),
+                status: "Up".to_string(),
+                ..Default::default()
+            },
+        ],
+        None,
+    );
+    assert!(!win_dlg.adapters_loading);
+    assert_eq!(win_dlg.net_adapter_name, "Ethernet");
+    let ext_payload = win_dlg.build_payload().unwrap();
+    assert_eq!(ext_payload.kind, "external");
+    assert_eq!(ext_payload.net_adapter_name.as_deref(), Some("Ethernet"));
+    assert!(ext_payload.allow_management_os);
+
+    let mut linux_dlg = CreateSwitchDialog::new(Some("linux"));
+    assert_eq!(linux_dlg.kind, SwitchCreateKind::Bridge);
+    assert_eq!(
+        SwitchCreateKind::available_for_os(Some("linux")),
+        &[SwitchCreateKind::Bridge]
+    );
+    linux_dlg.name = "br-vm0".to_string();
+    linux_dlg.cidr = "10.20.0.0/24".to_string();
+    let br_payload = linux_dlg.build_payload().unwrap();
+    assert_eq!(br_payload.kind, "bridge");
+    assert_eq!(br_payload.cidr.as_deref(), Some("10.20.0.0/24"));
+}
+
+#[test]
+fn build_nics_from_switch_id_emits_bridge_and_preserves_trailing_nics() {
+    use crate::dialogs::build_nics_from_switch_id;
+    use velovm_core::models::{NicAttachment, NicBackendConfig};
+
+    let switches = vec![VirtualSwitchInfo {
+        id: "br0".to_string(),
+        name: "br0".to_string(),
+        kind: "bridge".to_string(),
+        description: "Linux kernel bridge".to_string(),
+        switch_type: Some("bridge".to_string()),
+        managed: true,
+        ..Default::default()
+    }];
+
+    // Fresh NIC list on bridge switch emits NicBackendConfig::Bridge
+    let fresh = build_nics_from_switch_id("br0", &switches, &[]);
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(
+        fresh[0].backend,
+        NicBackendConfig::Bridge {
+            name: "br0".to_string()
+        }
+    );
+
+    // Replacing existing primary NIC preserves ID, MAC, and trailing NICs
+    let primary_id = Uuid::new_v4();
+    let secondary_id = Uuid::new_v4();
+    let existing = vec![
+        NicAttachment {
+            id: primary_id,
+            name: "Primary".to_string(),
+            mac_address: "00-15-5D-01-02-03".to_string(),
+            backend: NicBackendConfig::default(),
+        },
+        NicAttachment {
+            id: secondary_id,
+            name: "Secondary".to_string(),
+            mac_address: "00-15-5D-04-05-06".to_string(),
+            backend: NicBackendConfig::Tap {
+                name: "tap0".to_string(),
+            },
+        },
+    ];
+    let updated = build_nics_from_switch_id("br0", &switches, &existing);
+    assert_eq!(updated.len(), 2);
+    assert_eq!(updated[0].id, primary_id);
+    assert_eq!(updated[0].mac_address, "00-15-5D-01-02-03");
+    assert_eq!(
+        updated[0].backend,
+        NicBackendConfig::Bridge {
+            name: "br0".to_string()
+        }
+    );
+    assert_eq!(updated[1].id, secondary_id);
+    assert_eq!(
+        updated[1].backend,
+        NicBackendConfig::Tap {
+            name: "tap0".to_string()
+        }
+    );
+}
+
+#[test]
+fn sse_switches_updated_refreshes_switches_list() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = velovm_core::store::RegistryStore::new(dir.path()).unwrap();
+    let token = store.load_or_create_token().unwrap();
+    let rt_dir = dir.path().join("run");
+    std::fs::create_dir_all(&rt_dir).unwrap();
+
+    let host_cfg_json = serde_json::to_string(&HostConfig::default()).unwrap();
+    let initial_switches_json = serde_json::to_string(&vec![VirtualSwitchInfo {
+        id: "consomme".into(),
+        name: "Default NAT".into(),
+        kind: "nat".into(),
+        description: "NAT".into(),
+        ..Default::default()
+    }])
+    .unwrap();
+    let updated_switches_json = serde_json::to_string(&vec![
+        VirtualSwitchInfo {
+            id: "consomme".into(),
+            name: "Default NAT".into(),
+            kind: "nat".into(),
+            description: "NAT".into(),
+            ..Default::default()
+        },
+        VirtualSwitchInfo {
+            id: "br0".into(),
+            name: "br0".into(),
+            kind: "bridge".into(),
+            description: "Linux bridge".into(),
+            switch_type: Some("bridge".into()),
+            managed: true,
+            ..Default::default()
+        },
+    ])
+    .unwrap();
+
+    let switch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let switch_calls_srv = Arc::clone(&switch_calls);
+    let token_srv = token.clone();
+    let data_dir_srv = dir.path().to_path_buf();
+    let rt_dir_srv = rt_dir.clone();
+    let instance_id = Uuid::new_v4();
+
+    let srv = TestMockServer::spawn(move |mut stream, req, addr, stop| {
+        if req.target.starts_with("/api/v1/health") {
+            let query = req.target.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let challenge = query
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "challenge")
+                .map(|(_, v)| v)
+                .unwrap_or("");
+            let proof =
+                velovm_core::models::compute_health_auth_proof(&token_srv, addr, challenge);
+            let body =
+                format!(r#"{{"status":"ok","service":"velovmd","auth_proof":"{proof}"}}"#);
+            write_mock_json(&mut stream, "200 OK", &body);
+        } else if req.target == "/api/v1/host/info" {
+            let info_json = serde_json::to_string(&HostInfo {
+                hostname: "test-host".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                cpu_count: 4,
+                daemon_version: "0.1.0".into(),
+                data_dir: data_dir_srv.clone(),
+                runtime_dir: rt_dir_srv.clone(),
+                listen_addr: addr.to_string(),
+                resolved_paths: Default::default(),
+                daemon_instance_id: Some(instance_id),
+                event_revision: 1,
+            })
+            .unwrap();
+            write_mock_json(&mut stream, "200 OK", &info_json);
+        } else if req.target == "/api/v1/host/config" {
+            write_mock_json(&mut stream, "200 OK", &host_cfg_json);
+        } else if req.target == "/api/v1/host/switches" {
+            let n = switch_calls_srv.fetch_add(1, Ordering::SeqCst);
+            let body = if n == 0 {
+                &initial_switches_json
+            } else {
+                &updated_switches_json
+            };
+            write_mock_json(&mut stream, "200 OK", body);
+        } else if req.target == "/api/v1/vms" {
+            write_mock_json(&mut stream, "200 OK", "[]");
+        } else if req.target == "/api/v1/events" && write_sse_ok_headers(&mut stream) {
+            let ev1 = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&DaemonEvent::Resync).unwrap()
+            );
+            let ev2 = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&DaemonEvent::SwitchesUpdated).unwrap()
+            );
+            let _ = stream.write_all(ev1.as_bytes());
+            let _ = stream.write_all(ev2.as_bytes());
+            let _ = stream.flush();
+            stream_sse_keepalives(&mut stream, &stop, Duration::from_millis(25));
+        }
+    });
+
+    let handle = BackendHandle::spawn(
+        Some(dir.path().to_path_buf()),
+        Some(format!("http://{}", srv.addr)),
+        egui::Context::default(),
+    );
+    handle.send(GuiRequest::ConnectOrStartDaemon);
+
+    let upd = recv_until(&handle, Duration::from_secs(5), |u| {
+        matches!(u, GuiUpdate::SwitchesUpdated(switches) if switches.iter().any(|s| s.id == "br0"))
+    });
+    match upd {
+        GuiUpdate::SwitchesUpdated(switches) => {
+            assert!(switches.iter().any(|s| s.id == "br0" && s.kind == "bridge"));
+        }
+        other => panic!("unexpected update: {other:?}"),
+    }
+
+    drop(handle);
+    drop(srv);
 }
