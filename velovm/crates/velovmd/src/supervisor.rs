@@ -4,6 +4,7 @@ use chrono::Utc;
 use velovm_core::disk;
 use velovm_core::models::AttachDiskPayload;
 use velovm_core::models::CreateDiskPayload;
+use velovm_core::models::CreateSwitchPayload;
 use velovm_core::models::CreateVmPayload;
 use velovm_core::models::DaemonEvent;
 use velovm_core::models::DiskAttachment;
@@ -14,6 +15,7 @@ use velovm_core::models::FastDeskTransport;
 use velovm_core::models::HostConfig;
 use velovm_core::models::HostConfigPatch;
 use velovm_core::models::HostInfo;
+use velovm_core::models::HostNetAdapterInfo;
 use velovm_core::models::IpProto;
 use velovm_core::models::LiveVmProperties;
 use velovm_core::models::MountIsoPayload;
@@ -115,6 +117,7 @@ struct ManagedVm {
     pending_port_forwards: Vec<(Uuid, PortForward)>,
     orphaned_disks: Vec<DiskAttachment>,
     orphaned_port_forwards: Vec<OrphanedPortForward>,
+    ephemeral_taps: Vec<String>,
     detach_on_drop: bool,
     deleting: bool,
 }
@@ -151,6 +154,10 @@ impl Drop for ManagedVm {
                 self.runtime.rpc_socket_path.take(),
                 self.runtime.shm_path.take(),
             );
+        }
+        if !self.detach_on_drop && !self.ephemeral_taps.is_empty() {
+            let taps = std::mem::take(&mut self.ephemeral_taps);
+            teardown_ephemeral_taps(&taps);
         }
     }
 }
@@ -213,6 +220,7 @@ pub struct Supervisor {
     initial_listen_addr: String,
     host_config: RwLock<HostConfig>,
     host_config_lock: tokio::sync::Mutex<()>,
+    switch_op_lock: std::sync::Mutex<()>,
     active_listener: std::sync::Mutex<Option<ActiveListener>>,
     draining_listeners: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     vms: RwLock<HashMap<Uuid, ManagedVm>>,
@@ -260,6 +268,7 @@ impl Supervisor {
                     pending_port_forwards: Vec::new(),
                     orphaned_disks: Vec::new(),
                     orphaned_port_forwards: Vec::new(),
+                    ephemeral_taps: Vec::new(),
                     detach_on_drop: false,
                     deleting: false,
                 },
@@ -276,6 +285,7 @@ impl Supervisor {
             initial_listen_addr,
             host_config: RwLock::new(host_config),
             host_config_lock: tokio::sync::Mutex::new(()),
+            switch_op_lock: std::sync::Mutex::new(()),
             active_listener: std::sync::Mutex::new(None),
             draining_listeners: std::sync::Mutex::new(Vec::new()),
             vms: RwLock::new(vm_map),
@@ -554,6 +564,10 @@ impl Supervisor {
                         );
                         Self::restore_pending_disks_from_journal(vm, &sock_path);
                         Self::restore_pending_port_forwards_from_journal(vm, &sock_path);
+                        #[cfg(target_os = "linux")]
+                        {
+                            vm.ephemeral_taps = collect_existing_ephemeral_taps(&vm.config);
+                        }
                         vm.runtime.revision = self.next_revision();
                         vm.generation = 1;
                         adopted_vms.push((id, sock_path));
@@ -983,9 +997,169 @@ impl Supervisor {
         }
         #[cfg(target_os = "linux")]
         {
+            out.extend(discover_linux_bridge_interfaces());
             out.extend(discover_linux_tap_interfaces());
         }
         out
+    }
+
+    pub fn create_switch(
+        &self,
+        mut payload: CreateSwitchPayload,
+    ) -> anyhow::Result<VirtualSwitchInfo> {
+        if self.is_shutting_down() {
+            return Err(err_conflict("cannot create virtual switch while velovmd is shutting down"));
+        }
+        payload.normalize();
+        payload
+            .validate()
+            .map_err(|e| err_bad_request(format!("{e:#}")))?;
+
+        if is_protected_builtin_switch(&payload.name) {
+            return Err(err_bad_request(format!(
+                "virtual switch name '{}' is reserved for a built-in switch",
+                payload.name
+            )));
+        }
+
+        let _switch_guard = self.switch_op_lock.lock().unwrap();
+        let existing = self.list_switches();
+        if existing.iter().any(|s| {
+            s.name.eq_ignore_ascii_case(&payload.name) || s.id.eq_ignore_ascii_case(&payload.name)
+        }) {
+            return Err(err_conflict(format!(
+                "virtual switch '{}' already exists",
+                payload.name
+            )));
+        }
+
+        match payload.kind.as_str() {
+            "external" | "internal" | "private" => {
+                #[cfg(windows)]
+                {
+                    let info = create_windows_switch(&payload)?;
+                    invalidate_windows_switch_cache();
+                    Ok(info)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(err_bad_request(format!(
+                        "Hyper-V virtual switch kind '{}' is only supported on Windows",
+                        payload.kind
+                    )))
+                }
+            }
+            "bridge" => {
+                #[cfg(target_os = "linux")]
+                {
+                    create_linux_bridge(&payload)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(err_bad_request(
+                        "Linux bridge virtual switches are only supported on Linux",
+                    ))
+                }
+            }
+            "l2" | "l2_hub" => Err(err_bad_request(
+                "userspace L2 virtual switches are not yet supported",
+            )),
+            other => Err(err_bad_request(format!(
+                "unsupported virtual switch kind '{other}'"
+            ))),
+        }
+    }
+
+    pub fn delete_switch(&self, id_or_name: &str) -> anyhow::Result<()> {
+        if self.is_shutting_down() {
+            return Err(err_conflict("cannot delete virtual switch while velovmd is shutting down"));
+        }
+        let target = id_or_name.trim();
+        if target.is_empty() {
+            return Err(err_bad_request("virtual switch identifier cannot be empty"));
+        }
+        if is_protected_builtin_switch(target) {
+            return Err(err_bad_request(format!(
+                "built-in virtual switch '{target}' cannot be deleted"
+            )));
+        }
+
+        let _switch_guard = self.switch_op_lock.lock().unwrap();
+        let switches = self.list_switches();
+        let resolved = resolve_switch_target(&switches, target)?;
+        if let Some(ref sw) = resolved
+            && is_protected_builtin_switch(&sw.id)
+        {
+            return Err(err_bad_request(format!(
+                "built-in virtual switch '{}' cannot be deleted",
+                sw.name
+            )));
+        }
+
+        {
+            let guard = self.vms.read().unwrap();
+            ensure_switch_not_referenced_by_vms(&guard, target, resolved.as_ref())?;
+        }
+
+        let Some(sw) = resolved else {
+            return Err(err_not_found(format!(
+                "virtual switch '{target}' not found"
+            )));
+        };
+        if !sw.managed {
+            return Err(err_bad_request(format!(
+                "virtual switch '{}' is unmanaged and cannot be deleted",
+                sw.name
+            )));
+        }
+
+        match sw.kind.as_str() {
+            "vmswitch" => {
+                #[cfg(windows)]
+                {
+                    delete_windows_switch(&sw.id)?;
+                    invalidate_windows_switch_cache();
+                    Ok(())
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(err_bad_request(
+                        "Hyper-V virtual switches can only be deleted on Windows",
+                    ))
+                }
+            }
+            "bridge" => {
+                #[cfg(target_os = "linux")]
+                {
+                    delete_linux_bridge(&sw.name)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(err_bad_request(
+                        "Linux bridge virtual switches can only be deleted on Linux",
+                    ))
+                }
+            }
+            other => Err(err_bad_request(format!(
+                "virtual switch '{}' of kind '{other}' cannot be deleted",
+                sw.name
+            ))),
+        }
+    }
+
+    pub fn list_net_adapters(&self) -> anyhow::Result<Vec<HostNetAdapterInfo>> {
+        #[cfg(windows)]
+        {
+            discover_windows_net_adapters()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Ok(discover_linux_net_adapters_in(Path::new("/sys/class/net")))
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            Ok(Vec::new())
+        }
     }
 
     fn resolve_vm_id(&self, id_or_name: &str) -> anyhow::Result<Uuid> {
@@ -1375,6 +1549,7 @@ impl Supervisor {
                             pending_port_forwards: Vec::new(),
                             orphaned_disks: Vec::new(),
                             orphaned_port_forwards: Vec::new(),
+                            ephemeral_taps: Vec::new(),
                             detach_on_drop: false,
                             deleting: false,
                         };
@@ -2305,14 +2480,30 @@ impl Supervisor {
 
         let log_path = self.store.vm_log_path(id);
         let stderr_log_path = log_path.with_extension("stderr.log");
+        #[cfg(target_os = "linux")]
+        let provisioned_taps = {
+            let cfg_clone = cfg.clone();
+            tokio::task::spawn_blocking(move || provision_ephemeral_taps_for_vm(&cfg_clone))
+                .await
+                .context("provisioning ephemeral bridge TAP devices")??
+        };
+        #[cfg(not(target_os = "linux"))]
+        let provisioned_taps: Vec<String> = Vec::new();
+
         let (shm_path, stderr_file) = {
             let mut guard = self.vms.write().unwrap();
-            let vm = guard.get_mut(&id).context("VM vanished")?;
+            let Some(vm) = guard.get_mut(&id) else {
+                drop(guard);
+                teardown_ephemeral_taps(&provisioned_taps);
+                bail!("VM vanished");
+            };
             if *cancel_rx.borrow()
                 || self.is_shutting_down()
                 || vm.generation != start_gen
                 || vm.runtime.status != VmStatus::Starting
             {
+                drop(guard);
+                teardown_ephemeral_taps(&provisioned_taps);
                 bail!("VM startup cancelled by stop request");
             }
             let _ = fs::remove_file(&sock_path);
@@ -2322,24 +2513,41 @@ impl Supervisor {
 
             let shm_path = if cfg.fastdesk.enabled && cfg.fastdesk.use_shm {
                 let path = runtime_dir.join(format!("vram-{id}.shm"));
-                prepare_shm_path(&path)?;
+                if let Err(err) = prepare_shm_path(&path) {
+                    drop(guard);
+                    teardown_ephemeral_taps(&provisioned_taps);
+                    return Err(err);
+                }
                 Some(path)
             } else {
                 None
             };
 
-            if let Some(parent) = log_path.parent() {
-                fs::create_dir_all(parent)?;
+            if let Some(parent) = log_path.parent()
+                && let Err(err) = fs::create_dir_all(parent)
+            {
+                drop(guard);
+                teardown_ephemeral_taps(&provisioned_taps);
+                return Err(err.into());
             }
-            let stderr_file = fs::OpenOptions::new()
+            let stderr_file = match fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&stderr_log_path)
-                .with_context(|| format!("opening {}", stderr_log_path.display()))?;
+                .with_context(|| format!("opening {}", stderr_log_path.display()))
+            {
+                Ok(f) => f,
+                Err(err) => {
+                    drop(guard);
+                    teardown_ephemeral_taps(&provisioned_taps);
+                    return Err(err);
+                }
+            };
 
             vm.runtime.rpc_socket_path = Some(sock_path.clone());
             vm.runtime.shm_path = shm_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+            vm.ephemeral_taps = provisioned_taps;
             (shm_path, stderr_file)
         };
 
@@ -2576,6 +2784,7 @@ impl Supervisor {
                 let _ = child.wait();
             }
             cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
+            let taps = std::mem::take(&mut vm.ephemeral_taps);
             vm.adopted_proc = None;
             vm.runtime.pid = None;
             vm.runtime.started_at = None;
@@ -2586,6 +2795,7 @@ impl Supervisor {
             vm.runtime.revision = self.next_revision();
             let summary = vm.summary();
             drop(guard);
+            teardown_ephemeral_taps(&taps);
             self.emit(DaemonEvent::VmUpdated { vm: summary });
         }
     }
@@ -2890,6 +3100,7 @@ impl Supervisor {
             (None, stopped)
         };
 
+        let mut exited_taps = Vec::new();
         let summary = {
             let mut guard = self.vms.write().unwrap();
             let Some(vm) = guard.get_mut(&id) else {
@@ -2933,6 +3144,7 @@ impl Supervisor {
                 }
             } else {
                 cleanup_runtime_files(vm.runtime.rpc_socket_path.take(), vm.runtime.shm_path.take());
+                exited_taps = std::mem::take(&mut vm.ephemeral_taps);
                 vm.adopted_proc = None;
                 vm.runtime.pid = None;
                 vm.runtime.started_at = None;
@@ -2966,6 +3178,10 @@ impl Supervisor {
             vm.runtime.revision = self.next_revision();
             vm.summary()
         };
+
+        if !exited_taps.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || teardown_ephemeral_taps(&exited_taps)).await;
+        }
 
         let done_summary = matches!(summary.runtime.status, VmStatus::Off | VmStatus::Error).then(|| {
             let mut stopped = summary.clone();
@@ -3156,10 +3372,12 @@ impl Supervisor {
                 }
 
                 cleanup_runtime_files(sock_opt, shm_opt);
+                let mut stopped_taps = Vec::new();
                 let (done_summary, emit_summary) = {
                     let mut guard = sup.vms.write().unwrap();
                     if let Some(vm) = guard.get_mut(&id) {
                         if vm.generation == stop_gen {
+                            stopped_taps = std::mem::take(&mut vm.ephemeral_taps);
                             vm.runtime.status = VmStatus::Off;
                             vm.adopted_proc = None;
                             vm.runtime.pid = None;
@@ -3180,6 +3398,12 @@ impl Supervisor {
                         (None, None)
                     }
                 };
+                if !stopped_taps.is_empty() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        teardown_ephemeral_taps(&stopped_taps);
+                    })
+                    .await;
+                }
                 let _ = stop_done_tx.send(StopOutcome::Done(done_summary));
                 if let Some(summary) = emit_summary {
                     sup.emit(DaemonEvent::VmUpdated { vm: summary });
@@ -6236,11 +6460,10 @@ fn to_proto_nic_config(nic: &NicAttachment) -> vmservice::NicConfig {
                 )),
             })
         }
-        NicBackendConfig::Bridge { name } => {
-            // Ephemeral TAP provisioning for Bridge backends is implemented in #189.
+        NicBackendConfig::Bridge { .. } => {
             vmservice::nic_config::Backend::Tap(vmservice::TapBackend {
                 source: Some(vmservice::tap_backend::Source::Name(
-                    name.trim().to_string(),
+                    ephemeral_tap_name_for_nic(nic.id),
                 )),
             })
         }
@@ -6296,6 +6519,141 @@ fn read_log_tail(path: &Path, tail: usize) -> anyhow::Result<String> {
     Ok(lines[start..].join("\n"))
 }
 
+const HYPERV_DEFAULT_SWITCH_ID: &str = "c08cb7b8-9b3c-408e-8e30-5e16a3aeb444";
+
+fn is_protected_builtin_switch(id_or_name: &str) -> bool {
+    let normalized = id_or_name.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "consomme"
+            | "default nat (consomme)"
+            | "default"
+            | "default switch"
+            | HYPERV_DEFAULT_SWITCH_ID
+    )
+}
+
+fn resolve_switch_target(
+    switches: &[VirtualSwitchInfo],
+    target: &str,
+) -> anyhow::Result<Option<VirtualSwitchInfo>> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(found) = switches.iter().find(|s| s.id == target) {
+            return Ok(Some(found.clone()));
+        }
+        let mut by_name: Vec<&VirtualSwitchInfo> =
+            switches.iter().filter(|s| s.name == target).collect();
+        if by_name.len() > 1 {
+            return Err(err_conflict(format!(
+                "multiple virtual switches share name '{target}'; specify switch ID"
+            )));
+        }
+        if let Some(found) = by_name.pop() {
+            return Ok(Some(found.clone()));
+        }
+    }
+
+    if let Some(found) = switches
+        .iter()
+        .find(|s| s.id.eq_ignore_ascii_case(target))
+    {
+        return Ok(Some(found.clone()));
+    }
+    let mut by_name: Vec<&VirtualSwitchInfo> = switches
+        .iter()
+        .filter(|s| s.name.eq_ignore_ascii_case(target))
+        .collect();
+    if by_name.len() > 1 {
+        return Err(err_conflict(format!(
+            "multiple virtual switches share name '{target}'; specify switch ID"
+        )));
+    }
+    Ok(by_name.pop().cloned())
+}
+
+fn ensure_switch_not_referenced_by_vms(
+    vms: &HashMap<Uuid, ManagedVm>,
+    raw_target: &str,
+    resolved: Option<&VirtualSwitchInfo>,
+) -> anyhow::Result<()> {
+    let mut keys: Vec<&str> = vec![raw_target];
+    if let Some(sw) = resolved {
+        if !keys.iter().any(|k| k.eq_ignore_ascii_case(&sw.id)) {
+            keys.push(&sw.id);
+        }
+        if !keys.iter().any(|k| k.eq_ignore_ascii_case(&sw.name)) {
+            keys.push(&sw.name);
+        }
+    }
+
+    let matches_key = |candidate: &str, case_insensitive: bool| {
+        let trimmed = candidate.trim();
+        keys.iter().any(|k| {
+            if case_insensitive {
+                trimmed.eq_ignore_ascii_case(k)
+            } else {
+                trimmed == *k
+            }
+        })
+    };
+
+    for (vm_id, vm) in vms {
+        for nic in &vm.config.nics {
+            let matched = match &nic.backend {
+                NicBackendConfig::Consomme { .. } => false,
+                NicBackendConfig::VmSwitch {
+                    switch_id,
+                    switch_name,
+                } => {
+                    matches_key(switch_id, true)
+                        || switch_name
+                            .as_deref()
+                            .is_some_and(|n| matches_key(n, true))
+                }
+                NicBackendConfig::Bridge { name } | NicBackendConfig::Tap { name } => {
+                    matches_key(name, !cfg!(target_os = "linux"))
+                }
+            };
+            if matched {
+                return Err(err_conflict(format!(
+                    "cannot delete virtual switch '{raw_target}': still attached to VM '{}' ({vm_id})",
+                    vm.config.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ephemeral_tap_name_for_nic(nic_id: Uuid) -> String {
+    let hex = nic_id.simple().to_string();
+    format!("vvm-{}", &hex[..11])
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_ephemeral_tap_name(name: &str) -> bool {
+    name.len() == 15
+        && name.starts_with("vvm-")
+        && name[4..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(windows)]
+fn windows_switch_cache()
+-> &'static std::sync::Mutex<Option<(std::time::Instant, Vec<VirtualSwitchInfo>)>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<Option<(std::time::Instant, Vec<VirtualSwitchInfo>)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(windows)]
+fn invalidate_windows_switch_cache() {
+    if let Ok(mut guard) = windows_switch_cache().lock() {
+        *guard = None;
+    }
+}
+
 #[cfg(windows)]
 fn windows_hyperv_module_available() -> bool {
     let mut roots: Vec<PathBuf> = std::env::var_os("PSModulePath")
@@ -6334,19 +6692,115 @@ fn windows_powershell_path() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
+fn is_windows_permission_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("access is denied")
+        || lower.contains("unauthorizedaccess")
+        || lower.contains("required permission")
+        || lower.contains("administrator")
+        || lower.contains("0x80070005")
+}
+
+#[cfg(windows)]
+fn run_powershell_with_timeout(
+    ps_path: &Path,
+    script: &str,
+    envs: &[(&str, &str)],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     use std::os::windows::process::CommandExt;
-    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut cmd = Command::new(ps_path);
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {}", ps_path.display()))?;
+
+    let stdout_handle = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + timeout;
+    let st = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("PowerShell command timed out after {}s", timeout.as_secs());
+            }
+        }
+    };
+
+    let stdout_bytes = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr_bytes = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if !st.success() {
+        let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        if is_windows_permission_error(&stderr_text) {
+            bail!(
+                "Hyper-V operation requires Administrator privileges (elevate velovmd): {stderr_text}"
+            );
+        }
+        if stderr_text.to_ascii_lowercase().contains("already exists") {
+            return Err(err_conflict(stderr_text));
+        }
+        if stderr_text.to_ascii_lowercase().contains("unable to find")
+            || stderr_text.to_ascii_lowercase().contains("not found")
+        {
+            return Err(err_not_found(stderr_text));
+        }
+        bail!(
+            "PowerShell command failed ({st}): {}",
+            if stderr_text.is_empty() {
+                "unknown error".to_string()
+            } else {
+                stderr_text
+            }
+        );
+    }
+
+    Ok(stdout_bytes)
+}
+
+#[cfg(windows)]
+fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
     use std::time::Instant;
 
     const CACHE_TTL: Duration = Duration::from_secs(10);
     const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    static CACHE: OnceLock<std::sync::Mutex<Option<(Instant, Vec<VirtualSwitchInfo>)>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let cache = windows_switch_cache();
     let mut guard = cache.lock().unwrap();
     if let Some((captured_at, cached)) = guard.as_ref()
         && captured_at.elapsed() < CACHE_TTL
@@ -6355,7 +6809,7 @@ fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
     }
 
     let mut out = vec![VirtualSwitchInfo {
-        id: "c08cb7b8-9b3c-408e-8e30-5e16a3aeb444".to_string(),
+        id: HYPERV_DEFAULT_SWITCH_ID.to_string(),
         name: "Default Switch".to_string(),
         kind: "vmswitch".to_string(),
         description: "Windows Hyper-V Default Switch (HCN)".to_string(),
@@ -6366,74 +6820,456 @@ fn discover_windows_switches() -> Vec<VirtualSwitchInfo> {
 
     if windows_hyperv_module_available()
         && let Some(ps_path) = windows_powershell_path()
-        && let Ok(mut child) = Command::new(ps_path)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-VMSwitch | Select-Object @{n='Id';e={$_.Id.ToString()}},Name,SwitchType | ConvertTo-Json -Compress",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
+        && let Ok(stdout_bytes) = run_powershell_with_timeout(
+            &ps_path,
+            "Get-VMSwitch | Select-Object @{n='Id';e={$_.Id.ToString()}},Name,SwitchType,NetAdapterInterfaceDescription | ConvertTo-Json -Compress",
+            &[],
+            QUERY_TIMEOUT,
+        )
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout_bytes)
     {
-        let reader_handle = child.stdout.take().map(|mut stdout| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = stdout.read_to_end(&mut buf);
-                buf
-            })
-        });
-        let deadline = Instant::now() + QUERY_TIMEOUT;
-        let mut status = None;
-        loop {
-            match child.try_wait() {
-                Ok(Some(st)) => {
-                    status = Some(st);
-                    break;
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-            }
-        }
-        if status.is_some_and(|st| st.success())
-            && let Some(stdout_bytes) = reader_handle.and_then(|h| h.join().ok())
-            && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout_bytes)
-        {
-            let arr = match val {
-                serde_json::Value::Array(items) => items,
-                obj @ serde_json::Value::Object(_) => vec![obj],
-                _ => Vec::new(),
-            };
-            for item in arr {
-                if let (Some(id), Some(name)) = (item["Id"].as_str(), item["Name"].as_str()) {
-                    let id_lower = id.to_ascii_lowercase();
-                    if !out.iter().any(|s| s.id.eq_ignore_ascii_case(&id_lower)) {
-                        let switch_type = item["SwitchType"].as_str().unwrap_or("Unknown");
-                        out.push(VirtualSwitchInfo {
-                            id: id_lower,
-                            name: name.to_string(),
-                            kind: "vmswitch".to_string(),
-                            description: format!("Hyper-V Virtual Switch ({switch_type})"),
-                            switch_type: Some(switch_type.to_ascii_lowercase()),
-                            managed: true,
-                            ..Default::default()
-                        });
-                    }
+        let arr = match val {
+            serde_json::Value::Array(items) => items,
+            obj @ serde_json::Value::Object(_) => vec![obj],
+            _ => Vec::new(),
+        };
+        for item in arr {
+            if let (Some(id), Some(name)) = (item["Id"].as_str(), item["Name"].as_str()) {
+                let id_lower = id.to_ascii_lowercase();
+                if !out.iter().any(|s| s.id.eq_ignore_ascii_case(&id_lower)) {
+                    let switch_type = item["SwitchType"].as_str().unwrap_or("Unknown");
+                    let uplink_adapter = item["NetAdapterInterfaceDescription"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned);
+                    out.push(VirtualSwitchInfo {
+                        id: id_lower,
+                        name: name.to_string(),
+                        kind: "vmswitch".to_string(),
+                        description: format!("Hyper-V Virtual Switch ({switch_type})"),
+                        switch_type: Some(switch_type.to_ascii_lowercase()),
+                        managed: true,
+                        uplink_adapter,
+                        ..Default::default()
+                    });
                 }
             }
         }
     }
 
     *guard = Some((Instant::now(), out.clone()));
+    out
+}
+
+#[cfg(windows)]
+fn create_windows_switch(payload: &CreateSwitchPayload) -> anyhow::Result<VirtualSwitchInfo> {
+    if !windows_hyperv_module_available() {
+        return Err(err_bad_request(
+            "Hyper-V PowerShell module is not available on this Windows host",
+        ));
+    }
+    let ps_path = windows_powershell_path()
+        .ok_or_else(|| err_internal("powershell.exe not found under SystemRoot"))?;
+
+    const MUTATE_TIMEOUT: Duration = Duration::from_secs(15);
+    let ps_switch_type = match payload.kind.as_str() {
+        "external" => "External",
+        "internal" => "Internal",
+        "private" => "Private",
+        other => {
+            return Err(err_bad_request(format!(
+                "unsupported Hyper-V switch type '{other}'"
+            )));
+        }
+    };
+
+    let stdout_bytes = if payload.kind == "external" {
+        let adapter = payload
+            .net_adapter_name
+            .as_deref()
+            .ok_or_else(|| err_bad_request("external switch requires net_adapter_name"))?;
+        let allow_mgmt = if payload.allow_management_os {
+            "true"
+        } else {
+            "false"
+        };
+        run_powershell_with_timeout(
+            &ps_path,
+            "New-VMSwitch -Name $env:VELOVM_SW_NAME -NetAdapterName $env:VELOVM_SW_ADAPTER -AllowManagementOS:([System.Convert]::ToBoolean($env:VELOVM_SW_ALLOW_MGMT)) -ErrorAction Stop | Select-Object @{n='Id';e={$_.Id.ToString()}},Name,SwitchType,NetAdapterInterfaceDescription | ConvertTo-Json -Compress",
+            &[
+                ("VELOVM_SW_NAME", &payload.name),
+                ("VELOVM_SW_ADAPTER", adapter),
+                ("VELOVM_SW_ALLOW_MGMT", allow_mgmt),
+            ],
+            MUTATE_TIMEOUT,
+        )?
+    } else {
+        run_powershell_with_timeout(
+            &ps_path,
+            "New-VMSwitch -Name $env:VELOVM_SW_NAME -SwitchType $env:VELOVM_SW_TYPE -ErrorAction Stop | Select-Object @{n='Id';e={$_.Id.ToString()}},Name,SwitchType | ConvertTo-Json -Compress",
+            &[
+                ("VELOVM_SW_NAME", &payload.name),
+                ("VELOVM_SW_TYPE", ps_switch_type),
+            ],
+            MUTATE_TIMEOUT,
+        )?
+    };
+
+    let val: serde_json::Value = serde_json::from_slice(&stdout_bytes)
+        .context("parsing New-VMSwitch JSON output")?;
+    let id = val["Id"]
+        .as_str()
+        .context("New-VMSwitch output missing Id")?
+        .to_ascii_lowercase();
+    let name = val["Name"]
+        .as_str()
+        .unwrap_or(&payload.name)
+        .to_string();
+    let switch_type = val["SwitchType"]
+        .as_str()
+        .unwrap_or(ps_switch_type)
+        .to_ascii_lowercase();
+    let uplink_adapter = val["NetAdapterInterfaceDescription"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| payload.net_adapter_name.clone());
+
+    Ok(VirtualSwitchInfo {
+        id,
+        name,
+        kind: "vmswitch".to_string(),
+        description: format!("Hyper-V Virtual Switch ({ps_switch_type})"),
+        switch_type: Some(switch_type),
+        managed: true,
+        uplink_adapter,
+        cidr: payload.cidr.clone(),
+    })
+}
+
+#[cfg(windows)]
+fn delete_windows_switch(switch_id: &str) -> anyhow::Result<()> {
+    if !windows_hyperv_module_available() {
+        return Err(err_bad_request(
+            "Hyper-V PowerShell module is not available on this Windows host",
+        ));
+    }
+    let ps_path = windows_powershell_path()
+        .ok_or_else(|| err_internal("powershell.exe not found under SystemRoot"))?;
+
+    const MUTATE_TIMEOUT: Duration = Duration::from_secs(15);
+    run_powershell_with_timeout(
+        &ps_path,
+        "$sw = Get-VMSwitch -Id ([guid]$env:VELOVM_SW_ID) -ErrorAction Stop; Remove-VMSwitch -VMSwitch $sw -Force -ErrorAction Stop",
+        &[("VELOVM_SW_ID", switch_id)],
+        MUTATE_TIMEOUT,
+    )?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn discover_windows_net_adapters() -> anyhow::Result<Vec<HostNetAdapterInfo>> {
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+    let Some(ps_path) = windows_powershell_path() else {
+        return Ok(Vec::new());
+    };
+    let stdout_bytes = run_powershell_with_timeout(
+        &ps_path,
+        "Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Select-Object Name,InterfaceDescription,MacAddress,Status,LinkSpeed | ConvertTo-Json -Compress",
+        &[],
+        QUERY_TIMEOUT,
+    )?;
+    let trimmed = String::from_utf8_lossy(&stdout_bytes);
+    if trimmed.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let val: serde_json::Value = serde_json::from_slice(&stdout_bytes)
+        .context("parsing Get-NetAdapter JSON output")?;
+    let arr = match val {
+        serde_json::Value::Array(items) => items,
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        if let Some(name) = item["Name"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(HostNetAdapterInfo {
+                name: name.to_string(),
+                interface_description: item["InterfaceDescription"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                mac_address: item["MacAddress"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                status: item["Status"].as_str().unwrap_or_default().to_string(),
+                link_speed: item["LinkSpeed"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ip_program() -> &'static str {
+    for candidate in ["/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip"] {
+        if Path::new(candidate).is_file() {
+            return candidate;
+        }
+    }
+    "ip"
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_ip(args: &[&str]) -> anyhow::Result<()> {
+    let ip_bin = linux_ip_program();
+    let output = Command::new(ip_bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("executing `{ip_bin} {}`", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("operation not permitted") || lower.contains("permission denied") {
+        bail!(
+            "Linux network operation `{ip_bin} {}` requires CAP_NET_ADMIN or root privileges: {stderr}",
+            args.join(" ")
+        );
+    }
+    if lower.contains("file exists") {
+        return Err(err_conflict(format!(
+            "network interface already exists ({stderr})"
+        )));
+    }
+    if lower.contains("cannot find device") || lower.contains("does not exist") {
+        return Err(err_not_found(format!(
+            "network interface not found ({stderr})"
+        )));
+    }
+    bail!(
+        "`{ip_bin} {}` failed ({}): {}",
+        args.join(" "),
+        output.status,
+        if stderr.is_empty() {
+            "unknown error".to_string()
+        } else {
+            stderr
+        }
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_bridge(payload: &CreateSwitchPayload) -> anyhow::Result<VirtualSwitchInfo> {
+    let name = payload.name.as_str();
+    let sys_path = Path::new("/sys/class/net").join(name);
+    if sys_path.exists() {
+        return Err(err_conflict(format!(
+            "network interface '{name}' already exists"
+        )));
+    }
+
+    run_linux_ip(&["link", "add", "dev", name, "type", "bridge"])?;
+    if let Some(cidr) = payload.cidr.as_deref()
+        && let Err(err) = run_linux_ip(&["addr", "add", cidr, "dev", name])
+    {
+        let _ = run_linux_ip(&["link", "del", "dev", name]);
+        return Err(err);
+    }
+    if let Err(err) = run_linux_ip(&["link", "set", "dev", name, "up"]) {
+        let _ = run_linux_ip(&["link", "del", "dev", name]);
+        return Err(err);
+    }
+
+    Ok(VirtualSwitchInfo {
+        id: name.to_string(),
+        name: name.to_string(),
+        kind: "bridge".to_string(),
+        description: "Linux kernel bridge virtual switch".to_string(),
+        switch_type: Some("bridge".to_string()),
+        managed: true,
+        uplink_adapter: payload.net_adapter_name.clone(),
+        cidr: payload.cidr.clone(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn delete_linux_bridge(name: &str) -> anyhow::Result<()> {
+    let sys_path = Path::new("/sys/class/net").join(name);
+    if !sys_path.exists() {
+        return Err(err_not_found(format!(
+            "Linux bridge '{name}' does not exist"
+        )));
+    }
+    if !sys_path.join("bridge").is_dir() {
+        return Err(err_bad_request(format!(
+            "network interface '{name}' is not a Linux bridge"
+        )));
+    }
+    run_linux_ip(&["link", "del", "dev", name])
+}
+
+#[cfg(target_os = "linux")]
+fn provision_ephemeral_taps_for_vm(cfg: &VmConfig) -> anyhow::Result<Vec<String>> {
+    let mut created = Vec::new();
+    for nic in &cfg.nics {
+        let NicBackendConfig::Bridge { name: bridge_name } = &nic.backend else {
+            continue;
+        };
+        let bridge = bridge_name.trim();
+        let bridge_dir = Path::new("/sys/class/net").join(bridge).join("bridge");
+        if !bridge_dir.is_dir() {
+            teardown_ephemeral_taps(&created);
+            return Err(err_bad_request(format!(
+                "Linux bridge '{bridge}' for NIC '{}' does not exist",
+                nic.name
+            )));
+        }
+        let tap = ephemeral_tap_name_for_nic(nic.id);
+        // Clean up any leftover TAP with the same deterministic name from a prior crash.
+        if Path::new("/sys/class/net").join(&tap).exists() {
+            let _ = run_linux_ip(&["link", "del", "dev", &tap]);
+        }
+        if let Err(err) = run_linux_ip(&["tuntap", "add", "dev", &tap, "mode", "tap", "vnet_hdr"])
+            .and_then(|()| run_linux_ip(&["link", "set", "dev", &tap, "master", bridge]))
+            .and_then(|()| run_linux_ip(&["link", "set", "dev", &tap, "up"]))
+        {
+            let _ = run_linux_ip(&["link", "del", "dev", &tap]);
+            teardown_ephemeral_taps(&created);
+            return Err(err);
+        }
+        created.push(tap);
+    }
+    Ok(created)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_existing_ephemeral_taps(cfg: &VmConfig) -> Vec<String> {
+    cfg.nics
+        .iter()
+        .filter_map(|nic| match &nic.backend {
+            NicBackendConfig::Bridge { .. } => {
+                let tap = ephemeral_tap_name_for_nic(nic.id);
+                Path::new("/sys/class/net")
+                    .join(&tap)
+                    .exists()
+                    .then_some(tap)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn teardown_ephemeral_taps(taps: &[String]) {
+    #[cfg(target_os = "linux")]
+    {
+        for tap in taps {
+            if Path::new("/sys/class/net").join(tap).exists()
+                && let Err(err) = run_linux_ip(&["link", "del", "dev", tap])
+            {
+                warn!(tap = %tap, error = %err, "failed to tear down ephemeral TAP device");
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = taps;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn discover_linux_bridge_interfaces() -> Vec<VirtualSwitchInfo> {
+    discover_linux_bridge_interfaces_in(Path::new("/sys/class/net"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn discover_linux_bridge_interfaces_in(sys_class_net: &Path) -> Vec<VirtualSwitchInfo> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(sys_class_net) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(info) = parse_linux_bridge_in_dir(&entry.path(), &name) {
+                out.push(info);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_bridge_in_dir(iface_path: &Path, name: &str) -> Option<VirtualSwitchInfo> {
+    if !iface_path.join("bridge").is_dir() {
+        return None;
+    }
+    let mut ports: Vec<String> = fs::read_dir(iface_path.join("brif"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    ports.sort();
+    let description = if ports.is_empty() {
+        "Linux kernel bridge virtual switch".to_string()
+    } else {
+        format!("Linux kernel bridge virtual switch (ports: {})", ports.join(", "))
+    };
+    Some(VirtualSwitchInfo {
+        id: name.to_string(),
+        name: name.to_string(),
+        kind: "bridge".to_string(),
+        description,
+        switch_type: Some("bridge".to_string()),
+        managed: true,
+        ..Default::default()
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn discover_linux_net_adapters_in(sys_class_net: &Path) -> Vec<HostNetAdapterInfo> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(sys_class_net) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let iface_path = entry.path();
+            if !iface_path.join("device").exists()
+                || iface_path.join("bridge").is_dir()
+                || iface_path.join("tun_flags").exists()
+            {
+                continue;
+            }
+            let mac_address = fs::read_to_string(iface_path.join("address"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let status = fs::read_to_string(iface_path.join("operstate"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let link_speed = fs::read_to_string(iface_path.join("speed"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&mbps| mbps > 0)
+                .map(|mbps| format!("{mbps} Mbps"))
+                .unwrap_or_default();
+            out.push(HostNetAdapterInfo {
+                name,
+                interface_description: "Linux network adapter".to_string(),
+                mac_address,
+                status,
+                link_speed,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -6448,11 +7284,15 @@ fn discover_linux_tap_interfaces_in(sys_class_net: &Path) -> Vec<VirtualSwitchIn
     if let Ok(entries) = fs::read_dir(sys_class_net) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if is_ephemeral_tap_name(&name) {
+                continue;
+            }
             if let Some(info) = parse_linux_tap_in_dir(&entry.path(), &name) {
                 out.push(info);
             }
         }
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -11061,5 +11901,269 @@ mod tests {
         );
         srv.join().unwrap();
         assert_eq!(recorded.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_switch_rejects_protected_builtin_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), None).unwrap();
+
+        for builtin in [
+            "consomme",
+            "CONSOMME",
+            "Default NAT (Consomme)",
+            HYPERV_DEFAULT_SWITCH_ID,
+            "Default Switch",
+            "default",
+        ] {
+            let err = sup.delete_switch(builtin).unwrap_err();
+            assert!(
+                matches!(err.downcast_ref::<ApiErrorKind>(), Some(ApiErrorKind::BadRequest(_))),
+                "expected BadRequest for built-in switch '{builtin}', got: {err:#}"
+            );
+        }
+
+        let err = sup.delete_switch("   ").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ApiErrorKind>(),
+            Some(ApiErrorKind::BadRequest(_))
+        ));
+
+        let err = sup.delete_switch("nonexistent-switch-xyz").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ApiErrorKind>(),
+            Some(ApiErrorKind::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_switch_returns_conflict_when_vm_references_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), None).unwrap();
+
+        let mut cfg = VmConfig::from_preset(
+            "SwitchRefVm",
+            velovm_core::models::VmPreset::Custom,
+            &dir.path().join("vms/refvm"),
+        );
+        cfg.nics = vec![NicAttachment {
+            id: Uuid::new_v4(),
+            name: "NIC 1".to_string(),
+            mac_address: "00-15-5D-01-02-03".to_string(),
+            backend: NicBackendConfig::VmSwitch {
+                switch_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                switch_name: Some("LabSwitch".to_string()),
+            },
+        }];
+
+        {
+            let mut guard = sup.vms.write().unwrap();
+            guard.insert(
+                cfg.id,
+                ManagedVm {
+                    config: cfg.clone(),
+                    runtime: VmRuntimeState::default(),
+                    child: None,
+                    adopted_proc: None,
+                    monitor_cancel: None,
+                    monitor_handle: None,
+                    generation: 0,
+                    start_cancel: None,
+                    stop_wait: None,
+                    prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    power_op_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    hotplug_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    pending_disks: Vec::new(),
+                    pending_port_forwards: Vec::new(),
+                    orphaned_disks: Vec::new(),
+                    orphaned_port_forwards: Vec::new(),
+                    ephemeral_taps: Vec::new(),
+                    detach_on_drop: false,
+                    deleting: false,
+                },
+            );
+        }
+
+        // Direct ID and switch_name references both return 409 Conflict.
+        let err_by_id = sup
+            .delete_switch("11111111-2222-3333-4444-555555555555")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err_by_id.downcast_ref::<ApiErrorKind>(),
+                Some(ApiErrorKind::Conflict(_))
+            ),
+            "expected Conflict by ID, got: {err_by_id:#}"
+        );
+
+        let err_by_name = sup.delete_switch("LabSwitch").unwrap_err();
+        assert!(
+            matches!(
+                err_by_name.downcast_ref::<ApiErrorKind>(),
+                Some(ApiErrorKind::Conflict(_))
+            ),
+            "expected Conflict by name, got: {err_by_name:#}"
+        );
+
+        // Resolved switch alias matching: VM stores Bridge { name: "br-lab" } and resolved info matches.
+        let mut cfg_br = VmConfig::from_preset(
+            "BridgeRefVm",
+            velovm_core::models::VmPreset::Custom,
+            &dir.path().join("vms/brvm"),
+        );
+        cfg_br.nics = vec![NicAttachment {
+            id: Uuid::new_v4(),
+            name: "Bridge NIC".to_string(),
+            mac_address: "00-15-5D-04-05-06".to_string(),
+            backend: NicBackendConfig::Bridge {
+                name: "br-lab".to_string(),
+            },
+        }];
+        {
+            let mut guard = sup.vms.write().unwrap();
+            guard.insert(
+                cfg_br.id,
+                ManagedVm {
+                    config: cfg_br,
+                    runtime: VmRuntimeState::default(),
+                    child: None,
+                    adopted_proc: None,
+                    monitor_cancel: None,
+                    monitor_handle: None,
+                    generation: 0,
+                    start_cancel: None,
+                    stop_wait: None,
+                    prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    power_op_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    hotplug_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    pending_disks: Vec::new(),
+                    pending_port_forwards: Vec::new(),
+                    orphaned_disks: Vec::new(),
+                    orphaned_port_forwards: Vec::new(),
+                    ephemeral_taps: Vec::new(),
+                    detach_on_drop: false,
+                    deleting: false,
+                },
+            );
+        }
+
+        let err_br = sup.delete_switch("br-lab").unwrap_err();
+        assert!(
+            matches!(
+                err_br.downcast_ref::<ApiErrorKind>(),
+                Some(ApiErrorKind::Conflict(_))
+            ),
+            "expected Conflict for Bridge NIC, got: {err_br:#}"
+        );
+    }
+
+    #[test]
+    fn create_switch_validates_payload_and_reserved_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(dir.path(), None).unwrap();
+
+        let bad_payload = CreateSwitchPayload {
+            name: "   ".to_string(),
+            kind: "internal".to_string(),
+            ..Default::default()
+        };
+        let err = sup.create_switch(bad_payload).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ApiErrorKind>(),
+            Some(ApiErrorKind::BadRequest(_))
+        ));
+
+        let reserved_payload = CreateSwitchPayload {
+            name: "consomme".to_string(),
+            kind: "private".to_string(),
+            ..Default::default()
+        };
+        let err = sup.create_switch(reserved_payload).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ApiErrorKind>(),
+            Some(ApiErrorKind::BadRequest(_))
+        ));
+
+        #[cfg(not(windows))]
+        {
+            let win_only = CreateSwitchPayload {
+                name: "LabInternal".to_string(),
+                kind: "internal".to_string(),
+                ..Default::default()
+            };
+            let err = sup.create_switch(win_only).unwrap_err();
+            assert!(matches!(
+                err.downcast_ref::<ApiErrorKind>(),
+                Some(ApiErrorKind::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn linux_bridge_adapter_discovery_and_ephemeral_tap_naming() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = dir.path();
+
+        // Linux bridge with one attached port
+        fs::create_dir_all(net.join("br0").join("bridge")).unwrap();
+        fs::create_dir_all(net.join("br0").join("brif").join("eth0")).unwrap();
+
+        // Physical NIC (has `device/` dir, not a bridge or tun/tap)
+        fs::create_dir_all(net.join("eth0").join("device")).unwrap();
+        fs::write(net.join("eth0").join("address"), "52:54:00:12:34:56\n").unwrap();
+        fs::write(net.join("eth0").join("operstate"), "up\n").unwrap();
+        fs::write(net.join("eth0").join("speed"), "1000\n").unwrap();
+
+        // Persistent TAP (must appear in tap discovery)
+        fs::create_dir_all(net.join("tap0")).unwrap();
+        fs::write(net.join("tap0").join("tun_flags"), "0x1002\n").unwrap();
+
+        // Ephemeral VeloVM TAP (must be excluded from tap discovery)
+        let nic_id = Uuid::parse_str("a1b2c3d4-e5f6-4789-abcd-ef0123456789").unwrap();
+        let eph_tap = ephemeral_tap_name_for_nic(nic_id);
+        assert_eq!(eph_tap, "vvm-a1b2c3d4e5f");
+        assert!(eph_tap.len() <= 15);
+        assert!(is_ephemeral_tap_name(&eph_tap));
+        velovm_core::models::validate_linux_iface_name(&eph_tap, "TAP").unwrap();
+        fs::create_dir_all(net.join(&eph_tap)).unwrap();
+        fs::write(net.join(&eph_tap).join("tun_flags"), "0x1002\n").unwrap();
+
+        let bridges = discover_linux_bridge_interfaces_in(net);
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(bridges[0].id, "br0");
+        assert_eq!(bridges[0].kind, "bridge");
+        assert!(bridges[0].managed);
+        assert!(bridges[0].description.contains("eth0"));
+
+        let taps = discover_linux_tap_interfaces_in(net);
+        assert_eq!(taps.len(), 1);
+        assert_eq!(taps[0].id, "tap0");
+
+        let adapters = discover_linux_net_adapters_in(net);
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].name, "eth0");
+        assert_eq!(adapters[0].mac_address, "52:54:00:12:34:56");
+        assert_eq!(adapters[0].status, "up");
+        assert_eq!(adapters[0].link_speed, "1000 Mbps");
+
+        // Bridge NIC translates to the deterministic ephemeral TAP in OpenVMM proto config.
+        let bridge_nic = NicAttachment {
+            id: nic_id,
+            name: "Bridge NIC".to_string(),
+            mac_address: "00-15-5D-AA-BB-CC".to_string(),
+            backend: NicBackendConfig::Bridge {
+                name: "br0".to_string(),
+            },
+        };
+        let proto = to_proto_nic_config(&bridge_nic);
+        match proto.backend {
+            Some(vmservice::nic_config::Backend::Tap(tap)) => {
+                assert_eq!(
+                    tap.source,
+                    Some(vmservice::tap_backend::Source::Name(eph_tap))
+                );
+            }
+            other => panic!("expected Tap backend, got {other:?}"),
+        }
     }
 }
