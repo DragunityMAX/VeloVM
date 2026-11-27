@@ -12,6 +12,7 @@ use velovm_core::api_client::resolve_client_path;
 use velovm_core::api_client::resolve_local_viewer_binary;
 use velovm_core::models::AttachDiskPayload;
 use velovm_core::models::CreateDiskPayload;
+use velovm_core::models::CreateSwitchPayload;
 use velovm_core::models::CreateVmPayload;
 use velovm_core::models::DiskAttachment;
 use velovm_core::models::DiskFormat;
@@ -77,7 +78,7 @@ enum TopCommand {
         #[command(subcommand)]
         action: HostCmd,
     },
-    /// List virtual switches and network backends
+    /// Manage virtual switches and network backends
     Switch {
         #[command(subcommand)]
         action: SwitchCmd,
@@ -130,10 +131,55 @@ enum HostCmd {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SwitchKindArg {
+    External,
+    Internal,
+    Private,
+    Bridge,
+    L2,
+}
+
+impl SwitchKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            SwitchKindArg::External => "external",
+            SwitchKindArg::Internal => "internal",
+            SwitchKindArg::Private => "private",
+            SwitchKindArg::Bridge => "bridge",
+            SwitchKindArg::L2 => "l2",
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum SwitchCmd {
     /// List available virtual switches / network backends
     List,
+    /// Create a new virtual switch
+    Create {
+        /// Name for the new virtual switch
+        name: String,
+        /// Switch type (external, internal, private, bridge, or l2)
+        #[arg(long, value_enum)]
+        kind: SwitchKindArg,
+        /// Host physical network adapter name (required for external switches)
+        #[arg(long, value_name = "NIC")]
+        adapter: Option<String>,
+        /// Allow the host management OS to share the external adapter
+        #[arg(long, value_name = "true|false")]
+        allow_host_os: Option<bool>,
+        /// Optional CIDR subnet for bridge or private switches (e.g. 192.168.50.0/24)
+        #[arg(long)]
+        cidr: Option<String>,
+    },
+    /// Delete a managed virtual switch
+    Delete {
+        /// Switch ID or name
+        id_or_name: String,
+    },
+    /// List physical host network adapters available for External switches
+    Adapters,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -298,7 +344,7 @@ struct CreateVmArgs {
     /// Optional installer ISO image
     #[arg(long)]
     iso: Option<PathBuf>,
-    /// Network specification: consomme | vmswitch:<guid_or_default> | tap:<dev> | none
+    /// Network specification: consomme | vmswitch:<guid|default> | tap:<dev> | bridge:<dev> | none
     #[arg(long)]
     net: Option<String>,
     #[arg(long)]
@@ -597,6 +643,81 @@ fn handle_switch(cli: &Cli, action: &SwitchCmd) -> anyhow::Result<()> {
                     println!(
                         "{:<38} {:<24} {:<10} {}",
                         sw.id, sw.name, sw.kind, sw.description
+                    );
+                }
+            }
+            Ok(())
+        }
+        SwitchCmd::Create {
+            name,
+            kind,
+            adapter,
+            allow_host_os,
+            cidr,
+        } => {
+            let mut payload = CreateSwitchPayload {
+                name: name.clone(),
+                kind: kind.as_str().to_string(),
+                net_adapter_name: adapter.clone(),
+                allow_management_os: allow_host_os
+                    .unwrap_or(matches!(kind, SwitchKindArg::External)),
+                cidr: cidr.clone(),
+            };
+            payload.normalize();
+            payload.validate()?;
+            let created = client.create_switch(&payload)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&created)?);
+            } else {
+                println!("Created virtual switch:");
+                println!("  ID:          {}", created.id);
+                println!("  Name:        {}", created.name);
+                println!("  Kind:        {}", created.kind);
+                if let Some(st) = &created.switch_type {
+                    println!("  Type:        {st}");
+                }
+                if let Some(uplink) = &created.uplink_adapter {
+                    println!("  Adapter:     {uplink}");
+                }
+                if let Some(cidr) = &created.cidr {
+                    println!("  CIDR:        {cidr}");
+                }
+            }
+            Ok(())
+        }
+        SwitchCmd::Delete { id_or_name } => {
+            client.delete_switch(id_or_name)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "deleted": id_or_name
+                    }))?
+                );
+            } else {
+                println!("Deleted virtual switch '{id_or_name}'.");
+            }
+            Ok(())
+        }
+        SwitchCmd::Adapters => {
+            let adapters = client.list_net_adapters()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&adapters)?);
+            } else if adapters.is_empty() {
+                println!("No physical host network adapters found.");
+            } else {
+                println!(
+                    "{:<24} {:<18} {:<14} {:<12} {}",
+                    "NAME", "MAC", "STATUS", "LINK SPEED", "DESCRIPTION"
+                );
+                for nic in adapters {
+                    println!(
+                        "{:<24} {:<18} {:<14} {:<12} {}",
+                        nic.name,
+                        nic.mac_address,
+                        nic.status,
+                        nic.link_speed,
+                        nic.interface_description
                     );
                 }
             }
@@ -1069,8 +1190,22 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
             },
         }]);
     }
+    if let Some(bridge_name) = trimmed.strip_prefix("bridge:") {
+        let bridge_name = bridge_name.trim();
+        if bridge_name.is_empty() {
+            bail!("bridge:<interface> requires a bridge interface name");
+        }
+        return Ok(vec![NicAttachment {
+            id: Uuid::new_v4(),
+            name: format!("Bridge ({bridge_name})"),
+            mac_address: generate_hyperv_mac(),
+            backend: NicBackendConfig::Bridge {
+                name: bridge_name.to_string(),
+            },
+        }]);
+    }
     bail!(
-        "invalid --net spec '{spec}' (expected consomme, vmswitch:<id|default>, tap:<dev>, or none)"
+        "invalid --net spec '{spec}' (expected consomme, vmswitch:<id|default>, tap:<dev>, bridge:<dev>, or none)"
     )
 }
 
@@ -1246,7 +1381,103 @@ mod tests {
         assert!(parse_net_spec("none").unwrap().is_empty());
         assert_eq!(parse_net_spec("consomme").unwrap().len(), 1);
         assert!(parse_net_spec("tap:tap0").is_ok());
+        let bridge_nics = parse_net_spec("bridge:br0").unwrap();
+        assert_eq!(bridge_nics.len(), 1);
+        assert_eq!(
+            bridge_nics[0].backend,
+            NicBackendConfig::Bridge {
+                name: "br0".to_string()
+            }
+        );
+        assert!(parse_net_spec("bridge:   ").is_err());
         assert!(parse_net_spec("invalid").is_err());
+    }
+
+    #[test]
+    fn cli_parses_switch_create_delete_and_adapters() {
+        let create_ext = Cli::try_parse_from([
+            "velovm",
+            "--json",
+            "switch",
+            "create",
+            "LabExternal",
+            "--kind",
+            "external",
+            "--adapter",
+            "Ethernet",
+            "--allow-host-os",
+            "false",
+        ])
+        .unwrap();
+        assert!(create_ext.json);
+        match create_ext.command {
+            TopCommand::Switch {
+                action:
+                    SwitchCmd::Create {
+                        name,
+                        kind,
+                        adapter,
+                        allow_host_os,
+                        cidr,
+                    },
+            } => {
+                assert_eq!(name, "LabExternal");
+                assert_eq!(kind, SwitchKindArg::External);
+                assert_eq!(adapter.as_deref(), Some("Ethernet"));
+                assert_eq!(allow_host_os, Some(false));
+                assert_eq!(cidr, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let create_br = Cli::try_parse_from([
+            "velovm",
+            "switch",
+            "create",
+            "br0",
+            "--kind",
+            "bridge",
+            "--cidr",
+            "10.10.0.0/24",
+        ])
+        .unwrap();
+        match create_br.command {
+            TopCommand::Switch {
+                action:
+                    SwitchCmd::Create {
+                        name,
+                        kind,
+                        adapter,
+                        allow_host_os,
+                        cidr,
+                    },
+            } => {
+                assert_eq!(name, "br0");
+                assert_eq!(kind, SwitchKindArg::Bridge);
+                assert_eq!(adapter, None);
+                assert_eq!(allow_host_os, None);
+                assert_eq!(cidr.as_deref(), Some("10.10.0.0/24"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let del = Cli::try_parse_from(["velovm", "switch", "delete", "br0"]).unwrap();
+        assert!(matches!(
+            del.command,
+            TopCommand::Switch {
+                action: SwitchCmd::Delete { ref id_or_name }
+            } if id_or_name == "br0"
+        ));
+
+        let adapters =
+            Cli::try_parse_from(["velovm", "--json", "switch", "adapters"]).unwrap();
+        assert!(adapters.json);
+        assert!(matches!(
+            adapters.command,
+            TopCommand::Switch {
+                action: SwitchCmd::Adapters
+            }
+        ));
     }
 
     #[test]
