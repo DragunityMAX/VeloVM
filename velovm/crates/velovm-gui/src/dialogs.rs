@@ -4,6 +4,7 @@ use crate::controller::HostConfigPatch;
 use egui::Color32;
 use egui::RichText;
 use velovm_core::models::CreateDiskPayload;
+use velovm_core::models::CreateSwitchPayload;
 use velovm_core::models::CreateVmPayload;
 use velovm_core::models::DiskAttachment;
 use velovm_core::models::DiskFormat;
@@ -13,6 +14,7 @@ use velovm_core::models::FastDeskSettings;
 use velovm_core::models::FastDeskTransport;
 use velovm_core::models::HostConfig;
 use velovm_core::models::HostInfo;
+use velovm_core::models::HostNetAdapterInfo;
 use velovm_core::models::MAX_VM_MEMORY_MB;
 use velovm_core::models::NicAttachment;
 use velovm_core::models::NicBackendConfig;
@@ -1094,6 +1096,116 @@ impl DeleteVmDialog {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchCreateKind {
+    External,
+    Internal,
+    Private,
+    Bridge,
+    L2,
+}
+
+impl SwitchCreateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Internal => "internal",
+            Self::Private => "private",
+            Self::Bridge => "bridge",
+            Self::L2 => "l2",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::External => "External (bridged to physical adapter)",
+            Self::Internal => "Internal (VMs + Host OS)",
+            Self::Private => "Private (VMs only)",
+            Self::Bridge => "Linux Bridge (kernel bridge + managed TAP)",
+            Self::L2 => "Userspace L2 Switch (cross-platform)",
+        }
+    }
+
+    pub fn available_for_os(host_os: Option<&str>) -> &'static [Self] {
+        let os = host_os.unwrap_or(std::env::consts::OS);
+        if os.eq_ignore_ascii_case("windows") {
+            &[Self::External, Self::Internal, Self::Private, Self::L2]
+        } else if os.eq_ignore_ascii_case("linux") {
+            &[Self::Bridge, Self::L2]
+        } else {
+            &[Self::L2]
+        }
+    }
+}
+
+pub struct CreateSwitchDialog {
+    pub dialog_id: Uuid,
+    pub name: String,
+    pub kind: SwitchCreateKind,
+    pub net_adapter_name: String,
+    pub allow_management_os: bool,
+    pub cidr: String,
+    pub adapters: Vec<HostNetAdapterInfo>,
+    pub adapters_loading: bool,
+    pub adapters_error: Option<String>,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+impl CreateSwitchDialog {
+    pub fn new(host_os: Option<&str>) -> Self {
+        let available = SwitchCreateKind::available_for_os(host_os);
+        let default_kind = if available.contains(&SwitchCreateKind::Internal) {
+            SwitchCreateKind::Internal
+        } else {
+            available.first().copied().unwrap_or(SwitchCreateKind::L2)
+        };
+        Self {
+            dialog_id: Uuid::new_v4(),
+            name: String::new(),
+            kind: default_kind,
+            net_adapter_name: String::new(),
+            allow_management_os: true,
+            cidr: String::new(),
+            adapters: Vec::new(),
+            adapters_loading: true,
+            adapters_error: None,
+            submitting: false,
+            error: None,
+        }
+    }
+
+    pub fn set_adapters(&mut self, adapters: Vec<HostNetAdapterInfo>, error: Option<String>) {
+        self.adapters_loading = false;
+        self.adapters_error = error;
+        self.adapters = adapters;
+        if self.net_adapter_name.trim().is_empty()
+            && let Some(first) = self
+                .adapters
+                .iter()
+                .find(|a| a.status.eq_ignore_ascii_case("up"))
+                .or_else(|| self.adapters.first())
+        {
+            self.net_adapter_name = first.name.clone();
+        }
+    }
+
+    pub fn build_payload(&self) -> anyhow::Result<CreateSwitchPayload> {
+        let mut payload = CreateSwitchPayload {
+            name: self.name.clone(),
+            kind: self.kind.as_str().to_string(),
+            net_adapter_name: (self.kind == SwitchCreateKind::External)
+                .then(|| self.net_adapter_name.clone()),
+            allow_management_os: self.kind == SwitchCreateKind::External
+                && self.allow_management_os,
+            cidr: (!self.cidr.trim().is_empty()).then(|| self.cidr.clone()),
+        };
+        payload.normalize();
+        payload.validate()?;
+        Ok(payload)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PendingConfirmAction {
     TurnOff {
@@ -1110,6 +1222,10 @@ pub enum PendingConfirmAction {
         lun: u32,
         path: PathBuf,
         vm_active: bool,
+    },
+    DeleteSwitch {
+        id: String,
+        name: String,
     },
 }
 
@@ -1171,20 +1287,16 @@ pub fn build_nics_from_switch_id(
         return out;
     }
     let sw = switches.iter().find(|s| s.id == switch_id);
-    if sw.is_some_and(|s| s.kind == "bridge") {
-        // Linux bridges are not TAP devices; keep existing NICs or fall back to Consomme rather than emitting an unusable TAP config.
-        if !existing_nics.is_empty() {
-            return existing_nics.to_vec();
-        }
-        return vec![NicAttachment::default_consomme()];
-    }
     let mac = existing_nics
         .first()
         .map(|n| n.mac_address.clone())
         .unwrap_or_else(generate_hyperv_mac);
     let backend = match sw.map(|s| s.kind.as_str()) {
         Some("tap") => NicBackendConfig::Tap {
-            name: switch_id.to_string(),
+            name: sw.map(|s| s.name.clone()).unwrap_or_else(|| switch_id.to_string()),
+        },
+        Some("bridge") => NicBackendConfig::Bridge {
+            name: sw.map(|s| s.name.clone()).unwrap_or_else(|| switch_id.to_string()),
         },
         Some("l2") | Some("l2_hub") => NicBackendConfig::L2Switch {
             switch_id: switch_id.to_string(),
@@ -2314,6 +2426,16 @@ pub fn render_confirm_action_dialog(
                     },
                 )
             }
+            PendingConfirmAction::DeleteSwitch { id, name } => (
+                "Delete Virtual Switch",
+                format!(
+                    "Delete virtual switch '{name}' ({id})?\n\nVMs currently attached to this switch will block deletion until detached."
+                ),
+                "Delete",
+                GuiRequest::DeleteSwitch {
+                    id_or_name: id.clone(),
+                },
+            ),
         };
 
         egui::Window::new(title)
@@ -2332,6 +2454,193 @@ pub fn render_confirm_action_dialog(
                         close = true;
                     }
                     if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+    }
+    if close {
+        *dlg_opt = None;
+    }
+}
+
+pub fn render_create_switch_dialog(
+    ctx: &egui::Context,
+    dlg_opt: &mut Option<CreateSwitchDialog>,
+    host_info: Option<&HostInfo>,
+    backend: &BackendHandle,
+) {
+    let mut close = false;
+    if let Some(d) = dlg_opt.as_mut() {
+        let host_os = host_info.map(|h| h.os.as_str());
+        let available_kinds = SwitchCreateKind::available_for_os(host_os);
+        if !available_kinds.contains(&d.kind)
+            && let Some(&first) = available_kinds.first()
+        {
+            d.kind = first;
+        }
+
+        egui::Window::new("New Virtual Switch")
+            .id(egui::Id::new(("create_switch_dialog", d.dialog_id)))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("create_switch_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Switch Name:");
+                        ui.add_enabled(
+                            !d.submitting,
+                            egui::TextEdit::singleline(&mut d.name).desired_width(280.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Switch Type:");
+                        egui::ComboBox::from_id_salt("create_switch_kind")
+                            .selected_text(d.kind.label())
+                            .show_ui(ui, |ui| {
+                                for &kind in available_kinds {
+                                    ui.selectable_value(&mut d.kind, kind, kind.label());
+                                }
+                            });
+                        ui.end_row();
+
+                        if d.kind == SwitchCreateKind::External {
+                            ui.label("Physical Adapter:");
+                            ui.horizontal(|ui| {
+                                if d.adapters_loading {
+                                    ui.label("Loading adapters…");
+                                } else if d.adapters.is_empty() {
+                                    ui.add_enabled(
+                                        !d.submitting,
+                                        egui::TextEdit::singleline(&mut d.net_adapter_name)
+                                            .hint_text("Adapter name (e.g. Ethernet)")
+                                            .desired_width(220.0),
+                                    );
+                                } else {
+                                    let selected_label = d
+                                        .adapters
+                                        .iter()
+                                        .find(|a| a.name == d.net_adapter_name)
+                                        .map(|a| {
+                                            if a.interface_description.is_empty() {
+                                                a.name.clone()
+                                            } else {
+                                                format!(
+                                                    "{} — {} ({})",
+                                                    a.name, a.interface_description, a.status
+                                                )
+                                            }
+                                        })
+                                        .unwrap_or_else(|| d.net_adapter_name.clone());
+                                    egui::ComboBox::from_id_salt("create_switch_adapter")
+                                        .selected_text(selected_label)
+                                        .width(240.0)
+                                        .show_ui(ui, |ui| {
+                                            for adapter in &d.adapters {
+                                                let label = if adapter.interface_description.is_empty()
+                                                {
+                                                    format!("{} ({})", adapter.name, adapter.status)
+                                                } else {
+                                                    format!(
+                                                        "{} — {} ({})",
+                                                        adapter.name,
+                                                        adapter.interface_description,
+                                                        adapter.status
+                                                    )
+                                                };
+                                                ui.selectable_value(
+                                                    &mut d.net_adapter_name,
+                                                    adapter.name.clone(),
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !d.submitting && !d.adapters_loading,
+                                        egui::Button::new("↻"),
+                                    )
+                                    .on_hover_text("Refresh physical adapters")
+                                    .clicked()
+                                {
+                                    d.adapters_loading = true;
+                                    d.adapters_error = None;
+                                    backend.send(GuiRequest::FetchNetAdapters);
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label("");
+                            ui.add_enabled(
+                                !d.submitting,
+                                egui::Checkbox::new(
+                                    &mut d.allow_management_os,
+                                    "Allow management OS to share this network adapter",
+                                ),
+                            );
+                            ui.end_row();
+                        }
+
+                        if matches!(
+                            d.kind,
+                            SwitchCreateKind::Bridge
+                                | SwitchCreateKind::Private
+                                | SwitchCreateKind::L2
+                        ) {
+                            ui.label("Subnet CIDR (optional):");
+                            ui.add_enabled(
+                                !d.submitting,
+                                egui::TextEdit::singleline(&mut d.cidr)
+                                    .hint_text("e.g. 192.168.50.0/24")
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+                        }
+                    });
+
+                if let Some(adapter_err) = &d.adapters_error {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        Color32::from_rgb(245, 194, 66),
+                        format!("Adapter lookup warning: {adapter_err}"),
+                    );
+                }
+
+                if let Some(err) = &d.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let create_label = if d.submitting {
+                        "Creating…"
+                    } else {
+                        "Create Switch"
+                    };
+                    if ui
+                        .add_enabled(!d.submitting, egui::Button::new(create_label))
+                        .clicked()
+                    {
+                        match d.build_payload() {
+                            Ok(payload) => {
+                                d.error = None;
+                                d.submitting = true;
+                                backend.send(GuiRequest::CreateSwitch {
+                                    dialog_id: d.dialog_id,
+                                    payload,
+                                });
+                            }
+                            Err(err) => {
+                                d.error = Some(format!("{err:#}"));
+                            }
+                        }
+                    }
+                    if ui.add_enabled(!d.submitting, egui::Button::new("Cancel")).clicked() {
                         close = true;
                     }
                 });
@@ -2598,7 +2907,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_switch_is_never_mapped_to_tap_backend() {
+    fn bridge_switch_maps_to_bridge_backend() {
         let switches = vec![VirtualSwitchInfo {
             id: "br0".to_string(),
             name: "br0".to_string(),
@@ -2608,7 +2917,12 @@ mod tests {
         }];
         let nics = build_nics_from_switch_id("br0", &switches, &[]);
         assert_eq!(nics.len(), 1);
-        assert!(matches!(nics[0].backend, NicBackendConfig::Consomme { .. }));
+        assert_eq!(
+            nics[0].backend,
+            NicBackendConfig::Bridge {
+                name: "br0".to_string()
+            }
+        );
     }
 
     #[test]
