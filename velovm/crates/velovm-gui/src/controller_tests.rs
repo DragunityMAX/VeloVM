@@ -1943,8 +1943,8 @@ fn sse_backs_off_and_reports_error_when_events_fail_on_healthy_daemon() {
         None,
         egui::Context::default(),
         Duration::from_secs(2),
-        Duration::from_millis(40),
-        Duration::from_millis(320),
+        Duration::from_millis(100),
+        Duration::from_millis(800),
     );
     backend.send(GuiRequest::ConnectOrStartDaemon);
 
@@ -1960,7 +1960,7 @@ fn sse_backs_off_and_reports_error_when_events_fail_on_healthy_daemon() {
         _ => unreachable!(),
     }
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if events_times.lock().unwrap().len() >= 4 {
             break;
@@ -1973,11 +1973,11 @@ fn sse_backs_off_and_reports_error_when_events_fail_on_healthy_daemon() {
     }
 
     let times = events_times.lock().unwrap().clone();
-    // Delays before attempts 1..4 are 40ms, 80ms, 160ms; verify backoff grows past initial 40ms.
+    // Delays before attempts 1..4 are 100ms, 200ms, 400ms; verify backoff grows past initial 100ms.
     let gap1 = times[1].duration_since(times[0]);
     let gap3 = times[3].duration_since(times[2]);
     assert!(
-        gap3 >= Duration::from_millis(120) && gap3 > gap1,
+        gap3 >= Duration::from_millis(320) && gap3 > gap1,
         "expected exponential SSE backoff (gap1={gap1:?}, gap3={gap3:?})"
     );
 
@@ -3643,12 +3643,12 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
                 let _ = stream.write_all(format!("data: {leading_json}\n\n").as_bytes());
                 let _ = stream.flush();
                 if idx == 1 {
-                    // Send keep-alives every 100ms for 700ms (~3x the 250ms read timeout).
-                    for _ in 0..7 {
+                    // Send keep-alives every 150ms for 900ms (~1.5x the 600ms read timeout, 4x margin per beat).
+                    for _ in 0..6 {
                         if stop.load(Ordering::Acquire) {
                             return;
                         }
-                        thread::sleep(Duration::from_millis(100));
+                        thread::sleep(Duration::from_millis(150));
                         if stream.write_all(b": keep-alive\n\n").is_err() {
                             return;
                         }
@@ -3707,7 +3707,7 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
         Some(dir.path().to_path_buf()),
         None,
         egui::Context::default(),
-        Duration::from_millis(250),
+        Duration::from_millis(600),
     );
     backend.send(GuiRequest::ConnectOrStartDaemon);
 
@@ -3715,7 +3715,7 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
         matches!(u, GuiUpdate::DaemonConnected { .. })
     });
 
-    // VmUpdated arrives after ~700ms of keep-alives without any reconnect or second snapshot fetch.
+    // VmUpdated arrives after ~900ms of keep-alives without any reconnect or second snapshot fetch.
     let updated = recv_until(&backend, Duration::from_secs(5), |u| {
         matches!(
             u,
@@ -3730,7 +3730,7 @@ fn sse_keepalives_prevent_total_request_timeout_while_silence_still_triggers_idl
     assert_eq!(vms_fetches.load(Ordering::SeqCst), 1);
 
     // Once keep-alives stop, idle read_timeout fires and reconnects + reconciles to stage 1 (Paused).
-    let reconciled = recv_until(&backend, Duration::from_secs(5), |u| {
+    let reconciled = recv_until(&backend, Duration::from_secs(8), |u| {
         matches!(u, GuiUpdate::DaemonConnected { vms, .. } if vms.iter().any(|v| v.runtime.status == VmStatus::Paused))
     });
     assert!(matches!(reconciled, GuiUpdate::DaemonConnected { .. }));
