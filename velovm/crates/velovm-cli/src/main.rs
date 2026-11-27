@@ -169,7 +169,7 @@ enum SwitchCmd {
         /// Allow the host management OS to share the external adapter
         #[arg(long, value_name = "true|false")]
         allow_host_os: Option<bool>,
-        /// Optional CIDR subnet for bridge or private switches (e.g. 192.168.50.0/24)
+        /// Optional CIDR subnet for bridge, private, or l2 switches (e.g. 192.168.50.0/24)
         #[arg(long)]
         cidr: Option<String>,
     },
@@ -344,7 +344,7 @@ struct CreateVmArgs {
     /// Optional installer ISO image
     #[arg(long)]
     iso: Option<PathBuf>,
-    /// Network specification: consomme | vmswitch:<guid|default> | tap:<dev> | bridge:<dev> | none
+    /// Network specification: consomme | vmswitch:<guid|default> | tap:<dev> | bridge:<dev> | l2:<id> | none
     #[arg(long)]
     net: Option<String>,
     #[arg(long)]
@@ -1204,8 +1204,20 @@ pub fn parse_net_spec(spec: &str) -> anyhow::Result<Vec<NicAttachment>> {
             },
         }]);
     }
+    if let Some(switch_id) = trimmed.strip_prefix("l2:") {
+        let switch_id = switch_id.trim();
+        velovm_core::models::validate_l2_switch_id(switch_id)?;
+        return Ok(vec![NicAttachment {
+            id: Uuid::new_v4(),
+            name: format!("L2 Switch ({switch_id})"),
+            mac_address: generate_hyperv_mac(),
+            backend: NicBackendConfig::L2Switch {
+                switch_id: switch_id.to_string(),
+            },
+        }]);
+    }
     bail!(
-        "invalid --net spec '{spec}' (expected consomme, vmswitch:<id|default>, tap:<dev>, bridge:<dev>, or none)"
+        "invalid --net spec '{spec}' (expected consomme, vmswitch:<id|default>, tap:<dev>, bridge:<dev>, l2:<id>, or none)"
     )
 }
 
@@ -1390,6 +1402,16 @@ mod tests {
             }
         );
         assert!(parse_net_spec("bridge:   ").is_err());
+        let l2_nics = parse_net_spec("l2:lab-net_1").unwrap();
+        assert_eq!(l2_nics.len(), 1);
+        assert_eq!(
+            l2_nics[0].backend,
+            NicBackendConfig::L2Switch {
+                switch_id: "lab-net_1".to_string()
+            }
+        );
+        assert!(parse_net_spec("l2:   ").is_err());
+        assert!(parse_net_spec("l2:bad name").is_err());
         assert!(parse_net_spec("invalid").is_err());
     }
 
@@ -1460,6 +1482,30 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let create_l2 = Cli::try_parse_from([
+            "velovm",
+            "switch",
+            "create",
+            "lab-mesh_1",
+            "--kind",
+            "l2",
+            "--cidr",
+            "10.30.0.0/24",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create_l2.command,
+            TopCommand::Switch {
+                action: SwitchCmd::Create {
+                    ref name,
+                    kind: SwitchKindArg::L2,
+                    adapter: None,
+                    allow_host_os: None,
+                    ref cidr,
+                }
+            } if name == "lab-mesh_1" && cidr.as_deref() == Some("10.30.0.0/24")
+        ));
 
         let del = Cli::try_parse_from(["velovm", "switch", "delete", "br0"]).unwrap();
         assert!(matches!(
