@@ -1,0 +1,32 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "net_l2"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+net_backend.workspace = true
+net_backend_resources.workspace = true
+vm_resource.workspace = true
+
+inspect.workspace = true
+pal_async.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+unix_socket.workspace = true
+
+[dev-dependencies]
+guestmem.workspace = true
+pal_async_test.workspace = true
+
+[lints]
+workspace = true

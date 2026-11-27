@@ -5280,6 +5280,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "net_l2"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "guestmem",
+ "inspect",
+ "net_backend",
+ "net_backend_resources",
+ "pal_async",
+ "pal_async_test",
+ "parking_lot",
+ "thiserror 2.0.16",
+ "tracing",
+ "unix_socket",
+ "vm_resource",
+]
+
+[[package]]
 name = "net_mana"
 version = "0.0.0"
 dependencies = [
@@ -6503,6 +6523,7 @@ dependencies = [
  "net_backend",
  "net_consomme",
  "net_dio",
+ "net_l2",
  "net_tap",
  "netvsp",
  "nvme",

@@ -4157,6 +4157,7 @@ fn create_switch_dialog_validates_os_aware_kinds_and_external_adapter() {
             SwitchCreateKind::External,
             SwitchCreateKind::Internal,
             SwitchCreateKind::Private,
+            SwitchCreateKind::L2,
         ]
     );
     assert!(win_dlg.build_payload().is_err(), "empty name must fail");
@@ -4199,13 +4200,25 @@ fn create_switch_dialog_validates_os_aware_kinds_and_external_adapter() {
     assert_eq!(linux_dlg.kind, SwitchCreateKind::Bridge);
     assert_eq!(
         SwitchCreateKind::available_for_os(Some("linux")),
-        &[SwitchCreateKind::Bridge]
+        &[SwitchCreateKind::Bridge, SwitchCreateKind::L2]
     );
     linux_dlg.name = "br-vm0".to_string();
     linux_dlg.cidr = "10.20.0.0/24".to_string();
     let br_payload = linux_dlg.build_payload().unwrap();
     assert_eq!(br_payload.kind, "bridge");
     assert_eq!(br_payload.cidr.as_deref(), Some("10.20.0.0/24"));
+
+    let mut mac_dlg = CreateSwitchDialog::new(Some("macos"));
+    assert_eq!(mac_dlg.kind, SwitchCreateKind::L2);
+    assert_eq!(
+        SwitchCreateKind::available_for_os(Some("macos")),
+        &[SwitchCreateKind::L2]
+    );
+    mac_dlg.name = "l2-mesh".to_string();
+    mac_dlg.cidr = "10.30.0.0/24".to_string();
+    let l2_payload = mac_dlg.build_payload().unwrap();
+    assert_eq!(l2_payload.kind, "l2");
+    assert_eq!(l2_payload.cidr.as_deref(), Some("10.30.0.0/24"));
 }
 
 #[test]

@@ -198,3 +198,21 @@ pub mod tap {
         const ID: &'static str = "tap";
     }
 }
+
+/// Cross-platform userspace L2 virtual switch socket/pipe backend.
+pub mod l2 {
+    use mesh::MeshPayload;
+    use vm_resource::ResourceId;
+    use vm_resource::kind::NetEndpointHandleKind;
+
+    /// Handle to a userspace L2 virtual switch endpoint.
+    #[derive(MeshPayload)]
+    pub struct L2SocketHandle {
+        /// Path to the daemon Unix domain socket (Linux/macOS) or named pipe (Windows).
+        pub path: String,
+    }
+
+    impl ResourceId<NetEndpointHandleKind> for L2SocketHandle {
+        const ID: &'static str = "l2_socket";
+    }
+}

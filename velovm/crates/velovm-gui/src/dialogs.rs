@@ -762,6 +762,7 @@ impl VmSettingsDialog {
             Some(NicBackendConfig::Tap { name }) | Some(NicBackendConfig::Bridge { name }) => {
                 name.clone()
             }
+            Some(NicBackendConfig::L2Switch { switch_id }) => switch_id.clone(),
         };
         let uefi_firmware = cfg
             .uefi_firmware
@@ -1101,6 +1102,7 @@ pub enum SwitchCreateKind {
     Internal,
     Private,
     Bridge,
+    L2,
 }
 
 impl SwitchCreateKind {
@@ -1110,6 +1112,7 @@ impl SwitchCreateKind {
             Self::Internal => "internal",
             Self::Private => "private",
             Self::Bridge => "bridge",
+            Self::L2 => "l2",
         }
     }
 
@@ -1119,15 +1122,18 @@ impl SwitchCreateKind {
             Self::Internal => "Internal (VMs + Host OS)",
             Self::Private => "Private (VMs only)",
             Self::Bridge => "Linux Bridge (kernel bridge + managed TAP)",
+            Self::L2 => "Userspace L2 Switch (cross-platform)",
         }
     }
 
     pub fn available_for_os(host_os: Option<&str>) -> &'static [Self] {
         let os = host_os.unwrap_or(std::env::consts::OS);
         if os.eq_ignore_ascii_case("windows") {
-            &[Self::External, Self::Internal, Self::Private]
+            &[Self::External, Self::Internal, Self::Private, Self::L2]
+        } else if os.eq_ignore_ascii_case("linux") {
+            &[Self::Bridge, Self::L2]
         } else {
-            &[Self::Bridge]
+            &[Self::L2]
         }
     }
 }
@@ -1152,7 +1158,7 @@ impl CreateSwitchDialog {
         let default_kind = if available.contains(&SwitchCreateKind::Internal) {
             SwitchCreateKind::Internal
         } else {
-            available.first().copied().unwrap_or(SwitchCreateKind::Bridge)
+            available.first().copied().unwrap_or(SwitchCreateKind::L2)
         };
         Self {
             dialog_id: Uuid::new_v4(),
@@ -1291,6 +1297,9 @@ pub fn build_nics_from_switch_id(
         },
         Some("bridge") => NicBackendConfig::Bridge {
             name: sw.map(|s| s.name.clone()).unwrap_or_else(|| switch_id.to_string()),
+        },
+        Some("l2") | Some("l2_hub") => NicBackendConfig::L2Switch {
+            switch_id: switch_id.to_string(),
         },
         _ => NicBackendConfig::VmSwitch {
             switch_id: switch_id.to_string(),
@@ -2576,7 +2585,12 @@ pub fn render_create_switch_dialog(
                             ui.end_row();
                         }
 
-                        if matches!(d.kind, SwitchCreateKind::Bridge | SwitchCreateKind::Private) {
+                        if matches!(
+                            d.kind,
+                            SwitchCreateKind::Bridge
+                                | SwitchCreateKind::Private
+                                | SwitchCreateKind::L2
+                        ) {
                             ui.label("Subnet CIDR (optional):");
                             ui.add_enabled(
                                 !d.submitting,
