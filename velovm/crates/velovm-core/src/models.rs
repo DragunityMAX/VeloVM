@@ -1639,7 +1639,10 @@ impl CreateSwitchPayload {
             "bridge" => {
                 validate_linux_iface_name(name, "bridge")?;
             }
-            "internal" | "private" | "l2" | "l2_hub" => {}
+            "l2" | "l2_hub" => {
+                validate_l2_switch_id(name)?;
+            }
+            "internal" | "private" => {}
             other => bail!("unsupported virtual switch kind '{other}'"),
         }
 
@@ -2793,6 +2796,23 @@ mod tests {
             ..Default::default()
         };
         valid_bridge.validate().unwrap();
+
+        let valid_l2 = CreateSwitchPayload {
+            name: "l2-lab_01".into(),
+            kind: "l2".into(),
+            cidr: Some("10.30.0.0/24".into()),
+            ..Default::default()
+        };
+        valid_l2.validate().unwrap();
+
+        for bad_l2 in ["l2 with space", "l2.dot", "l2:colon"] {
+            let p = CreateSwitchPayload {
+                name: bad_l2.into(),
+                kind: "l2".into(),
+                ..Default::default()
+            };
+            assert!(p.validate().is_err(), "expected L2 name '{bad_l2}' to fail");
+        }
 
         let bad_cidr = CreateSwitchPayload {
             name: "priv0".into(),
